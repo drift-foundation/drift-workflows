@@ -1,0 +1,51 @@
+# Singular — language-neutral idempotency protocol + library ecosystem.
+#
+# Component layout (Drift Workflows monorepo):
+#   doc/                 normative protocol spec (singular-protocol.md) — neutral
+#   db/                  shared MariaDB backend: schema + stored procedures
+#   tests/conformance/   language-neutral protocol vectors (PLANNED)
+#   drift/               the Drift binding (self-contained Drift project)
+#   java/ rust/ python/  future bindings (created when implemented)
+#
+# This umbrella justfile delegates build/test to each language binding and
+# owns the shared backend (db/). The Drift binding has its own justfile under
+# drift/.
+
+DB_HOST := "127.0.0.1"
+DB_PORT := "34114"
+DB_USER := "root"
+DB_SCHEMA := "singular"
+MARIACHI := env("MARIACHI_BIN", "../../mariachi/.venv/bin/mariachi")
+
+# Build every implemented binding.
+build:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	echo "[singular] build drift binding"
+	( cd drift && just build )
+
+# Test every implemented binding (+ conformance once authored).
+test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	echo "[singular] test drift binding"
+	( cd drift && just test )
+
+# Foundation stress/perf gate stubs (populate as scenarios land).
+stress:
+	@echo "[singular] no stress scenarios defined yet (gate stub)"
+
+perf:
+	@echo "[singular] no perf scenarios defined yet (gate stub)"
+
+# Apply the shared backend schema (db/) via Mariachi.
+db-load-schema:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../../mariachi && just setup'" >&2; exit 1; }
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	"{{MARIACHI}}" \
+	  --schema-template db \
+	  --host {{DB_HOST}} --port {{DB_PORT}} \
+	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  apply --schema {{DB_SCHEMA}} --env=development --allow-destructive --destroy-database

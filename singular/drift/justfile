@@ -1,0 +1,217 @@
+# Singular — idempotency/lease coordination library
+#
+# Environment:
+#   DRIFT_TOOLCHAIN_ROOT — required for cert gates (just test). Toolchain >= 0.33.17.
+#   DRIFT_PKG_ROOT       — foundation-libs root for resolving external deps
+#                          (default: $HOME/opt/drift/certified/current/libs).
+#   PUSHCOIN_SIGN_KEY_FILE — Ed25519 signing key file (PushCoin publisher identity):
+#                          cert-claim signer for `just deploy`, author-claim signer
+#                          for `just author-claim`. Project-scoped on purpose so the
+#                          global $DRIFT_SIGN_KEY_FILE (foundation default) can't shadow
+#                          it (default: $HOME/.config/drift/keys/pushcoin.seed).
+#   DRIFT_DIST_ROOT      — deploy destination (default: build/dist/lib)
+
+MANIFEST := "drift/manifest.json"
+DEPLOY_DEST := env("DRIFT_DIST_ROOT", "build/dist/lib")
+_pkg-root := env("DRIFT_PKG_ROOT", env("HOME") + "/opt/drift/certified/current/libs")
+HEARTBEAT_SECS := "30"
+
+# --- Certification gates (shared executor) ---
+# Gates run on the toolchain's shared `drift_test_run` executor (mechanism),
+# driven by tools/emit_test_plan.py (policy: which files/deps/lanes). The executor
+# owns parallel compile under the flocker pool, dedup, valgrind wrap, heartbeat,
+# and the host concurrency budget — no per-team forked runner. perf/stress gates
+# are not defined yet (no scenarios); add them via the same emitter when they exist.
+
+# Correctness gate: unit (parallel base/memcheck/asan, DB-free) + e2e (serial
+# base/asan/memcheck on the shared mdb114-a, each lane state-isolated via its own
+# per-run service_group). Requires DRIFT_TOOLCHAIN_ROOT and a running mdb114-a.
+test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	export DRIFT_PKG_ROOT="{{_pkg-root}}"
+	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
+	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	WORK="$(mktemp -d -t singular-test-XXXXXX)"
+	trap 'rm -rf "$WORK"' EXIT
+	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
+	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
+
+# Raw-SQL / SP invariant regressions — focused DEV convenience. The certification path runs the SAME
+# script as a serialized DB_GROUP job inside `just test` (emit_test_plan LIVE jobs); this recipe just
+# runs it standalone for fast iteration. Asserts SQL NULL/edge inputs SIGNAL + leave table state
+# unchanged, and that a dangling head-history row is corruption (errno 30001 → BackendResponseInvalid),
+# distinct from a missing-projection NotFound.
+test-sql:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	../../../mariachi/.venv/bin/python packages/singular/tests/sql/sp_invariants_test.py
+
+# --- Dev workflows (generic, via the same emitter) ---
+
+# Build + run one test file (base lane). e2e files get an isolated namespace.
+#   just check-one packages/singular/tests/e2e/live_gateway_test.drift
+check-one FILE:
+	#!/usr/bin/env bash
+	set -uo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	export DRIFT_PKG_ROOT="{{_pkg-root}}"
+	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
+	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	WORK="$(mktemp -d /tmp/singular-one.XXXXXX)"
+	trap 'rm -rf "$WORK"' EXIT
+	python3 tools/emit_test_plan.py one --file "{{FILE}}" --out "$WORK/plan.json"
+	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK"
+
+# Focused dev runner for the malformed-backend regression (finding #1 / CORE_BUG). This is the
+# SAME fixture + test that the normal `just test` gate runs (malformed_backend_test is in
+# emit_test_plan's LIVE_TESTS, and `just db-load-schema` loads the `singular_malformed` schema) —
+# this recipe just loads that isolated schema and runs the one test in isolation for fast
+# iteration. Requires MDB_ROOT_PWD + a running mdb114-a.
+test-malformed-fixture:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	mariadb -h 127.0.0.1 -P 34114 -u root -p"${MDB_ROOT_PWD}" \
+	  < packages/singular/tests/fixtures/malformed_backend.sql
+	just check-one packages/singular/tests/fixtures/malformed_backend_test.drift
+
+# Type-check one file against singular's sources (no entry, no run).
+#   just compile-check packages/singular/src/gateway.drift
+compile-check FILE="packages/singular/src/lib.drift":
+	#!/usr/bin/env bash
+	set -uo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	export DRIFT_PKG_ROOT="{{_pkg-root}}"
+	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
+	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	WORK="$(mktemp -d /tmp/singular-compile.XXXXXX)"
+	trap 'rm -rf "$WORK"' EXIT
+	python3 tools/emit_test_plan.py compile --file "{{FILE}}" --out "$WORK/plan.json"
+	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK"
+
+# --- Package lifecycle ---
+
+# Resolve dependencies and refresh drift/lock.json against the current cert pool.
+prepare:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
+	"$DRIFT" prepare --package-root "{{_pkg-root}}"
+
+# Re-mint drift/singular.author-claim under the PushCoin author key. Run after
+# any source change that affects SCI (modules, assets, deps, version).
+# The author-claim is then committed; the cert-claim is emitted by `just deploy`.
+author-claim:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
+	KEY_FILE="${PUSHCOIN_SIGN_KEY_FILE:-${HOME}/.config/drift/keys/pushcoin.seed}"
+	[[ -f "${KEY_FILE}" ]] || { echo "error: signing key not found: ${KEY_FILE}" >&2; exit 1; }
+	echo "[author-claim] minting drift/singular.author-claim"
+	"$DRIFT" author \
+	  --artifact singular \
+	  --key-file "${KEY_FILE}" \
+	  --overwrite
+
+# Produce singular's release dist (signed .zdmp + sidecars) at build/dist/lib/.
+# Self-contained entrypoint for top-level orchestration and standalone-repo splits.
+# Chain: prepare → author-claim → cert (runs the test gate, writes evidence) → deploy.
+build: deploy
+
+# Wipe all generated artifacts under build/.
+clean:
+	rm -rf build
+
+# Reset Singular work-item data in the DB. No arg → ALL data; pass a
+# service_group to remove just that group (e.g. one accumulated
+# `drift-test-<pid>-<ns>` left by an e2e run). On-demand only — NOT run by
+# test/cert, which self-isolate via unique per-run groups. DB instance via
+# SINGULAR_DB_INSTANCE (default mdb114-a). History deleted first (FK child).
+clean-data GROUP="":
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DB_INSTANCE="${SINGULAR_DB_INSTANCE:-mdb114-a}"
+	if [[ -z "{{GROUP}}" ]]; then
+	  echo "[clean-data] removing ALL singular work-item data"
+	  WHERE=""
+	else
+	  echo "[clean-data] removing service_group={{GROUP}}"
+	  WHERE=" WHERE service_group='{{GROUP}}'"
+	fi
+	tools/db_instance.sh sql "$DB_INSTANCE" \
+	  "USE singular; DELETE FROM tb_singular_work_item_history${WHERE}; DELETE FROM tb_singular_work_item${WHERE};"
+
+# Run the test gate and write build/cert/evidence.json capturing exit code +
+# log digest + driftc banner + source SCI. Evidence file is what `just deploy`
+# hashes for --cert-suite-evidence-sha256. The test gate self-isolates its e2e
+# fixtures (unique per-run service_group), so repeated cert runs are idempotent.
+cert:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	mkdir -p build/cert
+	export DRIFT_TOOLCHAIN_ROOT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}"
+	DRIFT="$DRIFT_TOOLCHAIN_ROOT/bin/drift"
+	DRIFTC_BANNER=$("$DRIFT" --version)
+	SCI=$(python3 -c "import json; print(json.load(open('drift/singular.author-claim'))['body']['source_content_id'])" 2>/dev/null || echo "unknown")
+	APP_VER=$(python3 -c "import json; m=json.load(open('drift/manifest.json')); print(m['artifacts'][0]['version'])")
+	echo "[cert] test gate"
+	TEST_EXIT=0
+	just test > build/cert/test.log 2>&1 || TEST_EXIT=$?
+	TEST_SHA=$(sha256sum build/cert/test.log | cut -d' ' -f1)
+	TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	if [[ $TEST_EXIT -eq 0 ]]; then OVERALL=pass; else OVERALL=fail; fi
+	python3 -c "
+	import json, sys
+	json.dump({
+	  'schema': 'pushcoin.cert-evidence/1',
+	  'package': 'singular',
+	  'version': '${APP_VER}',
+	  'source_content_id': '${SCI}',
+	  'driftc_banner': '${DRIFTC_BANNER}',
+	  'timestamp_utc': '${TS}',
+	  'lanes': {
+	    'test': {'exit_code': ${TEST_EXIT}, 'log_sha256': 'sha256:${TEST_SHA}'}
+	  },
+	  'overall_result': '${OVERALL}'
+	}, sys.stdout, indent=2, sort_keys=True)
+	print()
+	" > build/cert/evidence.json
+	if [[ $OVERALL != pass ]]; then
+	  echo "error: cert failed (test=$TEST_EXIT) — see build/cert/test.log" >&2
+	  exit 1
+	fi
+	echo "[cert] $(sha256sum build/cert/evidence.json) → build/cert/evidence.json"
+
+# Build, sign, and publish singular to DEPLOY_DEST (default: build/dist/lib).
+# Consumes drift/singular.author-claim (committed) + build/cert/evidence.json
+# (from `just cert`) and emits an evidence-bearing cert-claim sidecar.
+# Override --cert-suite-* via ARGS for orchestrator runs.
+deploy *ARGS: author-claim cert
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
+	KEY_FILE="${PUSHCOIN_SIGN_KEY_FILE:-${HOME}/.config/drift/keys/pushcoin.seed}"
+	[[ -f "${KEY_FILE}" ]] || { echo "error: signing key not found: ${KEY_FILE}" >&2; exit 1; }
+	[[ -f build/cert/evidence.json ]] || { echo "error: build/cert/evidence.json missing — run 'just cert' first" >&2; exit 1; }
+	EVIDENCE_SHA=$(sha256sum build/cert/evidence.json | cut -d' ' -f1)
+	mkdir -p "{{DEPLOY_DEST}}"
+	EXTRA=""
+	if [[ "{{ARGS}}" != *--cert-suite* ]]; then
+	  EXTRA="--cert-suite-id pushcoin/singular --cert-suite-evidence-sha256 sha256:${EVIDENCE_SHA}"
+	fi
+	"$DRIFT" deploy --manifest {{MANIFEST}} \
+	  --trust-store drift/trust.json \
+	  --sign-key-file "${KEY_FILE}" \
+	  --dest "{{DEPLOY_DEST}}" \
+	  --package-root "{{_pkg-root}}" \
+	  ${EXTRA} {{ARGS}}
+
+# --- Database ---
+# Singular does not own DB lifecycle. PushCoin provides the running MariaDB
+# instance. The Singular schema lives as file-per-resource sources under
+# singular/db/{schema,procs,constants,grants}/*.sql and is applied by Mariachi
+# (same management model as the PushCoin business DB). Use the root-level
+# `just db-load-schema` recipe to (re-)apply.

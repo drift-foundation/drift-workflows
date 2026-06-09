@@ -1,0 +1,157 @@
+# Drift Workflows — Microflows component build/test/db recipes.
+# (Drift Workflows = Microflows [this tree] + Singular [external lib]. This
+#  justfile builds the Microflows package; milestone 1: MariaDB reference host.)
+#
+# Environment:
+#   DRIFT_TOOLCHAIN_ROOT — required for test gates (just test). Toolchain >= 0.33.17.
+#   DRIFT_PKG_ROOT       — foundation-libs root for resolving external deps
+#                          (default: $HOME/opt/drift/certified/current/libs).
+#   PUSHCOIN_SIGN_KEY_FILE — Ed25519 signing key file (PushCoin publisher identity)
+#                          (default: $HOME/.config/drift/keys/pushcoin.seed).
+#   DRIFT_DIST_ROOT      — deploy destination (default: build/dist/lib)
+#   MDB_ROOT_PWD         — MariaDB root password for db-* recipes.
+
+MANIFEST := "drift/manifest.json"
+DEPLOY_DEST := env("DRIFT_DIST_ROOT", "build/dist/lib")
+_pkg-root := env("DRIFT_PKG_ROOT", env("HOME") + "/opt/drift/certified/current/libs")
+HEARTBEAT_SECS := "30"
+
+DB_HOST := "127.0.0.1"
+DB_PORT := "34114"
+DB_USER := "root"
+DB_SCHEMA := "microflows"
+
+# --- Certification gates (shared executor) ---
+# Gates run on the toolchain's shared `drift_test_run` executor (mechanism),
+# driven by tools/emit_test_plan.py (policy: which files/deps/lanes).
+
+# Correctness gate: unit (parallel base/memcheck/asan, DB-free) + e2e (serial
+# base/asan/memcheck on the shared mdb114-a). Requires DRIFT_TOOLCHAIN_ROOT and
+# a running mdb114-a with the microflows schema loaded (`just db-load-schema`).
+test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	export DRIFT_PKG_ROOT="{{_pkg-root}}"
+	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
+	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	WORK="$(mktemp -d -t microflows-test-XXXXXX)"
+	trap 'rm -rf "$WORK"' EXIT
+	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
+	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
+
+# --- Dev workflows (generic, via the same emitter) ---
+
+# Build + run one test file (base lane). e2e files get an isolated namespace.
+#   just check-one packages/microflows/tests/unit/state_test.drift
+check-one FILE:
+	#!/usr/bin/env bash
+	set -uo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	export DRIFT_PKG_ROOT="{{_pkg-root}}"
+	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
+	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	WORK="$(mktemp -d /tmp/microflows-one.XXXXXX)"
+	trap 'rm -rf "$WORK"' EXIT
+	python3 tools/emit_test_plan.py one --file "{{FILE}}" --out "$WORK/plan.json"
+	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK"
+
+# Type-check one file against microflows's sources (no entry, no run).
+#   just compile-check packages/microflows/src/state.drift
+compile-check FILE="packages/microflows/src/lib.drift":
+	#!/usr/bin/env bash
+	set -uo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	export DRIFT_PKG_ROOT="{{_pkg-root}}"
+	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
+	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	WORK="$(mktemp -d /tmp/microflows-compile.XXXXXX)"
+	trap 'rm -rf "$WORK"' EXIT
+	python3 tools/emit_test_plan.py compile --file "{{FILE}}" --out "$WORK/plan.json"
+	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK"
+
+# --- Package lifecycle ---
+
+# Resolve dependencies and refresh drift/lock.json against the current cert pool.
+prepare:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
+	"$DRIFT" prepare --package-root "{{_pkg-root}}"
+
+# Re-mint drift/microflows.author-claim under the Drift Foundation author key
+# (Foundation convention: tools.drift_author + DRIFT_SIGN_KEY_FILE). Run after
+# any source change that affects SCI (modules, assets, deps, version).
+author-claim:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DRIFT_LANG_ROOT="${DRIFT_LANG_ROOT:-${HOME}/src/drift-lang}"
+	KEY_FILE="${DRIFT_SIGN_KEY_FILE:-${HOME}/.config/drift/keys/default.seed}"
+	[[ -d "${DRIFT_LANG_ROOT}/tools/drift_author" ]] || { echo "error: tools.drift_author not found at ${DRIFT_LANG_ROOT}" >&2; exit 1; }
+	[[ -f "${KEY_FILE}" ]] || { echo "error: signing key not found: ${KEY_FILE}" >&2; exit 1; }
+	echo "[author-claim] minting drift/microflows.author-claim"
+	PYTHONPATH="${DRIFT_LANG_ROOT}" python3 -m tools.drift_author publish \
+	  --manifest "$(pwd)/drift/manifest.json" \
+	  --artifact microflows \
+	  --key-file "${KEY_FILE}" \
+	  --overwrite
+
+# --- Stress / perf gates (Foundation standard) ---
+# Empty scaffolds so certification has the recipes; populate as scenarios land.
+
+# Stress gate — no scenarios yet.
+stress:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	echo "[stress] no stress scenarios defined yet (Foundation gate stub)"
+
+# Perf gate — no scenarios yet.
+perf:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	echo "[perf] no perf scenarios defined yet (Foundation gate stub)"
+
+# Wipe all generated artifacts under build/.
+clean:
+	rm -rf build
+
+# --- Database (Mariachi) ---
+# Coordinator control-state schema + stored procedures live under
+# db/{schema,procs,constants,grants} in Mariachi-compatible form and are
+# deployed via Mariachi (the Foundation schema orchestrator), not ad-hoc
+# loaders. Mariachi handles ordering (FK parents before children) and
+# idempotent apply. One-time bootstrap: `cd ../mariachi && just setup`.
+
+MARIACHI := env("MARIACHI_BIN", "../../mariachi/.venv/bin/mariachi")
+
+# (Re-)create the microflows schema from the db/ template via Mariachi
+# (dev recreation; --destroy-database is refused on production-marked DBs).
+db-load-schema:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../mariachi && just setup'" >&2; exit 1; }
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	"{{MARIACHI}}" \
+	  --schema-template db \
+	  --host {{DB_HOST}} --port {{DB_PORT}} \
+	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  apply --schema {{DB_SCHEMA}} --env=development --allow-destructive --destroy-database
+
+# Plan a schema diff (no mutation) via Mariachi.
+db-plan:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../mariachi && just setup'" >&2; exit 1; }
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	"{{MARIACHI}}" \
+	  --schema-template db \
+	  --host {{DB_HOST}} --port {{DB_PORT}} \
+	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  plan --schema {{DB_SCHEMA}}
+
+# Run a SQL statement against the microflows database.
+db-sql SQL:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	mariadb -h {{DB_HOST}} -P {{DB_PORT}} -u {{DB_USER}} -p"${MDB_ROOT_PWD}" {{DB_SCHEMA}} -e "{{SQL}}"

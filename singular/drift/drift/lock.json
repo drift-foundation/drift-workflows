@@ -1,0 +1,25 @@
+{
+  "schema_version": 4,
+  "artifacts": {
+    "singular": {
+      "resolved": {
+        "mariadb-rpc": {
+          "version": "0.6.0",
+          "sha256": "c8e3359ea022c6ecd2baeb1052add4ca066bcb033c37790bb48e500b66c46f9d",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:1188223ff332c060852d751b2e432ecb0259278fae8d398e5e71b64c0c84b397",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "direct"
+        },
+        "mariadb-wire-proto": {
+          "version": "0.4.0",
+          "sha256": "5c49fa540dd44c31e50a2e4c1b375c82b7202953a26af4f806840eb31495ca28",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:94b2231366549a7d0e108aed47b91db32a4b80b5900230d394b58edb214b3926",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "transitive"
+        }
+      }
+    }
+  }
+}

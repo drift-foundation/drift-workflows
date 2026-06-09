@@ -1,0 +1,433 @@
+// Workflow lifecycle state machine — Microflows coordinator
+// (microflows_design.md §2, §3.1; generalized blocked_resolution).
+//
+// SIX lifecycle states plus an orthogonal EXECUTION DIRECTION. "Running" is
+// NOT a lifecycle state: it means a claimable state currently holds a valid
+// executor lease. Retry and timer waits are due-time scheduling
+// (next_attempt_at), not states. Recovery is an expired lease on a claimable
+// state, not a transition.
+//
+// blocked_resolution is GENERAL: any point at which automatic execution
+// cannot safely choose a next action — not only reverse failure. It is
+// entered from forward (a forward operation returns indeterminate) and from
+// reversing (compensation returns indeterminate or terminal failure). The
+// direction the workflow was going when it blocked is tracked explicitly,
+// because the valid authorized-resolution transitions differ by direction.
+//
+// TWO distinct terminal "unwound" outcomes, deliberately separate:
+//   reversed            — genuine FULL compensation completed (UnwindComplete)
+//   resolved_exception  — terminated by an audited accepted exception WITHOUT
+//                         (full) compensation (ResolveAcceptException). Never
+//                         claim "reversed" when compensation did not occur.
+//
+// State/direction consistency invariant (enforced here AND by the
+// tb_mf_workflow CHECK):
+//   forward            requires direction=forward
+//   reversing          requires direction=reverse
+//   blocked_resolution retains either direction
+//   completed          requires direction=forward
+//   reversed           requires direction=reverse
+//   resolved_exception retains either direction
+//
+// State storage codes (sync with db/schema/tb_mf_workflow.sql):
+//   1=forward 2=reversing 3=blocked_resolution
+//   4=completed 5=reversed 6=resolved_exception
+// Execution-direction codes:
+//   1=forward 2=reverse
+// Disposition codes:
+//   0=none 1=completed 2=failed 3=cancelled 4=indeterminate
+
+module microflows.state;
+
+export {
+	WorkflowState,
+	ExecutionDirection,
+	TransitionCause,
+	Disposition,
+	Transition,
+	state_code,
+	state_from_code,
+	state_name,
+	state_from_name,
+	state_eq,
+	is_claimable,
+	is_terminal,
+	direction_code,
+	direction_from_code,
+	direction_name,
+	direction_from_name,
+	direction_eq,
+	state_direction_valid,
+	transition,
+	transition_target,
+	cause_disposition,
+	disposition_code,
+	disposition_from_code,
+	disposition_name,
+	disposition_from_name,
+	disposition_eq,
+	disposition_valid_for
+};
+
+// ===== Lifecycle states =====
+
+pub variant WorkflowState {
+	Forward,            // executing forward operations; claimable
+	Reversing,          // unwinding checkpoints newest-first; claimable
+	BlockedResolution,  // automatic execution cannot safely proceed; awaits resolution
+	Completed,          // terminal: forward success
+	Reversed,           // terminal: genuine full compensation completed
+	ResolvedException   // terminal: audited accepted exception, compensation NOT (fully) done
+}
+
+// ===== Execution direction =====
+
+pub variant ExecutionDirection {
+	Forward,
+	Reverse
+}
+
+// ===== Transition causes (microflows_design.md §2, §3.1) =====
+
+pub variant TransitionCause {
+	ForwardComplete,        // forward -> completed: workflow body finished
+	OperationFailure,       // forward -> reversing: nonretryable op failure / retry exhaustion
+	ForwardIndeterminate,   // forward -> blocked_resolution: forward op returned indeterminate
+	Cancellation,           // forward -> reversing: authorized cancel (direct fenced transition)
+	UnwindComplete,         // reversing -> reversed: checkpoint stack fully unwound
+	ReverseBlocked,         // reversing -> blocked_resolution: compensation indeterminate or terminal failure
+	ResolveForwardSuccess,  // blocked(forward) -> forward: resolve op as success w/ typed result
+	ResolveForwardFailed,   // blocked(forward) -> reversing: resolve op as definitively failed
+	ResolveReversalContinue,// blocked(reverse) -> reversing: resolve/retry compensation, continue unwind
+	ResolveAcceptException  // blocked(forward|reverse) -> resolved_exception: accept audited exception
+}
+
+// ===== Dispositions =====
+
+pub variant Disposition {
+	NoDisposition,      // forward execution, nothing declared
+	CompletedOk,        // terminal success
+	Failed,             // failure declared; drives (or drove) reversal
+	Cancelled,          // cancellation declared; drives (or drove) reversal
+	Indeterminate       // a forward op is indeterminate; blocked awaiting resolution
+}
+
+// ===== Transition result =====
+
+pub struct Transition {
+	pub to_state: WorkflowState,
+	pub to_direction: ExecutionDirection
+}
+
+// ===== State codes / names =====
+
+pub fn state_code(s: &WorkflowState) nothrow -> Int {
+	return match s {
+		WorkflowState::Forward => { 1 },
+		WorkflowState::Reversing => { 2 },
+		WorkflowState::BlockedResolution => { 3 },
+		WorkflowState::Completed => { 4 },
+		WorkflowState::Reversed => { 5 },
+		WorkflowState::ResolvedException => { 6 }
+	};
+}
+
+pub fn state_from_code(code: Int) nothrow -> Optional<WorkflowState> {
+	if code == 1 { return Optional<WorkflowState>::Some(WorkflowState::Forward()); }
+	if code == 2 { return Optional<WorkflowState>::Some(WorkflowState::Reversing()); }
+	if code == 3 { return Optional<WorkflowState>::Some(WorkflowState::BlockedResolution()); }
+	if code == 4 { return Optional<WorkflowState>::Some(WorkflowState::Completed()); }
+	if code == 5 { return Optional<WorkflowState>::Some(WorkflowState::Reversed()); }
+	if code == 6 { return Optional<WorkflowState>::Some(WorkflowState::ResolvedException()); }
+	return Optional<WorkflowState>::None();
+}
+
+pub fn state_name(s: &WorkflowState) nothrow -> String {
+	return match s {
+		WorkflowState::Forward => { "forward" },
+		WorkflowState::Reversing => { "reversing" },
+		WorkflowState::BlockedResolution => { "blocked_resolution" },
+		WorkflowState::Completed => { "completed" },
+		WorkflowState::Reversed => { "reversed" },
+		WorkflowState::ResolvedException => { "resolved_exception" }
+	};
+}
+
+pub fn state_from_name(name: String) nothrow -> Optional<WorkflowState> {
+	if name == "forward" { return Optional<WorkflowState>::Some(WorkflowState::Forward()); }
+	if name == "reversing" { return Optional<WorkflowState>::Some(WorkflowState::Reversing()); }
+	if name == "blocked_resolution" { return Optional<WorkflowState>::Some(WorkflowState::BlockedResolution()); }
+	if name == "completed" { return Optional<WorkflowState>::Some(WorkflowState::Completed()); }
+	if name == "reversed" { return Optional<WorkflowState>::Some(WorkflowState::Reversed()); }
+	if name == "resolved_exception" { return Optional<WorkflowState>::Some(WorkflowState::ResolvedException()); }
+	return Optional<WorkflowState>::None();
+}
+
+pub fn state_eq(a: &WorkflowState, b: &WorkflowState) nothrow -> Bool {
+	return state_code(a) == state_code(b);
+}
+
+pub fn is_claimable(s: &WorkflowState) nothrow -> Bool {
+	return match s {
+		WorkflowState::Forward => { true },
+		WorkflowState::Reversing => { true },
+		default => { false }
+	};
+}
+
+pub fn is_terminal(s: &WorkflowState) nothrow -> Bool {
+	return match s {
+		WorkflowState::Completed => { true },
+		WorkflowState::Reversed => { true },
+		WorkflowState::ResolvedException => { true },
+		default => { false }
+	};
+}
+
+// ===== Execution-direction codes / names =====
+
+pub fn direction_code(d: &ExecutionDirection) nothrow -> Int {
+	return match d {
+		ExecutionDirection::Forward => { 1 },
+		ExecutionDirection::Reverse => { 2 }
+	};
+}
+
+pub fn direction_from_code(code: Int) nothrow -> Optional<ExecutionDirection> {
+	if code == 1 { return Optional<ExecutionDirection>::Some(ExecutionDirection::Forward()); }
+	if code == 2 { return Optional<ExecutionDirection>::Some(ExecutionDirection::Reverse()); }
+	return Optional<ExecutionDirection>::None();
+}
+
+pub fn direction_name(d: &ExecutionDirection) nothrow -> String {
+	return match d {
+		ExecutionDirection::Forward => { "forward" },
+		ExecutionDirection::Reverse => { "reverse" }
+	};
+}
+
+pub fn direction_from_name(name: String) nothrow -> Optional<ExecutionDirection> {
+	if name == "forward" { return Optional<ExecutionDirection>::Some(ExecutionDirection::Forward()); }
+	if name == "reverse" { return Optional<ExecutionDirection>::Some(ExecutionDirection::Reverse()); }
+	return Optional<ExecutionDirection>::None();
+}
+
+pub fn direction_eq(a: &ExecutionDirection, b: &ExecutionDirection) nothrow -> Bool {
+	return direction_code(a) == direction_code(b);
+}
+
+// State/direction consistency invariant (mirror of the tb_mf_workflow CHECK).
+pub fn state_direction_valid(s: &WorkflowState, d: &ExecutionDirection) nothrow -> Bool {
+	val dc = direction_code(d);
+	return match s {
+		WorkflowState::Forward => { dc == 1 },
+		WorkflowState::Reversing => { dc == 2 },
+		WorkflowState::BlockedResolution => { dc == 1 or dc == 2 },
+		WorkflowState::Completed => { dc == 1 },
+		WorkflowState::Reversed => { dc == 2 },
+		WorkflowState::ResolvedException => { dc == 1 or dc == 2 }
+	};
+}
+
+// ===== Transition authority =====
+//
+// The single authority for the lifecycle machine. Validity depends on
+// (from_state, direction, cause) — direction matters for the resolution
+// causes out of blocked_resolution. The next direction is derived from the
+// target state so the state/direction invariant always holds: entering
+// Forward/Completed => Forward; entering Reversing/Reversed => Reverse;
+// entering blocked/resolved_exception => the incoming direction unchanged.
+
+pub fn transition(from: &WorkflowState, dir: &ExecutionDirection, cause: &TransitionCause) nothrow -> Optional<Transition> {
+	match transition_target(from, dir, cause) {
+		Optional::Some(to) => {
+			val to_dir = _derived_direction(&to, dir);
+			return Optional<Transition>::Some(Transition(to_state = move to, to_direction = move to_dir));
+		},
+		Optional::None => { return Optional<Transition>::None(); }
+	}
+}
+
+fn _derived_direction(to: &WorkflowState, incoming: &ExecutionDirection) nothrow -> ExecutionDirection {
+	return match to {
+		WorkflowState::Forward => { ExecutionDirection::Forward() },
+		WorkflowState::Completed => { ExecutionDirection::Forward() },
+		WorkflowState::Reversing => { ExecutionDirection::Reverse() },
+		WorkflowState::Reversed => { ExecutionDirection::Reverse() },
+		default => {
+			// blocked_resolution / resolved_exception: retain incoming direction.
+			match incoming {
+				ExecutionDirection::Forward => { ExecutionDirection::Forward() },
+				ExecutionDirection::Reverse => { ExecutionDirection::Reverse() }
+			}
+		}
+	};
+}
+
+// Resolution-arm helpers (Drift `if` is a statement, not an expression).
+fn _when_forward(is_forward_dir: Bool, target: WorkflowState) nothrow -> Optional<WorkflowState> {
+	if is_forward_dir { return Optional<WorkflowState>::Some(move target); }
+	return Optional<WorkflowState>::None();
+}
+
+fn _when_reverse(is_forward_dir: Bool, target: WorkflowState) nothrow -> Optional<WorkflowState> {
+	if is_forward_dir { return Optional<WorkflowState>::None(); }
+	return Optional<WorkflowState>::Some(move target);
+}
+
+// The target state for (from, direction, cause), or None if not legal. Exposed
+// for the fenced-publication "expected lifecycle state" check.
+pub fn transition_target(from: &WorkflowState, dir: &ExecutionDirection, cause: &TransitionCause) nothrow -> Optional<WorkflowState> {
+	// Enforce the state/direction consistency invariant on INPUT: an
+	// inconsistent (state, direction) pair is not a representable position, so
+	// no transition is legal from it. This makes the Drift API enforce the
+	// invariant (not only the MariaDB CHECK) — a caller cannot transition out
+	// of an impossible state.
+	if !state_direction_valid(from, dir) { return Optional<WorkflowState>::None(); }
+	val is_forward_dir = direction_code(dir) == 1;
+	return match cause {
+		TransitionCause::ForwardComplete => {
+			match from {
+				WorkflowState::Forward => { Optional<WorkflowState>::Some(WorkflowState::Completed()) },
+				default => { Optional<WorkflowState>::None() }
+			}
+		},
+		TransitionCause::OperationFailure => {
+			match from {
+				WorkflowState::Forward => { Optional<WorkflowState>::Some(WorkflowState::Reversing()) },
+				default => { Optional<WorkflowState>::None() }
+			}
+		},
+		TransitionCause::ForwardIndeterminate => {
+			match from {
+				WorkflowState::Forward => { Optional<WorkflowState>::Some(WorkflowState::BlockedResolution()) },
+				default => { Optional<WorkflowState>::None() }
+			}
+		},
+		TransitionCause::Cancellation => {
+			match from {
+				WorkflowState::Forward => { Optional<WorkflowState>::Some(WorkflowState::Reversing()) },
+				default => { Optional<WorkflowState>::None() }
+			}
+		},
+		TransitionCause::UnwindComplete => {
+			match from {
+				WorkflowState::Reversing => { Optional<WorkflowState>::Some(WorkflowState::Reversed()) },
+				default => { Optional<WorkflowState>::None() }
+			}
+		},
+		TransitionCause::ReverseBlocked => {
+			match from {
+				WorkflowState::Reversing => { Optional<WorkflowState>::Some(WorkflowState::BlockedResolution()) },
+				default => { Optional<WorkflowState>::None() }
+			}
+		},
+		TransitionCause::ResolveForwardSuccess => {
+			match from {
+				WorkflowState::BlockedResolution => { _when_forward(is_forward_dir, WorkflowState::Forward()) },
+				default => { Optional<WorkflowState>::None() }
+			}
+		},
+		TransitionCause::ResolveForwardFailed => {
+			match from {
+				WorkflowState::BlockedResolution => { _when_forward(is_forward_dir, WorkflowState::Reversing()) },
+				default => { Optional<WorkflowState>::None() }
+			}
+		},
+		TransitionCause::ResolveReversalContinue => {
+			match from {
+				WorkflowState::BlockedResolution => { _when_reverse(is_forward_dir, WorkflowState::Reversing()) },
+				default => { Optional<WorkflowState>::None() }
+			}
+		},
+		TransitionCause::ResolveAcceptException => {
+			match from {
+				WorkflowState::BlockedResolution => { Optional<WorkflowState>::Some(WorkflowState::ResolvedException()) },
+				default => { Optional<WorkflowState>::None() }
+			}
+		}
+	};
+}
+
+// The disposition a cause declares, or None to keep the current disposition.
+// ResolveAcceptException keeps the underlying cause (failed/cancelled/
+// indeterminate) — the terminal STATE resolved_exception carries the
+// "accepted exception" meaning, so no separate disposition is declared.
+pub fn cause_disposition(cause: &TransitionCause) nothrow -> Optional<Disposition> {
+	return match cause {
+		TransitionCause::ForwardComplete => { Optional<Disposition>::Some(Disposition::CompletedOk()) },
+		TransitionCause::OperationFailure => { Optional<Disposition>::Some(Disposition::Failed()) },
+		TransitionCause::ForwardIndeterminate => { Optional<Disposition>::Some(Disposition::Indeterminate()) },
+		TransitionCause::Cancellation => { Optional<Disposition>::Some(Disposition::Cancelled()) },
+		TransitionCause::UnwindComplete => { Optional<Disposition>::None() },
+		TransitionCause::ReverseBlocked => { Optional<Disposition>::None() },
+		TransitionCause::ResolveForwardSuccess => { Optional<Disposition>::Some(Disposition::NoDisposition()) },
+		TransitionCause::ResolveForwardFailed => { Optional<Disposition>::Some(Disposition::Failed()) },
+		TransitionCause::ResolveReversalContinue => { Optional<Disposition>::None() },
+		TransitionCause::ResolveAcceptException => { Optional<Disposition>::None() }
+	};
+}
+
+// ===== Disposition codes / names =====
+
+pub fn disposition_code(d: &Disposition) nothrow -> Int {
+	return match d {
+		Disposition::NoDisposition => { 0 },
+		Disposition::CompletedOk => { 1 },
+		Disposition::Failed => { 2 },
+		Disposition::Cancelled => { 3 },
+		Disposition::Indeterminate => { 4 }
+	};
+}
+
+pub fn disposition_from_code(code: Int) nothrow -> Optional<Disposition> {
+	if code == 0 { return Optional<Disposition>::Some(Disposition::NoDisposition()); }
+	if code == 1 { return Optional<Disposition>::Some(Disposition::CompletedOk()); }
+	if code == 2 { return Optional<Disposition>::Some(Disposition::Failed()); }
+	if code == 3 { return Optional<Disposition>::Some(Disposition::Cancelled()); }
+	if code == 4 { return Optional<Disposition>::Some(Disposition::Indeterminate()); }
+	return Optional<Disposition>::None();
+}
+
+pub fn disposition_name(d: &Disposition) nothrow -> String {
+	return match d {
+		Disposition::NoDisposition => { "none" },
+		Disposition::CompletedOk => { "completed" },
+		Disposition::Failed => { "failed" },
+		Disposition::Cancelled => { "cancelled" },
+		Disposition::Indeterminate => { "indeterminate" }
+	};
+}
+
+pub fn disposition_from_name(name: String) nothrow -> Optional<Disposition> {
+	if name == "none" { return Optional<Disposition>::Some(Disposition::NoDisposition()); }
+	if name == "completed" { return Optional<Disposition>::Some(Disposition::CompletedOk()); }
+	if name == "failed" { return Optional<Disposition>::Some(Disposition::Failed()); }
+	if name == "cancelled" { return Optional<Disposition>::Some(Disposition::Cancelled()); }
+	if name == "indeterminate" { return Optional<Disposition>::Some(Disposition::Indeterminate()); }
+	return Optional<Disposition>::None();
+}
+
+pub fn disposition_eq(a: &Disposition, b: &Disposition) nothrow -> Bool {
+	return disposition_code(a) == disposition_code(b);
+}
+
+// Which (state, disposition) pairs are representable (mirror of the schema
+// CHECK on tb_mf_workflow):
+//   forward             -> none
+//   reversing           -> failed | cancelled
+//   blocked_resolution  -> failed | cancelled | indeterminate
+//   completed           -> completed
+//   reversed            -> failed | cancelled
+//   resolved_exception  -> failed | cancelled | indeterminate (underlying cause)
+pub fn disposition_valid_for(s: &WorkflowState, d: &Disposition) nothrow -> Bool {
+	val dc = disposition_code(d);
+	return match s {
+		WorkflowState::Forward => { dc == 0 },
+		WorkflowState::Reversing => { dc == 2 or dc == 3 },
+		WorkflowState::BlockedResolution => { dc == 2 or dc == 3 or dc == 4 },
+		WorkflowState::Completed => { dc == 1 },
+		WorkflowState::Reversed => { dc == 2 or dc == 3 },
+		WorkflowState::ResolvedException => { dc == 2 or dc == 3 or dc == 4 }
+	};
+}

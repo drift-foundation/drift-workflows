@@ -1,0 +1,80 @@
+// Microflows reference participant stub.
+//
+// A narrow HTTP participant implementing the Microflows operation protocol
+// (microflows_design.md §5.1), backed by Singular for durable idempotent
+// state. It is the protocol CONFORMANCE REFERENCE — not domain logic.
+//
+//   PUT /microflows/v1/operations/{operation}/{operation_id}
+//   GET /microflows/v1/operations/{operation}/{operation_id}
+//
+// This first cut proves the web-rest app build + routing under the
+// two-package-root toolchain. Singular wiring, canonical input-hash
+// validation via Singular item_meta (-> 409), and the configurable outcome
+// state machine (pending/success/terminal-failure/deferred/indeterminate,
+// plus delayed and drop-after-commit for lost-ack tests) land next.
+// (Participant "busy, later" is DEFER, not failure; "retry" is reserved for
+// transport mechanics.)
+
+module microflows.participant_stub;
+
+import std.core as core;
+import std.console as console;
+import std.json as json;
+import std.format as fmt;
+import std.concurrent as conc;
+import web.rest as rest;
+
+const DEFAULT_PORT: Int = 8080;
+
+fn main(argv: Array<String>) nothrow -> Int {
+	// TODO: parse --config <file> for {port, service_group, worker_id, singular}.
+	return try _serve(DEFAULT_PORT) catch {
+		console.eprintln("participant-stub: fatal");
+		1
+	};
+}
+
+fn _serve(port: Int) throws -> Int {
+	var b = rest.new_app_builder();
+	rest.bind(b, "0.0.0.0", port);
+	var web_app = rest.build_app(move b);
+
+	val ops_rg = rest.add_route_group(web_app, "/microflows/v1/operations").or_throw();
+
+	rest.add_route_group_throws_route(web_app, ops_rg, "PUT", "/{operation}/{operation_id}",
+		|req, ctx| => { return _handle_put(req, ctx); }).or_throw();
+
+	rest.add_route_group_throws_route(web_app, ops_rg, "GET", "/{operation}/{operation_id}",
+		|req, ctx| => { return _handle_get(req, ctx); }).or_throw();
+
+	console.println("participant-stub listening on " + fmt.format_int(port));
+
+	var running = rest.start(move web_app, conc.Duration(millis = 0));
+	val _sig = conc.await_signal();
+	val _ = rest.shutdown(running);
+	return 0;
+}
+
+// PUT — idempotent creation at a caller-assigned operation_id. First cut:
+// echoes identity and returns 202 pending. (Singular-backed outcome state
+// machine + input-hash 409 land next.)
+fn _handle_put(req: &rest.Request, ctx: &mut rest.Context) throws -> rest.Response {
+	val op = rest.path_param(req, "operation").or_throw();
+	val op_id = rest.path_param(req, "operation_id").or_throw();
+	var o = json.new_object();
+	o.set("state", json.JsonNode::String("pending"));
+	o.set("operation", json.JsonNode::String(op));
+	o.set("operation_id", json.JsonNode::String(op_id));
+	return rest.json_response(202, json.encode(o.to_node()));
+}
+
+// GET — durable status/result lookup. First cut: 404 (no store yet).
+fn _handle_get(req: &rest.Request, ctx: &mut rest.Context) throws -> rest.Response {
+	val op = rest.path_param(req, "operation").or_throw();
+	val op_id = rest.path_param(req, "operation_id").or_throw();
+	var o = json.new_object();
+	o.set("state", json.JsonNode::String("unknown"));
+	o.set("operation", json.JsonNode::String(op));
+	o.set("operation_id", json.JsonNode::String(op_id));
+	return rest.json_response(404, json.encode(o.to_node()));
+}

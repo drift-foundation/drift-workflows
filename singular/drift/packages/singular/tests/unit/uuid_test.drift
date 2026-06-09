@@ -1,0 +1,132 @@
+// UUID helpers — parity tests against Java UUID.nameUUIDFromBytes().
+//
+// All expected values were generated from Java and pinned to ensure
+// byte-identical behavior between Drift and Java implementations.
+
+module singular.tests.unit.uuid_test;
+
+import std.core as core;
+import singular.uuid as uuid;
+
+// --- uuid_v3_from_string: Java UUID.nameUUIDFromBytes parity ---
+
+// Java: UUID.nameUUIDFromBytes("hello".getBytes(UTF_8))
+//   => 5d41402a-bc4b-3a76-b971-9d911017c592
+fn scenario_uuid_v3_hello() nothrow -> Int {
+	val result = uuid.uuid_v3_from_string(&"hello");
+	val expected: Array<Byte> = [cast<Byte>(93), cast<Byte>(65), cast<Byte>(64), cast<Byte>(42), cast<Byte>(188), cast<Byte>(75), cast<Byte>(58), cast<Byte>(118), cast<Byte>(185), cast<Byte>(113), cast<Byte>(157), cast<Byte>(145), cast<Byte>(16), cast<Byte>(23), cast<Byte>(197), cast<Byte>(146)];
+	if result.len != 16 { return 101; }
+	var i = 0;
+	while i < 16 {
+		if result[i] != expected[i] { return 110 + i; }
+		i = i + 1;
+	}
+	return 0;
+}
+
+// Java: UUID.nameUUIDFromBytes("bookkeeper-worker-1".getBytes(UTF_8))
+//   => eae14686-e10a-36b2-be6b-9249927e017f
+fn scenario_uuid_v3_worker_id() nothrow -> Int {
+	val result = uuid.uuid_v3_from_string(&"bookkeeper-worker-1");
+	val expected: Array<Byte> = [cast<Byte>(234), cast<Byte>(225), cast<Byte>(70), cast<Byte>(134), cast<Byte>(225), cast<Byte>(10), cast<Byte>(54), cast<Byte>(178), cast<Byte>(190), cast<Byte>(107), cast<Byte>(146), cast<Byte>(73), cast<Byte>(146), cast<Byte>(126), cast<Byte>(1), cast<Byte>(127)];
+	if result.len != 16 { return 201; }
+	var i = 0;
+	while i < 16 {
+		if result[i] != expected[i] { return 210 + i; }
+		i = i + 1;
+	}
+	return 0;
+}
+
+// Java: UUID.nameUUIDFromBytes("badcafe0-...:customers-snapshot:2026032214".getBytes(UTF_8))
+//   => c66fc405-e79d-3aff-b417-8eae72bf4810
+fn scenario_uuid_v3_snapshot_key() nothrow -> Int {
+	val result = uuid.uuid_v3_from_string(&"badcafe0-9760-11f0-8535-33362dcd2399:customers-snapshot:2026032214");
+	val expected: Array<Byte> = [cast<Byte>(198), cast<Byte>(111), cast<Byte>(196), cast<Byte>(5), cast<Byte>(231), cast<Byte>(157), cast<Byte>(58), cast<Byte>(255), cast<Byte>(180), cast<Byte>(23), cast<Byte>(142), cast<Byte>(174), cast<Byte>(114), cast<Byte>(191), cast<Byte>(72), cast<Byte>(16)];
+	if result.len != 16 { return 301; }
+	var i = 0;
+	while i < 16 {
+		if result[i] != expected[i] { return 310 + i; }
+		i = i + 1;
+	}
+	return 0;
+}
+
+// --- uuid_to_bytes / bytes_to_uuid roundtrip ---
+
+fn scenario_uuid_parse_format_roundtrip() nothrow -> Int {
+	val input = "badcafe0-9760-11f0-8535-33362dcd2399";
+	val expected_bytes: Array<Byte> = [cast<Byte>(186), cast<Byte>(220), cast<Byte>(175), cast<Byte>(224), cast<Byte>(151), cast<Byte>(96), cast<Byte>(17), cast<Byte>(240), cast<Byte>(133), cast<Byte>(53), cast<Byte>(51), cast<Byte>(54), cast<Byte>(45), cast<Byte>(205), cast<Byte>(35), cast<Byte>(153)];
+
+	match uuid.uuid_to_bytes(&input) {
+		core.Result::Err(_) => { return 401; },
+		core.Result::Ok(bytes) => {
+			if bytes.len != 16 { return 402; }
+			var i = 0;
+			while i < 16 {
+				if bytes[i] != expected_bytes[i] { return 410 + i; }
+				i = i + 1;
+			}
+			match uuid.bytes_to_uuid(&bytes) {
+				core.Result::Err(_) => { return 430; },
+				core.Result::Ok(back) => {
+					if back != input { return 431; }
+					return 0;
+				}
+			}
+		}
+	}
+}
+
+// --- uuid_to_bytes validation ---
+
+fn scenario_uuid_parse_wrong_length() nothrow -> Int {
+	match uuid.uuid_to_bytes(&"too-short") {
+		core.Result::Ok(_) => { return 501; },
+		core.Result::Err(e) => {
+			if e.tag != "uuid-invalid-length" { return 502; }
+			return 0;
+		}
+	}
+}
+
+fn scenario_uuid_parse_missing_dash() nothrow -> Int {
+	match uuid.uuid_to_bytes(&"badcafe0x9760-11f0-8535-33362dcd2399") {
+		core.Result::Ok(_) => { return 601; },
+		core.Result::Err(e) => {
+			if e.tag != "uuid-invalid-format" { return 602; }
+			return 0;
+		}
+	}
+}
+
+// --- uuid_v3 then format ---
+
+fn scenario_uuid_v3_then_format() nothrow -> Int {
+	val result = uuid.uuid_v3_from_string(&"hello");
+	match uuid.bytes_to_uuid(&result) {
+		core.Result::Err(_) => { return 701; },
+		core.Result::Ok(formatted) => {
+			if formatted != "5d41402a-bc4b-3a76-b971-9d911017c592" { return 702; }
+			return 0;
+		}
+	}
+}
+
+fn main() nothrow -> Int {
+	var r = scenario_uuid_v3_hello();
+	if r != 0 { return r; }
+	r = scenario_uuid_v3_worker_id();
+	if r != 0 { return r; }
+	r = scenario_uuid_v3_snapshot_key();
+	if r != 0 { return r; }
+	r = scenario_uuid_parse_format_roundtrip();
+	if r != 0 { return r; }
+	r = scenario_uuid_parse_wrong_length();
+	if r != 0 { return r; }
+	r = scenario_uuid_parse_missing_dash();
+	if r != 0 { return r; }
+	r = scenario_uuid_v3_then_format();
+	if r != 0 { return r; }
+	return 0;
+}

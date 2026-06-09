@@ -1,0 +1,88 @@
+module singular;
+
+import std.core as core;
+import std.core.arc as arc;
+import std.json as json;
+import singular.uuid as uuid;
+import singular.gateway as gw;
+
+export {
+    // UUID utilities
+    UuidError,
+    uuid_to_bytes,
+    bytes_to_uuid,
+    uuid_v3_from_bytes,
+    uuid_v3_from_string,
+
+    // Gateway surface (the new API)
+    SingularGateway,
+    SingularIdentity,
+    identity_from_worker_name,
+    SingularGatewayBuilder,
+    new_gateway_builder,
+    with_json,
+    with_identity,
+    with_event_sink,
+    build_gateway,
+    ConfigErrorKind,
+    ConfigError,
+    RuntimeErrorKind,
+    SingularException,
+    SingularEvent,
+    new_lease_token,
+
+    // Result shapes (re-exports)
+    WorkLease,
+    TerminalResult,
+    StartOutcome,
+    ResumeOutcome,
+    SettleOutcome,
+    ExtendLeaseOutcome,
+    WorkEvent,
+    InspectOutcome,
+    HistoryEntry
+};
+
+// ===== UUID =====
+
+pub type UuidError = uuid.UuidError;
+
+pub fn uuid_to_bytes(s: &String) nothrow -> core.Result<Array<Byte>, UuidError> { return uuid.uuid_to_bytes(s); }
+pub fn bytes_to_uuid(bytes: &Array<Byte>) nothrow -> core.Result<String, UuidError> { return uuid.bytes_to_uuid(bytes); }
+pub fn uuid_v3_from_bytes(input: &Array<Byte>) nothrow -> Array<Byte> { return uuid.uuid_v3_from_bytes(input); }
+pub fn uuid_v3_from_string(s: &String) nothrow -> Array<Byte> { return uuid.uuid_v3_from_string(s); }
+
+// ===== Gateway surface =====
+// These are public type re-exports for callers that import via singular::Type.
+
+pub type SingularGateway = gw.SingularGateway;
+pub type SingularIdentity = gw.SingularIdentity;
+pub type SingularGatewayBuilder = gw.SingularGatewayBuilder;
+pub type ConfigErrorKind = gw.ConfigErrorKind;
+pub type ConfigError = gw.ConfigError;
+pub type RuntimeErrorKind = gw.RuntimeErrorKind;
+pub type SingularException = gw.SingularException;
+pub type SingularEvent = gw.SingularEvent;
+pub type WorkLease = gw.WorkLease;
+pub type TerminalResult = gw.TerminalResult;
+pub type StartOutcome = gw.StartOutcome;
+pub type ResumeOutcome = gw.ResumeOutcome;
+pub type SettleOutcome = gw.SettleOutcome;
+pub type ExtendLeaseOutcome = gw.ExtendLeaseOutcome;
+pub type WorkEvent = gw.WorkEvent;
+pub type InspectOutcome = gw.InspectOutcome;
+pub type HistoryEntry = gw.HistoryEntry;
+
+pub fn identity_from_worker_name(service_group: String, worker_name: &String) nothrow -> SingularIdentity {
+    return gw.identity_from_worker_name(move service_group, worker_name);
+}
+pub fn new_gateway_builder() nothrow -> SingularGatewayBuilder { return gw.new_gateway_builder(); }
+pub fn with_json(b: &mut SingularGatewayBuilder, config: &json.JsonNode) nothrow -> Void { gw.with_json(b, config); }
+pub fn with_identity(b: &mut SingularGatewayBuilder, identity: SingularIdentity) -> Void { gw.with_identity(b, move identity); }
+pub fn with_event_sink(b: &mut SingularGatewayBuilder, sink: core.Callback1<SingularEvent, Void>) nothrow -> Void {
+    gw.with_event_sink(b, move sink);
+}
+pub fn build_gateway(b: SingularGatewayBuilder) nothrow -> core.Result<arc.Arc<SingularGateway>, ConfigError> {
+    return gw.build_gateway(move b);
+}
+pub fn new_lease_token() -> Array<Byte> { return gw.new_lease_token(); }

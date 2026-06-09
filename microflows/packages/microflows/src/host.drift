@@ -1,0 +1,861 @@
+// Microflows MariaDB host gateway — milestone 1 (microflows_design.md §6,
+// prior §24).
+//
+// Step 3 surface: workflow creation, lease claim/heartbeat/release, and
+// database-clock sourcing. Remote-operation dispatch + result persistence
+// arrive in step 4.
+//
+// Modeled on Singular's gateway (../pushcoin/singular gateway.drift): a
+// connection pool wrapped behind an interface, every operation calling one
+// stored procedure that returns ONE result row with ONE column `result` — a
+// discriminated JSON DOCUMENT keyed by `outcome`.
+//
+// Time discipline (§24.4): the gateway never invents time. clock_read() is
+// the sole clock source (database NOW(6)); every mutating call takes
+// explicit, caller-fixed datetime strings and passes them through unchanged.
+
+module microflows.host;
+
+import std.core as core;
+import std.core.arc as arc;
+import std.concurrent as conc;
+import std.io as io;
+import std.json as json;
+import std.codec as codec;
+import std.mem as mem;
+import std.uuid as uuid;
+
+import mariadb.rpc as rpc;
+import mariadb.rpc.pool as pool;
+import mariadb.rpc.managed as managed;
+
+export {
+	MicroflowsHost,
+	ExecutorIdentity,
+	identity_from_worker_name,
+	HostBuilder,
+	new_host_builder,
+	with_json,
+	with_identity,
+	build_host,
+	HostConfigErrorKind,
+	HostConfigError,
+	HostErrorKind,
+	HostException,
+	ClockReading,
+	ClaimedWorkflow,
+	CreateOutcome,
+	ClaimOutcome,
+	HeartbeatOutcome,
+	ReleaseOutcome
+};
+
+// ===== Identity =====
+
+pub struct ExecutorIdentity {
+	pub executor_id: Array<Byte>     // exactly 16 bytes
+}
+
+// Derive a stable 16-byte executor identity from a worker name (UUID v3).
+pub fn identity_from_worker_name(worker_name: &String) nothrow -> ExecutorIdentity {
+	val u: uuid.Uuid = uuid.v3_from_string(worker_name);
+	val bytes: Array<Byte> = uuid.to_bytes(&u);
+	return ExecutorIdentity(executor_id = move bytes);
+}
+
+// ===== Result shapes =====
+
+// A database clock reading (§24.4): `now` plus a lease deadline derived from
+// it server-side. Both are datetime(6) literals ("YYYY-MM-DD HH:MM:SS.ffffff")
+// passed onward as explicit, retry-fixed command parameters.
+pub struct ClockReading {
+	pub now: String,
+	pub lease_expires_at: String
+}
+
+// The claimed snapshot: everything an executor needs to resume from the
+// durable continuation under its new fencing token (§24.2, §24.5).
+pub struct ClaimedWorkflow {
+	pub workflow_id: Array<Byte>,
+	pub fencing_token: Int,
+	pub state_code: Int,             // microflows.state storage code
+	pub execution_direction: Int,    // 1=forward 2=reverse (microflows.state)
+	pub current_disposition: Int,
+	pub script_name: String,
+	pub script_revision: Int,
+	pub current_event_seq: Int,
+	pub current_operation_attempt: Int,
+	pub continuation_json: String    // JSON object text (compact)
+}
+
+// create_workflow: the PK INSERT is the serializer; a replay of the same
+// stable command ID (= workflow_id) resolves to Exists without mutating.
+pub variant CreateOutcome { Created, Exists }
+
+// claim_next: a due, unleased/expired instance for one registered script —
+// or nothing due.
+pub variant ClaimOutcome {
+	Claimed(wf: ClaimedWorkflow),
+	NoneDue
+}
+
+// Fenced lease operations: FenceLost covers every mismatch (wrong owner,
+// stale token, expired lease, non-claimable state) — a stale worker learns
+// only that it can no longer publish.
+pub variant HeartbeatOutcome { Extended, FenceLost, NotFound }
+pub variant ReleaseOutcome { Released, FenceLost, NotFound }
+
+// ===== Error surface =====
+
+pub variant HostConfigErrorKind {
+	BuilderMissingJson,
+	BuilderMissingIdentity,
+	BuilderBadExecutorIdLength(actual: Int),
+	JsonMissingKey(key: String),
+	JsonBadType(key: String, expected: String),
+	JsonUnknownBackend(value: String),
+	JsonPortOutOfRange(value: Int),
+	JsonTimeoutNonPositive(key: String, value: Int),
+	JsonPoolSizingInvalid(key: String, value: Int),
+	PoolOpenFailed(upstream_tag: String),
+	RpcConfigInvalid(upstream_tag: String)
+}
+
+implement core.Diagnostic for HostConfigErrorKind {
+	pub fn to_json_text(self: &HostConfigErrorKind) nothrow -> String {
+		return match self {
+			HostConfigErrorKind::BuilderMissingJson => { "\"builder-missing-json\"" },
+			HostConfigErrorKind::BuilderMissingIdentity => { "\"builder-missing-identity\"" },
+			HostConfigErrorKind::BuilderBadExecutorIdLength(actual) => { "\"builder-bad-executor-id-length\"" },
+			HostConfigErrorKind::JsonMissingKey(key) => { "\"json-missing-key\"" },
+			HostConfigErrorKind::JsonBadType(key, expected) => { "\"json-bad-type\"" },
+			HostConfigErrorKind::JsonUnknownBackend(value) => { "\"json-unknown-backend\"" },
+			HostConfigErrorKind::JsonPortOutOfRange(value) => { "\"json-port-out-of-range\"" },
+			HostConfigErrorKind::JsonTimeoutNonPositive(key, value) => { "\"json-timeout-non-positive\"" },
+			HostConfigErrorKind::JsonPoolSizingInvalid(key, value) => { "\"json-pool-sizing-invalid\"" },
+			HostConfigErrorKind::PoolOpenFailed(upstream_tag) => { "\"pool-open-failed\"" },
+			HostConfigErrorKind::RpcConfigInvalid(upstream_tag) => { "\"rpc-config-invalid\"" }
+		};
+	}
+}
+
+pub error HostConfigError {
+	kind: HostConfigErrorKind,
+	path: String
+}
+
+// Runtime failure taxonomy — caller-actionable, backend-agnostic. `detail`
+// is diagnostic-only, never a contract.
+pub variant HostErrorKind {
+	InvalidId(field: String, actual_len: Int),      // caller input bug
+	InvalidArg(field: String),                      // caller input bug
+	InvalidJson(field: String),                     // caller input bug
+	BackendUnavailable(detail: String),             // could not reach/acquire the store — retriable
+	BackendTimeout(detail: String),                 // a deadline elapsed — retriable / shed load
+	BackendRejected(detail: String),                // store ran the op and reported failure
+	BackendResponseInvalid(detail: String)          // malformed/unexpected response — schema/version skew
+}
+
+implement core.Diagnostic for HostErrorKind {
+	pub fn to_json_text(self: &HostErrorKind) nothrow -> String {
+		return match self {
+			HostErrorKind::InvalidId(field, actual_len) => { "\"invalid-id\"" },
+			HostErrorKind::InvalidArg(field) => { "\"invalid-arg\"" },
+			HostErrorKind::InvalidJson(field) => { "\"invalid-json\"" },
+			HostErrorKind::BackendUnavailable(detail) => { "\"backend-unavailable\"" },
+			HostErrorKind::BackendTimeout(detail) => { "\"backend-timeout\"" },
+			HostErrorKind::BackendRejected(detail) => { "\"backend-rejected\"" },
+			HostErrorKind::BackendResponseInvalid(detail) => { "\"backend-response-invalid\"" }
+		};
+	}
+}
+
+pub error HostException {
+	kind: HostErrorKind
+}
+
+// ===== Interface =====
+
+pub interface MicroflowsHost {
+	// Source database_now (+ a lease deadline lease_seconds ahead). The only
+	// clock read in the system (§24.4).
+	fn clock_read(self: &Self, lease_seconds: Int) -> ClockReading;
+	// Create a workflow instance pinned to (script_name, script_revision),
+	// with its 'created' event. Idempotent by workflow_id.
+	fn create_workflow(self: &Self, workflow_id: &Array<Byte>, script_name: &String,
+	                   script_revision: Int, event_ts: &String, next_attempt_at: &String,
+	                   continuation_json: &String, event_payload_json: &String) -> CreateOutcome;
+	// Claim the next due instance of one script (§24.2). db_now and
+	// lease_expires_at come from clock_read, fixed for this command.
+	fn claim_next(self: &Self, script_name: &String, db_now: &String,
+	              lease_expires_at: &String) -> ClaimOutcome;
+	// Fenced lease extension (§24.5).
+	fn heartbeat(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	             db_now: &String, lease_expires_at: &String) -> HeartbeatOutcome;
+	// Fenced voluntary release with explicit next due time (backoff lives on
+	// the row, §24.5).
+	fn release(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	           db_now: &String, next_attempt_at: &String) -> ReleaseOutcome
+}
+
+// ===== Builder =====
+
+pub struct HostBuilder {
+	json_config: Optional<json.JsonNode>,
+	identity: Optional<ExecutorIdentity>
+}
+
+pub fn new_host_builder() nothrow -> HostBuilder {
+	return HostBuilder(
+		json_config = Optional<json.JsonNode>::None(),
+		identity = Optional<ExecutorIdentity>::None()
+	);
+}
+
+pub fn with_json(b: &mut HostBuilder, config: &json.JsonNode) nothrow -> Void {
+	b.json_config = Optional<json.JsonNode>::Some(config.clone_deep());
+}
+
+pub fn with_identity(b: &mut HostBuilder, identity: ExecutorIdentity) -> Void {
+	if identity.executor_id.len() != 16 {
+		throw HostConfigError(
+			kind = HostConfigErrorKind::BuilderBadExecutorIdLength(actual = identity.executor_id.len()),
+			path = ""
+		);
+	}
+	b.identity = Optional<ExecutorIdentity>::Some(move identity);
+}
+
+pub fn build_host(var b: HostBuilder) nothrow -> core.Result<arc.Arc<MicroflowsHost>, HostConfigError> {
+	val have_json: Bool = match &b.json_config {
+		Optional::Some(_) => { true },
+		Optional::None => { false }
+	};
+	if !have_json {
+		return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(
+			HostConfigError(kind = HostConfigErrorKind::BuilderMissingJson(), path = "")
+		);
+	}
+	val have_id: Bool = match &b.identity {
+		Optional::Some(_) => { true },
+		Optional::None => { false }
+	};
+	if !have_id {
+		return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(
+			HostConfigError(kind = HostConfigErrorKind::BuilderMissingIdentity(), path = "")
+		);
+	}
+
+	var identity_local: Optional<ExecutorIdentity> = Optional<ExecutorIdentity>::None();
+	mem.swap(&mut b.identity, &mut identity_local);
+	var taken_identity: ExecutorIdentity = match move identity_local {
+		Optional::Some(v) => { move v },
+		Optional::None => { _dummy_identity() }
+	};
+
+	var json_local: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
+	mem.swap(&mut b.json_config, &mut json_local);
+	val cfg_node: json.JsonNode = match move json_local {
+		Optional::Some(n) => { move n },
+		Optional::None => { json.new_object().to_node() }
+	};
+
+	try {
+		val rpc_cfg: rpc.RpcConnectionConfig = _build_rpc_config_from_json_throwing(&cfg_node);
+		val pool_cfg: pool.PoolConfig = _build_pool_config_from_json_throwing(&cfg_node);
+		val p: pool.ConnectionPool = pool.open(move rpc_cfg, move pool_cfg).or_throw();
+
+		val inst = HostImpl(
+			identity = move taken_identity,
+			pool = move p
+		);
+		val inst_arc: arc.Arc<HostImpl> = arc.arc(move inst);
+		val host: arc.Arc<MicroflowsHost> = inst_arc.as_interface<type MicroflowsHost>();
+		return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Ok(move host);
+	} catch managed:ManagedError(e) {
+		return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(
+			HostConfigError(
+				kind = HostConfigErrorKind::PoolOpenFailed(upstream_tag = _dup(&e.tag)),
+				path = ""
+			)
+		);
+	} catch HostConfigError(e) {
+		return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(move e);
+	} catch unexpected {
+		return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(
+			HostConfigError(
+				kind = HostConfigErrorKind::PoolOpenFailed(upstream_tag = "unexpected"),
+				path = ""
+			)
+		);
+	}
+}
+
+// ===== JSON config parsing =====
+
+fn _build_rpc_config_from_json_throwing(node: &json.JsonNode) -> rpc.RpcConnectionConfig {
+	val backend: String = _read_string_throws(node, &"backend");
+	if backend != "mariadb" {
+		throw HostConfigError(
+			kind = HostConfigErrorKind::JsonUnknownBackend(value = move backend),
+			path = "backend"
+		);
+	}
+	val host: String = _read_string_throws(node, &"host");
+	val port: Int = _read_int_throws(node, &"port");
+	if port < 1 or port > 65535 {
+		throw HostConfigError(kind = HostConfigErrorKind::JsonPortOutOfRange(value = port), path = "port");
+	}
+	val user: String = _read_string_throws(node, &"user");
+	val password: String = _read_string_throws(node, &"password");
+	val database: String = _read_string_throws(node, &"database");
+	val connect_timeout_ms: Int = _read_optional_positive_int(node, &"connect_timeout_ms", 5000);
+	val io_timeout_ms: Int = _read_optional_positive_int(node, &"io_timeout_ms", 30000);
+
+	var builder = rpc.new_connection_config_builder();
+	builder.with_host(move host);
+	builder.with_port(port);
+	builder.with_user(move user);
+	builder.with_password(move password);
+	builder.with_database(move database);
+	builder.with_connect_timeout_ms(connect_timeout_ms);
+	builder.with_read_timeout_ms(io_timeout_ms);
+	builder.with_write_timeout_ms(io_timeout_ms);
+	match rpc.build_connection_config(move builder) {
+		core.Result::Ok(cfg) => { return move cfg; },
+		core.Result::Err(_) => {
+			throw HostConfigError(
+				kind = HostConfigErrorKind::RpcConfigInvalid(upstream_tag = "rpc-config-build-failed"),
+				path = ""
+			);
+		}
+	}
+}
+
+fn _build_pool_config_from_json_throwing(node: &json.JsonNode) -> pool.PoolConfig {
+	var pc: pool.PoolConfig = pool.default_pool_config();
+
+	val pool_opt: Optional<&json.JsonNode> = node.get(&"pool");
+	match pool_opt {
+		Optional::Some(psub) => {
+			match psub.get_int_at_path(&"min_idle") {
+				Optional::Some(v) => {
+					if v < 0 { throw HostConfigError(kind = HostConfigErrorKind::JsonPoolSizingInvalid(key = "min_idle", value = v), path = "pool.min_idle"); }
+					pc.min_idle = v;
+				},
+				Optional::None => {}
+			}
+			match psub.get_int_at_path(&"max_conns") {
+				Optional::Some(v) => {
+					if v < 1 { throw HostConfigError(kind = HostConfigErrorKind::JsonPoolSizingInvalid(key = "max_conns", value = v), path = "pool.max_conns"); }
+					pc.max_conns = v;
+				},
+				Optional::None => {}
+			}
+			match psub.get_int_at_path(&"idle_timeout_ms") {
+				Optional::Some(v) => {
+					if v <= 0 { throw HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "idle_timeout_ms", value = v), path = "pool.idle_timeout_ms"); }
+					pc.idle_timeout_ms = v;
+				},
+				Optional::None => {}
+			}
+			match psub.get_int_at_path(&"keepalive_interval_ms") {
+				Optional::Some(v) => {
+					if v < 0 { throw HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "keepalive_interval_ms", value = v), path = "pool.keepalive_interval_ms"); }
+					pc.keepalive_interval_ms = v;
+				},
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
+
+	// Always bound the pool acquire (mirrors Singular: never block forever).
+	pc.acquire_timeout = Optional<conc.Duration>::Some(conc.Duration(millis = _read_acquire_timeout_ms(node)));
+
+	return move pc;
+}
+
+fn _read_acquire_timeout_ms(node: &json.JsonNode) -> Int {
+	match node.get(&"pool") {
+		Optional::Some(psub) => {
+			match psub.get_int_at_path(&"acquire_timeout_ms") {
+				Optional::Some(v) => {
+					if v <= 0 { throw HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "acquire_timeout_ms", value = v), path = "pool.acquire_timeout_ms"); }
+					return v;
+				},
+				Optional::None => { return 5000; }
+			}
+		},
+		Optional::None => { return 5000; }
+	}
+}
+
+fn _read_string_throws(node: &json.JsonNode, key: &String) -> String {
+	val opt: Optional<&json.JsonNode> = node.get(key);
+	match opt {
+		Optional::None => {
+			throw HostConfigError(kind = HostConfigErrorKind::JsonMissingKey(key = _dup(key)), path = _dup(key));
+		},
+		Optional::Some(n) => {
+			match n.as_string() {
+				Optional::Some(s) => { return move s; },
+				Optional::None => {
+					throw HostConfigError(
+						kind = HostConfigErrorKind::JsonBadType(key = _dup(key), expected = "String"),
+						path = _dup(key)
+					);
+				}
+			}
+		}
+	}
+}
+
+fn _read_int_throws(node: &json.JsonNode, key: &String) -> Int {
+	val opt: Optional<&json.JsonNode> = node.get(key);
+	match opt {
+		Optional::None => {
+			throw HostConfigError(kind = HostConfigErrorKind::JsonMissingKey(key = _dup(key)), path = _dup(key));
+		},
+		Optional::Some(n) => {
+			match n.as_int() {
+				Optional::Some(v) => { return v; },
+				Optional::None => {
+					throw HostConfigError(
+						kind = HostConfigErrorKind::JsonBadType(key = _dup(key), expected = "Int"),
+						path = _dup(key)
+					);
+				}
+			}
+		}
+	}
+}
+
+fn _read_optional_positive_int(node: &json.JsonNode, key: &String, default_val: Int) nothrow -> Int {
+	val opt: Optional<&json.JsonNode> = node.get(key);
+	match opt {
+		Optional::None => { return default_val; },
+		Optional::Some(n) => {
+			match n.as_int() {
+				Optional::Some(v) => { if v > 0 { return v; } else { return default_val; } },
+				Optional::None => { return default_val; }
+			}
+		}
+	}
+}
+
+// ===== Implementation =====
+
+struct HostImpl
+	require Self is core.Destructible
+{
+	identity: ExecutorIdentity,
+	// acquire() is &Self + internally synchronized (mariadb-rpc 0.6); shared
+	// directly via Arc<HostImpl> with no outer mutex.
+	pool: pool.ConnectionPool
+}
+
+implement MicroflowsHost for HostImpl {
+	pub fn clock_read(self: &HostImpl, lease_seconds: Int) -> ClockReading {
+		if lease_seconds <= 0 {
+			throw HostException(kind = HostErrorKind::InvalidArg(field = "lease_seconds"));
+		}
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_int(lease_seconds));
+			val sp: String = "sp_mf_clock_read";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "ok" {
+				val now = _doc_str_req(&doc, &"now", "clock-no-now");
+				val expires = _doc_str_req(&doc, &"lease_expires_at", "clock-no-expiry");
+				return ClockReading(now = move now, lease_expires_at = move expires);
+			}
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:clock_read"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn create_workflow(self: &HostImpl, workflow_id: &Array<Byte>, script_name: &String,
+	                       script_revision: Int, event_ts: &String, next_attempt_at: &String,
+	                       continuation_json: &String, event_payload_json: &String) -> CreateOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_nonempty("script_name", script_name);
+		if script_revision < 1 {
+			throw HostException(kind = HostErrorKind::InvalidArg(field = "script_revision"));
+		}
+		_validate_nonempty("event_ts", event_ts);
+		_validate_nonempty("next_attempt_at", next_attempt_at);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_string(_dup(script_name)));
+			args.push(rpc.arg_int(script_revision));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(rpc.arg_string(_dup(next_attempt_at)));
+			args.push(_json_object_arg("continuation", continuation_json));
+			args.push(_meta_object_arg("event_payload", event_payload_json));
+			val sp: String = "sp_mf_workflow_create";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "created" { return CreateOutcome::Created(); }
+			if outcome == "exists" { return CreateOutcome::Exists(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:create"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn claim_next(self: &HostImpl, script_name: &String, db_now: &String,
+	                  lease_expires_at: &String) -> ClaimOutcome {
+		_validate_nonempty("script_name", script_name);
+		_validate_nonempty("db_now", db_now);
+		_validate_nonempty("lease_expires_at", lease_expires_at);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_string(_dup(script_name)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_string(_dup(db_now)));
+			args.push(rpc.arg_string(_dup(lease_expires_at)));
+			val sp: String = "sp_mf_workflow_claim";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "none" { return ClaimOutcome::NoneDue(); }
+			if outcome == "claimed" {
+				// Bind every (throwing) field read BEFORE construction; construct
+				// LAST with only nothrow moves.
+				val wf_hex = _doc_str_req(&doc, &"workflow_id", "claim-no-workflow-id");
+				val wf_id = _hex16("claim-workflow-id-hex", &wf_hex);
+				val fencing = _doc_int_req(&doc, &"fencing_token", "claim-no-fencing");
+				val state_code = _doc_int_req(&doc, &"state", "claim-no-state");
+				val direction = _doc_int_req(&doc, &"execution_direction", "claim-no-direction");
+				val disp = _doc_int_req(&doc, &"current_disposition", "claim-no-disposition");
+				val sname = _doc_str_req(&doc, &"script_name", "claim-no-script-name");
+				val srev = _doc_int_req(&doc, &"script_revision", "claim-no-script-revision");
+				val eseq = _doc_int_req(&doc, &"current_event_seq", "claim-no-event-seq");
+				val attempt = _doc_int_req(&doc, &"current_operation_attempt", "claim-no-attempt");
+				val continuation = _doc_object_text_req(&doc, &"continuation");
+				return ClaimOutcome::Claimed(ClaimedWorkflow(
+					workflow_id = move wf_id,
+					fencing_token = fencing,
+					state_code = state_code,
+					execution_direction = direction,
+					current_disposition = disp,
+					script_name = move sname,
+					script_revision = srev,
+					current_event_seq = eseq,
+					current_operation_attempt = attempt,
+					continuation_json = move continuation
+				));
+			}
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:claim"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn heartbeat(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                 db_now: &String, lease_expires_at: &String) -> HeartbeatOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		if fencing_token < 1 {
+			throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token"));
+		}
+		_validate_nonempty("db_now", db_now);
+		_validate_nonempty("lease_expires_at", lease_expires_at);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_string(_dup(db_now)));
+			args.push(rpc.arg_string(_dup(lease_expires_at)));
+			val sp: String = "sp_mf_workflow_heartbeat";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "extended" { return HeartbeatOutcome::Extended(); }
+			if outcome == "fence_lost" { return HeartbeatOutcome::FenceLost(); }
+			if outcome == "not_found" { return HeartbeatOutcome::NotFound(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:heartbeat"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn release(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	               db_now: &String, next_attempt_at: &String) -> ReleaseOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		if fencing_token < 1 {
+			throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token"));
+		}
+		_validate_nonempty("db_now", db_now);
+		_validate_nonempty("next_attempt_at", next_attempt_at);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_string(_dup(db_now)));
+			args.push(rpc.arg_string(_dup(next_attempt_at)));
+			val sp: String = "sp_mf_workflow_release";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "released" { return ReleaseOutcome::Released(); }
+			if outcome == "fence_lost" { return ReleaseOutcome::FenceLost(); }
+			if outcome == "not_found" { return ReleaseOutcome::NotFound(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:release"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+}
+
+implement core.Destructible for HostImpl {
+	pub fn destroy(var self: HostImpl) nothrow -> Void {
+		val _ = self.pool.close();
+	}
+}
+
+// ===== Internal helpers =====
+
+fn _dummy_identity() nothrow -> ExecutorIdentity {
+	val empty: Array<Byte> = [];
+	return ExecutorIdentity(executor_id = move empty);
+}
+
+fn _validate_id16(field: String, id: &Array<Byte>) -> Void {
+	if id.len != 16 {
+		throw HostException(kind = HostErrorKind::InvalidId(field = move field, actual_len = id.len));
+	}
+}
+
+fn _validate_nonempty(field: String, s: &String) -> Void {
+	if s.byte_length() == 0 {
+		throw HostException(kind = HostErrorKind::InvalidArg(field = move field));
+	}
+}
+
+fn _is_json_object(s: &String) nothrow -> Bool {
+	match json.parse(s) {
+		core.Result::Ok(node) => {
+			var is_obj = false;
+			match node.as_object() { Optional::Some(_) => { is_obj = true; }, Optional::None => {} }
+			return is_obj;
+		},
+		core.Result::Err(_) => { return false; }
+	}
+}
+
+// Required JSON object document argument (continuation): empty/malformed/
+// non-object -> caller-input InvalidJson.
+fn _json_object_arg(field: String, s: &String) -> rpc.RpcArg {
+	if s.byte_length() == 0 { throw HostException(kind = HostErrorKind::InvalidJson(field = move field)); }
+	if _is_json_object(s) { return rpc.arg_string(_dup(s)); }
+	throw HostException(kind = HostErrorKind::InvalidJson(field = move field));
+}
+
+// Optional metadata document: absent (empty input) is the empty document `{}`.
+fn _meta_object_arg(field: String, s: &String) -> rpc.RpcArg {
+	if s.byte_length() == 0 { return rpc.arg_string("{}"); }
+	if _is_json_object(s) { return rpc.arg_string(_dup(s)); }
+	throw HostException(kind = HostErrorKind::InvalidJson(field = move field));
+}
+
+fn _dup(s: &String) nothrow -> String {
+	val n = s.byte_length();
+	var buf = io.buffer(n);
+	var i = 0;
+	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
+	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), n);
+}
+
+fn _dup_bytes(b: &Array<Byte>) nothrow -> Array<Byte> {
+	var out: Array<Byte> = Array<type Byte>::with_capacity(b.len);
+	var i = 0;
+	while i < b.len { out.push(b[i]); i = i + 1; }
+	return move out;
+}
+
+// Decode a lowercase-hex string into EXACTLY 16 bytes.
+fn _hex16(detail: String, s: &String) -> Array<Byte> {
+	match codec.hex_decode(s) {
+		core.Result::Ok(b) => { if b.len == 16 { return move b; } },
+		core.Result::Err(_) => {}
+	}
+	throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = move detail));
+}
+
+// ===== RPC dispatch (Singular's document contract) =====
+
+fn _acquire_conn(impl_: &HostImpl) -> managed.LeasedConn {
+	match impl_.pool.acquire() {
+		core.Result::Ok(lease) => { return move lease; },
+		core.Result::Err(e) => {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = _classify_acquire_tag(move tag_owned));
+		}
+	}
+}
+
+fn _classify_acquire_tag(tag: String) nothrow -> HostErrorKind {
+	if tag == "acquire-timeout" {
+		return HostErrorKind::BackendTimeout(detail = move tag);
+	}
+	return HostErrorKind::BackendUnavailable(detail = move tag);
+}
+
+fn _exec_with_conn(conn: &mut rpc.RpcConnection, sp_name: &String, args: Array<rpc.RpcArg>)
+	-> rpc.RpcStatement
+{
+	match conn.call(sp_name, &args) {
+		core.Result::Err(e) => {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		},
+		core.Result::Ok(stmt) => { return move stmt; }
+	}
+}
+
+fn _finish_stmt_and_commit(stmt: &mut rpc.RpcStatement, conn: &mut rpc.RpcConnection) -> Void {
+	match rpc.skip_remaining(stmt) {
+		core.Result::Err(e) => {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		},
+		core.Result::Ok(_) => {}
+	}
+	match rpc.commit(conn) {
+		core.Result::Err(e) => {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendRejected(detail = move tag_owned));
+		},
+		core.Result::Ok(_) => {}
+	}
+}
+
+fn _next(stmt: &mut rpc.RpcStatement) -> rpc.RpcEvent {
+	match rpc.next_event(stmt) {
+		core.Result::Err(e) => {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		},
+		core.Result::Ok(ev) => { return move ev; }
+	}
+}
+
+fn _parse_object_doc(text: &String) -> json.JsonNode {
+	var got: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
+	var detail = "result-not-json";
+	match json.parse(text) {
+		core.Result::Ok(node) => {
+			var is_obj = false;
+			match node.as_object() { Optional::Some(_) => { is_obj = true; }, Optional::None => {} }
+			if is_obj { got = Optional<json.JsonNode>::Some(move node); }
+			else { detail = "result-not-object"; }
+		},
+		core.Result::Err(_) => {}
+	}
+	match move got {
+		Optional::Some(node) => { return move node; },
+		Optional::None => { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = detail)); }
+	}
+}
+
+fn _read_result_doc(stmt: &mut rpc.RpcStatement) -> json.JsonNode {
+	val event = _next(stmt);
+	match event {
+		rpc.RpcEvent::Row(row) => {
+			val text = _str_req(&row, 0);
+			return _parse_object_doc(&text);
+		},
+		rpc.RpcEvent::ServerErr(err) => {
+			val errcode_owned: Uint = err.error_code; val msg_owned: String = err.message;
+			throw HostException(kind = _server_err_kind(errcode_owned, move msg_owned));
+		},
+		default => {
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "missing-result-row"));
+		}
+	}
+}
+
+fn _call_sp_doc(conn: &mut rpc.RpcConnection, sp_name: &String, args: Array<rpc.RpcArg>)
+	-> json.JsonNode
+{
+	var stmt = _exec_with_conn(conn, sp_name, move args);
+	val doc = _read_result_doc(&mut stmt);
+	_finish_stmt_and_commit(&mut stmt, conn);
+	return move doc;
+}
+
+fn _doc_outcome(doc: &json.JsonNode) -> String {
+	return _doc_str_req(doc, &"outcome", "result-no-outcome");
+}
+
+fn _doc_str_req(doc: &json.JsonNode, key: &String, detail: String) -> String {
+	match doc.get(key) {
+		Optional::Some(n) => {
+			match n.as_string() {
+				Optional::Some(s) => { return move s; },
+				Optional::None => { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = move detail)); }
+			}
+		},
+		Optional::None => { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = move detail)); }
+	}
+}
+
+fn _doc_int_req(doc: &json.JsonNode, key: &String, detail: String) -> Int {
+	match doc.get(key) {
+		Optional::Some(n) => {
+			match n.as_int() {
+				Optional::Some(v) => { return v; },
+				Optional::None => { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = move detail)); }
+			}
+		},
+		Optional::None => { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = move detail)); }
+	}
+}
+
+fn _doc_object_text_req(doc: &json.JsonNode, key: &String) -> String {
+	match doc.get(key) {
+		Optional::Some(n) => {
+			var is_obj = false;
+			match n.as_object() { Optional::Some(_) => { is_obj = true; }, Optional::None => {} }
+			if !is_obj { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "doc-field-not-object")); }
+			return json.encode_compact(n);
+		},
+		Optional::None => { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "doc-field-missing")); }
+	}
+}
+
+// SPs SIGNAL caller-input/contract violations with SQLSTATE '45000' (errno
+// 1644). Map those to BackendRejected (the message names the Pd* contract);
+// everything else is also BackendRejected with its server message.
+fn _server_err_kind(error_code: Uint, message: String) nothrow -> HostErrorKind {
+	return HostErrorKind::BackendRejected(detail = move message);
+}
+
+fn _str_req(row: &rpc.RpcRow, col: Int) -> String {
+	match row.is_null(col) {
+		core.Result::Ok(v) => { if v { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "row-required-null")); } },
+		core.Result::Err(_) => { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "row-isnull")); }
+	}
+	match row.get_string(col) {
+		core.Result::Err(_) => { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "row-str")); },
+		core.Result::Ok(v) => { return v; }
+	}
+}

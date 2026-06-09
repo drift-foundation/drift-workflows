@@ -1,0 +1,1396 @@
+// Gateway interface — the new public surface for Singular.
+//
+// Replaces the old `SingularClient` struct + `&mut`-style free functions in
+// client.drift. See work/singular-gateway/plan.md for the design rationale.
+//
+// Public shape:
+//   - pub interface SingularGateway       — 7 &self methods
+//   - pub struct SingularIdentity         — service_group + lease_owner
+//   - pub fn identity_from_worker_name    — Java-compatible UUIDv3 helper
+//   - pub struct SingularGatewayBuilder   — opaque, mutated via with_*
+//   - pub fn new_gateway_builder / with_json / with_identity / with_event_sink
+//   - pub fn build_gateway                — returns Arc<SingularGateway>
+//   - pub variant ConfigErrorKind         — structured kind data, no prose
+//   - pub error ConfigError               — kind + path
+//   - pub variant SingularEvent           — observability surface
+//
+// Internally the gateway wraps a `mariadb.rpc.pool.ConnectionPool` directly
+// (mariadb-rpc 0.6: acquire() is &Self + internally synchronized, so no outer
+// mutex). Last-Arc-drop fires SingularImpl::destroy which closes the pool.
+
+module singular.gateway;
+
+import std.core as core;
+import std.core.arc as arc;
+import std.concurrent as conc;
+import std.io as io;
+import std.json as json;
+import std.codec as codec;
+import std.mem as mem;
+import std.random as random;
+import std.uuid as uuid;
+
+import mariadb.rpc as rpc;
+import mariadb.rpc.pool as pool;
+import mariadb.rpc.managed as managed;   // for ManagedError type referenced by ConfigErrorKind
+
+export {
+    SingularGateway,
+    SingularIdentity,
+    identity_from_worker_name,
+    SingularGatewayBuilder,
+    new_gateway_builder,
+    with_json,
+    with_identity,
+    with_event_sink,
+    build_gateway,
+    ConfigErrorKind,
+    ConfigError,
+    RuntimeErrorKind,
+    SingularException,
+    SingularEvent,
+    new_lease_token,
+    WorkLease,
+    TerminalResult,
+    StartOutcome,
+    ResumeOutcome,
+    SettleOutcome,
+    ExtendLeaseOutcome,
+    WorkEvent,
+    InspectOutcome,
+    HistoryEntry
+};
+
+// ===== Result shapes (PR1: capability-token lease model) =====
+//
+// "At-least-once attempts, effectively-once effects." The caller mints a
+// 16-byte capability token (new_lease_token, or any deterministic value in
+// tests) and proposes it to start()/resume(); Singular validates + stores it
+// only on a grant, and every mutator is fenced by it. lease_owner stays
+// descriptive (audit) and is never an authority check.
+
+// A granted lease — the capability handle threaded through the mutators. PR1 grants
+// only via start() (always "fresh"), so there is no mode/recovery reporting here yet.
+// PR2 adds an explicit WorkMode { Fresh, Recovery } + recovery-attempt fields once
+// reclaim/resume can be produced. fresh-vs-recovery MUST be that direct signal, never
+// inferred from checkpoint_json (a recovery lease can have an empty checkpoint — e.g. a
+// crash before the first checkpoint write — so emptiness does not imply fresh).
+pub struct WorkLease {
+    pub key: Array<Byte>,
+    pub lease_token: Array<Byte>,            // 16 bytes, app-minted, Singular-accepted
+    pub lease_expires_at: String
+    // checkpoint_json deferred to PR2 — only a resume/reclaim grant can produce a
+    // checkpoint, and PR1 grants only via start() (fresh, no checkpoint).
+}
+
+// The authoritative terminal result a caller delivers to Microflows. Payload-bearing
+// variant so illegal state/payload combinations are unrepresentable (no Done-with-error,
+// no terminal record carrying stale lease fields). PR1 produces Done | Failed; `Failed`
+// gains a `reason` at PR2 (e.g. "attempts_exhausted") and Indeterminate(reason, context)
+// lands at PR4 — each added only when the gateway can actually produce it.
+pub variant TerminalResult {
+    Done(response_json: String),
+    Failed(error_json: String)
+}
+
+// start(): brand-new work only — the PK INSERT is the serializer.
+pub variant StartOutcome {
+    Granted(lease: WorkLease),  // Fresh — this caller won the INSERT; spawn a worker
+    Exists                      // row already present — caller falls through to resume()
+}
+
+// resume(): existing work only — never inserts. PR1 subset (Granted/Deferred land
+// in PR2/PR3).
+pub variant ResumeOutcome {
+    Active(lease_expires_at: String),// WORKING under a lease — IN_PROGRESS, no spawn
+    Terminal(result: TerminalResult),// DONE / FAILED replay
+    NotFound                        // no row — protocol violation (should have start()ed)
+}
+
+// complete() and fail() share ONE actionable-state outcome (no "Duplicate"; the op is
+// disambiguated at the call site, and the resulting state is carried in `result`).
+// Whether this call performed the transition or it was already settled, the caller
+// action is identical — DELIVER `result` to Microflows on the current correlation
+// token; the effect is never repeated. First-write-vs-replay provenance, if ever
+// needed, belongs on the SingularEvent channel, not in the outcome.
+//   Settled(result) -> terminal; deliver the authoritative result.
+//   TokenStale      -> superseded/foreign token; SUPPRESS callbacks, exit.
+//   NotFound        -> missing row; protocol/integration alert.
+pub variant SettleOutcome { Settled(result: TerminalResult), TokenStale, NotFound }
+
+// Extended -> keep working; Terminal(result) -> the step settled under you, stop work
+// (the result is authoritative; delivery is the writer's/resumer's job); TokenStale ->
+// you lost the lease, stop and suppress; NotFound -> alert.
+pub variant ExtendLeaseOutcome { Extended, Terminal(result: TerminalResult), TokenStale, NotFound }
+
+// Journal event vocabulary for the history() audit trail. Domain-level: the numeric
+// event_type storage codes (10/11/20/40) never cross the gateway boundary. All four are
+// produced in PR1; RECLAIMED/RESUMED/DEFERRED/INDETERMINATE arrive in PR2–PR4. There is
+// no public WorkState enum: inspect() encodes lifecycle in InspectOutcome's arms,
+// history() exposes the event, and the (event, status) pair is cross-checked adapter-privately on
+// decode (status is transported only for that check, then dropped) — backed by a schema CHECK.
+pub variant WorkEvent { Claimed, Extended, Completed, Failed }
+
+// inspect() returns state-specific arms so no arm carries fields meaningless to it:
+//   Working  -> the live-lease snapshot (descriptive owner, expiry, current checkpoint).
+//   Terminal -> the authoritative TerminalResult PLUS the terminal checkpoint, kept for
+//               diagnosis/audit. The checkpoint is carried alongside TerminalResult, not
+//               inside it (TerminalResult is callback-delivery data only). A terminal
+//               item has no live lease, so lease_owner/lease_expires_at are intentionally
+//               absent — the finalizing owner is available per-event from history().
+//   NotFound -> no row.
+pub variant InspectOutcome {
+    Working(lease_owner: Array<Byte>, lease_expires_at: String, checkpoint_json: String),
+    Terminal(result: TerminalResult, checkpoint_json: String),
+    NotFound
+}
+
+// RAW AUDIT RECORD: the journal row as stored, deliberately NOT narrowed into a
+// payload-bearing variant. event_payload/checkpoint_payload meaning is event-dependent
+// (response for Completed, error for Failed, the empty document `{}` for Claimed/Extended) and is
+// exposed uninterpreted (compact JSON object text) for debugging/audit — the one type intentionally
+// exempt from the actionable-state "make illegal combinations unrepresentable" NARROWING, because
+// history() has no control-flow consumer. It is NOT exempt from the document transport contract:
+// each row is a JSON object keyed by `event`, meta/payload/checkpoint are objects, lease_owner is
+// 16 bytes, and lease_expires_at is "" for non-lease events. The lifecycle status is derivable from
+// `event` (cross-checked adapter-privately on decode, backed by a schema CHECK) and not re-exposed.
+pub struct HistoryEntry {
+    pub event_ts: String,
+    pub item_meta: String,           // JSON object text
+    pub lease_owner: Array<Byte>,    // exactly 16 bytes
+    pub lease_meta: String,          // JSON object text
+    pub lease_expires_at: String,    // "" for non-lease events (Completed/Failed)
+    pub event: WorkEvent,
+    pub event_payload: String,       // JSON object text ("{}" for Claimed/Extended)
+    pub checkpoint_payload: String   // JSON object text
+}
+
+// ===== Identity =====
+
+pub struct SingularIdentity {
+    pub service_group: String,
+    pub lease_owner: Array<Byte>     // exactly 16 bytes
+}
+
+// Derive identity from a worker name via UUID v3 (matches the Java legacy
+// bookkeeper's `nameUUIDFromBytes(...)` algorithm). Callers can also build
+// SingularIdentity directly if they have a lease_owner from elsewhere.
+pub fn identity_from_worker_name(service_group: String, worker_name: &String) nothrow -> SingularIdentity {
+    val u: uuid.Uuid = uuid.v3_from_string(worker_name);
+    val bytes: Array<Byte> = uuid.to_bytes(&u);
+    return SingularIdentity(service_group = move service_group, lease_owner = move bytes);
+}
+
+// Mint a fresh 16-byte capability token from the OS CSPRNG. Convenience only —
+// the lease token is caller-supplied, so callers (and tests) may pass any
+// deterministic 16-byte value to start()/resume() instead of calling this.
+pub fn new_lease_token() -> Array<Byte> {
+    match random.random_secure_bytes(16) {
+        core.Result::Ok(b) => { return move b; },
+        core.Result::Err(_) => {
+            throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = "csprng-unavailable"));
+        }
+    }
+}
+
+// ===== Error surface =====
+
+pub variant ConfigErrorKind {
+    BuilderMissingJson,
+    BuilderMissingIdentity,
+    BuilderBadLeaseOwnerLength(actual: Int),
+    JsonMissingKey(key: String),
+    JsonBadType(key: String, expected: String),
+    JsonBadValue(key: String, value: String),
+    JsonUnknownBackend(value: String),
+    JsonPortOutOfRange(value: Int),
+    JsonTimeoutNonPositive(key: String, value: Int),
+    JsonPoolSizingInvalid(key: String, value: Int),
+    PoolOpenFailed(upstream_tag: String),
+    RpcConfigInvalid(upstream_tag: String)
+}
+
+implement core.Diagnostic for ConfigErrorKind {
+    pub fn to_json_text(self: &ConfigErrorKind) nothrow -> String {
+        return match self {
+            ConfigErrorKind::BuilderMissingJson => { "\"builder-missing-json\"" },
+            ConfigErrorKind::BuilderMissingIdentity => { "\"builder-missing-identity\"" },
+            ConfigErrorKind::BuilderBadLeaseOwnerLength(actual) => { "\"builder-bad-lease-owner-length\"" },
+            ConfigErrorKind::JsonMissingKey(key) => { "\"json-missing-key\"" },
+            ConfigErrorKind::JsonBadType(key, expected) => { "\"json-bad-type\"" },
+            ConfigErrorKind::JsonBadValue(key, value) => { "\"json-bad-value\"" },
+            ConfigErrorKind::JsonUnknownBackend(value) => { "\"json-unknown-backend\"" },
+            ConfigErrorKind::JsonPortOutOfRange(value) => { "\"json-port-out-of-range\"" },
+            ConfigErrorKind::JsonTimeoutNonPositive(key, value) => { "\"json-timeout-non-positive\"" },
+            ConfigErrorKind::JsonPoolSizingInvalid(key, value) => { "\"json-pool-sizing-invalid\"" },
+            ConfigErrorKind::PoolOpenFailed(upstream_tag) => { "\"pool-open-failed\"" },
+            ConfigErrorKind::RpcConfigInvalid(upstream_tag) => { "\"rpc-config-invalid\"" }
+        };
+    }
+}
+
+pub error ConfigError {
+    kind: ConfigErrorKind,
+    path: String
+}
+
+// Runtime errors — anything that goes wrong DURING a gateway call (as opposed
+// to ConfigError, which is build-time). Wraps both transport-level (pool /
+// rpc) and protocol-level (SP returned unexpected shape) failures.
+
+// Backend-agnostic failure taxonomy. Singular's domain is idempotency + lease
+// coordination; the backing store (MariaDB-over-RPC today) is an implementation
+// detail that MUST NOT leak through this type. Cases are caller-actionable, not
+// mechanism-descriptive.
+//
+// `detail` is DIAGNOSTIC ONLY — for logs/operators. It is NOT a compatibility
+// contract: its contents and structure may change between versions and between
+// backends. Callers may match on the case (and on SingularEvent / domain
+// outcomes) but MUST NOT parse or depend on `detail`. Anything a caller needs
+// to branch on must be promoted to a typed case.
+pub variant RuntimeErrorKind {
+    InvalidKey(actual_len: Int),            // caller input bug — not retriable
+    InvalidLeaseToken(actual_len: Int),     // caller input bug — token must be exactly 16 bytes
+    InvalidJson(field: String),             // caller input bug — a required JSON arg was empty/invalid
+    InvalidLeaseTimeout(seconds: Int),      // caller input bug — lease timeout must be a positive number of seconds
+    BackendUnavailable(detail: String),     // could not reach/acquire the store — retriable
+    BackendTimeout(detail: String),         // a deadline elapsed — retriable / shed load
+    BackendRejected(detail: String),        // store ran the op and reported failure — not blindly retriable
+    BackendResponseInvalid(detail: String)  // store returned malformed/unexpected data — schema/version skew
+}
+
+implement core.Diagnostic for RuntimeErrorKind {
+    pub fn to_json_text(self: &RuntimeErrorKind) nothrow -> String {
+        return match self {
+            RuntimeErrorKind::InvalidKey(actual_len) => { "\"invalid-key\"" },
+            RuntimeErrorKind::InvalidLeaseToken(actual_len) => { "\"invalid-lease-token\"" },
+            RuntimeErrorKind::InvalidJson(field) => { "\"invalid-json\"" },
+            RuntimeErrorKind::InvalidLeaseTimeout(seconds) => { "\"invalid-lease-timeout\"" },
+            RuntimeErrorKind::BackendUnavailable(detail) => { "\"backend-unavailable\"" },
+            RuntimeErrorKind::BackendTimeout(detail) => { "\"backend-timeout\"" },
+            RuntimeErrorKind::BackendRejected(detail) => { "\"backend-rejected\"" },
+            RuntimeErrorKind::BackendResponseInvalid(detail) => { "\"backend-response-invalid\"" }
+        };
+    }
+}
+
+pub error SingularException {
+    kind: RuntimeErrorKind
+}
+// NB: no manual `implement core.Diagnostic for SingularException` — the toolchain requires the
+// SYNTHESIZED Diagnostic projection for typed-catch binding (E_TYPED_CATCH_BIND_REQUIRES_SYNTHESIZED),
+// and a manual impl breaks every `catch gw:SingularException(...)`. RuntimeErrorKind keeps its own.
+
+// ===== Event surface =====
+
+// Backend-agnostic observability surface. Same posture as RuntimeErrorKind:
+// no pool/transport/socket mechanics leak through. `detail` is diagnostic-only
+// (not a contract). Backend-internal mechanics with no domain meaning
+// (per-connection open/reap, keepalive-ok) are dropped at the translator, not
+// surfaced as events.
+pub variant SingularEvent {
+    ConfigUnknownKey(path: String),     // config diagnostic, backend-agnostic
+    BackendSaturated(waiters: Int),     // acquirers waiting on the store — load signal
+    BackendSaturationCleared,           // saturation relieved
+    BackendDegraded(detail: String),    // store connectivity trouble (keepalive/reconnect)
+    BackendRecovered                    // store connectivity recovered
+}
+
+// ===== Interface =====
+
+pub interface SingularGateway {
+    // start: brand-new work only (PK insert serializer). Granted(Fresh) | Exists.
+    fn start(self: &Self, key: &Array<Byte>, item_meta: &String, lease_meta: &String,
+             lease_timeout_seconds: Int, lease_token: &Array<Byte>) -> StartOutcome;
+    // resume: existing work only (never inserts). Active | Terminal | NotFound (PR1).
+    // PR1: resume(key) only — grants nothing, so no token/meta/timeout/max-recovery inputs
+    // (a structured recovery request returns in PR2).
+    fn resume(self: &Self, key: &Array<Byte>) -> ResumeOutcome;
+    // Mutators carry the granted WorkLease (key + capability token).
+    fn complete(self: &Self, lease: &WorkLease, response_json: &String) -> SettleOutcome;
+    fn fail(self: &Self, lease: &WorkLease, error_json: &String) -> SettleOutcome;
+    fn extend_lease(self: &Self, lease: &WorkLease, lease_timeout_seconds: Int) -> ExtendLeaseOutcome;
+    fn inspect(self: &Self, key: &Array<Byte>) -> InspectOutcome;
+    fn history(self: &Self, key: &Array<Byte>) -> Array<HistoryEntry>
+}
+
+// ===== Builder =====
+
+pub struct SingularGatewayBuilder {
+    json_config: Optional<json.JsonNode>,
+    identity: Optional<SingularIdentity>,
+    event_sink: Optional<core.Callback1<SingularEvent, Void> >
+}
+
+pub fn new_gateway_builder() nothrow -> SingularGatewayBuilder {
+    return SingularGatewayBuilder(
+        json_config = Optional<json.JsonNode>::None(),
+        identity = Optional<SingularIdentity>::None(),
+        event_sink = Optional<core.Callback1<SingularEvent, Void> >::None()
+    );
+}
+
+pub fn with_json(b: &mut SingularGatewayBuilder, config: &json.JsonNode) nothrow -> Void {
+    b.json_config = Optional<json.JsonNode>::Some(config.clone_deep());
+}
+
+pub fn with_identity(b: &mut SingularGatewayBuilder, identity: SingularIdentity) -> Void {
+    if identity.lease_owner.len() != 16 {
+        throw ConfigError(
+            kind = ConfigErrorKind::BuilderBadLeaseOwnerLength(actual = identity.lease_owner.len()),
+            path = ""
+        );
+    }
+    b.identity = Optional<SingularIdentity>::Some(move identity);
+}
+
+pub fn with_event_sink(b: &mut SingularGatewayBuilder,
+                      sink: core.Callback1<SingularEvent, Void>) nothrow -> Void {
+    b.event_sink = Optional<core.Callback1<SingularEvent, Void> >::Some(move sink);
+}
+
+pub fn build_gateway(var b: SingularGatewayBuilder) nothrow
+    -> core.Result<arc.Arc<SingularGateway>, ConfigError>
+{
+    val have_json: Bool = match &b.json_config {
+        Optional::Some(_) => { true },
+        Optional::None => { false }
+    };
+    if !have_json {
+        return core.Result<arc.Arc<SingularGateway>, ConfigError>::Err(
+            ConfigError(kind = ConfigErrorKind::BuilderMissingJson(), path = "")
+        );
+    }
+    val have_id: Bool = match &b.identity {
+        Optional::Some(_) => { true },
+        Optional::None => { false }
+    };
+    if !have_id {
+        return core.Result<arc.Arc<SingularGateway>, ConfigError>::Err(
+            ConfigError(kind = ConfigErrorKind::BuilderMissingIdentity(), path = "")
+        );
+    }
+
+    // Extract the validated identity into a local.
+    var identity_local: Optional<SingularIdentity> = Optional<SingularIdentity>::None();
+    mem.swap(&mut b.identity, &mut identity_local);
+    var taken_identity: SingularIdentity = match move identity_local {
+        Optional::Some(v) => { move v },
+        Optional::None => { _dummy_identity() }
+    };
+
+    // Extract the validated JsonNode into a local.
+    var json_local: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
+    mem.swap(&mut b.json_config, &mut json_local);
+    val cfg_node: json.JsonNode = match move json_local {
+        Optional::Some(n) => { move n },
+        Optional::None => { json.new_object().to_node() }
+    };
+
+    // Extract the optional sink (move ownership — Callback1 is not cloneable).
+    var sink_local: Optional<core.Callback1<SingularEvent, Void> > = Optional<core.Callback1<SingularEvent, Void> >::None();
+    mem.swap(&mut b.event_sink, &mut sink_local);
+
+    // One try/catch captures both ConfigError (from parse helpers) and
+    // managed.ManagedError (from pool.open via or_throw); the latter is
+    // converted to a structured ConfigError before returning.
+    try {
+        val rpc_cfg: rpc.RpcConnectionConfig = _build_rpc_config_from_json_throwing(&cfg_node);
+        val pool_cfg: pool.PoolConfig = _build_pool_config_from_json_throwing(&cfg_node, move sink_local);
+        val p: pool.ConnectionPool = pool.open(move rpc_cfg, move pool_cfg).or_throw();
+
+        val inst = SingularImpl(
+            identity = move taken_identity,
+            pool = move p
+        );
+        val inst_arc: arc.Arc<SingularImpl> = arc.arc(move inst);
+        val gw: arc.Arc<SingularGateway> = inst_arc.as_interface<type SingularGateway>();
+        return core.Result<arc.Arc<SingularGateway>, ConfigError>::Ok(move gw);
+    } catch managed:ManagedError(e) {
+        return core.Result<arc.Arc<SingularGateway>, ConfigError>::Err(
+            ConfigError(
+                kind = ConfigErrorKind::PoolOpenFailed(upstream_tag = _dup(&e.tag)),
+                path = ""
+            )
+        );
+    } catch ConfigError(e) {
+        return core.Result<arc.Arc<SingularGateway>, ConfigError>::Err(move e);
+    } catch unexpected {
+        // Catch-all for any other throw escaping the try block. Returned as
+        // a generic PoolOpenFailed since the most likely escape path is the
+        // pool subsystem.
+        return core.Result<arc.Arc<SingularGateway>, ConfigError>::Err(
+            ConfigError(
+                kind = ConfigErrorKind::PoolOpenFailed(upstream_tag = "unexpected"),
+                path = ""
+            )
+        );
+    }
+}
+
+// ===== JSON parsing helpers (Task 3) =====
+
+// Throwing variant — all parse errors propagate as ConfigError.
+fn _build_rpc_config_from_json_throwing(node: &json.JsonNode) -> rpc.RpcConnectionConfig {
+    val backend: String = _read_string_throws(node, &"backend");
+    if backend != "mariadb" {
+        throw ConfigError(
+            kind = ConfigErrorKind::JsonUnknownBackend(value = move backend),
+            path = "backend"
+        );
+    }
+    val host: String = _read_string_throws(node, &"host");
+    val port: Int = _read_int_throws(node, &"port");
+    if port < 1 or port > 65535 {
+        throw ConfigError(kind = ConfigErrorKind::JsonPortOutOfRange(value = port), path = "port");
+    }
+    val user: String = _read_string_throws(node, &"user");
+    val password: String = _read_string_throws(node, &"password");
+    val database: String = _read_string_throws(node, &"database");
+    val connect_timeout_ms: Int = _read_optional_positive_int(node, &"connect_timeout_ms", 5000);
+    val io_timeout_ms: Int = _read_optional_positive_int(node, &"io_timeout_ms", 30000);
+
+    var builder = rpc.new_connection_config_builder();
+    builder.with_host(move host);
+    builder.with_port(port);
+    builder.with_user(move user);
+    builder.with_password(move password);
+    builder.with_database(move database);
+    builder.with_connect_timeout_ms(connect_timeout_ms);
+    builder.with_read_timeout_ms(io_timeout_ms);
+    builder.with_write_timeout_ms(io_timeout_ms);
+    match rpc.build_connection_config(move builder) {
+        core.Result::Ok(cfg) => { return move cfg; },
+        core.Result::Err(_) => {
+            throw ConfigError(
+                kind = ConfigErrorKind::RpcConfigInvalid(upstream_tag = "rpc-config-build-failed"),
+                path = ""
+            );
+        }
+    }
+}
+
+fn _read_string_throws(node: &json.JsonNode, key: &String) -> String {
+    val opt: Optional<&json.JsonNode> = node.get(key);
+    match opt {
+        Optional::None => {
+            throw ConfigError(kind = ConfigErrorKind::JsonMissingKey(key = _dup(key)), path = _dup(key));
+        },
+        Optional::Some(n) => {
+            match n.as_string() {
+                Optional::Some(s) => { return move s; },
+                Optional::None => {
+                    throw ConfigError(
+                        kind = ConfigErrorKind::JsonBadType(key = _dup(key), expected = "String"),
+                        path = _dup(key)
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn _read_int_throws(node: &json.JsonNode, key: &String) -> Int {
+    val opt: Optional<&json.JsonNode> = node.get(key);
+    match opt {
+        Optional::None => {
+            throw ConfigError(kind = ConfigErrorKind::JsonMissingKey(key = _dup(key)), path = _dup(key));
+        },
+        Optional::Some(n) => {
+            match n.as_int() {
+                Optional::Some(v) => { return v; },
+                Optional::None => {
+                    throw ConfigError(
+                        kind = ConfigErrorKind::JsonBadType(key = _dup(key), expected = "Int"),
+                        path = _dup(key)
+                    );
+                }
+            }
+        }
+    }
+}
+
+// Throwing variant for pool config. Consumes the optional event sink by value:
+// Callback1 is not cloneable, so ownership transfer is the only way to install
+// it into the pool config. The caller is the builder being consumed in
+// build_gateway, so it has no further use for the sink anyway.
+fn _build_pool_config_from_json_throwing(node: &json.JsonNode,
+                                         var event_sink: Optional<core.Callback1<SingularEvent, Void> >)
+    -> pool.PoolConfig
+{
+    var pc: pool.PoolConfig = pool.default_pool_config();
+
+    val pool_opt: Optional<&json.JsonNode> = node.get(&"pool");
+    match pool_opt {
+        Optional::Some(psub) => {
+            match psub.get_int_at_path(&"min_idle") {
+                Optional::Some(v) => {
+                    if v < 0 { throw ConfigError(kind = ConfigErrorKind::JsonPoolSizingInvalid(key = "min_idle", value = v), path = "pool.min_idle"); }
+                    pc.min_idle = v;
+                },
+                Optional::None => {}
+            }
+            match psub.get_int_at_path(&"max_conns") {
+                Optional::Some(v) => {
+                    if v < 1 { throw ConfigError(kind = ConfigErrorKind::JsonPoolSizingInvalid(key = "max_conns", value = v), path = "pool.max_conns"); }
+                    pc.max_conns = v;
+                },
+                Optional::None => {}
+            }
+            match psub.get_int_at_path(&"idle_timeout_ms") {
+                Optional::Some(v) => {
+                    if v <= 0 { throw ConfigError(kind = ConfigErrorKind::JsonTimeoutNonPositive(key = "idle_timeout_ms", value = v), path = "pool.idle_timeout_ms"); }
+                    pc.idle_timeout_ms = v;
+                },
+                Optional::None => {}
+            }
+            match psub.get_int_at_path(&"keepalive_interval_ms") {
+                Optional::Some(v) => {
+                    if v < 0 { throw ConfigError(kind = ConfigErrorKind::JsonTimeoutNonPositive(key = "keepalive_interval_ms", value = v), path = "pool.keepalive_interval_ms"); }
+                    pc.keepalive_interval_ms = v;
+                },
+                Optional::None => {}
+            }
+        },
+        Optional::None => {}
+    }
+
+    // Singular always bounds the lease acquire — unbounded blocking is
+    // unacceptable for a coordination backend. Set a finite default deadline
+    // (configurable via pool.acquire_timeout_ms, default 5000ms) so the no-arg
+    // acquire() at the lease site (== AcquireWait::UseDefault) is finite. We
+    // never leave acquire_timeout = None (block forever) or pass Forever.
+    pc.acquire_timeout = Optional<conc.Duration>::Some(conc.Duration(millis = _read_acquire_timeout_ms(node)));
+
+    // Wire the translator if the caller installed a sink. Callback1 isn't
+    // cloneable; ownership transfers into the translator closure.
+    val have_sink: Bool = match &event_sink {
+        Optional::Some(_) => { true },
+        Optional::None => { false }
+    };
+    if have_sink {
+        var sink_owned: core.Callback1<SingularEvent, Void> = match move event_sink {
+            Optional::Some(s) => { move s },
+            Optional::None => { _dummy_singular_sink() }
+        };
+        val translator: core.Callback1<pool.PoolEvent, Void> = core.callback1(
+            |ev: pool.PoolEvent| captures(move sink_owned) => {
+                match _translate_pool_event(&ev) {
+                    Optional::Some(sev) => { sink_owned.call(sev); },
+                    Optional::None => {}
+                }
+            }
+        );
+        pc.event_sink = Optional<core.Callback1<pool.PoolEvent, Void> >::Some(move translator);
+    }
+
+    return move pc;
+}
+
+fn _dummy_singular_sink() nothrow -> core.Callback1<SingularEvent, Void> {
+    return core.callback1(|ev: SingularEvent| => {});
+}
+
+// Finite acquire deadline (ms) for PoolConfig.acquire_timeout, read from the
+// "pool" subtree; default 5000ms. A non-positive override is rejected — Singular
+// always bounds the wait (a finite <= 0 would mean "fail immediately", and
+// block-forever is expressed at the API as the named Forever, which Singular
+// never uses).
+fn _read_acquire_timeout_ms(node: &json.JsonNode) -> Int {
+    match node.get(&"pool") {
+        Optional::Some(psub) => {
+            match psub.get_int_at_path(&"acquire_timeout_ms") {
+                Optional::Some(v) => {
+                    if v <= 0 { throw ConfigError(kind = ConfigErrorKind::JsonTimeoutNonPositive(key = "acquire_timeout_ms", value = v), path = "pool.acquire_timeout_ms"); }
+                    return v;
+                },
+                Optional::None => { return 5000; }
+            }
+        },
+        Optional::None => { return 5000; }
+    }
+}
+
+fn _read_required_string(node: &json.JsonNode, key: &String)
+    nothrow -> core.Result<String, ConfigError>
+{
+    val opt: Optional<&json.JsonNode> = node.get(key);
+    match opt {
+        Optional::None => {
+            return core.Result<String, ConfigError>::Err(
+                ConfigError(kind = ConfigErrorKind::JsonMissingKey(key = _dup(key)), path = _dup(key))
+            );
+        },
+        Optional::Some(n) => {
+            match n.as_string() {
+                Optional::Some(s) => { return core.Result<String, ConfigError>::Ok(move s); },
+                Optional::None => {
+                    return core.Result<String, ConfigError>::Err(
+                        ConfigError(
+                            kind = ConfigErrorKind::JsonBadType(key = _dup(key), expected = "String"),
+                            path = _dup(key)
+                        )
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn _read_required_int(node: &json.JsonNode, key: &String)
+    nothrow -> core.Result<Int, ConfigError>
+{
+    val opt: Optional<&json.JsonNode> = node.get(key);
+    match opt {
+        Optional::None => {
+            return core.Result<Int, ConfigError>::Err(
+                ConfigError(kind = ConfigErrorKind::JsonMissingKey(key = _dup(key)), path = _dup(key))
+            );
+        },
+        Optional::Some(n) => {
+            match n.as_int() {
+                Optional::Some(v) => { return core.Result<Int, ConfigError>::Ok(v); },
+                Optional::None => {
+                    return core.Result<Int, ConfigError>::Err(
+                        ConfigError(
+                            kind = ConfigErrorKind::JsonBadType(key = _dup(key), expected = "Int"),
+                            path = _dup(key)
+                        )
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn _read_optional_positive_int(node: &json.JsonNode, key: &String, default_val: Int) nothrow -> Int {
+    val opt: Optional<&json.JsonNode> = node.get(key);
+    match opt {
+        Optional::None => { return default_val; },
+        Optional::Some(n) => {
+            match n.as_int() {
+                Optional::Some(v) => { if v > 0 { return v; } else { return default_val; } },
+                Optional::None => { return default_val; }
+            }
+        }
+    }
+}
+
+fn _dup(s: &String) nothrow -> String {
+    val n = s.byte_length();
+    var buf = io.buffer(n);
+    var i = 0;
+    while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
+    return core.string_from_utf8_bytes(io.buffer_ptr(&buf), n);
+}
+
+fn _managed_err_tag(e: &managed.ManagedError) nothrow -> String { return _dup(&e.tag); }
+
+// Map mariadb-rpc pool events into the backend-agnostic SingularEvent surface.
+// Returns None for backend-internal mechanics with no domain meaning
+// (per-connection open/reap, keepalive-ok) so they are never surfaced as events.
+fn _translate_pool_event(ev: &pool.PoolEvent) nothrow -> Optional<SingularEvent> {
+    return match ev {
+        pool.PoolEvent::ConnOpened(opened_total) => { Optional<SingularEvent>::None() },
+        pool.PoolEvent::ConnClosedByReap(closed_total) => { Optional<SingularEvent>::None() },
+        pool.PoolEvent::KeepalivePingOk => { Optional<SingularEvent>::None() },
+        pool.PoolEvent::KeepalivePingFailed(ping_failed_tag) => { Optional<SingularEvent>::Some(SingularEvent::BackendDegraded(detail = _dup(&ping_failed_tag))) },
+        pool.PoolEvent::ReconnectAttempt(attempt_attempt) => { Optional<SingularEvent>::Some(SingularEvent::BackendDegraded(detail = "reconnect-attempt")) },
+        pool.PoolEvent::ReconnectSucceeded(succeeded_attempt) => { Optional<SingularEvent>::Some(SingularEvent::BackendRecovered()) },
+        pool.PoolEvent::ReconnectFailed(failed_attempt, failed_tag) => { Optional<SingularEvent>::Some(SingularEvent::BackendDegraded(detail = _dup(&failed_tag))) },
+        pool.PoolEvent::AcquireWaiting(waiting_now) => { Optional<SingularEvent>::Some(SingularEvent::BackendSaturated(waiters = waiting_now)) },
+        pool.PoolEvent::AcquireUnblocked => { Optional<SingularEvent>::Some(SingularEvent::BackendSaturationCleared()) }
+    };
+}
+
+// ===== Implementation =====
+
+struct SingularImpl
+    require Self is core.Destructible
+{
+    identity: SingularIdentity,
+    // acquire() is &Self + internally synchronized as of mariadb-rpc 0.6, so no
+    // outer mutex is needed — the pool is shared directly and acquired
+    // concurrently from many VTs via Arc<SingularImpl>. The acquire deadline
+    // lives on the pool itself (PoolConfig.acquire_timeout), so the lease site
+    // just calls the no-arg acquire() (== AcquireWait::UseDefault).
+    pool: pool.ConnectionPool
+}
+
+implement SingularGateway for SingularImpl {
+    pub fn start(self: &SingularImpl, key: &Array<Byte>, item_meta: &String, lease_meta: &String,
+                 lease_timeout_seconds: Int, lease_token: &Array<Byte>) -> StartOutcome {
+        _validate_key(key);
+        _validate_lease_token(lease_token);
+        _validate_timeout(lease_timeout_seconds);
+        try {
+            var lease = _acquire_lease(self);
+            val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+            var args = rpc.new_args();
+            args.push(rpc.arg_string(_dup(&self.identity.service_group)));
+            args.push(rpc.arg_bytes(_dup_bytes(key)));
+            args.push(_meta_object_arg("item_meta", item_meta));
+            args.push(rpc.arg_bytes(_dup_bytes(&self.identity.lease_owner)));
+            args.push(_meta_object_arg("lease_meta", lease_meta));
+            args.push(rpc.arg_int(lease_timeout_seconds));
+            args.push(rpc.arg_bytes(_dup_bytes(lease_token)));
+            val sp: String = "sp_singular_start";
+            val doc = _call_sp_doc(conn, &sp, move args);
+            val outcome = _doc_outcome(&doc);
+            if outcome == "granted" {
+                // The granted lease token IS the caller's validated 16-byte input (echoed by
+                // the SP), so it is threaded from the input — never re-decoded from the result.
+                // Bind the (throwing) field read BEFORE the constructor: a throw after a moved
+                // constructor argument would strand the moved value (drift does not unwind a
+                // partially-evaluated constructor).
+                val expires = _doc_str_req(&doc, &"lease_expires_at", "start-no-expiry");
+                return StartOutcome::Granted(WorkLease(
+                    key = _dup_bytes(key),
+                    lease_token = _dup_bytes(lease_token),
+                    lease_expires_at = move expires
+                ));
+            } else if outcome == "exists" {
+                return StartOutcome::Exists();
+            } else {
+                throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:start"));
+            }
+        } catch managed:ManagedError(e) {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));
+        }
+    }
+
+    pub fn resume(self: &SingularImpl, key: &Array<Byte>) -> ResumeOutcome {
+        _validate_key(key);
+        try {
+            var lease = _acquire_lease(self);
+            val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+            var args = rpc.new_args();
+            args.push(rpc.arg_string(_dup(&self.identity.service_group)));
+            args.push(rpc.arg_bytes(_dup_bytes(key)));
+            val sp: String = "sp_singular_resume";
+            val doc = _call_sp_doc(conn, &sp, move args);
+            val outcome = _doc_outcome(&doc);
+            if outcome == "active" {
+                return ResumeOutcome::Active(_doc_str_req(&doc, &"lease_expires_at", "resume-no-expiry"));
+            } else if outcome == "terminal" {
+                return ResumeOutcome::Terminal(_terminal_from_doc(&doc));
+            } else if outcome == "not_found" {
+                return ResumeOutcome::NotFound();
+            } else {
+                throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:resume"));
+            }
+        } catch managed:ManagedError(e) {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));
+        }
+    }
+
+    pub fn complete(self: &SingularImpl, lease: &WorkLease, response_json: &String) -> SettleOutcome {
+        _validate_key(&lease.key);
+        _validate_lease_token(&lease.lease_token);
+        try {
+            var leased = _acquire_lease(self);
+            val conn: &mut rpc.RpcConnection = leased.conn().or_throw();
+            var args = rpc.new_args();
+            args.push(rpc.arg_string(_dup(&self.identity.service_group)));
+            args.push(rpc.arg_bytes(_dup_bytes(&lease.key)));
+            args.push(rpc.arg_bytes(_dup_bytes(&self.identity.lease_owner)));
+            args.push(rpc.arg_bytes(_dup_bytes(&lease.lease_token)));
+            args.push(_json_object_arg("response", response_json));
+            val sp: String = "sp_singular_complete";
+            val doc = _call_sp_doc(conn, &sp, move args);
+            val outcome = _doc_outcome(&doc);
+            if outcome == "settled" { return SettleOutcome::Settled(_terminal_from_doc(&doc)); }
+            else if outcome == "token_stale" { return SettleOutcome::TokenStale(); }
+            else if outcome == "not_found" { return SettleOutcome::NotFound(); }
+            else {
+                throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:complete"));
+            }
+        } catch managed:ManagedError(e) {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));
+        }
+    }
+
+    pub fn fail(self: &SingularImpl, lease: &WorkLease, error_json: &String) -> SettleOutcome {
+        _validate_key(&lease.key);
+        _validate_lease_token(&lease.lease_token);
+        try {
+            var leased = _acquire_lease(self);
+            val conn: &mut rpc.RpcConnection = leased.conn().or_throw();
+            var args = rpc.new_args();
+            args.push(rpc.arg_string(_dup(&self.identity.service_group)));
+            args.push(rpc.arg_bytes(_dup_bytes(&lease.key)));
+            args.push(rpc.arg_bytes(_dup_bytes(&self.identity.lease_owner)));
+            args.push(rpc.arg_bytes(_dup_bytes(&lease.lease_token)));
+            args.push(_json_object_arg("error", error_json));
+            val sp: String = "sp_singular_fail";
+            val doc = _call_sp_doc(conn, &sp, move args);
+            val outcome = _doc_outcome(&doc);
+            if outcome == "settled" { return SettleOutcome::Settled(_terminal_from_doc(&doc)); }
+            else if outcome == "token_stale" { return SettleOutcome::TokenStale(); }
+            else if outcome == "not_found" { return SettleOutcome::NotFound(); }
+            else {
+                throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:fail"));
+            }
+        } catch managed:ManagedError(e) {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));
+        }
+    }
+
+    pub fn inspect(self: &SingularImpl, key: &Array<Byte>) -> InspectOutcome {
+        _validate_key(key);
+        try {
+            var lease = _acquire_lease(self);
+            val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+            var args = rpc.new_args();
+            args.push(rpc.arg_string(_dup(&self.identity.service_group)));
+            args.push(rpc.arg_bytes(_dup_bytes(key)));
+            val sp: String = "sp_singular_inspect";
+            val doc = _call_sp_doc(conn, &sp, move args);
+            val outcome = _doc_outcome(&doc);
+            if outcome == "working" {
+                // Validate every (throwing) field FIRST, then allocate the owner bytes LAST, then
+                // construct with only nothrow moves — a throw after a moved constructor argument
+                // would strand it (drift does not unwind a partially-evaluated constructor).
+                val owner_hex = _doc_str_req(&doc, &"lease_owner", "inspect-no-owner");
+                val expires = _doc_str_req(&doc, &"lease_expires_at", "inspect-no-expiry");
+                val checkpoint = _doc_object_text_req(&doc, &"checkpoint");
+                val owner = _hex16("inspect-owner-hex", &owner_hex);
+                return InspectOutcome::Working(move owner, move expires, move checkpoint);
+            } else if outcome == "terminal" {
+                val checkpoint = _doc_object_text_req(&doc, &"checkpoint");
+                val tr = _terminal_from_doc(&doc);
+                return InspectOutcome::Terminal(move tr, move checkpoint);
+            } else if outcome == "not_found" {
+                return InspectOutcome::NotFound();
+            } else {
+                throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:inspect"));
+            }
+        } catch managed:ManagedError(e) {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));
+        }
+    }
+
+    pub fn extend_lease(self: &SingularImpl, lease: &WorkLease, lease_timeout_seconds: Int) -> ExtendLeaseOutcome {
+        _validate_key(&lease.key);
+        _validate_lease_token(&lease.lease_token);
+        _validate_timeout(lease_timeout_seconds);
+        try {
+            var leased = _acquire_lease(self);
+            val conn: &mut rpc.RpcConnection = leased.conn().or_throw();
+            var args = rpc.new_args();
+            args.push(rpc.arg_string(_dup(&self.identity.service_group)));
+            args.push(rpc.arg_bytes(_dup_bytes(&lease.key)));
+            args.push(rpc.arg_bytes(_dup_bytes(&self.identity.lease_owner)));
+            args.push(rpc.arg_bytes(_dup_bytes(&lease.lease_token)));
+            args.push(rpc.arg_int(lease_timeout_seconds));
+            val sp: String = "sp_singular_extend_lease";
+            val doc = _call_sp_doc(conn, &sp, move args);
+            val outcome = _doc_outcome(&doc);
+            if outcome == "extended" {
+                return ExtendLeaseOutcome::Extended();
+            } else if outcome == "token_stale" {
+                return ExtendLeaseOutcome::TokenStale();
+            } else if outcome == "not_found" {
+                return ExtendLeaseOutcome::NotFound();
+            } else if outcome == "terminal" {
+                return ExtendLeaseOutcome::Terminal(_terminal_from_doc(&doc));
+            } else {
+                throw SingularException(
+                    kind = RuntimeErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:extend_lease")
+                );
+            }
+        } catch managed:ManagedError(e) {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));
+        }
+    }
+
+    pub fn history(self: &SingularImpl, key: &Array<Byte>) -> Array<HistoryEntry> {
+        _validate_key(key);
+        try {
+            var lease = _acquire_lease(self);
+            val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+            var args = rpc.new_args();
+            args.push(rpc.arg_string(_dup(&self.identity.service_group)));
+            args.push(rpc.arg_bytes(_dup_bytes(key)));
+            val sp: String = "sp_singular_history";
+            var stmt = _exec_with_conn(conn, &sp, move args);
+            var entries: Array<HistoryEntry> = [];
+            var done = false;
+            while !done {
+                val event = _next(&mut stmt);
+                match event {
+                    rpc.RpcEvent::Row(row) => {
+                        // Each row is one audit DOCUMENT (object) keyed by `event`. Decode the object
+                        // contract, then bind every field to a local FIRST (each may throw; `val`
+                        // locals drop cleanly on a throw) and construct LAST with only nothrow moves —
+                        // so a throw never strands an already-moved constructor argument. payload/meta/
+                        // checkpoint are nested objects (re-encoded compact); lease_owner is hex16;
+                        // lease_expires_at is absent ("") on non-lease events.
+                        val text = _str_req(&row, 0);
+                        val doc = _parse_object_doc(&text);
+                        val h_event_ts = _doc_str_req(&doc, &"event_ts", "history-no-event-ts");
+                        val h_item_meta = _doc_object_text_req(&doc, &"item_meta");
+                        val h_owner_hex = _doc_str_req(&doc, &"lease_owner", "history-no-owner");
+                        val h_owner = _hex16("history-owner-hex", &h_owner_hex);
+                        val h_lease_meta = _doc_object_text_req(&doc, &"lease_meta");
+                        val h_expires = _doc_str_opt(&doc, &"lease_expires_at");
+                        val h_event = _work_event_from_name(_doc_str_req(&doc, &"event", "history-no-event"));
+                        // cross-check the (event, status) pair (schema CHECK + decode protection)
+                        _check_event_status(&h_event, _doc_int_req(&doc, &"status", "history-no-status"));
+                        val h_payload = _doc_object_text_req(&doc, &"event_payload");
+                        val h_checkpoint = _doc_object_text_req(&doc, &"checkpoint");
+                        entries.push(HistoryEntry(
+                            event_ts = move h_event_ts,
+                            item_meta = move h_item_meta,
+                            lease_owner = move h_owner,
+                            lease_meta = move h_lease_meta,
+                            lease_expires_at = move h_expires,
+                            event = h_event,
+                            event_payload = move h_payload,
+                            checkpoint_payload = move h_checkpoint
+                        ));
+                    },
+                    rpc.RpcEvent::ResultSetEnd => { done = true; },
+                    rpc.RpcEvent::StatementEnd(_) => { done = true; },
+                    rpc.RpcEvent::ServerErr(err) => {
+                        val errcode_owned: Uint = err.error_code; val msg_owned: String = err.message;
+                        throw SingularException(kind = _server_err_kind(errcode_owned, move msg_owned));
+                    },
+                    // An unexpected mid-stream event would truncate the audit history;
+                    // surface it rather than silently returning a partial trail.
+                    default => {
+                        throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "unexpected-event:history"));
+                    }
+                }
+            }
+            _finish_stmt_and_commit(&mut stmt, conn);
+            return move entries;
+        } catch managed:ManagedError(e) {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));
+        }
+    }
+
+}
+
+implement core.Destructible for SingularImpl {
+    pub fn destroy(var self: SingularImpl) nothrow -> Void {
+        // Last Arc-reference dropped → close the pool deterministically.
+        // Stops the keepalive VT and tears down idle/leased conns before
+        // the field-destruction phase. Best-effort: a non-Ok close logs
+        // through the pool's own event sink (if installed) and we drop the
+        // error here because destroy is nothrow.
+        val _ = self.pool.close();
+    }
+}
+
+// ===== Internal helpers =====
+
+fn _dummy_identity() nothrow -> SingularIdentity {
+    val empty: Array<Byte> = [];
+    return SingularIdentity(service_group = "", lease_owner = move empty);
+}
+
+fn _dummy_pool_unreachable() -> pool.ConnectionPool {
+    // Branch is unreachable in practice (presence checked above).
+    val rpc_cfg = _dummy_rpc_config();
+    var pc = pool.default_pool_config();
+    pc.min_idle = 0;
+    pc.max_conns = 1;
+    match pool.open(move rpc_cfg, move pc) {
+        core.Result::Ok(p) => { return move p; },
+        core.Result::Err(_) => {
+            // Truly unreachable in normal use; produce a panic-equivalent.
+            return pool.open(_dummy_rpc_config(), pool.default_pool_config()).or_throw();
+        }
+    }
+}
+
+fn _dummy_config_error() nothrow -> ConfigError {
+    return ConfigError(kind = ConfigErrorKind::BuilderMissingJson(), path = "");
+}
+
+fn _dummy_rpc_config() -> rpc.RpcConnectionConfig {
+    var builder = rpc.new_connection_config_builder();
+    builder.with_host("127.0.0.1");
+    builder.with_port(3306);
+    builder.with_user("u");
+    builder.with_password("p");
+    builder.with_database("d");
+    match rpc.build_connection_config(move builder) {
+        core.Result::Ok(cfg) => { return move cfg; },
+        core.Result::Err(_) => {
+            // Shouldn't happen for these defaults; return one anyway.
+            var b2 = rpc.new_connection_config_builder();
+            b2.with_user("u");
+            b2.with_password("p");
+            b2.with_database("d");
+            match rpc.build_connection_config(move b2) {
+                core.Result::Ok(cfg) => { return move cfg; },
+                core.Result::Err(_) => {
+                    // Truly unreachable.
+                    var b3 = rpc.new_connection_config_builder();
+                    b3.with_user("u");
+                    b3.with_password("p");
+                    b3.with_database("d");
+                    match rpc.build_connection_config(move b3) {
+                        core.Result::Ok(cfg) => { return move cfg; },
+                        core.Result::Err(_) => {
+                            // Surrender — produce something to satisfy the type.
+                            var b4 = rpc.new_connection_config_builder();
+                            b4.with_user("u"); b4.with_password("p"); b4.with_database("d");
+                            return rpc.build_connection_config(move b4).or_throw();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ===== RPC dispatch helpers =====
+
+// Every actionable SP (start/resume/complete/fail/extend_lease/inspect) returns ONE result
+// set with ONE row, ONE column `result`: a discriminated JSON DOCUMENT (always a non-null JSON
+// OBJECT) keyed by `outcome`, with arm-inapplicable fields OMITTED (never SQL/JSON null). There
+// are no positional result-code columns and no nullable primitives crossing the boundary; the
+// numeric storage codes / SP names / SIGNALs stay backend-private. _read_result_doc validates
+// the object contract on decode; _doc_* read fields; callers branch on `outcome` only.
+
+fn _validate_key(key: &Array<Byte>) -> Void {
+    if key.len == 0 or key.len > 32 {
+        throw SingularException(kind = RuntimeErrorKind::InvalidKey(actual_len = key.len));
+    }
+}
+
+// Capability tokens are exactly 16 bytes. Validated client-side so a malformed
+// token never reaches the store; the SP also signals SingularLeaseTokenInvalid
+// as a defense-in-depth backstop.
+fn _validate_lease_token(tok: &Array<Byte>) -> Void {
+    if tok.len != 16 {
+        throw SingularException(kind = RuntimeErrorKind::InvalidLeaseToken(actual_len = tok.len));
+    }
+}
+
+// A live lease must be bounded: the timeout must be a positive number of seconds. Rejected
+// client-side as InvalidLeaseTimeout (a caller-input error) before any SQL; the SPs also
+// SIGNAL SingularLeaseTimeoutInvalid as a backend-side guarantee.
+fn _validate_timeout(seconds: Int) -> Void {
+    if seconds <= 0 {
+        throw SingularException(kind = RuntimeErrorKind::InvalidLeaseTimeout(seconds = seconds));
+    }
+}
+
+// True iff `s` parses to a JSON OBJECT (the DB document contract). A malformed string,
+// JSON null, array, or scalar is NOT an object. Used to validate caller JSON before SQL.
+fn _is_json_object(s: &String) nothrow -> Bool {
+    match json.parse(s) {
+        core.Result::Ok(node) => {
+            var is_obj = false;
+            match node.as_object() { Optional::Some(_) => { is_obj = true; }, Optional::None => {} }
+            return is_obj;
+        },
+        core.Result::Err(_) => { return false; }
+    }
+}
+
+// PERSISTED metadata JSON (item_meta / lease_meta): the DB document contract — non-null, valid,
+// JSON OBJECT. Absent (empty input) is the empty document `{}`. A non-object/malformed value is a
+// caller-input error -> InvalidJson(field). Enforces the SAME object contract before SQL that the
+// schema CHECK + SP enforce at the backend.
+fn _meta_object_arg(field: String, s: &String) -> rpc.RpcArg {
+    if s.byte_length() == 0 { return rpc.arg_string("{}"); }
+    if _is_json_object(s) { return rpc.arg_string(_dup(s)); }
+    throw SingularException(kind = RuntimeErrorKind::InvalidJson(field = move field));
+}
+
+// Required terminal payload JSON (complete response / fail error): a non-empty JSON OBJECT (the DB
+// document contract). Empty/malformed/JSON-null/array/scalar -> caller-input InvalidJson(field).
+// JSON arrays NESTED inside the object are fine — only the top-level value must be an object.
+fn _json_object_arg(field: String, s: &String) -> rpc.RpcArg {
+    if s.byte_length() == 0 { throw SingularException(kind = RuntimeErrorKind::InvalidJson(field = move field)); }
+    if _is_json_object(s) { return rpc.arg_string(_dup(s)); }
+    throw SingularException(kind = RuntimeErrorKind::InvalidJson(field = move field));
+}
+
+// ===== Result-document decode (the discriminated JSON contract) =====
+
+// Parse a `result` column's text and enforce the object contract ON DECODE (the mirror of the
+// before-SQL validation): a malformed JSON string or a non-object (JSON null / array / scalar) is a
+// BackendResponseInvalid. Never holds a parsed node live across the throw — `got` is set only on the
+// accept path and the throw runs after the match when nothing owned is live.
+fn _parse_object_doc(text: &String) -> json.JsonNode {
+    var got: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
+    var detail = "result-not-json";
+    match json.parse(text) {
+        core.Result::Ok(node) => {
+            var is_obj = false;
+            match node.as_object() { Optional::Some(_) => { is_obj = true; }, Optional::None => {} }
+            if is_obj { got = Optional<json.JsonNode>::Some(move node); }
+            else { detail = "result-not-object"; }
+        },
+        core.Result::Err(_) => {}
+    }
+    match move got {
+        Optional::Some(node) => { return move node; },
+        Optional::None => { throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = detail)); }
+    }
+}
+
+// Read the single `result` column of an SP and decode it as a JSON object document. A SQL NULL /
+// read failure (col 0) is BackendResponseInvalid; the rest is delegated to _parse_object_doc.
+fn _read_result_doc(stmt: &mut rpc.RpcStatement) -> json.JsonNode {
+    val event = _next(stmt);
+    match event {
+        rpc.RpcEvent::Row(row) => {
+            val text = _str_req(&row, 0);   // required, non-null (SQL NULL -> BackendResponseInvalid)
+            return _parse_object_doc(&text);
+        },
+        rpc.RpcEvent::ServerErr(err) => {
+            val errcode_owned: Uint = err.error_code; val msg_owned: String = err.message;
+            throw SingularException(kind = _server_err_kind(errcode_owned, move msg_owned));
+        },
+        default => {
+            throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "missing-result-row"));
+        }
+    }
+}
+
+fn _call_sp_doc(conn: &mut rpc.RpcConnection, sp_name: &String, args: Array<rpc.RpcArg>)
+    -> json.JsonNode
+{
+    var stmt = _exec_with_conn(conn, sp_name, move args);
+    val doc = _read_result_doc(&mut stmt);
+    _finish_stmt_and_commit(&mut stmt, conn);
+    return move doc;
+}
+
+// The discriminant. Every result document carries a String `outcome`.
+fn _doc_outcome(doc: &json.JsonNode) -> String {
+    return _doc_str_req(doc, &"outcome", "result-no-outcome");
+}
+
+// A required String property. Missing key or non-String value -> BackendResponseInvalid(detail).
+fn _doc_str_req(doc: &json.JsonNode, key: &String, detail: String) -> String {
+    match doc.get(key) {
+        Optional::Some(n) => {
+            match n.as_string() {
+                Optional::Some(s) => { return move s; },
+                Optional::None => { throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = move detail)); }
+            }
+        },
+        Optional::None => { throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = move detail)); }
+    }
+}
+
+// A required property that IS a NESTED JSON OBJECT (payload/checkpoint are documents, not
+// JSON-in-a-string). Returns the canonical compact serialization of that object — the authoritative
+// document re-encoded for delivery (document semantics, not byte-formatting). A missing key or a
+// non-object value (string/array/scalar/null) is a BackendResponseInvalid.
+fn _doc_object_text_req(doc: &json.JsonNode, key: &String) -> String {
+    match doc.get(key) {
+        Optional::Some(n) => {
+            var is_obj = false;
+            match n.as_object() { Optional::Some(_) => { is_obj = true; }, Optional::None => {} }
+            if !is_obj { throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "doc-field-not-object")); }
+            return json.encode_compact(n);
+        },
+        Optional::None => { throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "doc-field-missing")); }
+    }
+}
+
+// A terminal arm ({"state":"done|failed","payload":{...}}) -> the authoritative TerminalResult.
+// state is required; payload is a required nested JSON-object document. An unknown state is a
+// malformed backend response (never a silent Failed, which would manufacture a FAILED callback).
+// payload is extracted only inside the matched state branch and returned immediately, so no owned
+// local is ever live across a throw.
+fn _terminal_from_doc(doc: &json.JsonNode) -> TerminalResult {
+    val state = _doc_str_req(doc, &"state", "terminal-no-state");
+    if state == "done" {
+        val payload = _doc_object_text_req(doc, &"payload");
+        return TerminalResult::Done(move payload);
+    }
+    if state == "failed" {
+        val payload = _doc_object_text_req(doc, &"payload");
+        return TerminalResult::Failed(move payload);
+    }
+    throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "terminal-unknown-state"));
+}
+
+// Decode a lowercase-hex string into EXACTLY 16 bytes (the descriptive lease_owner that inspect
+// reports). Bad hex or a wrong length is a malformed backend response.
+fn _hex16(detail: String, s: &String) -> Array<Byte> {
+    // Return inside the arm only when valid; otherwise let the decoded bytes drop at the arm end
+    // and throw AFTER the match (never hold an owned local across the throw).
+    match codec.hex_decode(s) {
+        core.Result::Ok(b) => { if b.len == 16 { return move b; } },
+        core.Result::Err(_) => {}
+    }
+    throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = move detail));
+}
+
+// An OPTIONAL String property (history's omitted-when-absent fields, e.g. lease_expires_at on a
+// non-lease event): a missing key -> "" (legitimately absent); a present-but-non-String value is a
+// malformed backend response.
+fn _doc_str_opt(doc: &json.JsonNode, key: &String) -> String {
+    match doc.get(key) {
+        Optional::Some(n) => {
+            match n.as_string() {
+                Optional::Some(s) => { return move s; },
+                Optional::None => { throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "doc-opt-not-string")); }
+            }
+        },
+        Optional::None => { return ""; }
+    }
+}
+
+// history's `event` discriminator string -> domain WorkEvent. FALLIBLE (BackendResponseInvalid on
+// an unknown name). Takes the name by value so the comparisons are owned-String == literal.
+fn _work_event_from_name(s: String) -> WorkEvent {
+    if s == "claimed" { return WorkEvent::Claimed(); }
+    if s == "extended" { return WorkEvent::Extended(); }
+    if s == "completed" { return WorkEvent::Completed(); }
+    if s == "failed" { return WorkEvent::Failed(); }
+    throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "unknown-event-name"));
+}
+
+// A required Int property. Missing key or non-Int value -> BackendResponseInvalid(detail).
+fn _doc_int_req(doc: &json.JsonNode, key: &String, detail: String) -> Int {
+    match doc.get(key) {
+        Optional::Some(n) => {
+            match n.as_int() {
+                Optional::Some(v) => { return v; },
+                Optional::None => { throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = move detail)); }
+            }
+        },
+        Optional::None => { throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = move detail)); }
+    }
+}
+
+// Cross-check the transported (event, status) pair: the lifecycle status is derivable from the
+// event, so a row where they disagree is a malformed/non-conforming backend (the product schema's
+// CHECK already makes it unrepresentable). Status is validated here, then DROPPED (not re-exposed).
+fn _check_event_status(ev: &WorkEvent, status: Int) -> Void {
+    val expected: Int = match ev {
+        WorkEvent::Claimed => { 1 },
+        WorkEvent::Extended => { 1 },
+        WorkEvent::Completed => { 2 },
+        WorkEvent::Failed => { 3 }
+    };
+    if status != expected {
+        throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "event-status-mismatch"));
+    }
+}
+
+// Required (non-null) reader for the single `result` column (col 0). NULL or read-failure is
+// malformed (BackendResponseInvalid), never a silent default.
+fn _str_req(row: &rpc.RpcRow, col: Int) -> String {
+    match row.is_null(col) {
+        core.Result::Ok(v) => { if v { throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "row-required-null")); } },
+        core.Result::Err(_) => { throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "row-isnull")); }
+    }
+    match row.get_string(col) {
+        core.Result::Err(_) => { throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "row-str")); },
+        core.Result::Ok(v) => { return v; }
+    }
+}
+
+fn _dup_bytes(b: &Array<Byte>) nothrow -> Array<Byte> {
+    var out: Array<Byte> = Array<type Byte>::with_capacity(b.len);
+    var i = 0;
+    while i < b.len { out.push(b[i]); i = i + 1; }
+    return move out;
+}
+
+// Classify a server-side SQL error (RpcEvent::ServerErr) by its structured error code. SPs raise
+// corruption / malformed-backend-state signals with MYSQL_ERRNO 30001 (SQLSTATE '45001'), e.g.
+// SingularHeadHistoryMissing (a dangling head-history pointer); those map to BackendResponseInvalid.
+// Everything else (generic user SIGNALs at errno 1644, real SQL errors) is a BackendRejected.
+// 30001 is kept < 2^15 so every client reads the code identically (a >32767 errno wraps signed in
+// some clients). Keyed on the structured numeric code, not by parsing the message text.
+fn _server_err_kind(error_code: Uint, message: String) nothrow -> RuntimeErrorKind {
+    if error_code == 30001 {
+        return RuntimeErrorKind::BackendResponseInvalid(detail = move message);
+    }
+    return RuntimeErrorKind::BackendRejected(detail = move message);
+}
+
+fn _next(stmt: &mut rpc.RpcStatement) -> rpc.RpcEvent {
+    match rpc.next_event(stmt) {
+        core.Result::Err(e) => {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));
+        },
+        core.Result::Ok(ev) => { return move ev; }
+    }
+}
+
+// Acquire a lease from the pool, bounded by the pool's configured finite
+// deadline (PoolConfig.acquire_timeout, set in _build_pool_config). The no-arg
+// acquire() == AcquireWait::UseDefault, so it picks up that finite default; on
+// elapse the pool returns the `acquire-timeout` tag, which _classify_acquire_tag
+// maps to BackendTimeout. Returns LeasedConn for the caller to drop at end of
+// scope (returns conn to pool automatically).
+fn _acquire_lease(impl_: &SingularImpl) -> managed.LeasedConn {
+    match impl_.pool.acquire() {
+        core.Result::Ok(lease) => { return move lease; },
+        core.Result::Err(e) => {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = _classify_acquire_tag(move tag_owned));
+        }
+    }
+}
+
+// The mariadb-rpc 0.6 ConnectionSource emits the interface-level `acquire-timeout`
+// tag when the deadline elapses (retriable / shed load) vs other tags
+// (pool-closed, open-failed) for an unreachable store. Map the deadline tag to
+// BackendTimeout; everything else is BackendUnavailable. The raw tag rides along
+// as diagnostic-only detail.
+fn _classify_acquire_tag(tag: String) nothrow -> RuntimeErrorKind {
+    if tag == "acquire-timeout" {
+        return RuntimeErrorKind::BackendTimeout(detail = move tag);
+    }
+    return RuntimeErrorKind::BackendUnavailable(detail = move tag);
+}
+
+// _lease_conn was tried as a helper but Drift can't return &mut from a match arm.
+// Each method inlines `lease.conn().or_throw()` and catches managed:ManagedError
+// at the method boundary to translate into SingularException.
+
+fn _exec_with_conn(conn: &mut rpc.RpcConnection, sp_name: &String, args: Array<rpc.RpcArg>)
+    -> rpc.RpcStatement
+{
+    match conn.call(sp_name, &args) {
+        core.Result::Err(e) => {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));
+        },
+        core.Result::Ok(stmt) => { return move stmt; }
+    }
+}
+
+fn _finish_stmt_and_commit(stmt: &mut rpc.RpcStatement, conn: &mut rpc.RpcConnection) -> Void {
+    match rpc.skip_remaining(stmt) {
+        core.Result::Err(e) => {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));
+        },
+        core.Result::Ok(_) => {}
+    }
+    match rpc.commit(conn) {
+        core.Result::Err(e) => {
+            val tag_owned: String = e.tag;
+            throw SingularException(kind = RuntimeErrorKind::BackendRejected(detail = move tag_owned));
+        },
+        core.Result::Ok(_) => {}
+    }
+}
+
+// (Per-shape positional row readers + _OpRow/_StartRow/_ResumeRow are gone: every actionable SP
+// now returns one discriminated JSON document, decoded by _read_result_doc / _call_sp_doc above.)

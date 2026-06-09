@@ -1,0 +1,82 @@
+// Microflows — typed durable workflow coordinator.
+//
+// Milestone 1: durable runtime spine over MariaDB/InnoDB, driven by manually
+// constructed IR. See README.md and doc/microflows_design.md.
+//
+// Public surface re-exports for callers that import via microflows::Name.
+
+module microflows;
+
+import microflows.state as state;
+
+export {
+	// Lifecycle state machine (state.drift)
+	WorkflowState,
+	ExecutionDirection,
+	TransitionCause,
+	Disposition,
+	Transition,
+	state_code,
+	state_from_code,
+	state_name,
+	state_from_name,
+	state_eq,
+	is_claimable,
+	is_terminal,
+	direction_code,
+	direction_from_code,
+	direction_name,
+	direction_from_name,
+	direction_eq,
+	state_direction_valid,
+	transition,
+	transition_target,
+	cause_disposition,
+	disposition_code,
+	disposition_from_code,
+	disposition_name,
+	disposition_from_name,
+	disposition_eq,
+	disposition_valid_for
+};
+
+// ===== Lifecycle state machine =====
+
+pub type WorkflowState = state.WorkflowState;
+pub type ExecutionDirection = state.ExecutionDirection;
+pub type TransitionCause = state.TransitionCause;
+pub type Disposition = state.Disposition;
+pub type Transition = state.Transition;
+
+pub fn state_code(s: &WorkflowState) nothrow -> Int { return state.state_code(s); }
+pub fn state_from_code(code: Int) nothrow -> Optional<WorkflowState> { return state.state_from_code(code); }
+pub fn state_name(s: &WorkflowState) nothrow -> String { return state.state_name(s); }
+pub fn state_from_name(name: String) nothrow -> Optional<WorkflowState> { return state.state_from_name(move name); }
+pub fn state_eq(a: &WorkflowState, b: &WorkflowState) nothrow -> Bool { return state.state_eq(a, b); }
+pub fn is_claimable(s: &WorkflowState) nothrow -> Bool { return state.is_claimable(s); }
+pub fn is_terminal(s: &WorkflowState) nothrow -> Bool { return state.is_terminal(s); }
+
+pub fn direction_code(d: &ExecutionDirection) nothrow -> Int { return state.direction_code(d); }
+pub fn direction_from_code(code: Int) nothrow -> Optional<ExecutionDirection> { return state.direction_from_code(code); }
+pub fn direction_name(d: &ExecutionDirection) nothrow -> String { return state.direction_name(d); }
+pub fn direction_from_name(name: String) nothrow -> Optional<ExecutionDirection> { return state.direction_from_name(move name); }
+pub fn direction_eq(a: &ExecutionDirection, b: &ExecutionDirection) nothrow -> Bool { return state.direction_eq(a, b); }
+pub fn state_direction_valid(s: &WorkflowState, d: &ExecutionDirection) nothrow -> Bool { return state.state_direction_valid(s, d); }
+
+pub fn transition(from: &WorkflowState, dir: &ExecutionDirection, cause: &TransitionCause) nothrow -> Optional<Transition> {
+	return state.transition(from, dir, cause);
+}
+pub fn transition_target(from: &WorkflowState, dir: &ExecutionDirection, cause: &TransitionCause) nothrow -> Optional<WorkflowState> {
+	return state.transition_target(from, dir, cause);
+}
+pub fn cause_disposition(cause: &TransitionCause) nothrow -> Optional<Disposition> {
+	return state.cause_disposition(cause);
+}
+pub fn disposition_code(d: &Disposition) nothrow -> Int { return state.disposition_code(d); }
+pub fn disposition_from_code(code: Int) nothrow -> Optional<Disposition> { return state.disposition_from_code(code); }
+pub fn disposition_name(d: &Disposition) nothrow -> String { return state.disposition_name(d); }
+pub fn disposition_from_name(name: String) nothrow -> Optional<Disposition> { return state.disposition_from_name(move name); }
+pub fn disposition_eq(a: &Disposition, b: &Disposition) nothrow -> Bool { return state.disposition_eq(a, b); }
+pub fn disposition_valid_for(s: &WorkflowState, d: &Disposition) nothrow -> Bool {
+	return state.disposition_valid_for(s, d);
+}

@@ -1,0 +1,846 @@
+// Singular gateway e2e test suite (PR1) — runs against a real MariaDB instance.
+//
+// Exercises the start/resume capability-token model:
+//   - start(): brand-new work only; the PK insert is the serializer
+//     (Granted(Fresh) | Exists).
+//   - resume(): existing work only; never inserts (Active | Terminal | NotFound).
+//   - complete/fail/extend_lease: fenced by the app-minted lease token; on a settled
+//     item the writer's token gets the authoritative result (complete/fail → Settled,
+//     extend_lease → Terminal), any other token → TokenStale; a missing key → NotFound
+//     (a result, not an error).
+//
+// Prerequisites:
+//   - MariaDB on 127.0.0.1:34114 with root/rootpw (container mdb114-a)
+//   - singular database with schema + stored procedures loaded
+//     (`just db-load-schema` in pushcoin root)
+//
+// No test-data cleanup needed: each run uses a unique service_group
+// (SINGULAR_E2E_SVCGROUP, set by the check-e2e recipe), so repeated runs are
+// idempotent — see _e2e_service_group below.
+
+module singular.tests.e2e.live_gateway_test;
+
+import std.core as core;
+import std.core.arc as arc;
+import std.console as con;
+import std.json as json;
+import std.concurrent as conc;
+import std.containers as containers;
+import std.format as fmt;
+import std.env as env;
+import singular.uuid as uuid;
+import singular.gateway as gw;
+
+const TIMEOUT_MS: Int = 3000;
+
+fn _config_json() -> json.JsonNode {
+    val text: String = "{\"backend\":\"mariadb\",\"host\":\"127.0.0.1\",\"port\":34114,\"user\":\"root\",\"password\":\"rootpw\",\"database\":\"singular\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
+    return json.parse(&text).or_throw();
+}
+
+fn _build_gw(worker_name: &String) -> arc.Arc<gw.SingularGateway> {
+    val cfg = _config_json();
+    val identity = gw.identity_from_worker_name(_e2e_service_group(), worker_name);
+    var b = gw.new_gateway_builder();
+    gw.with_json(&mut b, &cfg);
+    gw.with_identity(&mut b, move identity);
+    return gw.build_gateway(move b).or_throw();
+}
+
+// Per-run service group, so repeated `just test` runs are idempotent without any
+// cleanup. Singular's terminal records are immutable — a fixed-key lifecycle can
+// only be observed against a virgin (service_group, idempotency_key) pair.
+fn _e2e_service_group() nothrow -> String {
+    match env.get("SINGULAR_E2E_SVCGROUP") {
+        Optional::Some(v) => { if v.byte_length() > 0 { return move v; } },
+        Optional::None => {}
+    }
+    return "drift-test";
+}
+
+fn _key(seed: &String) nothrow -> Array<Byte> {
+    return uuid.uuid_v3_from_string(seed);
+}
+
+// A deterministic 16-byte capability token (UUIDv3 of the seed). Tokens are
+// caller-supplied, so the suite mints them deterministically rather than via
+// new_lease_token() — distinct seeds give distinct tokens.
+fn _tok(seed: &String) nothrow -> Array<Byte> {
+    return uuid.uuid_v3_from_string(seed);
+}
+
+// Fabricate a WorkLease for a key + token. Used to drive the fencing / missing-key
+// paths (a mutator carrying the "wrong" or a never-granted token).
+fn _lease_for(key: &Array<Byte>, tok: Array<Byte>) nothrow -> gw.WorkLease {
+    return gw.WorkLease(
+        key = key.clone(),
+        lease_token = move tok,
+        lease_expires_at = ""
+    );
+}
+
+// Start brand-new work and return the granted lease. Statement-form match (so the
+// arms may return/throw). A non-grant here is a setup failure — the scenarios that
+// assert Exists/race outcomes call start() directly instead.
+fn _must_start(g: &arc.Arc<gw.SingularGateway>, key: &Array<Byte>, tok: &Array<Byte>) -> gw.WorkLease {
+    // Fresh unique key per run → Granted. A surprise Exists is a setup bug: fail
+    // loudly (caught by main's per-scenario catch) rather than proceed on a wrong
+    // lease. (driftc 0.33.24: the inline qualified `throw gw.SingularException(...)`
+    // codegen ICE — E-AUTO-56dbd38a, missing CallInfo — is fixed; inline form restored.)
+    var out = _lease_for(key, tok.clone());
+    var ok = false;
+    match g.get().start(key, &"{\"t\":\"start\"}", &"{}", 30, tok) {
+        gw.StartOutcome::Granted(l) => { out = move l; ok = true; },
+        gw.StartOutcome::Exists => {}
+    }
+    if !ok {
+        throw gw.SingularException(kind = gw.RuntimeErrorKind::BackendRejected(detail = "must-start-but-exists"));
+    }
+    return move out;
+}
+
+
+// Test-local readback of WorkEvent to a compact int, purely for terse assertions.
+fn _event_name(e: &gw.WorkEvent) nothrow -> Int {
+    return match e {
+        gw.WorkEvent::Claimed => { 10 },
+        gw.WorkEvent::Extended => { 11 },
+        gw.WorkEvent::Completed => { 20 },
+        gw.WorkEvent::Failed => { 40 }
+    };
+}
+
+// inspect() assertion helpers. A surprise outcome where a specific arm is expected is a
+// setup failure -> throw (caught by main). Terminal kind: 2 = Done, 3 = Failed.
+fn _inspect_terminal_kind(g: &arc.Arc<gw.SingularGateway>, key: &Array<Byte>) -> Int {
+    match g.get().inspect(key) {
+        gw.InspectOutcome::Terminal(r, _) => {
+            return match r { gw.TerminalResult::Done(_) => { 2 }, gw.TerminalResult::Failed(_) => { 3 } };
+        },
+        default => { throw gw.SingularException(kind = gw.RuntimeErrorKind::BackendRejected(detail = "inspect-not-terminal")); }
+    }
+}
+fn _inspect_terminal_payload(g: &arc.Arc<gw.SingularGateway>, key: &Array<Byte>) -> String {
+    match g.get().inspect(key) {
+        gw.InspectOutcome::Terminal(r, _) => {
+            return match r { gw.TerminalResult::Done(p) => { p }, gw.TerminalResult::Failed(e) => { e } };
+        },
+        default => { throw gw.SingularException(kind = gw.RuntimeErrorKind::BackendRejected(detail = "inspect-not-terminal")); }
+    }
+}
+fn _inspect_working_expires(g: &arc.Arc<gw.SingularGateway>, key: &Array<Byte>) -> String {
+    match g.get().inspect(key) {
+        gw.InspectOutcome::Working(_, expires, _) => { return move expires; },
+        default => { throw gw.SingularException(kind = gw.RuntimeErrorKind::BackendRejected(detail = "inspect-not-working")); }
+    }
+}
+
+// ============================================================
+// 1. start → complete → resume(terminal Done)
+// ============================================================
+fn scenario_start_complete_resume() -> Int {
+    val g = _build_gw(&"w1");
+    val key = _key(&"pr1-start-complete-resume");
+    val t1 = _tok(&"pr1-t1");
+
+    var lease = _must_start(&g, &key, &t1);
+
+    val cr = g.get().complete(&lease, &"{\"r\":\"ok\"}");
+    val ok2 = match cr { gw.SettleOutcome::Settled(_) => { true }, default => { false } };
+    if !ok2 { return 102; }
+
+    // A resubmit drives start→Exists then resume→Terminal(Done) with the payload.
+    match g.get().start(&key, &"{\"t\":\"1\"}", &"{\"w\":\"w1\"}", 30, &t1) {
+        gw.StartOutcome::Granted(_) => { return 103; },
+        gw.StartOutcome::Exists => {}
+    }
+
+    match g.get().resume(&key) {
+        gw.ResumeOutcome::Terminal(tr) => {
+            match tr { gw.TerminalResult::Done(p) => { if p.byte_length() == 0 { return 106; } }, default => { return 105; } }
+        },
+        default => { return 107; }
+    }
+
+    if _inspect_terminal_kind(&g, &key) != 2 { return 109; }
+    return 0;
+}
+
+// ============================================================
+// 2. start → fail → resume(terminal Failed)
+// ============================================================
+fn scenario_start_fail_resume() -> Int {
+    val g = _build_gw(&"w2");
+    val key = _key(&"pr1-start-fail-resume");
+    val t1 = _tok(&"pr1-t2");
+
+    var lease = _must_start(&g, &key, &t1);
+
+    val fr = g.get().fail(&lease, &"{\"error\":\"boom\"}");
+    val ok2 = match fr { gw.SettleOutcome::Settled(_) => { true }, default => { false } };
+    if !ok2 { return 202; }
+
+    match g.get().resume(&key) {
+        gw.ResumeOutcome::Terminal(tr) => {
+            match tr { gw.TerminalResult::Failed(e) => { if e.byte_length() == 0 { return 204; } }, default => { return 203; } }
+        },
+        default => { return 205; }
+    }
+
+    if _inspect_terminal_kind(&g, &key) != 3 { return 206; }
+    return 0;
+}
+
+// ============================================================
+// 3. start(existing) → Exists; resume while WORKING → Active, same AND different
+//    identity (merged ex-#3/#4: a resubmit while WORKING never spawns a second worker
+//    or grants a second lease; Active carries no owner, so the no-spawn decision is
+//    owner-independent and identical for both identities).
+// ============================================================
+fn scenario_start_exists_resume_active() -> Int {
+    val ga = _build_gw(&"w3a");
+    val key = _key(&"pr1-exists-active");
+    val t1 = _tok(&"pr1-t3");
+
+    val _ = _must_start(&ga, &key, &t1);
+
+    // Second start (same key) → Exists.
+    match ga.get().start(&key, &"{\"t\":\"3\"}", &"{}", 30, &t1) {
+        gw.StartOutcome::Granted(_) => { return 302; },
+        gw.StartOutcome::Exists => {}
+    }
+
+    // Resume while WORKING → Active (no second lease) — owner-independent, so both the
+    // SAME identity (ga, different proposed token) ...
+    match ga.get().resume(&key) {
+        gw.ResumeOutcome::Active(_) => {},
+        default => { return 303; }
+    }
+    // ... and a DIFFERENT worker identity (gb) report Active. (Active carries no owner;
+    // ownership is descriptive, and the post-same_owner-removal behavior is identical.)
+    val gb = _build_gw(&"w3b");
+    match gb.get().resume(&key) {
+        gw.ResumeOutcome::Active(_) => {},
+        default => { return 304; }
+    }
+    return 0;
+}
+
+// ============================================================
+// 5. stale/never-granted token cannot complete/fail/extend_lease → TokenStale
+//    (pins the fencing). The real lease still works afterward.
+// ============================================================
+fn scenario_token_stale_fence() -> Int {
+    val g = _build_gw(&"w5");
+    val key = _key(&"pr1-token-stale-fence");
+    val t1 = _tok(&"pr1-t5");
+
+    var real_lease = _must_start(&g, &key, &t1);
+
+    val bogus = _lease_for(&key, _tok(&"pr1-t5-bogus"));
+
+    val cr = g.get().complete(&bogus, &"{\"r\":\"stale\"}");
+    if !(match cr { gw.SettleOutcome::TokenStale => { true }, default => { false } }) { return 502; }
+
+    val fr = g.get().fail(&bogus, &"{\"e\":\"stale\"}");
+    if !(match fr { gw.SettleOutcome::TokenStale => { true }, default => { false } }) { return 503; }
+
+    val er = g.get().extend_lease(&bogus, 60);
+    if !(match er { gw.ExtendLeaseOutcome::TokenStale => { true }, default => { false } }) { return 504; }
+
+    // The real token still holds the lease.
+    val cr2 = g.get().complete(&real_lease, &"{\"r\":\"ok\"}");
+    if !(match cr2 { gw.SettleOutcome::Settled(_) => { true }, default => { false } }) { return 505; }
+
+    // Now the item is terminal. A stale token's extend_lease must be fenced as
+    // TokenStale (#1) — NOT handed the authoritative Terminal result.
+    val er2 = g.get().extend_lease(&bogus, 60);
+    if !(match er2 { gw.ExtendLeaseOutcome::TokenStale => { true }, default => { false } }) { return 506; }
+    return 0;
+}
+
+// ============================================================
+// 6. terminal replay vs stale: complete(T1)→Settled(Done,"first");
+//    complete(T1) again→Settled(Done,"first") — the AUTHORITATIVE payload,
+//    not the "second" request echo; complete(T2≠T1)→TokenStale.
+// ============================================================
+fn scenario_terminal_replay_vs_stale() -> Int {
+    val g = _build_gw(&"w6");
+    val key = _key(&"pr1-terminal-replay-stale");
+    val t1 = _tok(&"pr1-t6");
+
+    var lease = _must_start(&g, &key, &t1);
+
+    val c1 = g.get().complete(&lease, &"{\"r\":\"first\"}");
+    match c1 {
+        gw.SettleOutcome::Settled(tr) => {
+            match tr { gw.TerminalResult::Done(_) => {}, default => { return 602; } }
+        },
+        default => { return 603; }
+    }
+
+    // Same-token replay on the terminal item → Terminal, carrying the AUTHORITATIVE
+    // result ("first"), never the resubmitted "second" payload. This is the caller's
+    // redeliver path: effect not repeated, but the stored outcome is handed back.
+    val c2 = g.get().complete(&lease, &"{\"r\":\"second\"}");
+    match c2 {
+        gw.SettleOutcome::Settled(tr) => {
+            match tr { gw.TerminalResult::Done(p) => { if p != "{\"r\":\"first\"}" { return 605; } }, default => { return 604; } }
+        },
+        default => { return 606; }
+    }
+
+    // Different token on the terminal item → TokenStale (suppress; not the delivery owner).
+    val bogus = _lease_for(&key, _tok(&"pr1-t6-other"));
+    val c3 = g.get().complete(&bogus, &"{\"r\":\"third\"}");
+    if !(match c3 { gw.SettleOutcome::TokenStale => { true }, default => { false } }) { return 607; }
+
+    // The cached response stays "first" (terminal record immutable).
+    if _inspect_terminal_payload(&g, &key) != "{\"r\":\"first\"}" { return 608; }
+    return 0;
+}
+
+// ============================================================
+// 7. extend_lease: Extended while WORKING; never SHORTENs the live lease (#2);
+//    Terminal(Done) for the writer after complete.
+// ============================================================
+fn scenario_extend_lease() -> Int {
+    val g = _build_gw(&"w7");
+    val key = _key(&"pr1-extend-lease");
+    val t1 = _tok(&"pr1-t7");
+
+    var lease = _must_start(&g, &key, &t1);
+
+    // Extend to a long horizon; capture the expiry.
+    val er = g.get().extend_lease(&lease, 60);
+    if !(match er { gw.ExtendLeaseOutcome::Extended => { true }, default => { false } }) { return 702; }
+    val exp1 = _inspect_working_expires(&g, &key);
+    if exp1.byte_length() == 0 { return 703; }
+
+    // A SHORTER subsequent extension must NOT pull the deadline in (#2): the expiry
+    // is floored at the existing (longer) value, so it stays exactly exp1.
+    val er_short = g.get().extend_lease(&lease, 1);
+    if !(match er_short { gw.ExtendLeaseOutcome::Extended => { true }, default => { false } }) { return 704; }
+    val exp2 = _inspect_working_expires(&g, &key);
+    if exp2 != exp1 { return 705; }
+
+    // After completion, the writer's extend → Terminal(Done) (no live lease to extend).
+    val _ = g.get().complete(&lease, &"{\"r\":\"done\"}");
+    val er2 = g.get().extend_lease(&lease, 60);
+    match er2 {
+        gw.ExtendLeaseOutcome::Terminal(tr) => {
+            match tr { gw.TerminalResult::Done(_) => {}, default => { return 706; } }
+        },
+        default => { return 707; }
+    }
+    return 0;
+}
+
+// ============================================================
+// 8. missing key: complete/fail/extend_lease → NotFound (result code)
+// ============================================================
+fn scenario_missing_key_notfound() -> Int {
+    val g = _build_gw(&"w8");
+    val key = _key(&"pr1-missing-key");          // never start()ed
+    val lease = _lease_for(&key, _tok(&"pr1-t8"));
+
+    val cr = g.get().complete(&lease, &"{\"r\":\"x\"}");
+    if !(match cr { gw.SettleOutcome::NotFound => { true }, default => { false } }) { return 801; }
+
+    val fr = g.get().fail(&lease, &"{\"e\":\"x\"}");
+    if !(match fr { gw.SettleOutcome::NotFound => { true }, default => { false } }) { return 802; }
+
+    val er = g.get().extend_lease(&lease, 30);
+    if !(match er { gw.ExtendLeaseOutcome::NotFound => { true }, default => { false } }) { return 803; }
+
+    // resume on a missing key → NotFound.
+    match g.get().resume(&key) {
+        gw.ResumeOutcome::NotFound => {},
+        default => { return 804; }
+    }
+    return 0;
+}
+
+// ============================================================
+// 9. token validation: NULL/non-16-byte token rejected client-side on every
+//    token-carrying entrypoint (start/complete/fail/extend_lease — PR1 resume(key) is
+//    tokenless), plus strict JSON inputs on complete/fail; no row created/mutated.
+// ============================================================
+fn scenario_token_validation() -> Int {
+    val g = _build_gw(&"w9");
+    val key = _key(&"pr1-token-validation");
+
+    var bad: Array<Byte> = [];
+    var i = 0;
+    while i < 8 { bad.push(cast<Byte>(0)); i = i + 1; }
+
+    // Each entrypoint must reject by raising our `SingularException` specifically — a
+    // typed catch, not bare `catch unexpected` (which would also pass on an unrelated
+    // failure). The key here is valid, so InvalidLeaseToken is the only SingularException
+    // these calls can raise. (We can't assert `ex.kind == InvalidLeaseToken` directly:
+    // typed-catch projection of a non-scalar field is unsupported this toolchain —
+    // E_TYPED_CATCH_FIELD_UNSUPPORTED_TYPE.)
+    var ok_start = false;
+    try {
+        val _ = g.get().start(&key, &"{\"t\":\"9\"}", &"{}", 30, &bad);
+    } catch gw:SingularException(_) {
+        ok_start = true;
+    }
+    if !ok_start { return 901; }
+
+    // complete/fail/extend_lease also reject a malformed token (lease carrying it).
+    val bad_lease = _lease_for(&key, bad.clone());
+
+    var ok_complete = false;
+    try {
+        val _ = g.get().complete(&bad_lease, &"{\"r\":\"x\"}");
+    } catch gw:SingularException(_) {
+        ok_complete = true;
+    }
+    if !ok_complete { return 904; }
+
+    var ok_fail = false;
+    try {
+        val _ = g.get().fail(&bad_lease, &"{\"e\":\"x\"}");
+    } catch gw:SingularException(_) {
+        ok_fail = true;
+    }
+    if !ok_fail { return 905; }
+
+    var ok_extend = false;
+    try {
+        val _ = g.get().extend_lease(&bad_lease, 30);
+    } catch gw:SingularException(_) {
+        ok_extend = true;
+    }
+    if !ok_extend { return 906; }
+
+    // Strict JSON inputs: complete/fail reject a non-JSON terminal payload client-side
+    // (InvalidJson — a caller-input error). A valid 16-byte token gets past token
+    // validation, so the throw here is the JSON check, not the token check.
+    val json_lease = _lease_for(&key, _tok(&"pr1-json"));
+    var ok_complete_json = false;
+    try {
+        val _ = g.get().complete(&json_lease, &"not json");
+    } catch gw:SingularException(_) {
+        ok_complete_json = true;
+    }
+    if !ok_complete_json { return 908; }
+
+    var ok_fail_json = false;
+    try {
+        val _ = g.get().fail(&json_lease, &"");
+    } catch gw:SingularException(_) {
+        ok_fail_json = true;
+    }
+    if !ok_fail_json { return 909; }
+
+    // None of the rejected calls created or mutated a row.
+    match g.get().inspect(&key) {
+        gw.InspectOutcome::NotFound => {},
+        default => { return 907; }
+    }
+    return 0;
+}
+
+// ============================================================
+// 10. token > owner authority: two gateways with the SAME lease_owner
+//     (same worker name) — only the start-winner's token can mutate.
+// ============================================================
+fn scenario_token_gt_owner() -> Int {
+    val key = _key(&"pr1-token-gt-owner");
+    val ga = _build_gw(&"w10-same");
+    val gb = _build_gw(&"w10-same");          // identical identity (same lease_owner)
+    val t1 = _tok(&"pr1-t10");
+
+    var lease = _must_start(&ga, &key, &t1);
+
+    // gb shares the owner but carries a different token → TokenStale.
+    val bogus = _lease_for(&key, _tok(&"pr1-t10-other"));
+    val cr_b = gb.get().complete(&bogus, &"{\"r\":\"stolen\"}");
+    if !(match cr_b { gw.SettleOutcome::TokenStale => { true }, default => { false } }) { return 1002; }
+
+    // The real token completes.
+    val cr_a = ga.get().complete(&lease, &"{\"r\":\"ok\"}");
+    if !(match cr_a { gw.SettleOutcome::Settled(_) => { true }, default => { false } }) { return 1003; }
+    return 0;
+}
+
+// ============================================================
+// 11. concurrent start race: N distinct workers race to start the same
+//     key (each proposing its own token). Exactly one wins (Granted);
+//     the rest see Exists. None error.
+// ============================================================
+fn scenario_concurrent_start_race() -> Int {
+    val n = 4;
+    val key = _key(&"pr1-concurrent-start-race");
+
+    var tasks = containers.deque<type conc.VirtualThread<Int> >();
+    var i = 0;
+    while i < n {
+        val name = "csr-" + fmt.format_int(i);
+        var g = _build_gw(&name);
+        val k = key.clone();
+        val tok = _tok(&("csr-tok-" + fmt.format_int(i)));
+        var t = conc.spawn(| | captures(move g, move k, move tok) nothrow => {
+            // 0.33.23: statement-form try/catch-unexpected clears the throw effect
+            // inside a nothrow lambda (was the constraint-#3 workaround).
+            var code = 0;
+            try {
+                match g.get().start(&k, &"{\"t\":\"csr\"}", &"{}", 30, &tok) {
+                    gw.StartOutcome::Granted(_) => { code = 1; },
+                    gw.StartOutcome::Exists => { code = 2; }
+                }
+            } catch unexpected {
+                code = 0;
+            }
+            return code;
+        });
+        tasks.push_back(move t);
+        i = i + 1;
+    }
+
+    var granted = 0;
+    var exists = 0;
+    var errored = 0;
+    while true {
+        match tasks.pop_front() {
+            Optional::Some(var t) => {
+                match t.join() {
+                    core.Result::Ok(code) => {
+                        if code == 1 { granted = granted + 1; }
+                        else if code == 2 { exists = exists + 1; }
+                        else { errored = errored + 1; }
+                    },
+                    default => { return 1101; }
+                }
+            },
+            default => { break; }
+        }
+    }
+
+    if errored != 0 { return 1102; }
+    if granted != 1 { return 1103; }
+    if (granted + exists) != n { return 1104; }
+    return 0;
+}
+
+// ============================================================
+// 12. concurrent complete race: owner starts (token T1), then T1's
+//     complete races N foreign-token completes. Exactly one Settled,
+//     the rest TokenStale (token fences, not owner identity).
+// ============================================================
+fn scenario_concurrent_complete_race() -> Int {
+    val n = 4;
+    val key = _key(&"pr1-concurrent-complete-race");
+    val t1 = _tok(&"pr1-ccr");
+
+    val w0 = _build_gw(&"ccr-owner");
+    val _ = _must_start(&w0, &key, &t1);
+
+    var tasks = containers.deque<type conc.VirtualThread<Int> >();
+
+    // Owner's real-token complete on its own VT (lease fabricated with the same
+    // token T1 — equivalent to the granted lease, avoids needing WorkLease.clone).
+    var g_owner = w0.clone();
+    val lease_owner = _lease_for(&key, _tok(&"pr1-ccr"));
+    var t_owner = conc.spawn(| | captures(move g_owner, move lease_owner) nothrow => {
+        var code = 0;
+        try {
+            val cr = g_owner.get().complete(&lease_owner, &"{\"r\":\"owner\"}");
+            match cr {
+                gw.SettleOutcome::Settled(_) => { code = 1; },
+                gw.SettleOutcome::TokenStale => { code = 3; },
+                gw.SettleOutcome::NotFound => { code = 4; }
+            }
+        } catch unexpected {
+            code = 0;
+        }
+        return code;
+    });
+    tasks.push_back(move t_owner);
+
+    // N foreign-token completes.
+    var i = 0;
+    while i < n {
+        val name = "ccr-other-" + fmt.format_int(i);
+        var g = _build_gw(&name);
+        val bogus = _lease_for(&key, _tok(&("ccr-other-tok-" + fmt.format_int(i))));
+        var t = conc.spawn(| | captures(move g, move bogus) nothrow => {
+            var code = 0;
+            try {
+                val cr = g.get().complete(&bogus, &"{\"r\":\"other\"}");
+                match cr {
+                    gw.SettleOutcome::Settled(_) => { code = 1; },
+                    gw.SettleOutcome::TokenStale => { code = 3; },
+                    gw.SettleOutcome::NotFound => { code = 4; }
+                }
+            } catch unexpected {
+                code = 0;
+            }
+            return code;
+        });
+        tasks.push_back(move t);
+        i = i + 1;
+    }
+
+    var completed = 0;
+    var token_stale = 0;
+    var other = 0;
+    var errored = 0;
+    while true {
+        match tasks.pop_front() {
+            Optional::Some(var t) => {
+                match t.join() {
+                    core.Result::Ok(code) => {
+                        if code == 1 { completed = completed + 1; }
+                        else if code == 3 { token_stale = token_stale + 1; }
+                        else if code == 0 { errored = errored + 1; }
+                        else { other = other + 1; }
+                    },
+                    default => { return 1202; }
+                }
+            },
+            default => { break; }
+        }
+    }
+
+    if errored != 0 { return 1203; }
+    if completed != 1 { return 1204; }
+    if token_stale != n { return 1205; }
+    if other != 0 { return 1206; }
+    return 0;
+}
+
+// ============================================================
+// 13. inspect field mapping + history ordering across the lifecycle.
+// ============================================================
+fn scenario_inspect_and_history() -> Int {
+    val g = _build_gw(&"w13");
+    val key = _key(&"pr1-inspect-history");
+    val t1 = _tok(&"pr1-t13");
+
+    var lease = _must_start(&g, &key, &t1);
+
+    // In-progress inspect: WORKING, owner present, never the token.
+    match g.get().inspect(&key) {
+        gw.InspectOutcome::Working(owner, expires, _) => {
+            if owner.len != 16 { return 1304; }
+            if expires.byte_length() == 0 { return 1305; }
+        },
+        default => { return 1303; }
+    }
+
+    val _ = g.get().extend_lease(&lease, 60);
+    val _ = g.get().complete(&lease, &"{\"r\":\"done\"}");
+
+    if _inspect_terminal_kind(&g, &key) != 2 { return 1306; }
+    if _inspect_terminal_payload(&g, &key).byte_length() == 0 { return 1307; }
+
+    // History (raw audit): CLAIMED(10) → EXTENDED(11) → COMPLETED(20). Status is not
+    // exposed (derivable from event; the event/status pair is validated adapter-privately).
+    val hist = g.get().history(&key);
+    if hist.len != 3 { return 1308; }
+    if _event_name(&hist[0].event) != 10 { return 1309; }
+    if _event_name(&hist[1].event) != 11 { return 1310; }
+    if _event_name(&hist[2].event) != 20 { return 1311; }
+    return 0;
+}
+
+// ============================================================
+// 14. cross-terminal fence (finding #1): once settled, the OPPOSITE terminal op
+//     on the writer's own token returns the AUTHORITATIVE Settled(result) —
+//     never a false success. complete() on a FAILED item -> Settled(Failed);
+//     fail() on a DONE item -> Settled(Done). The recorded state/payload never
+//     flips, so a confused worker can only redeliver the true outcome.
+// ============================================================
+fn scenario_cross_terminal() -> Int {
+    // Direction A: fail then complete — complete must NOT report success.
+    val ga = _build_gw(&"w14a");
+    val ka = _key(&"pr1-cross-fail-then-complete");
+    val ta = _tok(&"pr1-t14a");
+    val la = _must_start(&ga, &ka, &ta);
+
+    val fa = ga.get().fail(&la, &"{\"e\":\"declined\"}");
+    if !(match fa { gw.SettleOutcome::Settled(_) => { true }, default => { false } }) { return 1402; }
+
+    val ca = ga.get().complete(&la, &"{\"r\":\"oops-success\"}");
+    match ca {
+        gw.SettleOutcome::Settled(tr) => {
+            match tr { gw.TerminalResult::Failed(e) => { if e != "{\"e\":\"declined\"}" { return 1404; } }, default => { return 1403; } }
+        },
+        default => { return 1405; }   // anything but Settled(Failed) would be the bug
+    }
+    if _inspect_terminal_kind(&ga, &ka) != 3 { return 1406; }   // still FAILED
+
+    // Direction B: complete then fail — fail must NOT flip it to failure.
+    val gb = _build_gw(&"w14b");
+    val kb = _key(&"pr1-cross-complete-then-fail");
+    val tb = _tok(&"pr1-t14b");
+    val lb = _must_start(&gb, &kb, &tb);
+
+    val cb = gb.get().complete(&lb, &"{\"r\":\"charged\"}");
+    if !(match cb { gw.SettleOutcome::Settled(_) => { true }, default => { false } }) { return 1407; }
+
+    val fb = gb.get().fail(&lb, &"{\"e\":\"oops-failure\"}");
+    match fb {
+        gw.SettleOutcome::Settled(tr) => {
+            match tr { gw.TerminalResult::Done(p) => { if p != "{\"r\":\"charged\"}" { return 1409; } }, default => { return 1408; } }
+        },
+        default => { return 1410; }
+    }
+    if _inspect_terminal_kind(&gb, &kb) != 2 { return 1411; }   // still DONE
+    return 0;
+}
+
+// ============================================================
+// 15. lease-timeout validation: a live lease must be bounded. start/extend_lease reject a
+//     non-positive timeout (InvalidLeaseTimeout) client-side with NO row/history mutation;
+//     a valid positive extend still works (never-shorten preserved). (NULL timeout is not
+//     representable through the Int gateway; the SPs SIGNAL SingularLeaseTimeoutInvalid as
+//     a backend-side defense.)
+// ============================================================
+fn scenario_lease_timeout_validation() -> Int {
+    val g = _build_gw(&"w15");
+    val key = _key(&"pr1-lease-timeout");
+    val t1 = _tok(&"pr1-t15");
+
+    // start with zero / negative timeout → throws, creates no row.
+    var threw_zero = false;
+    try { val _ = g.get().start(&key, &"{\"t\":\"x\"}", &"{}", 0, &t1); } catch gw:SingularException(_) { threw_zero = true; }
+    if !threw_zero { return 1502; }
+    var threw_neg = false;
+    try { val _ = g.get().start(&key, &"{\"t\":\"x\"}", &"{}", -5, &t1); } catch gw:SingularException(_) { threw_neg = true; }
+    if !threw_neg { return 1503; }
+    match g.get().inspect(&key) {
+        gw.InspectOutcome::NotFound => {},
+        default => { return 1504; }   // a rejected start must not have created a row
+    }
+
+    // real start, then extend with zero / negative → throws, lease expiry unchanged.
+    val lease = _must_start(&g, &key, &t1);
+    val exp_before = _inspect_working_expires(&g, &key);
+    var threw_e0 = false;
+    try { val _ = g.get().extend_lease(&lease, 0); } catch gw:SingularException(_) { threw_e0 = true; }
+    if !threw_e0 { return 1505; }
+    var threw_en = false;
+    try { val _ = g.get().extend_lease(&lease, -1); } catch gw:SingularException(_) { threw_en = true; }
+    if !threw_en { return 1506; }
+    if _inspect_working_expires(&g, &key) != exp_before { return 1507; }   // rejected extends mutated nothing
+
+    // a valid positive extend still works.
+    match g.get().extend_lease(&lease, 60) {
+        gw.ExtendLeaseOutcome::Extended => {},
+        default => { return 1508; }
+    }
+    return 0;
+}
+
+// complete() with `payload` MUST throw our SingularException (the before-SQL object contract
+// firing as InvalidJson). Returns true iff it threw.
+fn _complete_rejects(g: &arc.Arc<gw.SingularGateway>, lease: &gw.WorkLease, payload: &String) nothrow -> Bool {
+    var threw = false;
+    try { val _ = g.get().complete(lease, payload); } catch gw:SingularException(_) { threw = true; } catch unexpected { threw = false; }
+    return threw;
+}
+
+// ============================================================
+// 16. JSON object contract (before SQL): all persisted/terminal JSON is a DOCUMENT — a non-null
+//     JSON OBJECT. complete/fail/start reject JSON null / array / scalar / malformed / empty
+//     client-side (InvalidJson) with NO mutation; {} and populated objects (incl. NESTED arrays)
+//     are accepted. (Decode-side rejection is pinned by the malformed-backend fixture.)
+// ============================================================
+fn scenario_json_object_contract() -> Int {
+    val g = _build_gw(&"w16");
+    val key = _key(&"pr1-json-object-contract");
+    val t1 = _tok(&"pr1-t16");
+    var lease = _must_start(&g, &key, &t1);
+
+    // REJECT non-object terminal payloads client-side; none of these may mutate the item.
+    if !_complete_rejects(&g, &lease, &"[1,2]") { return 1602; }       // array
+    if !_complete_rejects(&g, &lease, &"5") { return 1603; }           // scalar number
+    if !_complete_rejects(&g, &lease, &"\"s\"") { return 1604; }       // scalar string
+    if !_complete_rejects(&g, &lease, &"null") { return 1605; }        // JSON null
+    if !_complete_rejects(&g, &lease, &"") { return 1606; }            // empty
+    if !_complete_rejects(&g, &lease, &"{not json") { return 1607; }   // malformed
+
+    // Still WORKING — no rejected call created a terminal event.
+    match g.get().inspect(&key) {
+        gw.InspectOutcome::Working(_, _, _) => {},
+        default => { return 1608; }
+    }
+
+    // ACCEPT: a populated object with a NESTED array (only the TOP level must be an object).
+    val cr = g.get().complete(&lease, &"{\"items\":[1,2]}");
+    match cr {
+        gw.SettleOutcome::Settled(tr) => {
+            match tr { gw.TerminalResult::Done(p) => { if p != "{\"items\":[1,2]}" { return 1610; } }, default => { return 1609; } }
+        },
+        default => { return 1611; }
+    }
+
+    // start REJECTS a non-object item_meta client-side (no row); ACCEPTS {} (the empty document).
+    val key2 = _key(&"pr1-json-object-contract-2");
+    var threw_meta = false;
+    try { val _ = g.get().start(&key2, &"[1,2]", &"{}", 30, &t1); } catch gw:SingularException(_) { threw_meta = true; }
+    if !threw_meta { return 1612; }
+    match g.get().inspect(&key2) {
+        gw.InspectOutcome::NotFound => {},
+        default => { return 1613; }   // a rejected start must not have created a row
+    }
+    match g.get().start(&key2, &"{}", &"{}", 30, &t1) {
+        gw.StartOutcome::Granted(_) => {},
+        default => { return 1614; }
+    }
+    return 0;
+}
+
+fn main() nothrow -> Int {
+    con.println("01 start_complete_resume");
+    val r01 = try scenario_start_complete_resume() catch { 199 };
+    if r01 != 0 { return r01; }
+    con.println("02 start_fail_resume");
+    val r02 = try scenario_start_fail_resume() catch { 299 };
+    if r02 != 0 { return r02; }
+    con.println("03 start_exists_resume_active (same + different identity)");
+    val r03 = try scenario_start_exists_resume_active() catch { 399 };
+    if r03 != 0 { return r03; }
+    con.println("05 token_stale_fence");
+    val r05 = try scenario_token_stale_fence() catch { 599 };
+    if r05 != 0 { return r05; }
+    con.println("06 terminal_replay_vs_stale");
+    val r06 = try scenario_terminal_replay_vs_stale() catch { 699 };
+    if r06 != 0 { return r06; }
+    con.println("07 extend_lease");
+    val r07 = try scenario_extend_lease() catch { 799 };
+    if r07 != 0 { return r07; }
+    con.println("08 missing_key_notfound");
+    val r08 = try scenario_missing_key_notfound() catch { 899 };
+    if r08 != 0 { return r08; }
+    con.println("09 token_validation");
+    val r09 = try scenario_token_validation() catch { 999 };
+    if r09 != 0 { return r09; }
+    con.println("10 token_gt_owner");
+    val r10 = try scenario_token_gt_owner() catch { 1099 };
+    if r10 != 0 { return r10; }
+    con.println("11 concurrent_start_race");
+    val r11 = try scenario_concurrent_start_race() catch { 1199 };
+    if r11 != 0 { return r11; }
+    con.println("12 concurrent_complete_race");
+    val r12 = try scenario_concurrent_complete_race() catch { 1299 };
+    if r12 != 0 { return r12; }
+    con.println("13 inspect_and_history");
+    val r13 = try scenario_inspect_and_history() catch { 1399 };
+    if r13 != 0 { return r13; }
+    con.println("15 lease_timeout_validation");
+    val r15 = try scenario_lease_timeout_validation() catch { 1599 };
+    if r15 != 0 { return r15; }
+    con.println("14 cross_terminal");
+    val r14 = try scenario_cross_terminal() catch { 1499 };
+    if r14 != 0 { return r14; }
+    con.println("16 json_object_contract");
+    val r16 = try scenario_json_object_contract() catch { 1699 };
+    if r16 != 0 { return r16; }
+    con.println("all pass");
+    return 0;
+}

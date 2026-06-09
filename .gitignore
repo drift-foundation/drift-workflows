@@ -1,0 +1,19 @@
+# IDE / agent session state
+.claude-session
+.codex-session
+.claude
+.codex
+memory
+
+# Generated build output (both components)
+microflows/build/
+microflows/participant-stub/build/
+singular/drift/build/
+**/*.ll
+
+# Perf gate outputs (Foundation convention)
+microflows/perf/captures/
+microflows/perf/results/
+
+# Temp DB instances
+**/tmp_db_instances/

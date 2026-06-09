@@ -1,0 +1,117 @@
+// UUID helpers for Singular.
+//
+// Provides:
+//   uuid_to_bytes — parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" to 16 bytes
+//   bytes_to_uuid — format 16 bytes as UUID string
+//   uuid_v3_from_bytes — MD5 hash with UUID v3 version/variant bits
+//                        (matches Java UUID.nameUUIDFromBytes exactly)
+//
+// All conversions use big-endian byte order, matching Java's ByteBuffer default.
+
+module singular.uuid;
+
+import std.core as core;
+import std.io as io;
+import std.codec as codec;
+import std.crypto as crypto;
+
+export {
+	UuidError,
+	uuid_to_bytes,
+	bytes_to_uuid,
+	uuid_v3_from_bytes,
+	uuid_v3_from_string
+};
+
+pub struct UuidError {
+	pub tag: String,
+	pub message: String
+}
+
+implement core.Diagnostic for UuidError {
+	pub fn to_json_text(self: &UuidError) nothrow -> String {
+		return core.diagnostic_json_string(&self.tag);
+	}
+}
+
+// Parse a UUID string into 16 bytes (big-endian MSB+LSB).
+// Input must be 36 characters: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+pub fn uuid_to_bytes(s: &String) nothrow -> core.Result<Array<Byte>, UuidError> {
+	if s.byte_length() != 36 {
+		return core.Result::Err(UuidError(tag = "uuid-invalid-length", message = "expected 36 characters"));
+	}
+	var out: Array<Byte> = Array<type Byte>::with_capacity(16);
+	var si = 0;
+	while si < 36 {
+		if si == 8 or si == 13 or si == 18 or si == 23 {
+			if s.byte_at(si) != cast<Byte>(45) {
+				return core.Result::Err(UuidError(tag = "uuid-invalid-format", message = "expected dash"));
+			}
+			si = si + 1;
+			continue;
+		}
+		val hi = _hex_val(s.byte_at(si));
+		if hi < 0 { return core.Result::Err(UuidError(tag = "uuid-invalid-hex", message = "bad hex digit")); }
+		val lo = _hex_val(s.byte_at(si + 1));
+		if lo < 0 { return core.Result::Err(UuidError(tag = "uuid-invalid-hex", message = "bad hex digit")); }
+		out.push(cast<Byte>(hi * 16 + lo));
+		si = si + 2;
+	}
+	return core.Result::Ok(move out);
+}
+
+// Format 16 bytes as UUID string: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+pub fn bytes_to_uuid(bytes: &Array<Byte>) nothrow -> core.Result<String, UuidError> {
+	if bytes.len != 16 {
+		return core.Result::Err(UuidError(tag = "uuid-invalid-length", message = "expected 16 bytes"));
+	}
+	val hex = codec.hex_encode(bytes);
+	var buf = io.buffer(36);
+	var hi = 0;
+	var bi = 0;
+	while hi < 32 {
+		if hi == 8 or hi == 12 or hi == 16 or hi == 20 {
+			io.buffer_write(&mut buf, bi, cast<Byte>(45));
+			bi = bi + 1;
+		}
+		io.buffer_write(&mut buf, bi, hex.byte_at(hi));
+		hi = hi + 1;
+		bi = bi + 1;
+	}
+	return core.Result::Ok(core.string_from_utf8_bytes(io.buffer_ptr(&buf), 36));
+}
+
+// Generate a UUID v3 (MD5-based) from raw bytes.
+// Exactly matches Java's UUID.nameUUIDFromBytes():
+//   1. MD5 hash the input bytes (no namespace prepended)
+//   2. Set byte[6] version to 3: (byte[6] & 0x0f) | 0x30
+//   3. Set byte[8] variant to IETF: (byte[8] & 0x3f) | 0x80
+pub fn uuid_v3_from_bytes(input: &Array<Byte>) nothrow -> Array<Byte> {
+	var md5 = crypto.md5(input);
+	md5[6] = cast<Byte>((cast<Uint>(md5[6]) & 15u) | 48u);
+	md5[8] = cast<Byte>((cast<Uint>(md5[8]) & 63u) | 128u);
+	return move md5;
+}
+
+// Convenience: UUID v3 from a UTF-8 string.
+pub fn uuid_v3_from_string(s: &String) nothrow -> Array<Byte> {
+	val bytes = _string_to_bytes(s);
+	return uuid_v3_from_bytes(&bytes);
+}
+
+// --- Helpers ---
+
+fn _hex_val(b: Byte) nothrow -> Int {
+	val v = cast<Int>(b);
+	if v >= 48 and v <= 57 { return v - 48; }
+	if v >= 97 and v <= 102 { return v - 87; }
+	if v >= 65 and v <= 70 { return v - 55; }
+	return -1;
+}
+
+fn _string_to_bytes(s: &String) nothrow -> Array<Byte> {
+	var out: Array<Byte> = Array<type Byte>::with_capacity(s.byte_length());
+	var i = 0;
+	while i < s.byte_length() { out.push(s.byte_at(i)); i = i + 1; }
+	return move out;
+}

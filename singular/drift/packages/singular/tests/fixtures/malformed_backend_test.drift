@@ -1,0 +1,117 @@
+// Malformed-backend regression — decode-side JSON object-contract (part of the e2e gate).
+//
+// Runs the gateway against the `singular_malformed` fixture schema (loaded by `just db-load-schema`
+// from malformed_backend.sql), whose inspect/history SPs return hand-built `result` documents per
+// idempotency key. The gateway requires every SP result to be ONE non-null JSON OBJECT discriminated
+// by `outcome` (or, for history, by `event`), with payload/checkpoint being NESTED JSON objects and
+// lease_owner being lowercase hex of exactly 16 bytes; history rows also carry a `status` the gateway
+// cross-checks against `event`.
+//
+// ACCEPT keys parse cleanly to the expected outcome WITHOUT throwing — proving the SP/signature/CALL
+// are fine; so a REJECT key's throw can ONLY be the contract check firing (not a missing proc /
+// signature mismatch / backend rejection), which is what stops this regression from passing
+// vacuously. (We can't assert the exact exception kind: typed-catch can't project the non-scalar
+// `kind` this toolchain; the SP-invariant raw-SQL track pins the structured error_code.)
+
+module singular.tests.fixtures.malformed_backend_test;
+
+import std.core as core;
+import std.core.arc as arc;
+import std.console as con;
+import std.json as json;
+import singular.gateway as gw;
+
+fn _gw() -> arc.Arc<gw.SingularGateway> {
+    val text: String = "{\"backend\":\"mariadb\",\"host\":\"127.0.0.1\",\"port\":34114,\"user\":\"root\",\"password\":\"rootpw\",\"database\":\"singular_malformed\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
+    val cfg = json.parse(&text).or_throw();
+    var b = gw.new_gateway_builder();
+    gw.with_json(&mut b, &cfg);
+    val id = gw.identity_from_worker_name("singular-malformed-fixture", &"mfx-worker");
+    gw.with_identity(&mut b, move id);
+    return gw.build_gateway(move b).or_throw();
+}
+
+fn _key(b: Int) nothrow -> Array<Byte> { var k: Array<Byte> = []; k.push(cast<Byte>(b)); return move k; }
+
+// A reject key: inspect MUST throw our SingularException (the object-contract check firing).
+fn _expect_reject(g: &arc.Arc<gw.SingularGateway>, b: Int) nothrow -> Bool {
+    var threw = false;
+    try {
+        val _ = g.get().inspect(&_key(b));
+    } catch gw:SingularException(_) {
+        threw = true;
+    } catch unexpected {
+        // Any other escape is still a rejection of the malformed document, but we want the typed one.
+        threw = false;
+    }
+    return threw;
+}
+
+fn scenario_object_contract() -> Int {
+    val g = _gw();
+
+    // ACCEPT: valid documents parse cleanly to the expected outcome.
+    match g.get().inspect(&_key(1)) {        // terminal Done, valid object payload
+        gw.InspectOutcome::Terminal(_, _) => {},
+        default => { return 11; }
+    }
+    match g.get().inspect(&_key(10)) {       // 0x0A working, valid owner + {} checkpoint
+        gw.InspectOutcome::Working(owner, _, _) => { if owner.len != 16 { return 12; } },
+        default => { return 13; }
+    }
+    match g.get().inspect(&_key(11)) {       // 0x0B terminal Done, payload object with a NESTED array
+        gw.InspectOutcome::Terminal(tr, _) => {
+            match tr { gw.TerminalResult::Done(p) => { if p != "{\"items\":[1,2]}" { return 15; } }, default => { return 14; } }
+        },
+        default => { return 16; }
+    }
+
+    // REJECT: nested terminal payload is not a JSON object.
+    if !_expect_reject(&g, 2) { return 21; }   // non-JSON string
+    if !_expect_reject(&g, 3) { return 22; }   // JSON null
+    if !_expect_reject(&g, 4) { return 23; }   // JSON array
+    if !_expect_reject(&g, 5) { return 24; }   // scalar "5" (parses, not an object)
+
+    // REJECT: the result envelope itself is not a JSON object.
+    if !_expect_reject(&g, 6) { return 31; }   // array envelope
+    if !_expect_reject(&g, 7) { return 32; }   // SQL NULL envelope
+    if !_expect_reject(&g, 8) { return 33; }   // malformed JSON envelope
+    if !_expect_reject(&g, 9) { return 34; }   // scalar envelope
+
+    // REJECT: working snapshot fields.
+    if !_expect_reject(&g, 12) { return 41; }  // 0x0C checkpoint not an object
+    if !_expect_reject(&g, 13) { return 42; }  // 0x0D owner not hex
+    if !_expect_reject(&g, 14) { return 43; }  // 0x0E owner hex != 16 bytes
+    return 0;
+}
+
+// history() decode: a matched (event,status) row parses; a COMPLETED+WORKING mismatch is rejected
+// by the gateway's adapter-private cross-check (backed by the product schema CHECK).
+fn scenario_history_event_status() -> Int {
+    val g = _gw();
+    // ACCEPT: matched control (claimed/status=1) -> one entry, no throw.
+    val ok = g.get().history(&_key(1));
+    if ok.len != 1 { return 51; }
+    // REJECT: completed event carrying status=WORKING -> throw.
+    var threw = false;
+    try {
+        val _ = g.get().history(&_key(2));
+    } catch gw:SingularException(_) {
+        threw = true;
+    } catch unexpected {
+        threw = false;
+    }
+    if !threw { return 52; }
+    return 0;
+}
+
+fn main() nothrow -> Int {
+    con.println("malformed object-contract (envelope + payload + owner/checkpoint; accept + reject)");
+    val r1 = try scenario_object_contract() catch { 91 };
+    if r1 != 0 { return r1; }
+    con.println("malformed history (event/status cross-check; accept + reject)");
+    val r2 = try scenario_history_event_status() catch { 92 };
+    if r2 != 0 { return r2; }
+    con.println("all pass");
+    return 0;
+}

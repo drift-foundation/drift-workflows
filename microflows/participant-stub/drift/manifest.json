@@ -1,0 +1,25 @@
+{
+  "schema_version": 2,
+  "project": {
+    "name": "microflows-participant-stub",
+    "license": "MIT"
+  },
+  "artifacts": [
+    {
+      "kind": "app",
+      "name": "microflows-participant-stub",
+      "module_namespace": "microflows.participant_stub",
+      "version": "0.1.0",
+      "description": "Microflows reference participant — narrow PUT/GET operation endpoint backed by Singular (protocol conformance reference)",
+      "entry_module": "src/app.drift",
+      "entry_point": "microflows.participant_stub::main",
+      "modules": ["src/"],
+      "package_deps": [
+        { "name": "web-rest", "version": "0.5" },
+        { "name": "singular", "version": "0.4" },
+        { "name": "mariadb-rpc", "version": "0.6" }
+      ],
+      "assets": []
+    }
+  ]
+}
