@@ -21,9 +21,9 @@
         },
         "singular": {
           "version": "0.4.0",
-          "sha256": "ad3681d0046f11fb543ac2fe20271d95977e98a9590462510b7706a25929a2b9",
+          "sha256": "fc865633a30f652a2c4c706be471a52e83931d2f03a794126fa25e41ae000673",
           "author_key": "ed25519:YvjbJdKVqMCnpiDHk8k+Fz53PplWaBPjXGZxWJ7JoVw=",
-          "source_content_id": "sha256:bc76c63f26fec1d6270d523feefbe7bef01de6963c1b6e77d46b89be777acb67",
+          "source_content_id": "sha256:cf488f3bc4069c6660fa9de13ab88b8fb57a941cf30ef3cf81bf03daf4123b86",
           "source_attestation_key": "ed25519:YvjbJdKVqMCnpiDHk8k+Fz53PplWaBPjXGZxWJ7JoVw=",
           "dep_type": "direct"
         },

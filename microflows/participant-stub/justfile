@@ -38,6 +38,16 @@ run CONFIG: build
 	set -euo pipefail
 	exec ./{{BIN_DIR}}/participant-stub --config "{{CONFIG}}"
 
+# Black-box HTTP conformance harness (stdlib Python). Builds first, then spawns
+# the stub against the running `singular` schema and asserts protocol behavior.
+# Requires MariaDB up + `singular` schema loaded (cd ../../singular && just
+# db-load-schema) and MDB_ROOT_PWD.
+test-http: build
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	python3 tests/http/conformance.py
+
 # Wipe build artifacts.
 clean:
 	rm -rf build

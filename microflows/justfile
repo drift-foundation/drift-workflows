@@ -155,3 +155,12 @@ db-sql SQL:
 	set -euo pipefail
 	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
 	mariadb -h {{DB_HOST}} -P {{DB_PORT}} -u {{DB_USER}} -p"${MDB_ROOT_PWD}" {{DB_SCHEMA}} -e "{{SQL}}"
+
+# Focused SQL regression for the operation lifecycle stored procedures
+# (NULL fencing, command-identity conflict, idempotent settle, invariants).
+# Requires the schema loaded (just db-load-schema) + MDB_ROOT_PWD.
+test-sp:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	../../mariachi/.venv/bin/python db/tests/sp_operation_test.py

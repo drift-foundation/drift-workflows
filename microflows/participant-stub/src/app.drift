@@ -1,51 +1,146 @@
-// Microflows reference participant stub.
+// Microflows reference participant stub — Singular-backed.
 //
-// A narrow HTTP participant implementing the Microflows operation protocol
-// (microflows_design.md §5.1), backed by Singular for durable idempotent
-// state. It is the protocol CONFORMANCE REFERENCE — not domain logic.
+// The protocol CONFORMANCE REFERENCE participant (microflows_design.md §5,
+// §8). It implements the operation protocol over a real HTTP boundary, backed
+// by Singular for durable idempotent state — exactly the intended PushCoin
+// participant pattern.
 //
 //   PUT /microflows/v1/operations/{operation}/{operation_id}
 //   GET /microflows/v1/operations/{operation}/{operation_id}
 //
-// This first cut proves the web-rest app build + routing under the
-// two-package-root toolchain. Singular wiring, canonical input-hash
-// validation via Singular item_meta (-> 409), and the configurable outcome
-// state machine (pending/success/terminal-failure/deferred/indeterminate,
-// plus delayed and drop-after-commit for lost-ack tests) land next.
-// (Participant "busy, later" is DEFER, not failure; "retry" is reserved for
-// transport mechanics.)
+// First runnable slice (Singular 0.4: start / complete / inspect / history):
+//   PUT  -> Singular start():
+//             Granted -> run echo-transform, complete(), return 200 succeeded
+//             Exists  -> compare canonical input hash held in Singular item_meta
+//                        (mismatch -> 409); else replay the terminal result
+//   GET  -> Singular inspect(): Terminal -> 200 | Working -> 202 | NotFound -> 404
+//
+// Input-conflict (409) reuses Singular's item_meta as the single authority: the
+// canonical input hash is stored in item_meta on start() and read back via
+// history() on Exists — no second store. (Singular-native input conflict is a
+// planned extension; until then the comparison lives here — protocol §0.3.)
+//
+// "busy, later" would be a DEFER (planned Singular extension), not a failure;
+// "retry" is reserved for transport mechanics.
 
 module microflows.participant_stub;
 
 import std.core as core;
+import std.core.arc as arc;
 import std.console as console;
 import std.json as json;
 import std.format as fmt;
 import std.concurrent as conc;
+import std.io as io;
+import std.cli as cli;
+import std.env as env;
 import web.rest as rest;
+import singular as singular;
 
 const DEFAULT_PORT: Int = 8080;
+const LEASE_TIMEOUT_SECONDS: Int = 30;
+
+// ===== App state =====
+
+struct StubApp {
+	gateway: arc.Arc<singular.SingularGateway>,
+	service_group: String,
+	// Observable instrumentation: incremented ONCE each time the operation body
+	// actually executes (the start()=Granted branch). The harness asserts this
+	// stays 1 across replays — proving effectively-once EXECUTION, not merely
+	// result replay (the stored result is a fixed document and proves nothing).
+	exec_count: conc.AtomicInt
+}
+
+const SUPPORTED_OPERATION: String = "echo-transform";
+
+// ===== Entry point =====
 
 fn main(argv: Array<String>) nothrow -> Int {
-	// TODO: parse --config <file> for {port, service_group, worker_id, singular}.
-	return try _serve(DEFAULT_PORT) catch {
-		console.eprintln("participant-stub: fatal");
+	var p = cli.parser("participant-stub", "0.1.0", "Microflows reference participant (Singular-backed)");
+	val _ = p.option_string("config", "c", "FILE", "path to JSON config (singular subtree, port, service-group, worker-id)", true);
+	val _ = p.option_int("port", "p", "PORT", "listening port (default: 8080)", false);
+
+	var config_path: String = "";
+	var port_cli: Optional<Int> = Optional<Int>::None();
+	val service_group: String = "participant-stub";
+	val worker_id: String = "participant-stub-worker";
+
+	match p.parse(argv) {
+		core.Result::Ok(parsed) => {
+			match parsed.get_string("config", p) {
+				Some(v) => { config_path = _dup(v); },
+				None => {}
+			}
+			match parsed.get_int("port", p) {
+				Some(v) => { port_cli = Optional<Int>::Some(v); },
+				None => {}
+			}
+		},
+		core.Result::Err(_) => {
+			console.eprintln("participant-stub: bad arguments (need --config FILE)");
+			return 2;
+		}
+	}
+
+	if config_path.byte_length() == 0 {
+		console.eprintln("participant-stub: --config FILE is required");
+		return 2;
+	}
+
+	return try _run(config_path, port_cli, service_group, worker_id) catch {
+		console.eprintln("participant-stub: fatal during startup");
 		1
 	};
 }
 
-fn _serve(port: Int) throws -> Int {
-	var b = rest.new_app_builder();
-	rest.bind(b, "0.0.0.0", port);
-	var web_app = rest.build_app(move b);
+fn _run(config_path: String, port_cli: Optional<Int>, service_group_default: String, worker_id_default: String) throws -> Int {
+	val cfg = _load_config_json(&config_path);
+
+	// port precedence: --port wins, else config.port, else default.
+	var port = DEFAULT_PORT;
+	match cfg.get(&"port") {
+		Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { port = v; }, Optional::None => {} } },
+		Optional::None => {}
+	}
+	match port_cli {
+		Optional::Some(v) => { port = v; },
+		Optional::None => {}
+	}
+	val service_group = _config_str(&cfg, &"service_group", service_group_default);
+	val worker_id = _config_str(&cfg, &"worker_id", worker_id_default);
+
+	// Build the Singular gateway from the "singular" subtree.
+	val singular_sub = _require_singular(&cfg);
+	val gateway = _build_singular_gw(&singular_sub, &service_group, &worker_id);
+
+	val app = conc.arc(StubApp(gateway = move gateway, service_group = move service_group, exec_count = conc.atomic_int(0)));
+
+	var ab = rest.new_app_builder();
+	rest.bind(ab, "0.0.0.0", port);
+	var web_app = rest.build_app(move ab);
 
 	val ops_rg = rest.add_route_group(web_app, "/microflows/v1/operations").or_throw();
 
 	rest.add_route_group_throws_route(web_app, ops_rg, "PUT", "/{operation}/{operation_id}",
-		|req, ctx| => { return _handle_put(req, ctx); }).or_throw();
+		|req, ctx| captures(share app) => {
+			val a = app.get();
+			return a.handle_put(req, ctx);
+		}).or_throw();
 
 	rest.add_route_group_throws_route(web_app, ops_rg, "GET", "/{operation}/{operation_id}",
-		|req, ctx| => { return _handle_get(req, ctx); }).or_throw();
+		|req, ctx| captures(share app) => {
+			val a = app.get();
+			return a.handle_get(req, ctx);
+		}).or_throw();
+
+	// Observable instrumentation for the harness: total operation-body executions.
+	val debug_rg = rest.add_route_group(web_app, "/debug").or_throw();
+	rest.add_route_group_throws_route(web_app, debug_rg, "GET", "/exec-count",
+		|req, ctx| captures(share app) => {
+			val a = app.get();
+			return a.handle_exec_count(req, ctx);
+		}).or_throw();
 
 	console.println("participant-stub listening on " + fmt.format_int(port));
 
@@ -55,26 +150,350 @@ fn _serve(port: Int) throws -> Int {
 	return 0;
 }
 
-// PUT — idempotent creation at a caller-assigned operation_id. First cut:
-// echoes identity and returns 202 pending. (Singular-backed outcome state
-// machine + input-hash 409 land next.)
-fn _handle_put(req: &rest.Request, ctx: &mut rest.Context) throws -> rest.Response {
-	val op = rest.path_param(req, "operation").or_throw();
-	val op_id = rest.path_param(req, "operation_id").or_throw();
-	var o = json.new_object();
-	o.set("state", json.JsonNode::String("pending"));
-	o.set("operation", json.JsonNode::String(op));
-	o.set("operation_id", json.JsonNode::String(op_id));
-	return rest.json_response(202, json.encode(o.to_node()));
+// Statement-form helpers (Drift: an expression-form match arm may not `throw`).
+fn _require_singular(cfg: &json.JsonNode) -> json.JsonNode {
+	match cfg.get(&"singular") {
+		Optional::Some(n) => { return n.clone_deep(); },
+		Optional::None => { throw StubError(message = "config: missing 'singular' subtree"); }
+	}
 }
 
-// GET — durable status/result lookup. First cut: 404 (no store yet).
-fn _handle_get(req: &rest.Request, ctx: &mut rest.Context) throws -> rest.Response {
-	val op = rest.path_param(req, "operation").or_throw();
-	val op_id = rest.path_param(req, "operation_id").or_throw();
+fn _build_singular_gw(singular_sub: &json.JsonNode, service_group: &String, worker_id: &String)
+	-> arc.Arc<singular.SingularGateway>
+{
+	val identity = singular.identity_from_worker_name(_dup(service_group), worker_id);
+	var b = singular.new_gateway_builder();
+	singular.with_json(&mut b, singular_sub);
+	singular.with_identity(&mut b, move identity);
+	match singular.build_gateway(move b) {
+		core.Result::Ok(g) => { return move g; },
+		core.Result::Err(_) => { throw StubError(message = "config: singular gateway build failed"); }
+	}
+}
+
+// ===== Handlers =====
+
+implement StubApp {
+
+	// PUT — idempotent creation at a caller-assigned operation id.
+	pub fn handle_put(self: &StubApp, req: &rest.Request, ctx: &mut rest.Context) throws -> rest.Response {
+		val op = rest.path_param(req, "operation").or_throw();
+		val op_id = rest.path_param(req, "operation_id").or_throw();
+		if req.body.byte_length() == 0 {
+			return _json(400, _envelope_error("empty-body"));
+		}
+		// Statement-form match: a bad parse returns 400; otherwise dispatch with
+		// the parsed input.
+		match json.parse(&req.body) {
+			core.Result::Ok(input) => { return self.handle_put_input(&op, &op_id, &input); },
+			core.Result::Err(_) => { return _json(400, _envelope_error("invalid-json")); }
+		}
+	}
+
+	fn handle_put_input(self: &StubApp, op: &String, op_id: &String, input: &json.JsonNode) throws -> rest.Response {
+		// Validate operation name + input schema BEFORE touching Singular: an
+		// invalid request must return 400 and create NO operation.
+		if op != SUPPORTED_OPERATION {
+			return _json(400, _envelope_error("unknown-operation"));
+		}
+		if !_validate_echo(input) {
+			return _json(400, _envelope_error("invalid-input"));
+		}
+
+		val key = _op_key(op, op_id);
+		val token = _lease_token(op, op_id);
+		val input_hash = _input_hash(input);
+		val item_meta = _hash_meta(&input_hash);
+
+		match self.gateway.get().start(&key, &item_meta, &"{}", LEASE_TIMEOUT_SECONDS, &token) {
+			singular.StartOutcome::Granted(lease) => {
+				// First submit: run the operation body EXACTLY ONCE.
+				val _prev = self.exec_count.fetch_add(1, conc.MemoryOrder::SeqCst());
+				val result_json = _echo_transform(input);
+				match self.gateway.get().complete(&lease, &result_json) {
+					singular.SettleOutcome::Settled(tr) => {
+						return _json(200, _envelope_terminal(&tr));
+					},
+					default => {
+						return _json(500, _envelope_error("complete-unexpected"));
+					}
+				}
+			},
+			singular.StartOutcome::Exists => {
+				// Already exists: same id + different input -> 409. The bound input
+				// hash lives in Singular's item_meta (single authority), read back
+				// via history. A missing/corrupt record is NOT a conflict -> 500.
+				match self.read_original_hash(&key) {
+					Optional::Some(original_hash) => {
+						if original_hash != input_hash {
+							return _json(409, _envelope_error("input-conflict"));
+						}
+						// Same input: replay the terminal result (or report pending).
+						match self.gateway.get().inspect(&key) {
+							singular.InspectOutcome::Terminal(tr, _) => { return _json(200, _envelope_terminal(&tr)); },
+							singular.InspectOutcome::Working(_, _, _) => { return _json(202, _envelope_pending()); },
+							singular.InspectOutcome::NotFound => { return _json(500, _envelope_error("exists-but-not-found")); }
+						}
+					},
+					Optional::None => {
+						return _json(500, _envelope_error("item-meta-unreadable"));
+					}
+				}
+			}
+		}
+	}
+
+	// GET /debug/exec-count -> { "count": N } : total operation-body executions.
+	pub fn handle_exec_count(self: &StubApp, req: &rest.Request, ctx: &mut rest.Context) throws -> rest.Response {
+		val n = self.exec_count.load(conc.MemoryOrder::SeqCst());
+		var o = json.new_object();
+		o.set("count", json.JsonNode::Number(fmt.format_int(n)));
+		return _json(200, json.encode(o.to_node()));
+	}
+
+	// GET — durable status/result lookup.
+	pub fn handle_get(self: &StubApp, req: &rest.Request, ctx: &mut rest.Context) throws -> rest.Response {
+		val op = rest.path_param(req, "operation").or_throw();
+		val op_id = rest.path_param(req, "operation_id").or_throw();
+		val key = _op_key(&op, &op_id);
+		match self.gateway.get().inspect(&key) {
+			singular.InspectOutcome::Terminal(tr, _) => { return _json(200, _envelope_terminal(&tr)); },
+			singular.InspectOutcome::Working(_, _, _) => { return _json(202, _envelope_pending()); },
+			singular.InspectOutcome::NotFound => { return _json(404, _envelope_unknown()); }
+		}
+	}
+
+	// Read the canonical input hash bound at start(), from Singular's item_meta
+	// (the first history entry). Singular is the single authority for the bound
+	// input — there is no second store. Returns None on a missing/corrupt
+	// record (the caller maps None to 500, NEVER to a 409 conflict).
+	fn read_original_hash(self: &StubApp, key: &Array<Byte>) -> Optional<String> {
+		val entries = self.gateway.get().history(key);
+		if entries.len == 0 { return Optional<String>::None(); }
+		// The earliest entry (Claimed at start) carries the original item_meta.
+		val meta = entries[0].item_meta.clone();
+		match json.parse(&meta) {
+			core.Result::Ok(n) => {
+				match n.get(&"input_hash") {
+					Optional::Some(h) => {
+						match h.as_string() {
+							Optional::Some(s) => { return Optional<String>::Some(move s); },
+							Optional::None => { return Optional<String>::None(); }
+						}
+					},
+					Optional::None => { return Optional<String>::None(); }
+				}
+			},
+			core.Result::Err(_) => { return Optional<String>::None(); }
+		}
+	}
+}
+
+// ===== Operation logic =====
+
+// echo-transform: input { "values": [a,b,c] } -> { "sum": a+b+c, "execution_count": 1 }.
+// execution_count is fixed at 1: the work runs exactly once (only on the
+// Granted branch); replays return this stored result unchanged, proving
+// effectively-once execution.
+fn _echo_transform(input: &json.JsonNode) -> String {
+	// Precondition: _validate_echo(input) is true (checked before start()).
+	var sum: Int = 0;
+	match input.get(&"values") {
+		Optional::Some(arr) => {
+			match arr.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						match items[i].as_int() {
+							Optional::Some(n) => { sum = sum + n; },
+							Optional::None => {}
+						}
+						i = i + 1;
+					}
+				},
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
 	var o = json.new_object();
-	o.set("state", json.JsonNode::String("unknown"));
-	o.set("operation", json.JsonNode::String(op));
-	o.set("operation_id", json.JsonNode::String(op_id));
-	return rest.json_response(404, json.encode(o.to_node()));
+	o.set("sum", json.JsonNode::Number(fmt.format_int(sum)));
+	return json.encode(o.to_node());
+}
+
+// Validate the echo-transform input schema: an INTEGER array, i.e.
+// { "values": [int, int, ...] }. Elements are accepted via as_int(), so only
+// JSON integers pass — missing values, non-array values, and non-integer
+// numbers/elements are rejected.
+fn _validate_echo(input: &json.JsonNode) nothrow -> Bool {
+	match input.get(&"values") {
+		Optional::Some(arr) => {
+			match arr.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						match items[i].as_int() {
+							Optional::Some(_) => {},
+							Optional::None => { return false; }
+						}
+						i = i + 1;
+					}
+					return true;
+				},
+				Optional::None => { return false; }
+			}
+		},
+		Optional::None => { return false; }
+	}
+}
+
+// ===== Identity / hashing =====
+
+// Unambiguous, length-prefixed join of structured components: distinct
+// (operation, operation_id) pairs always produce distinct seed strings (e.g.
+// "a:b"/"c" vs "a"/"b:c" no longer alias). The UUIDv3 derivation below is then
+// collision-RESISTANT (128-bit hash), not collision-free in the absolute sense.
+fn _join(parts: &Array<String>) nothrow -> String {
+	var out: String = "";
+	var i = 0;
+	while i < parts.len {
+		out = out + fmt.format_int(parts[i].byte_length()) + ":" + _dup(&parts[i]) + ";";
+		i = i + 1;
+	}
+	return move out;
+}
+
+// Stable 16-byte Singular key from (operation, operation_id) — caller-assigned,
+// stable across retries, collision-free via length-prefixed encoding.
+fn _op_key(op: &String, op_id: &String) nothrow -> Array<Byte> {
+	val parts: Array<String> = ["key", _dup(op), _dup(op_id)];
+	val seed = _join(&parts);
+	return singular.uuid_v3_from_string(&seed);
+}
+
+// Deterministic 16-byte capability token per operation (single-worker stub).
+fn _lease_token(op: &String, op_id: &String) nothrow -> Array<Byte> {
+	val parts: Array<String> = ["tok", _dup(op), _dup(op_id)];
+	val seed = _join(&parts);
+	return singular.uuid_v3_from_string(&seed);
+}
+
+// Canonical input hash: a UUIDv3 (md5-based) over the COMPACT canonical
+// serialization of the input document. Equal documents -> equal compact text
+// -> equal hash. (Byte-canonical serialization is a planned Singular feature;
+// this is the stub's pragmatic canonicalization — protocol §0.3.)
+fn _input_hash(input: &json.JsonNode) -> String {
+	// CANONICAL: lexicographically-ordered object keys, so semantically equal
+	// documents with reordered keys hash identically (no false 409).
+	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
+	val compact = json.encode_compact_with_config(input, &cfg);
+	val bytes = singular.uuid_v3_from_string(&compact);
+	match singular.bytes_to_uuid(&bytes) {
+		core.Result::Ok(s) => { return move s; },
+		core.Result::Err(_) => { throw StubError(message = "input-hash encode failed"); }
+	}
+}
+
+fn _hash_meta(input_hash: &String) -> String {
+	var o = json.new_object();
+	o.set("input_hash", json.JsonNode::String(_dup(input_hash)));
+	return json.encode(o.to_node());
+}
+
+// ===== Response envelopes =====
+
+fn _envelope_terminal(tr: &singular.TerminalResult) -> String {
+	// echo-transform only completes successfully; Done carries the result text.
+	match tr {
+		singular.TerminalResult::Done(payload) => {
+			var o = json.new_object();
+			o.set("state", json.JsonNode::String("succeeded"));
+			match json.parse(payload) {
+				core.Result::Ok(n) => { o.set("result", n); },
+				core.Result::Err(_) => {}
+			}
+			return json.encode(o.to_node());
+		},
+		singular.TerminalResult::Failed(payload) => {
+			var o = json.new_object();
+			o.set("state", json.JsonNode::String("failed"));
+			match json.parse(payload) {
+				core.Result::Ok(n) => { o.set("error", n); },
+				core.Result::Err(_) => {}
+			}
+			return json.encode(o.to_node());
+		}
+	}
+}
+
+fn _envelope_pending() nothrow -> String { return "{\"state\":\"pending\"}"; }
+fn _envelope_unknown() nothrow -> String { return "{\"state\":\"unknown\"}"; }
+
+fn _envelope_error(reason: String) nothrow -> String {
+	var o = json.new_object();
+	o.set("state", json.JsonNode::String("error"));
+	o.set("reason", json.JsonNode::String(reason));
+	return json.encode(o.to_node());
+}
+
+fn _json(code: Int, body: String) nothrow -> rest.Response {
+	return rest.json_response(code, body);
+}
+
+// ===== Config loading =====
+
+fn _load_config_json(path: &String) throws -> json.JsonNode {
+	val timeout = conc.Duration(millis = 5000);
+	match io.file_builder(_dup(path)).read(true).timeout(timeout).build() {
+		core.Result::Ok(file) => {
+			val text = _drain(move file);
+			match json.parse(&text) {
+				core.Result::Ok(n) => { return move n; },
+				core.Result::Err(_) => { throw StubError(message = "config: JSON parse failed"); }
+			}
+		},
+		core.Result::Err(_) => { throw StubError(message = "config: cannot open " + _dup(path)); }
+	}
+}
+
+fn _drain(var f: io.ConfiguredFile) throws -> String {
+	var out: String = "";
+	var buf = io.buffer(4096);
+	var done = false;
+	while !done {
+		match f.read(&mut buf) {
+			core.Result::Ok(n) => {
+				if n == 0 { done = true; }
+				else { out = out + core.string_from_utf8_bytes(io.buffer_ptr(&buf), n); }
+			},
+			core.Result::Err(_) => { val _ = f.close(); throw StubError(message = "config: read error"); }
+		}
+	}
+	val _ = f.close();
+	return move out;
+}
+
+fn _config_str(cfg: &json.JsonNode, key: &String, default_val: String) nothrow -> String {
+	match cfg.get(key) {
+		Optional::Some(n) => {
+			match n.as_string() {
+				Optional::Some(s) => { if s.byte_length() > 0 { return move s; } },
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
+	return move default_val;
+}
+
+// ===== Errors / helpers =====
+
+pub error StubError { message: String }
+
+fn _dup(s: &String) nothrow -> String {
+	val n = s.byte_length();
+	var buf = io.buffer(n);
+	var i = 0;
+	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
+	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), n);
 }

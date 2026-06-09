@@ -393,6 +393,20 @@ schema and stored procedures using the existing `mariadb-rpc` client. SPs
 receive explicit IDs and timestamps, avoid ambient nondeterminism, and
 implement reproducible, state-idempotent transitions (prior §24.4).
 
+**Time direction (milestone-1 TimeSource).**
+
+```text
+sp_mf_clock_read is Microflows' TimeSource; transition SPs receive fixed
+  timestamps explicitly and NEVER call NOW() (future deployments may use
+  NTP-synchronized local clocks — not implemented in the spike).
+each workflow retains current_event_ts; a transition requires
+  new_event_ts > current_event_ts.
+a non-increasing timestamp indicates CLOCK SKEW: abort and DEFER the workflow
+  (do NOT adjust the timestamp or immediately retry).
+event_seq remains the authoritative causal ordering; timestamps must remain
+  chronological alongside it.
+```
+
 ```text
 workflows and definition revisions
 continuations and durable values
@@ -547,9 +561,24 @@ The fake operation:
 
 ```text
 operation: echo-transform
-input:  { "values": [1, 2, 3] }
-result: { "sum": 6, "execution_count": 1 }
+input:  { "values": [1, 2, 3] }   (validated: values present, array, all numeric)
+result: { "sum": 6 }
 ```
+
+Effectively-once **execution** is proven by **observable instrumentation**, not
+by a literal in the result document: the stub increments a process-level
+execution counter only when the operation body actually runs (the Singular
+`start()`=Granted branch), and exposes it at `GET /debug/exec-count`. The
+harness submits the same operation repeatedly and asserts the counter stays
+`1` — distinguishing genuine effectively-once execution from mere result
+replay. (Status of the result document on replay is "durable replay verified".)
+
+The participant stub is exercised by a checked-in black-box conformance
+harness (`participant-stub/tests/http/conformance.py`, `just test-http`):
+first-submit + replay + exec-count==1, input-conflict 409 (via Singular
+`item_meta`), reordered-keys-no-false-conflict (canonical lex-ordered hash),
+invalid-input→400-creating-no-operation, unknown-operation→400, GET
+terminal/404. 6/6 passing.
 
 ### 8.3b What the loop must prove
 
