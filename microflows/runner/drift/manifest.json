@@ -1,0 +1,23 @@
+{
+  "schema_version": 2,
+  "project": {
+    "name": "microflows-runner",
+    "license": "MIT"
+  },
+  "artifacts": [
+    {
+      "kind": "app",
+      "name": "microflows-runner",
+      "module_namespace": "microflows.runner",
+      "version": "0.1.0",
+      "description": "Microflows coordinator runner — first dispatch slice (manual IR)",
+      "entry_module": "src/runner.drift",
+      "entry_point": "microflows.runner::main",
+      "modules": ["src/"],
+      "package_deps": [
+        { "name": "microflows", "version": "0.1" },
+        { "name": "web-client", "version": "0.4" }
+      ]
+    }
+  ]
+}

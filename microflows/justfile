@@ -20,25 +20,56 @@ DB_HOST := "127.0.0.1"
 DB_PORT := "34114"
 DB_USER := "root"
 DB_SCHEMA := "microflows"
+# Shared host-global DB lock — same flocker key the test executor uses for its
+# serial DB jobs (group `mariadb-mdb114-a`), so a destructive reset / DB
+# regression here can't overlap another gate's DB-backed execution.
+FLOCKER := env("DRIFT_TOOLCHAIN_ROOT", env("HOME") + "/opt/drift/certified/current/toolchain") + "/bin/flocker"
+DB_LOCK := "serial-mariadb-mdb114-a"
+# Executor serial DB key used WHILE this gate holds the shared lock across its
+# whole phase. Distinct from `mariadb-mdb114-a` so the executor's per-job lock
+# can't deadlock against the outer hold (flocker is not re-entrant); only ever
+# active under the held lock, so a fixed non-shared key is safe.
+DB_HELD_GROUP := "mariadb-mdb114-a-held"
 
 # --- Certification gates (shared executor) ---
 # Gates run on the toolchain's shared `drift_test_run` executor (mechanism),
 # driven by tools/emit_test_plan.py (policy: which files/deps/lanes).
 
-# Correctness gate: unit (parallel base/memcheck/asan, DB-free) + e2e (serial
-# base/asan/memcheck on the shared mdb114-a). Requires DRIFT_TOOLCHAIN_ROOT and
-# a running mdb114-a with the microflows schema loaded (`just db-load-schema`).
+# Correctness gate (microflows-only): unit (parallel base/memcheck/asan, DB-free)
+# + e2e (serial base/asan/memcheck on the shared mdb114-a) + the stored-procedure
+# regression. Requires DRIFT_TOOLCHAIN_ROOT, a running mdb114-a, and MDB_ROOT_PWD.
+# Cross-component E2E lives under ../integration and is run by the ROOT gate, not
+# here — this recipe stays component-isolated.
+# PUBLIC entry: acquire the shared host-global DB lock ONCE, then run the whole
+# setup+DB-test phase under it (so no other checkout can reset/migrate the schema
+# mid-test). Lock ownership is conveyed by recipe STRUCTURE (this acquires it; the
+# private `_test-locked` is reachable only from here) — never by a caller-settable
+# env var. flocker is REQUIRED (ships with the toolchain); missing => hard error.
 test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _test-locked
+
+# PRIVATE: the complete setup+DB-test phase. Runs ONLY under the shared lock held
+# by `test`. The executor's DB jobs take a non-shared serial key ({{DB_HELD_GROUP}}
+# via --db-group) so their per-job lock can't deadlock against the outer hold.
+_test-locked:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
 	export DRIFT_PKG_ROOT="{{_pkg-root}}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	# Provision the microflows schema fresh BEFORE the e2e lane (already under the lock).
+	just _db-load-schema
 	WORK="$(mktemp -d -t microflows-test-XXXXXX)"
 	trap 'rm -rf "$WORK"' EXIT
-	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
+	python3 tools/emit_test_plan.py test --db-group "{{DB_HELD_GROUP}}" --out "$WORK/plan.json"
 	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
+	# Stored-procedure regression reuses the freshly-loaded schema (unique ids per run).
+	just _test-sp
 
 # --- Dev workflows (generic, via the same emitter) ---
 
@@ -96,6 +127,13 @@ author-claim:
 	  --key-file "${KEY_FILE}" \
 	  --overwrite
 
+# NOTE: there is intentionally no test-time `deploy` recipe. The cross-component
+# integration suite COMPILES the runner directly against these library sources
+# (integration/coordinator-singular/tools/emit_test_plan.py), so `just test`
+# never needs a signed package, signing keys, or author-claim mutation. A signed
+# library deploy is a RELEASE operation (run `drift deploy` with real
+# credentials), deliberately kept out of the test path.
+
 # --- Stress / perf gates (Foundation standard) ---
 # Empty scaffolds so certification has the recipes; populate as scenarios land.
 
@@ -126,7 +164,18 @@ MARIACHI := env("MARIACHI_BIN", "../../mariachi/.venv/bin/mariachi")
 
 # (Re-)create the microflows schema from the db/ template via Mariachi
 # (dev recreation; --destroy-database is refused on production-marked DBs).
+# PUBLIC entry: acquire the shared DB lock, then run the private reset. flocker is
+# REQUIRED (ships with the toolchain); missing => hard error so a destructive reset
+# never runs unserialized.
 db-load-schema:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 -- just _db-load-schema
+
+# PRIVATE: the actual destructive reset. Runs ONLY under the shared lock (held by
+# `db-load-schema` or `_test-locked`) — not a standalone entry point.
+_db-load-schema:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../mariachi && just setup'" >&2; exit 1; }
@@ -159,8 +208,22 @@ db-sql SQL:
 # Focused SQL regression for the operation lifecycle stored procedures
 # (NULL fencing, command-identity conflict, idempotent settle, invariants).
 # Requires the schema loaded (just db-load-schema) + MDB_ROOT_PWD.
+# PUBLIC entry: acquire the shared DB lock, then run the private regression.
 test-sp:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 -- just _test-sp
+
+# PRIVATE: the DB-backed regression. Runs ONLY under the shared lock (held by
+# `test-sp` or `_test-locked`).
+_test-sp:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
 	../../mariachi/.venv/bin/python db/tests/sp_operation_test.py
+
+# NOTE: the cross-component coordinator<->Singular E2E moved to the repository
+# level: integration/coordinator-singular/ (run via root `just test-integration`
+# or `just test`). The fixtures it seeds remain a microflows schema asset at
+# db/scenarios/coordinator-fixtures/.

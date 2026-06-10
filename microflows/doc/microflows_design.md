@@ -291,6 +291,87 @@ every remote call is an implicit durable suspension boundary; no await keyword
 Raw JSON is an explicit, runtime-checked **escape hatch**, never the default.
 Schemas are authoritative at remote and durable boundaries.
 
+### 4.1 Script deployment model (milestone 1)
+
+Microflows is a **standalone service**. Workflow scripts are hot-loadable `.mf`
+**source**, compiled at runtime into in-memory portable IR — never native
+binaries, and (in milestone 1) never persisted or reloaded as serialized IR.
+**The deployment environment owns workflow source revisions; `.mf` source files
+are the deployment artifacts.**
+
+This model is reached in two corrections from an initial sketch: loading is
+driven by an **explicit manifest** (not a directory scan), and Microflows
+**compiles from source on every startup** (it does not persist/reload compiler
+artifacts). The points below are the authoritative consolidation.
+
+**Source of truth — an explicit manifest, not a directory scan.** Microflows
+loads only the scripts a deployment manifest declares. Undeclared files in the
+same trees are ignored, so work-in-progress scripts coexist safely.
+
+```json
+{
+  "scripts": [
+    { "path": "/opt/microflows/scripts/refund.mf" },
+    { "directory": "/opt/microflows/scripts/settlement", "pattern": "*.mf" }
+  ]
+}
+```
+
+- Resolve only the manifest's declared files/directories. Normalize paths and
+  reject duplicates or conflicting script identities.
+- Explicit file paths are the preferred, higher-discipline form; `directory`
+  entries MUST carry a restrictive `pattern`.
+
+**Compile-on-startup; staged, atomic reload.**
+
+```text
+on startup:
+  load the configured manifest; compile the ENTIRE declared set into an
+    in-memory IR registry: parse, type-check, bind, verify each script.
+  startup FAILS if any declared file is missing, unreadable, or fails to
+    parse / type-check / bind / verify, or if identities conflict.
+
+on SIGHUP / SIGUSR1:
+  perform the same work in a STAGING registry.
+  reject the entire reload if ANY declared script fails — the active registry
+    is left untouched.
+  atomically swap staging -> active only after the complete set succeeds.
+```
+
+The active registry is an **immutable IR registry keyed by (script name,
+revision, content hash)**. Manifest + scripts are one deployment unit.
+
+**Revision pinning (no in-flight migration in milestone 1).**
+
+```text
+new workflows pin the newly active revision.
+running workflows keep their pinned revision; old IR is retained while still
+  referenced.
+compensation uses the checkpoint's pinned revision.
+the deployment environment MUST provide every revision active workflows need;
+  Microflows MUST NEVER silently substitute another revision.
+```
+
+**Identity & audit.** Content hashes identify loaded revisions (cryptographic
+IR signatures are not required in milestone 1). Reload audit records the
+manifest hash, every loaded script hash, and the supplied deployment / Git
+commit identifier. JSON is **not** the workflow language; serialized JSON IR is
+deferred.
+
+**Recommended production deployment.** A Git-managed script repository, with
+immutable release directories/worktrees named by commit and an atomic `current`
+symlink switch performed *before* signalling the service (directory rename or
+symlink swap — never an in-place edit of the live set). **Rollback** = point
+`current` at a known-good commit and signal Microflows.
+
+**Abstraction.** All of the above sits behind a `ScriptRegistry` interface, so a
+MariaDB-backed or administrative-API implementation can replace the filesystem
+manifest loader later without touching the executor.
+
+**Sequencing.** The current **manual IR** (§8.3a) remains correct for the
+feasibility slice. The parser and this filesystem manifest registry follow
+**after** the executor/recovery loop is proven — see §7.
+
 ---
 
 ## 5. Remote participant protocol (proposed minimum)
@@ -463,7 +544,15 @@ speculatively. Only the spike-independent control-state changes happen first.
 9  Generic REST dispatcher .......................... after the spike proves
      the model
 7  Parser + type checker ............................ after runtime proven
+10 Script deployment: manifest-driven ScriptRegistry
+     (compile-on-startup + staged SIGHUP reload) .... after 7; see §4.1
 ```
+
+**Script deployment (§4.1):** milestone 1 compiles `.mf` source from an explicit
+manifest into an in-memory IR registry on startup, with staged atomic
+SIGHUP/SIGUSR1 reload; no serialized IR is persisted. It follows the parser
+(step 7), which follows a proven executor/recovery loop. The manual IR (§8.3a)
+remains the spike's loader until then.
 
 The code/schema rename (`phasedrift`→`microflows`, `tb_pd_`/`sp_pd_`
 prefixes) folds into step 2a/2b and the next code touch, rather than a

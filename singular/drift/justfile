@@ -26,7 +26,19 @@ HEARTBEAT_SECS := "30"
 # Correctness gate: unit (parallel base/memcheck/asan, DB-free) + e2e (serial
 # base/asan/memcheck on the shared mdb114-a, each lane state-isolated via its own
 # per-run service_group). Requires DRIFT_TOOLCHAIN_ROOT and a running mdb114-a.
+# Binding test gate. A DIRECT run serializes its DB jobs per-job on the SHARED
+# host-global key (default). The singular UMBRELLA `test` instead holds that key
+# across the whole setup+DB-test phase and drives the private `_test-grouped` with
+# a NON-shared executor key, so the executor's per-job lock can't deadlock against
+# that outer hold (flocker is not re-entrant). The per-run key is a CONTROLLED
+# recipe arg, never an ambient env var.
 test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	just _test-grouped "mariadb-mdb114-a"
+
+# PRIVATE: binding test with an explicit executor serial DB key.
+_test-grouped DB_GROUP:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
@@ -35,7 +47,7 @@ test:
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
 	WORK="$(mktemp -d -t singular-test-XXXXXX)"
 	trap 'rm -rf "$WORK"' EXIT
-	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
+	python3 tools/emit_test_plan.py test --db-group "{{DB_GROUP}}" --out "$WORK/plan.json"
 	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
 
 # Raw-SQL / SP invariant regressions — focused DEV convenience. The certification path runs the SAME
@@ -208,6 +220,11 @@ deploy *ARGS: author-claim cert
 	  --dest "{{DEPLOY_DEST}}" \
 	  --package-root "{{_pkg-root}}" \
 	  ${EXTRA} {{ARGS}}
+
+# NOTE: no test-time lib deploy. Consumers that need this library for a test
+# (e.g. the cross-component integration suite) COMPILE against these sources
+# directly via driftc (--package-root for external deps only). `just deploy`
+# remains the signed RELEASE path.
 
 # --- Database ---
 # Singular does not own DB lifecycle. PushCoin provides the running MariaDB

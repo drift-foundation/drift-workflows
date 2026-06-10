@@ -1,0 +1,22 @@
+# Microflows coordinator runner — first dispatch slice (manual IR).
+_pkg-root := env("DRIFT_PKG_ROOT", env("HOME") + "/opt/drift/certified/current/libs")
+_pkg-local := "../build/dist/lib"
+BIN_DIR := "build/dist/bin"
+
+prepare:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
+	PKG_LOCAL="$(realpath -m "{{_pkg-local}}")"
+	"$DRIFT" prepare --package-root "$PKG_LOCAL" --package-root "{{_pkg-root}}"
+
+build:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
+	PKG_LOCAL="$(realpath -m "{{_pkg-local}}")"
+	mkdir -p "{{BIN_DIR}}"
+	"$DRIFT" build --package-root "$PKG_LOCAL" --package-root "{{_pkg-root}}" -o "{{BIN_DIR}}/microflows-runner"
+
+clean:
+	rm -rf build

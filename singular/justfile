@@ -16,6 +16,15 @@ DB_PORT := "34114"
 DB_USER := "root"
 DB_SCHEMA := "singular"
 MARIACHI := env("MARIACHI_BIN", "../../mariachi/.venv/bin/mariachi")
+# Shared host-global DB lock — same flocker key the test executor uses for its
+# serial DB jobs (group `mariadb-mdb114-a`), so a destructive reset here can't
+# overlap any gate's DB-backed execution on the one shared MariaDB instance.
+FLOCKER := env("DRIFT_TOOLCHAIN_ROOT", env("HOME") + "/opt/drift/certified/current/toolchain") + "/bin/flocker"
+DB_LOCK := "serial-mariadb-mdb114-a"
+# Executor serial DB key used WHILE the umbrella holds the shared lock across its
+# whole phase. Distinct from `mariadb-mdb114-a` so the binding executor's per-job
+# lock can't deadlock against the outer hold (flocker is not re-entrant).
+DB_HELD_GROUP := "mariadb-mdb114-a-held"
 
 # Build every implemented binding.
 build:
@@ -24,12 +33,30 @@ build:
 	echo "[singular] build drift binding"
 	( cd drift && just build )
 
-# Test every implemented binding (+ conformance once authored).
+# Test every implemented binding (+ conformance once authored). Owns its isolated
+# DB setup: loads the singular schema fresh first, so root `just test` never
+# depends on prior database state.
+# PUBLIC entry: acquire the shared host-global DB lock ONCE, then run the whole
+# setup+DB-test phase under it. Lock ownership is conveyed by recipe STRUCTURE
+# (this acquires it; private `_test-locked` is reachable only from here) — never
+# by a caller-settable env var. flocker REQUIRED; missing => hard error.
 test:
 	#!/usr/bin/env bash
 	set -euo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 -- just _test-locked
+
+# PRIVATE: the complete setup+DB-test phase. Runs ONLY under the shared lock held
+# by `test`. The binding's DB jobs take a non-shared serial key ({{DB_HELD_GROUP}})
+# so their per-job lock can't deadlock against the outer hold.
+_test-locked:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	echo "[singular] load schema"
+	just _db-load-schema
 	echo "[singular] test drift binding"
-	( cd drift && just test )
+	( cd drift && just _test-grouped "{{DB_HELD_GROUP}}" )
 
 # Foundation stress/perf gate stubs (populate as scenarios land).
 stress:
@@ -38,8 +65,24 @@ stress:
 perf:
 	@echo "[singular] no perf scenarios defined yet (gate stub)"
 
-# Apply the shared backend schema (db/) via Mariachi.
+# Apply the shared backend schema (db/) via Mariachi, AND load the isolated
+# malformed-backend fixture schema the binding's malformed_backend_test depends
+# on. The fixture is deliberately malformed (hand-built SPs returning literal
+# documents to drive the gateway's decode path), so it is NOT Mariachi-managed —
+# it DROP/CREATEs its own `singular_malformed` schema and is loaded raw. Without
+# this, a genuinely clean DB fails malformed_backend_test (it's in the test plan).
+# PUBLIC entry: acquire the shared DB lock, then run the private reset. flocker is
+# REQUIRED (ships with the toolchain); missing => hard error so a destructive reset
+# never runs unserialized.
 db-load-schema:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 -- just _db-load-schema
+
+# PRIVATE: the destructive reset + malformed-fixture load. Runs ONLY under the
+# shared lock (held by `db-load-schema` or `_test-locked`).
+_db-load-schema:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../../mariachi && just setup'" >&2; exit 1; }
@@ -49,3 +92,6 @@ db-load-schema:
 	  --host {{DB_HOST}} --port {{DB_PORT}} \
 	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
 	  apply --schema {{DB_SCHEMA}} --env=development --allow-destructive --destroy-database
+	echo "[singular] load malformed-backend fixture schema (singular_malformed)"
+	mariadb -h {{DB_HOST}} -P {{DB_PORT}} -u {{DB_USER}} -p"${MDB_ROOT_PWD}" \
+	  < drift/packages/singular/tests/fixtures/malformed_backend.sql

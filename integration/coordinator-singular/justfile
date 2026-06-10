@@ -1,0 +1,85 @@
+# Cross-component integration suite: Microflows coordinator <-> Singular participant.
+#
+# This suite OWNS its destructive, isolated setup: it resets BOTH schemas, builds
+# BOTH binaries, seeds the Microflows fixtures, and runs the harness. It is the
+# only place that legitimately reaches across components — that is the point of
+# living under integration/ rather than inside microflows/ or singular/.
+#
+# Invoked by the root aggregate gate (`just test`); independently runnable here.
+#
+# Prereqs: MariaDB up; MDB_ROOT_PWD set; Mariachi >= 1.0.0; DRIFT_TOOLCHAIN_ROOT
+# set (the shared executor + driftc). NO signing keys and NO deployed packages
+# are needed: this suite COMPILES both apps from current library source.
+
+DB_HOST := "127.0.0.1"
+DB_PORT := "34114"
+DB_USER := "root"
+HEARTBEAT_SECS := "30"
+MARIACHI := env("MARIACHI_BIN", "../../../mariachi/.venv/bin/mariachi")
+MF := "../../microflows"
+SG := "../../singular"
+# Host-global DB serialization: the same flocker key the shared executor uses for
+# its serial DB jobs (group `mariadb-mdb114-a`). Holding it across the reset +
+# harness keeps a destructive schema reset from ever overlapping another gate's
+# DB-backed execution on the one shared MariaDB instance.
+FLOCKER := env("DRIFT_TOOLCHAIN_ROOT", env("HOME") + "/opt/drift/certified/current/toolchain") + "/bin/flocker"
+DB_LOCK := "serial-mariadb-mdb114-a"
+
+# Cross-component E2E with destructive, isolated setup (dev-only schemas).
+test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../../../mariachi && just setup'" >&2; exit 1; }
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
+	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	WORK="$(mktemp -d -t coord-singular-XXXXXX)"
+	trap 'rm -rf "$WORK"' EXIT
+
+	# 1. COMPILE both apps from CURRENT source — runner against the Microflows
+	# library sources, stub against the Singular library sources; external deps
+	# from DRIFT_PKG_ROOT, verified against each app's committed trust store. No
+	# deploy, no signing, no author-claim mutation; a clean checkout builds.
+	# (DB-free — runs on the executor's compile pool, not the DB resource.)
+	echo "[integration] compile participant-stub + microflows-runner from source"
+	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
+	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
+
+	# 2+3. Schema reset + harness, held under ONE acquisition of the shared
+	# host-global DB lock so no destructive reset overlaps another gate's DB use.
+	# flocker is REQUIRED (ships with the toolchain); missing => hard error, never
+	# run destructive resets unserialized.
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	"{{FLOCKER}}" --key {{DB_LOCK}} -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _db-and-harness "$WORK"
+
+# Internal: the DB-touching phase (reset both schemas, then run the harness).
+# Always invoked under the shared DB lock by `test` — never run it standalone
+# during a concurrent gate.
+_db-and-harness WORK:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	echo "[integration] reset singular schema (clean participant store)"
+	"{{MARIACHI}}" \
+	  --schema-template "{{SG}}/db" \
+	  --host {{DB_HOST}} --port {{DB_PORT}} \
+	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  apply --schema singular --env=development --allow-destructive --destroy-database
+	echo "[integration] reset + seed microflows schema (coordinator-fixtures)"
+	"{{MARIACHI}}" \
+	  --schema-template "{{MF}}/db" \
+	  --host {{DB_HOST}} --port {{DB_PORT}} \
+	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  scenario --schema microflows --name coordinator-fixtures
+	echo "[integration] run coordinator<->singular harness"
+	STUB_BIN="{{WORK}}/participant-stub" RUNNER_BIN="{{WORK}}/microflows-runner" python3 test.py
+
+# No performance scenarios for this suite yet (explicit no-op, not a silent skip).
+perf:
+	@echo "[integration:coordinator-singular] no perf scenarios defined yet (gate stub)"
+
+# No stress/soak/recovery scenarios for this suite yet (explicit no-op).
+stress:
+	@echo "[integration:coordinator-singular] no stress scenarios defined yet (gate stub)"

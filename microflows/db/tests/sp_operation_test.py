@@ -126,6 +126,68 @@ def main():
     cur.execute("SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id=%s", (WF,))
     check("checkpoint_created", cur.fetchone()[0] == 1)
 
+    # claim_by_id / inspect on the now-completed workflow.
+    absent = os.urandom(16)
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (WF, EXEC, ts(10), "2026-02-01 12:30:00.000000"))
+    check("claim_by_id_terminal_not_claimable", r and r["outcome"] == "not_claimable", r)
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (absent, EXEC, ts(10), "2026-02-01 12:30:00.000000"))
+    check("claim_by_id_absent_not_found", r and r["outcome"] == "not_found", r)
+    _, r = call(cur, "sp_mf_workflow_inspect", (WF, ts(10)))
+    check("inspect_terminal", r and r["outcome"] == "found" and r["state"] == 4
+          and r["is_terminal"] == 1 and r["leased"] == 0, r)
+    _, r = call(cur, "sp_mf_workflow_inspect", (absent, ts(10)))
+    check("inspect_absent_not_found", r and r["outcome"] == "not_found", r)
+
+    # claim_by_id claims a fresh, due workflow and inspect then reports it leased.
+    wf2 = os.urandom(16)
+    call(cur, "sp_mf_workflow_create", (wf2, SCRIPT, 1, ts(0), ts(0), '{"pos":"start"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wf2, EXEC, ts(1), "2026-02-01 12:30:00.000000"))
+    check("claim_by_id_claims_due", r and r["outcome"] == "claimed"
+          and r["workflow_id"] == wf2.hex(), r)
+    _, r = call(cur, "sp_mf_workflow_inspect", (wf2, ts(1)))
+    check("inspect_active_leased", r and r["outcome"] == "found"
+          and r["is_terminal"] == 0 and r["leased"] == 1, r)
+    for t in ("tb_mf_workflow_event", "tb_mf_workflow"):
+        cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf2,))
+
+    # operation_result on the completed main workflow (local authoritative result).
+    _, r = call(cur, "sp_mf_operation_result", (WF, 1))
+    check("operation_result_succeeded", r and r["outcome"] == "succeeded" and r["result"] == {"sum": 1}, r)
+    _, r = call(cur, "sp_mf_operation_result", (WF, 99))
+    check("operation_result_not_found", r and r["outcome"] == "not_found", r)
+
+    # Fresh workflow wf3: a requested (unsettled) op, exact skew defer_until, and
+    # release fence-loss.
+    wf3 = os.urandom(16)
+    T = lambda s: f"2026-02-01 13:00:{s:02d}.000000"  # noqa: E731
+    OPID3 = bytes.fromhex("00000000000000000000000000000c33")
+    call(cur, "sp_mf_workflow_create", (wf3, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wf3, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    tok3 = r["fencing_token"]
+    _, r = call(cur, "sp_mf_operation_request",
+                (wf3, EXEC, tok3, 1, OPID3, "echo-transform", '{"values":[2]}', "h3", '{"pos":"d"}', T(2), "{}"))
+    check("wf3_request", r and r["outcome"] == "requested", r)
+    _, r = call(cur, "sp_mf_operation_result", (wf3, 1))
+    check("operation_result_requested", r and r["outcome"] == "requested", r)
+
+    # current_event_ts is now T(2); a non-increasing event_ts defers to T(2)+5s.
+    _, r = call(cur, "sp_mf_operation_request",
+                (wf3, EXEC, tok3, 2, bytes.fromhex("00000000000000000000000000000c34"),
+                 "echo-transform", '{"values":[3]}', "h4", '{"pos":"d"}', T(2), "{}"))
+    check("request_skew_defer_until", r and r["outcome"] == "event_time_skew"
+          and r["defer_until"] == "2026-02-01 13:00:07.000000", r)
+    _, r = call(cur, "sp_mf_operation_settle",
+                (wf3, EXEC, tok3, 1, OPID3, 1, '{"sum":2}', '{"sum":2}', '{"pos":"done"}', T(2), "{}"))
+    check("settle_skew_defer_until", r and r["outcome"] == "event_time_skew"
+          and r["defer_until"] == "2026-02-01 13:00:07.000000", r)
+
+    # release with a wrong token -> fence_lost (the runner maps this to a distinct
+    # defer_failed, never reporting a committed defer).
+    _, r = call(cur, "sp_mf_workflow_release", (wf3, EXEC, 999, T(3), T(4)))
+    check("release_fence_lost", r and r["outcome"] == "fence_lost", r)
+    for t in ("tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+        cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf3,))
+
     # status/result table invariant: requested + result must be rejected.
     try:
         cur.execute(
@@ -142,7 +204,7 @@ def main():
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (WF,))
     conn.close()
 
-    total = 15
+    total = 28
     print(f"sp_operation regression: {total - len(failures)}/{total} passed")
     return 1 if failures else 0
 

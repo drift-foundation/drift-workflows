@@ -17,3 +17,4 @@ microflows/perf/results/
 
 # Temp DB instances
 **/tmp_db_instances/
+microflows/runner/build

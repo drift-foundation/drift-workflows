@@ -49,7 +49,11 @@ struct StubApp {
 	// actually executes (the start()=Granted branch). The harness asserts this
 	// stays 1 across replays — proving effectively-once EXECUTION, not merely
 	// result replay (the stored result is a fixed document and proves nothing).
-	exec_count: conc.AtomicInt
+	exec_count: conc.AtomicInt,
+	// Total inbound operation requests (every PUT or GET on an operation route).
+	// Lets the harness assert that a blocked/terminal re-run makes NO participant
+	// request at all — a stronger property than "no body executed".
+	request_count: conc.AtomicInt
 }
 
 const SUPPORTED_OPERATION: String = "echo-transform";
@@ -114,7 +118,8 @@ fn _run(config_path: String, port_cli: Optional<Int>, service_group_default: Str
 	val singular_sub = _require_singular(&cfg);
 	val gateway = _build_singular_gw(&singular_sub, &service_group, &worker_id);
 
-	val app = conc.arc(StubApp(gateway = move gateway, service_group = move service_group, exec_count = conc.atomic_int(0)));
+	val app = conc.arc(StubApp(gateway = move gateway, service_group = move service_group,
+	                           exec_count = conc.atomic_int(0), request_count = conc.atomic_int(0)));
 
 	var ab = rest.new_app_builder();
 	rest.bind(ab, "0.0.0.0", port);
@@ -140,6 +145,11 @@ fn _run(config_path: String, port_cli: Optional<Int>, service_group_default: Str
 		|req, ctx| captures(share app) => {
 			val a = app.get();
 			return a.handle_exec_count(req, ctx);
+		}).or_throw();
+	rest.add_route_group_throws_route(web_app, debug_rg, "GET", "/request-count",
+		|req, ctx| captures(share app) => {
+			val a = app.get();
+			return a.handle_request_count(req, ctx);
 		}).or_throw();
 
 	console.println("participant-stub listening on " + fmt.format_int(port));
@@ -177,6 +187,7 @@ implement StubApp {
 
 	// PUT — idempotent creation at a caller-assigned operation id.
 	pub fn handle_put(self: &StubApp, req: &rest.Request, ctx: &mut rest.Context) throws -> rest.Response {
+		val _rc = self.request_count.fetch_add(1, conc.MemoryOrder::SeqCst());
 		val op = rest.path_param(req, "operation").or_throw();
 		val op_id = rest.path_param(req, "operation_id").or_throw();
 		if req.body.byte_length() == 0 {
@@ -207,11 +218,29 @@ implement StubApp {
 
 		match self.gateway.get().start(&key, &item_meta, &"{}", LEASE_TIMEOUT_SECONDS, &token) {
 			singular.StartOutcome::Granted(lease) => {
+				// Fault injection: RESPOND-PENDING. Simulate accepted-but-not-terminal
+				// by returning 202 without completing. The lease drops, leaving the op
+				// permanently Working: there is NO reclaim or asynchronous-completion
+				// path yet, so this exercises only the runner's INITIAL pending
+				// deferral, not end-to-end pending recovery. No body execution, so
+				// exec_count is unchanged.
+				if _fault_respond_pending(input) {
+					return _json(202, _envelope_pending());
+				}
 				// First submit: run the operation body EXACTLY ONCE.
 				val _prev = self.exec_count.fetch_add(1, conc.MemoryOrder::SeqCst());
 				val result_json = _echo_transform(input);
 				match self.gateway.get().complete(&lease, &result_json) {
 					singular.SettleOutcome::Settled(tr) => {
+						// Fault injection: DROP-AFTER-COMMIT. The result is already
+						// durably committed above; sleeping past the client's PUT
+						// timeout makes the client experience a genuine uncertain
+						// outcome (timeout) — a real lost ack, not a discarded
+						// known response. The operation still executed exactly once.
+						val delay_ms = _fault_delay_after_commit_ms(input);
+						if delay_ms > 0 {
+							val _ = conc.sleep(conc.Duration(millis = delay_ms));
+						}
 						return _json(200, _envelope_terminal(&tr));
 					},
 					default => {
@@ -251,8 +280,17 @@ implement StubApp {
 		return _json(200, json.encode(o.to_node()));
 	}
 
+	// GET /debug/request-count -> { "count": N } : total inbound operation requests.
+	pub fn handle_request_count(self: &StubApp, req: &rest.Request, ctx: &mut rest.Context) throws -> rest.Response {
+		val n = self.request_count.load(conc.MemoryOrder::SeqCst());
+		var o = json.new_object();
+		o.set("count", json.JsonNode::Number(fmt.format_int(n)));
+		return _json(200, json.encode(o.to_node()));
+	}
+
 	// GET — durable status/result lookup.
 	pub fn handle_get(self: &StubApp, req: &rest.Request, ctx: &mut rest.Context) throws -> rest.Response {
+		val _rc = self.request_count.fetch_add(1, conc.MemoryOrder::SeqCst());
 		val op = rest.path_param(req, "operation").or_throw();
 		val op_id = rest.path_param(req, "operation_id").or_throw();
 		val key = _op_key(&op, &op_id);
@@ -295,6 +333,35 @@ implement StubApp {
 // execution_count is fixed at 1: the work runs exactly once (only on the
 // Granted branch); replays return this stored result unchanged, proving
 // effectively-once execution.
+// Optional test-only fault directive: input._fault.delay_after_commit_ms.
+// Ignored by validation and the transform; used only to inject a real
+// uncertain outcome (drop-after-commit) for lost-ack testing.
+// Optional test-only fault: input._fault.respond_pending -> return 202 (working)
+// without committing, to exercise the coordinator's pending/defer path.
+fn _fault_respond_pending(input: &json.JsonNode) nothrow -> Bool {
+	match input.get(&"_fault") {
+		Optional::Some(f) => {
+			match f.get(&"respond_pending") {
+				Optional::Some(n) => { match n.as_bool() { Optional::Some(v) => { return v; }, Optional::None => { return false; } } },
+				Optional::None => { return false; }
+			}
+		},
+		Optional::None => { return false; }
+	}
+}
+
+fn _fault_delay_after_commit_ms(input: &json.JsonNode) nothrow -> Int {
+	match input.get(&"_fault") {
+		Optional::Some(f) => {
+			match f.get(&"delay_after_commit_ms") {
+				Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { return v; }, Optional::None => { return 0; } } },
+				Optional::None => { return 0; }
+			}
+		},
+		Optional::None => { return 0; }
+	}
+}
+
 fn _echo_transform(input: &json.JsonNode) -> String {
 	// Precondition: _validate_echo(input) is true (checked before start()).
 	var sum: Int = 0;

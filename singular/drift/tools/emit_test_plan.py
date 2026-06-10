@@ -56,6 +56,11 @@ PKG_ROOT = os.path.abspath(os.environ.get(
 # Host-global mutex key naming the shared MariaDB *instance* (mdb114-a @ :34114).
 # Must match other consumers' string (mariadb-client) to serialize across suites
 # on the one physical box — resource contention, not state (A1 isolates state).
+# This DEFAULT serializes a direct executor run on the shared resource. An
+# orchestrator that already holds the shared lock across a wider setup+DB-test
+# phase passes a non-shared key via the `--db-group` CLI flag (a CONTROLLED arg
+# from the locked recipe — never an ambient env var), so the executor's per-job
+# lock can't deadlock against that outer hold (flocker is not re-entrant).
 DB_GROUP = "mariadb-mdb114-a"
 
 # DB-free unit tests (globbed for executable `fn main` entries).
@@ -221,11 +226,16 @@ def emit_compile(rel):
 
 
 def main():
+    global DB_GROUP
     ap = argparse.ArgumentParser(description="Emit a drift_test_run.py plan for a Singular gate.")
     ap.add_argument("gate", choices=["test", "one", "compile"])
     ap.add_argument("--file", help="test/source file (for one|compile)")
     ap.add_argument("--out", default="-", help="output path for the plan JSON (default: stdout)")
+    ap.add_argument("--db-group", default=DB_GROUP,
+                    help="serial flocker group for DB-backed jobs (default: the shared host-global "
+                         "key; a locked phase passes a non-shared key to avoid self-deadlock)")
     args = ap.parse_args()
+    DB_GROUP = args.db_group
     if args.gate in ("one", "compile"):
         if not args.file:
             sys.exit("error: --file required for one|compile")

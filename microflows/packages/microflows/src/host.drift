@@ -47,7 +47,16 @@ export {
 	CreateOutcome,
 	ClaimOutcome,
 	HeartbeatOutcome,
-	ReleaseOutcome
+	ReleaseOutcome,
+	ClaimByIdOutcome,
+	WorkflowSnapshot,
+	WorkflowInspectOutcome,
+	OperationRequestOutcome,
+	OperationSettleOutcome,
+	OperationResultOutcome,
+	OperationFailOutcome,
+	OperationRequestRecord,
+	OperationRequestGetOutcome
 };
 
 // ===== Identity =====
@@ -65,12 +74,15 @@ pub fn identity_from_worker_name(worker_name: &String) nothrow -> ExecutorIdenti
 
 // ===== Result shapes =====
 
-// A database clock reading (§24.4): `now` plus a lease deadline derived from
-// it server-side. Both are datetime(6) literals ("YYYY-MM-DD HH:MM:SS.ffffff")
-// passed onward as explicit, retry-fixed command parameters.
+// A database clock reading (§24.4): `now` plus an absolute deadline `now +
+// lease_seconds` derived server-side. `deadline` is NEUTRAL — the caller decides
+// what it bounds (a lease expiry for claim/heartbeat, OR a next-attempt time for
+// a voluntary deferral), so retry scheduling is not coupled to lease duration.
+// Both are datetime(6) literals ("YYYY-MM-DD HH:MM:SS.ffffff") passed onward as
+// explicit, retry-fixed command parameters.
 pub struct ClockReading {
 	pub now: String,
-	pub lease_expires_at: String
+	pub deadline: String
 }
 
 // The claimed snapshot: everything an executor needs to resume from the
@@ -99,11 +111,98 @@ pub variant ClaimOutcome {
 	NoneDue
 }
 
+// claim_workflow: claim ONE specific workflow by id. NotClaimable = exists but
+// leased / not due / terminal (inspect to distinguish); NotFound = absent.
+pub variant ClaimByIdOutcome {
+	Claimed(wf: ClaimedWorkflow),
+	NotClaimable,
+	NotFound
+}
+
+// A read-only workflow snapshot (inspect_workflow) — enough to distinguish
+// terminal vs active(leased) vs claimable/deferred vs absent.
+pub struct WorkflowSnapshot {
+	pub state_code: Int,             // microflows.state storage code
+	pub execution_direction: Int,
+	pub current_disposition: Int,
+	pub is_terminal: Bool,
+	pub leased: Bool,                // an unexpired lease is held at db_now
+	pub continuation_json: String
+}
+
+pub variant WorkflowInspectOutcome {
+	Found(snapshot: WorkflowSnapshot),
+	NotFound
+}
+
 // Fenced lease operations: FenceLost covers every mismatch (wrong owner,
 // stale token, expired lease, non-claimable state) — a stale worker learns
 // only that it can no longer publish.
 pub variant HeartbeatOutcome { Extended, FenceLost, NotFound }
 pub variant ReleaseOutcome { Released, FenceLost, NotFound }
+
+// Operation request (persist request + suspended continuation before dispatch).
+// FenceLost is fence-first (a stale executor must NOT receive Exists and
+// dispatch). OperationConflict = same (workflow_id, operation_seq) with
+// different immutable fields. EventTimeSkew = non-increasing event_ts.
+pub variant OperationRequestOutcome {
+	Requested(operation_id: Array<Byte>),
+	Exists(operation_id: Array<Byte>),
+	OperationConflict,
+	FenceLost,
+	NotFound,
+	// defer_until = current_event_ts + margin (the deferral deadline).
+	EventTimeSkew(defer_until: String)
+}
+
+// operation_result: the LOCAL authoritative result (participant-independent),
+// so a completed workflow stays inspectable when the participant is down.
+pub variant OperationResultOutcome {
+	Succeeded(result_json: String),
+	Requested,
+	NotFound
+}
+
+// operation_fail: durable non-retryable failure -> blocked_resolution. Blocked
+// is the committed transition; AlreadyBlocked is the idempotent replay.
+pub variant OperationFailOutcome {
+	Blocked,
+	AlreadyBlocked,
+	OperationConflict,
+	FenceLost,
+	NotFound,
+	OperationNotFound,
+	EventTimeSkew(defer_until: String)
+}
+
+// The durable operation request — authoritative for recovery (a resuming worker
+// uses this, never re-derives from CLI input).
+pub struct OperationRequestRecord {
+	pub operation_id: Array<Byte>,
+	pub operation_name: String,
+	pub input_json: String,
+	pub input_hash: String,
+	pub status: Int
+}
+
+pub variant OperationRequestGetOutcome {
+	Found(record: OperationRequestRecord),
+	NotFound
+}
+
+// Operation settle (record success + checkpoint + advance continuation +
+// complete workflow). AlreadySettled.result is AUTHORITATIVE — the caller must
+// use it, never its submitted result. Identify-first then idempotent-read
+// before fence (settle clears the lease).
+pub variant OperationSettleOutcome {
+	Settled(result_json: String),
+	AlreadySettled(result_json: String),
+	OperationConflict,
+	FenceLost,
+	NotFound,
+	OperationNotFound,
+	EventTimeSkew(defer_until: String)
+}
 
 // ===== Error surface =====
 
@@ -189,13 +288,40 @@ pub interface MicroflowsHost {
 	// lease_expires_at come from clock_read, fixed for this command.
 	fn claim_next(self: &Self, script_name: &String, db_now: &String,
 	              lease_expires_at: &String) -> ClaimOutcome;
+	// Claim ONE specific workflow by id (no wrong-workflow claims).
+	fn claim_workflow(self: &Self, workflow_id: &Array<Byte>, db_now: &String,
+	                  lease_expires_at: &String) -> ClaimByIdOutcome;
+	// Read-only workflow inspection (terminal/active/deferred/absent).
+	fn inspect_workflow(self: &Self, workflow_id: &Array<Byte>, db_now: &String) -> WorkflowInspectOutcome;
 	// Fenced lease extension (§24.5).
 	fn heartbeat(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
 	             db_now: &String, lease_expires_at: &String) -> HeartbeatOutcome;
 	// Fenced voluntary release with explicit next due time (backoff lives on
 	// the row, §24.5).
 	fn release(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
-	           db_now: &String, next_attempt_at: &String) -> ReleaseOutcome
+	           db_now: &String, next_attempt_at: &String) -> ReleaseOutcome;
+	// Persist an operation request + the suspended continuation, atomically,
+	// BEFORE dispatch. Fenced (fence-first). Idempotent by (workflow_id,
+	// operation_seq); command-identity-checked.
+	fn operation_request(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                     operation_seq: Int, operation_id: &Array<Byte>, operation_name: &String,
+	                     input_json: &String, input_hash: &String, new_continuation: &String,
+	                     event_ts: &String, event_payload: &String) -> OperationRequestOutcome;
+	// Record a durable operation SUCCESS + Checkpoint + advanced continuation,
+	// completing the workflow, atomically. Fenced; identify-first; idempotent
+	// (AlreadySettled.result is authoritative).
+	fn operation_settle(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                    operation_seq: Int, operation_id: &Array<Byte>, checkpoint_seq: Int,
+	                    result_json: &String, checkpoint_payload: &String, new_continuation: &String,
+	                    event_ts: &String, event_payload: &String) -> OperationSettleOutcome;
+	// Read the LOCAL authoritative operation result (participant-independent).
+	fn operation_result(self: &Self, workflow_id: &Array<Byte>, operation_seq: Int) -> OperationResultOutcome;
+	// Durable non-retryable failure: forward -> blocked_resolution (fenced).
+	fn operation_fail(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                  operation_seq: Int, operation_id: &Array<Byte>, new_continuation: &String,
+	                  event_ts: &String, event_payload: &String) -> OperationFailOutcome;
+	// Load the durable operation request (authoritative for recovery).
+	fn operation_request_get(self: &Self, workflow_id: &Array<Byte>, operation_seq: Int) -> OperationRequestGetOutcome
 }
 
 // ===== Builder =====
@@ -470,8 +596,10 @@ implement MicroflowsHost for HostImpl {
 			val outcome = _doc_outcome(&doc);
 			if outcome == "ok" {
 				val now = _doc_str_req(&doc, &"now", "clock-no-now");
-				val expires = _doc_str_req(&doc, &"lease_expires_at", "clock-no-expiry");
-				return ClockReading(now = move now, lease_expires_at = move expires);
+				// SP doc key stays "lease_expires_at" (its server-side name); the
+				// host surfaces it as the neutral `deadline`.
+				val deadline = _doc_str_req(&doc, &"lease_expires_at", "clock-no-expiry");
+				return ClockReading(now = move now, deadline = move deadline);
 			}
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:clock_read"));
 		} catch managed:ManagedError(e) {
@@ -623,6 +751,289 @@ implement MicroflowsHost for HostImpl {
 			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
 		}
 	}
+
+	pub fn operation_request(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                         operation_seq: Int, operation_id: &Array<Byte>, operation_name: &String,
+	                         input_json: &String, input_hash: &String, new_continuation: &String,
+	                         event_ts: &String, event_payload: &String) -> OperationRequestOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("operation_id", operation_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
+		_validate_nonempty("operation_name", operation_name);
+		_validate_nonempty("input_hash", input_hash);
+		_validate_nonempty("event_ts", event_ts);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(operation_seq));
+			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
+			args.push(rpc.arg_string(_dup(operation_name)));
+			args.push(_json_object_arg("input_json", input_json));
+			args.push(rpc.arg_string(_dup(input_hash)));
+			args.push(_json_object_arg("continuation", new_continuation));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(_meta_object_arg("event_payload", event_payload));
+			val sp: String = "sp_mf_operation_request";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "requested" {
+				val hex = _doc_str_req(&doc, &"operation_id", "request-no-opid");
+				return OperationRequestOutcome::Requested(_hex16("request-opid-hex", &hex));
+			}
+			if outcome == "exists" {
+				val hex = _doc_str_req(&doc, &"operation_id", "request-no-opid");
+				return OperationRequestOutcome::Exists(_hex16("request-opid-hex", &hex));
+			}
+			if outcome == "operation_conflict" { return OperationRequestOutcome::OperationConflict(); }
+			if outcome == "fence_lost" { return OperationRequestOutcome::FenceLost(); }
+			if outcome == "not_found" { return OperationRequestOutcome::NotFound(); }
+			if outcome == "event_time_skew" {
+				return OperationRequestOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "request-no-defer-until"));
+			}
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_request"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn operation_settle(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                        operation_seq: Int, operation_id: &Array<Byte>, checkpoint_seq: Int,
+	                        result_json: &String, checkpoint_payload: &String, new_continuation: &String,
+	                        event_ts: &String, event_payload: &String) -> OperationSettleOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("operation_id", operation_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
+		if checkpoint_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "checkpoint_seq")); }
+		_validate_nonempty("event_ts", event_ts);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(operation_seq));
+			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
+			args.push(rpc.arg_int(checkpoint_seq));
+			args.push(_json_object_arg("result_json", result_json));
+			args.push(_json_object_arg("checkpoint_payload", checkpoint_payload));
+			args.push(_json_object_arg("continuation", new_continuation));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(_meta_object_arg("event_payload", event_payload));
+			val sp: String = "sp_mf_operation_settle";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "settled" {
+				return OperationSettleOutcome::Settled(_doc_object_text_req(&doc, &"result"));
+			}
+			if outcome == "already_settled" {
+				return OperationSettleOutcome::AlreadySettled(_doc_object_text_req(&doc, &"result"));
+			}
+			if outcome == "operation_conflict" { return OperationSettleOutcome::OperationConflict(); }
+			if outcome == "fence_lost" { return OperationSettleOutcome::FenceLost(); }
+			if outcome == "not_found" { return OperationSettleOutcome::NotFound(); }
+			if outcome == "operation_not_found" { return OperationSettleOutcome::OperationNotFound(); }
+			if outcome == "event_time_skew" {
+				return OperationSettleOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "settle-no-defer-until"));
+			}
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_settle"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn claim_workflow(self: &HostImpl, workflow_id: &Array<Byte>, db_now: &String,
+	                      lease_expires_at: &String) -> ClaimByIdOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_nonempty("db_now", db_now);
+		_validate_nonempty("lease_expires_at", lease_expires_at);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_string(_dup(db_now)));
+			args.push(rpc.arg_string(_dup(lease_expires_at)));
+			val sp: String = "sp_mf_workflow_claim_by_id";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "not_found" { return ClaimByIdOutcome::NotFound(); }
+			if outcome == "not_claimable" { return ClaimByIdOutcome::NotClaimable(); }
+			if outcome == "claimed" { return ClaimByIdOutcome::Claimed(_parse_claimed(&doc)); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:claim_workflow"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn inspect_workflow(self: &HostImpl, workflow_id: &Array<Byte>, db_now: &String) -> WorkflowInspectOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_nonempty("db_now", db_now);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_string(_dup(db_now)));
+			val sp: String = "sp_mf_workflow_inspect";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "not_found" { return WorkflowInspectOutcome::NotFound(); }
+			if outcome == "found" {
+				val state_code = _doc_int_req(&doc, &"state", "inspect-no-state");
+				val direction = _doc_int_req(&doc, &"execution_direction", "inspect-no-direction");
+				val disp = _doc_int_req(&doc, &"current_disposition", "inspect-no-disposition");
+				val terminal = _doc_int_req(&doc, &"is_terminal", "inspect-no-terminal");
+				val leased = _doc_int_req(&doc, &"leased", "inspect-no-leased");
+				val continuation = _doc_object_text_req(&doc, &"continuation");
+				return WorkflowInspectOutcome::Found(WorkflowSnapshot(
+					state_code = state_code,
+					execution_direction = direction,
+					current_disposition = disp,
+					is_terminal = terminal != 0,
+					leased = leased != 0,
+					continuation_json = move continuation
+				));
+			}
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:inspect_workflow"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn operation_result(self: &HostImpl, workflow_id: &Array<Byte>, operation_seq: Int) -> OperationResultOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_int(operation_seq));
+			val sp: String = "sp_mf_operation_result";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "succeeded" { return OperationResultOutcome::Succeeded(_doc_object_text_req(&doc, &"result")); }
+			if outcome == "requested" { return OperationResultOutcome::Requested(); }
+			if outcome == "not_found" { return OperationResultOutcome::NotFound(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_result"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn operation_fail(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                      operation_seq: Int, operation_id: &Array<Byte>, new_continuation: &String,
+	                      event_ts: &String, event_payload: &String) -> OperationFailOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("operation_id", operation_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
+		_validate_nonempty("event_ts", event_ts);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(operation_seq));
+			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
+			args.push(_json_object_arg("continuation", new_continuation));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(_meta_object_arg("event_payload", event_payload));
+			val sp: String = "sp_mf_operation_fail";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "blocked" { return OperationFailOutcome::Blocked(); }
+			if outcome == "already_blocked" { return OperationFailOutcome::AlreadyBlocked(); }
+			if outcome == "operation_conflict" { return OperationFailOutcome::OperationConflict(); }
+			if outcome == "fence_lost" { return OperationFailOutcome::FenceLost(); }
+			if outcome == "not_found" { return OperationFailOutcome::NotFound(); }
+			if outcome == "operation_not_found" { return OperationFailOutcome::OperationNotFound(); }
+			if outcome == "event_time_skew" {
+				return OperationFailOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "fail-no-defer-until"));
+			}
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_fail"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn operation_request_get(self: &HostImpl, workflow_id: &Array<Byte>, operation_seq: Int) -> OperationRequestGetOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_int(operation_seq));
+			val sp: String = "sp_mf_operation_request_get";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "not_found" { return OperationRequestGetOutcome::NotFound(); }
+			if outcome == "found" {
+				val op_hex = _doc_str_req(&doc, &"operation_id", "reqget-no-opid");
+				val op_id = _hex16("reqget-opid-hex", &op_hex);
+				val op_name = _doc_str_req(&doc, &"operation_name", "reqget-no-name");
+				val input_json = _doc_object_text_req(&doc, &"input_json");
+				val input_hash = _doc_str_req(&doc, &"input_hash", "reqget-no-hash");
+				val status = _doc_int_req(&doc, &"status", "reqget-no-status");
+				return OperationRequestGetOutcome::Found(OperationRequestRecord(
+					operation_id = move op_id,
+					operation_name = move op_name,
+					input_json = move input_json,
+					input_hash = move input_hash,
+					status = status
+				));
+			}
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_request_get"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+}
+
+// Parse a 'claimed' result document into a ClaimedWorkflow.
+fn _parse_claimed(doc: &json.JsonNode) -> ClaimedWorkflow {
+	val wf_hex = _doc_str_req(doc, &"workflow_id", "claim-no-workflow-id");
+	val wf_id = _hex16("claim-workflow-id-hex", &wf_hex);
+	val fencing = _doc_int_req(doc, &"fencing_token", "claim-no-fencing");
+	val state_code = _doc_int_req(doc, &"state", "claim-no-state");
+	val direction = _doc_int_req(doc, &"execution_direction", "claim-no-direction");
+	val disp = _doc_int_req(doc, &"current_disposition", "claim-no-disposition");
+	val sname = _doc_str_req(doc, &"script_name", "claim-no-script-name");
+	val srev = _doc_int_req(doc, &"script_revision", "claim-no-script-revision");
+	val eseq = _doc_int_req(doc, &"current_event_seq", "claim-no-event-seq");
+	val attempt = _doc_int_req(doc, &"current_operation_attempt", "claim-no-attempt");
+	val continuation = _doc_object_text_req(doc, &"continuation");
+	return ClaimedWorkflow(
+		workflow_id = move wf_id,
+		fencing_token = fencing,
+		state_code = state_code,
+		execution_direction = direction,
+		current_disposition = disp,
+		script_name = move sname,
+		script_revision = srev,
+		current_event_seq = eseq,
+		current_operation_attempt = attempt,
+		continuation_json = move continuation
+	);
 }
 
 implement core.Destructible for HostImpl {

@@ -83,8 +83,8 @@ fn scenario_clock_read() -> Int {
 	val h = _build_host(&"pd-lease-w1");
 	val reading = h.get().clock_read(30);
 	if reading.now.byte_length() == 0 { return 101; }
-	if reading.lease_expires_at.byte_length() == 0 { return 102; }
-	if reading.now == reading.lease_expires_at { return 103; }
+	if reading.deadline.byte_length() == 0 { return 102; }
+	if reading.now == reading.deadline { return 103; }
 	return 0;
 }
 

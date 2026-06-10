@@ -123,8 +123,12 @@ proc:BEGIN
 	END IF;
 
 	-- Strictly increasing event time; a non-increasing value is clock skew.
+	-- Expose a deferral deadline based on the LAST ACCEPTED event time (not
+	-- db_now): defer until current_event_ts + margin, so retrying before the
+	-- clock catches up cannot repeat the same skew.
 	IF arg_event_ts <= v_event_ts THEN
-		SELECT JSON_OBJECT('outcome', 'event_time_skew') AS result;
+		SELECT JSON_OBJECT('outcome', 'event_time_skew',
+			'defer_until', DATE_FORMAT(v_event_ts + INTERVAL 5 SECOND, '%Y-%m-%d %H:%i:%s.%f')) AS result;
 		LEAVE proc;
 	END IF;
 

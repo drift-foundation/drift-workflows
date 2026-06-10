@@ -1,0 +1,656 @@
+// Microflows coordinator runner — first dispatch slice (manual IR).
+//
+// Drives ONE echo-transform operation through the dispatch-gap recovery loop,
+// proving the central property without the language frontend:
+//
+//   manual IR -> persist operation request + suspended continuation (BEFORE
+//   dispatch) -> HTTP PUT -> [lost response] -> GET by stable operation id
+//   -> persist success + Checkpoint + advanced continuation -> workflow done
+//
+// MANUAL IR (hardcoded; no parser): workflow `protocol_spike` rev 1, one
+// operation `echo-transform` whose input comes from --input.
+//
+// Two enforced runner requirements:
+//   1. on operation_settle AlreadySettled, the returned stored result is
+//      AUTHORITATIVE — we use it, never our submitted result.
+//   2. on operation_request FenceLost, STOP immediately — do NOT dispatch.
+//
+// One-shot CLI: runs the slice for one workflow id and prints a result JSON.
+//   --config FILE  (db subtree) --participant-url URL --workflow-id HEX
+//   [--operation NAME] [--input JSON] [--lose-put-response]
+
+module microflows.runner;
+
+import std.core as core;
+import std.core.arc as arc;
+import std.console as console;
+import std.json as json;
+import std.format as fmt;
+import std.concurrent as conc;
+import std.io as io;
+import std.cli as cli;
+import std.codec as codec;
+import std.uuid as uuid;
+import microflows.host as mf;
+import web.client as client;
+
+const SCRIPT_NAME: String = "protocol_spike";
+const SCRIPT_REVISION: Int = 1;
+const OPERATION_SEQ: Int = 1;
+const CHECKPOINT_SEQ: Int = 1;
+const LEASE_SECONDS: Int = 30;
+// Pending-retry policy (relative): how soon a durably-deferred pending operation
+// becomes due again. Independent of LEASE_SECONDS — retry scheduling must NOT be
+// coupled to lease duration. The DB clock turns this into an ABSOLUTE deadline.
+const PENDING_RETRY_SECONDS: Int = 1;
+const PUT_IO_TIMEOUT_MS: Int = 3000;
+const RECONCILE_IO_TIMEOUT_MS: Int = 8000;
+
+// microflows.state terminal storage codes.
+const STATE_COMPLETED: Int = 4;
+const STATE_REVERSED: Int = 5;
+const STATE_RESOLVED_EXCEPTION: Int = 6;
+
+pub error RunnerError { message: String }
+
+fn main(argv: Array<String>) nothrow -> Int {
+	var p = cli.parser("microflows-runner", "0.1.0", "Microflows coordinator runner (first slice)");
+	val _ = p.option_string("config", "c", "FILE", "JSON config with a `db` subtree", true);
+	val _ = p.option_string("participant-url", "u", "URL", "participant base URL", true);
+	val _ = p.option_string("workflow-id", "w", "HEX", "32-hex-char workflow id", true);
+	val _ = p.option_string("operation", "o", "NAME", "operation name (default echo-transform)", false);
+	val _ = p.option_string("input", "i", "JSON", "operation input (default {\"values\":[1,2,3]})", false);
+
+	var config_path: String = "";
+	var participant_url: String = "";
+	var workflow_hex: String = "";
+	var operation_name: String = "echo-transform";
+	var input_json: String = "{\"values\":[1,2,3]}";
+
+	match p.parse(argv) {
+		core.Result::Ok(parsed) => {
+			match parsed.get_string("config", p) { Some(v) => { config_path = _dup(v); }, None => {} }
+			match parsed.get_string("participant-url", p) { Some(v) => { participant_url = _dup(v); }, None => {} }
+			match parsed.get_string("workflow-id", p) { Some(v) => { workflow_hex = _dup(v); }, None => {} }
+			match parsed.get_string("operation", p) { Some(v) => { operation_name = _dup(v); }, None => {} }
+			match parsed.get_string("input", p) { Some(v) => { input_json = _dup(v); }, None => {} }
+		},
+		core.Result::Err(_) => {
+			console.eprintln("runner: bad arguments");
+			return 2;
+		}
+	}
+	if config_path.byte_length() == 0 or participant_url.byte_length() == 0 or workflow_hex.byte_length() != 32 {
+		console.eprintln("runner: --config, --participant-url, and a 32-hex --workflow-id are required");
+		return 2;
+	}
+
+	return try _run(&config_path, &participant_url, &workflow_hex, &operation_name, &input_json) catch {
+		console.eprintln("runner: fatal");
+		1
+	};
+}
+
+fn _run(config_path: &String, participant_url: &String, workflow_hex: &String,
+        operation_name: &String, input_json: &String) throws -> Int {
+	val cfg = _load_config_json(config_path);
+	val db_sub = _require_db(&cfg);
+	val worker_id = _config_str(&cfg, &"worker_id", "runner-1");
+
+	val identity = mf.identity_from_worker_name(&worker_id);
+	var b = mf.new_host_builder();
+	mf.with_json(&mut b, &db_sub);
+	mf.with_identity(&mut b, move identity);
+	val host = _build_host(move b);
+
+	val workflow_id = _hex_to_bytes(workflow_hex);
+	// Derive the operation id from the CANONICAL lowercase hex of the decoded
+	// workflow bytes (not the supplied hex spelling), so upper/lower spellings
+	// of the same workflow yield the same operation id.
+	val workflow_canon_hex = _bytes_to_hex(&workflow_id);
+	// CLI-derived request fields are the DEFAULT for a FRESH workflow. On resume
+	// (step 2a) they are replaced by the durable persisted request, which is
+	// authoritative — a restarted standalone worker must NOT depend on CLI input.
+	var eff_operation_name: String = _dup(operation_name);
+	var eff_input_json: String = _dup(input_json);
+	var operation_id: Array<Byte> = _operation_id(&workflow_canon_hex, OPERATION_SEQ);
+	var operation_id_hex: String = _bytes_to_hex(&operation_id);
+	var input_hash: String = _input_hash(&eff_input_json);
+
+	// --- 1. create workflow (idempotent) ---
+	val t_create = _now(host.get());
+	match host.get().create_workflow(&workflow_id, &SCRIPT_NAME, SCRIPT_REVISION,
+	                                 &t_create, &t_create, &"{\"pos\":\"start\"}", &"{}") {
+		mf.CreateOutcome::Created => {},
+		mf.CreateOutcome::Exists => {}
+	}
+
+	// --- 2. claim THIS workflow by id (never a different instance) ---
+	val clock = _clock(host.get());
+	var fencing_token: Int = 0;
+	match host.get().claim_workflow(&workflow_id, &clock.now, &clock.deadline) {
+		mf.ClaimByIdOutcome::Claimed(wf) => { fencing_token = wf.fencing_token; },
+		mf.ClaimByIdOutcome::NotFound => {
+			throw RunnerError(message = "workflow absent after create");
+		},
+		mf.ClaimByIdOutcome::NotClaimable => {
+			// Not claimable: INSPECT to distinguish terminal / active / deferred.
+			return _inspect_report(host.get(), &workflow_id, &operation_id_hex);
+		}
+	}
+
+	// --- 2a. recover the AUTHORITATIVE request on resume. If this workflow
+	// already persisted an operation request, use it verbatim — operation id,
+	// name, input, hash — so omitted or different CLI input cannot drive a
+	// spurious operation_conflict. A fresh workflow has no row yet and keeps the
+	// CLI-derived defaults set above. ---
+	match host.get().operation_request_get(&workflow_id, OPERATION_SEQ) {
+		mf.OperationRequestGetOutcome::Found(rec) => {
+			eff_operation_name = _dup(&rec.operation_name);
+			eff_input_json = _dup(&rec.input_json);
+			operation_id = _copy_bytes(&rec.operation_id);
+			operation_id_hex = _bytes_to_hex(&operation_id);
+			input_hash = _dup(&rec.input_hash);
+		},
+		mf.OperationRequestGetOutcome::NotFound => {}
+	}
+
+	// --- 3. persist operation request + suspended continuation BEFORE dispatch ---
+	val t_req = _now(host.get());
+	match host.get().operation_request(&workflow_id, fencing_token, OPERATION_SEQ, &operation_id,
+	                                   &eff_operation_name, &eff_input_json, &input_hash,
+	                                   &"{\"pos\":\"op:1:dispatched\",\"operation_seq\":1}", &t_req, &"{}") {
+		mf.OperationRequestOutcome::Requested(_) => {},
+		mf.OperationRequestOutcome::Exists(_) => {},
+		mf.OperationRequestOutcome::FenceLost => {
+			// Requirement 2: lost the fence -> STOP, do NOT dispatch.
+			console.println("{\"workflow\":\"aborted\",\"reason\":\"request_fence_lost\"}");
+			return 3;
+		},
+		mf.OperationRequestOutcome::OperationConflict => {
+			console.println("{\"workflow\":\"aborted\",\"reason\":\"operation_conflict\"}");
+			return 3;
+		},
+		mf.OperationRequestOutcome::EventTimeSkew(defer_until) => {
+			// Non-increasing timestamp = clock skew: release/defer until the last
+			// accepted event time + margin, don't retry now.
+			return _defer(host.get(), &workflow_id, fencing_token, &defer_until, "request_event_time_skew");
+		},
+		default => {
+			throw RunnerError(message = "operation_request unexpected outcome");
+		}
+	}
+
+	// --- 4/5. dispatch (PUT), classifying the outcome (§5.2). 200 -> result;
+	// 202/working or participant-unreachable -> PENDING, durably defer (release
+	// the lease) until the next poll, never throw while holding it; 400/409 ->
+	// definite rejection (abort, no poll/resubmit); transport/5xx -> reconcile. ---
+	var result_json: String = "";
+	match _classify_dispatch(participant_url, &eff_operation_name, &operation_id_hex, &eff_input_json) {
+		DispatchResult::Done(r) => { result_json = move r; },
+		DispatchResult::Pending => {
+			// Not terminal yet: release the lease and become due again to re-poll.
+			return _defer_pending(host.get(), &workflow_id, fencing_token);
+		},
+		DispatchResult::Rejected(reason) => {
+			// Definite rejection is NON-RETRYABLE: persist the failure (forward ->
+			// blocked_resolution, lease cleared) so the workflow stops advancing and
+			// cannot repeat after lease expiry. Never exit still forward/requested.
+			return _fail_operation(host.get(), &workflow_id, fencing_token, &operation_id, move reason);
+		}
+	}
+
+	// --- 6. persist success + checkpoint + advanced continuation (workflow done) ---
+	val t_settle = _now(host.get());
+	var final_result: String = result_json.clone();
+	match host.get().operation_settle(&workflow_id, fencing_token, OPERATION_SEQ, &operation_id, CHECKPOINT_SEQ,
+	                                  &result_json, &result_json, &"{\"pos\":\"complete\"}", &t_settle, &"{}") {
+		mf.OperationSettleOutcome::Settled(r) => { final_result = move r; },
+		mf.OperationSettleOutcome::AlreadySettled(r) => {
+			// Requirement 1: the stored result is AUTHORITATIVE.
+			final_result = move r;
+		},
+		mf.OperationSettleOutcome::FenceLost => {
+			console.println("{\"workflow\":\"aborted\",\"reason\":\"settle_fence_lost\"}");
+			return 3;
+		},
+		mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
+			return _defer(host.get(), &workflow_id, fencing_token, &defer_until, "settle_event_time_skew");
+		},
+		default => {
+			throw RunnerError(message = "operation_settle unexpected outcome");
+		}
+	}
+
+	console.println("{\"workflow\":\"completed\",\"operation_id\":\"" + operation_id_hex + "\",\"result\":" + final_result + "}");
+	return 0;
+}
+
+// ===== HTTP dispatch =====
+
+// A PUT either gets an HTTP response (any status) or fails at the transport
+// level (timeout / disconnect) — a genuinely uncertain outcome: the participant
+// MAY have committed. TransportFailed -> reconcile by GET.
+pub variant PutOutcome { Responded(status: Int, body: String), TransportFailed }
+
+// A GET observes the durable participant state, classified by status — only
+// 202 is pending; 400/409 are definite rejections; 5xx/unreadable/unreachable
+// are transport-uncertain.
+pub variant GetOutcome {
+	Terminal(result: String),    // 200 terminal result
+	Pending,                     // 202 accepted / working, not terminal
+	Unknown,                     // 404 no record
+	Rejected(reason: String),    // 400 / 409 definite protocol rejection
+	TransportFailed              // 5xx / unreadable body / unreachable
+}
+
+// The classified dispatch result fed back to the workflow loop:
+//   Done     -> a terminal result to settle
+//   Pending  -> not terminal (or unreachable); durably defer and re-poll later
+//   Rejected -> definite protocol rejection; abort
+pub variant DispatchResult { Done(result: String), Pending, Rejected(reason: String) }
+
+fn _op_url(base: &String, operation_name: &String, operation_id_hex: &String) nothrow -> String {
+	return _dup(base) + "/microflows/v1/operations/" + _dup(operation_name) + "/" + _dup(operation_id_hex);
+}
+
+fn _dispatch_put(base: &String, operation_name: &String, operation_id_hex: &String,
+                 input_json: &String, io_timeout_ms: Int) nothrow -> PutOutcome {
+	val url = _op_url(base, operation_name, operation_id_hex);
+	var cfg = client.new_client_config();
+	client.with_io_timeout(&mut cfg, io_timeout_ms);
+	var session = client.new_session(move cfg);
+	var req = client.new_request("PUT", move url);
+	client.set_json_body(&mut req, _dup(input_json));
+	match client.send(&session, move req) {
+		core.Result::Ok(resp) => {
+			match client.response_body_string(&resp) {
+				core.Result::Ok(body) => { return PutOutcome::Responded(resp.status, move body); },
+				// An unreadable response body is NOT a known response: the outcome
+				// is uncertain -> TransportFailed (reconcile), never Responded("").
+				core.Result::Err(_) => { return PutOutcome::TransportFailed(); }
+			}
+		},
+		core.Result::Err(_) => { return PutOutcome::TransportFailed(); }
+	}
+}
+
+// Classify the PUT outcome (§5.2). 200 success; 202 pending (defer + re-poll);
+// 400 invalid; 409 conflict; 5xx/other/transport-failure -> uncertain ->
+// reconcile by GET.
+fn _classify_dispatch(base: &String, operation_name: &String, operation_id_hex: &String, input_json: &String) -> DispatchResult {
+	match _dispatch_put(base, operation_name, operation_id_hex, input_json, PUT_IO_TIMEOUT_MS) {
+		PutOutcome::Responded(status, body) => {
+			if status == 200 { return DispatchResult::Done(_extract_result(&body)); }
+			if status == 202 { return DispatchResult::Pending(); }
+			if status == 400 { return DispatchResult::Rejected("participant_invalid_request"); }
+			if status == 409 { return DispatchResult::Rejected("participant_identity_conflict"); }
+			return _reconcile(base, operation_name, operation_id_hex, input_json);
+		},
+		PutOutcome::TransportFailed => {
+			return _reconcile(base, operation_name, operation_id_hex, input_json);
+		}
+	}
+}
+
+fn _get_op(base: &String, operation_name: &String, operation_id_hex: &String) nothrow -> GetOutcome {
+	val url = _op_url(base, operation_name, operation_id_hex);
+	var cfg = client.new_client_config();
+	client.with_io_timeout(&mut cfg, RECONCILE_IO_TIMEOUT_MS);
+	var session = client.new_session(move cfg);
+	var req = client.new_request("GET", move url);
+	match client.send(&session, move req) {
+		core.Result::Ok(resp) => {
+			if resp.status == 404 { return GetOutcome::Unknown(); }
+			if resp.status == 202 { return GetOutcome::Pending(); }
+			if resp.status == 400 { return GetOutcome::Rejected("participant_invalid_request"); }
+			if resp.status == 409 { return GetOutcome::Rejected("participant_identity_conflict"); }
+			if resp.status == 200 {
+				match client.response_body_string(&resp) {
+					core.Result::Ok(body) => {
+						match _try_extract_result(&body) {
+							Optional::Some(r) => { return GetOutcome::Terminal(move r); },
+							Optional::None => { return GetOutcome::TransportFailed(); }
+						}
+					},
+					core.Result::Err(_) => { return GetOutcome::TransportFailed(); }
+				}
+			}
+			// 5xx or any other status: unreachable / uncertain.
+			return GetOutcome::TransportFailed();
+		},
+		core.Result::Err(_) => { return GetOutcome::TransportFailed(); }
+	}
+}
+
+// Reconcile an uncertain outcome by GET on the stable operation id. Terminal ->
+// Done; 202/working or unreachable -> Pending (defer); 400/409 -> Rejected; a
+// 404 means the participant has no record -> safe re-PUT the identical request
+// under the same id, then GET again (effectively-once replay).
+fn _reconcile(base: &String, operation_name: &String, operation_id_hex: &String, input_json: &String) -> DispatchResult {
+	match _get_op(base, operation_name, operation_id_hex) {
+		GetOutcome::Terminal(r) => { return DispatchResult::Done(move r); },
+		GetOutcome::Pending => { return DispatchResult::Pending(); },
+		GetOutcome::Rejected(reason) => { return DispatchResult::Rejected(move reason); },
+		GetOutcome::TransportFailed => {
+			// Unreachable/uncertain -> defer + retry later; never throw holding the lease.
+			return DispatchResult::Pending();
+		},
+		GetOutcome::Unknown => {
+			// 404-reconcile: participant has no record -> resubmit identical PUT.
+			match _dispatch_put(base, operation_name, operation_id_hex, input_json, RECONCILE_IO_TIMEOUT_MS) {
+				PutOutcome::Responded(status, body) => {
+					if status == 200 { return DispatchResult::Done(_extract_result(&body)); }
+					if status == 202 { return DispatchResult::Pending(); }
+					if status == 400 { return DispatchResult::Rejected("participant_invalid_request"); }
+					if status == 409 { return DispatchResult::Rejected("participant_identity_conflict"); }
+					return _reconcile_after_resubmit(base, operation_name, operation_id_hex);
+				},
+				PutOutcome::TransportFailed => { return _reconcile_after_resubmit(base, operation_name, operation_id_hex); }
+			}
+		}
+	}
+}
+
+fn _reconcile_after_resubmit(base: &String, operation_name: &String, operation_id_hex: &String) -> DispatchResult {
+	match _get_op(base, operation_name, operation_id_hex) {
+		GetOutcome::Terminal(r) => { return DispatchResult::Done(move r); },
+		GetOutcome::Rejected(reason) => { return DispatchResult::Rejected(move reason); },
+		// Still not terminal (pending / unreachable / 404 again) -> defer + retry.
+		default => { return DispatchResult::Pending(); }
+	}
+}
+
+// Workflow not claimable: inspect to distinguish terminal / active / deferred,
+// and report. Terminal -> replay the LOCAL authoritative result (Microflows
+// already persisted it; no dependency on the participant being reachable).
+fn _inspect_report(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, operation_id_hex: &String) -> Int {
+	val now = _now(host);
+	match host.inspect_workflow(workflow_id, &now) {
+		mf.WorkflowInspectOutcome::Found(snap) => {
+			if snap.is_terminal {
+				return _report_terminal(host, workflow_id, &snap, operation_id_hex);
+			}
+			if snap.leased {
+				console.println("{\"workflow\":\"active\",\"reason\":\"leased_by_another\"}");
+				return 4;
+			}
+			console.println("{\"workflow\":\"deferred\",\"reason\":\"not_yet_due_or_blocked\"}");
+			return 5;
+		},
+		mf.WorkflowInspectOutcome::NotFound => {
+			throw RunnerError(message = "workflow vanished during inspect");
+		}
+	}
+}
+
+// Branch by terminal state: ONLY `completed` carries a successful operation
+// result; `reversed` and `resolved_exception` are terminal WITHOUT a forward
+// success, so they must not assume one.
+fn _report_terminal(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>,
+                    snap: &mf.WorkflowSnapshot, operation_id_hex: &String) -> Int {
+	if snap.state_code == STATE_COMPLETED {
+		match host.operation_result(workflow_id, OPERATION_SEQ) {
+			mf.OperationResultOutcome::Succeeded(r) => {
+				console.println("{\"workflow\":\"already_terminal\",\"operation_id\":\"" + _dup(operation_id_hex) + "\",\"result\":" + r + "}");
+				return 0;
+			},
+			mf.OperationResultOutcome::Requested => {
+				// COMPLETED but the operation has only a request, no settled result:
+				// inconsistent durable state. A completed workflow MUST carry its
+				// forward result — this is an error, not a success.
+				console.println("{\"workflow\":\"error\",\"reason\":\"completed_operation_unsettled\"}");
+				return 10;
+			},
+			mf.OperationResultOutcome::NotFound => {
+				// COMPLETED but no operation row at all: corrupted durable state.
+				console.println("{\"workflow\":\"error\",\"reason\":\"completed_without_operation\"}");
+				return 10;
+			}
+		}
+	}
+	if snap.state_code == STATE_REVERSED {
+		console.println("{\"workflow\":\"reversed\"}");
+		return 0;
+	}
+	if snap.state_code == STATE_RESOLVED_EXCEPTION {
+		console.println("{\"workflow\":\"resolved_exception\"}");
+		return 0;
+	}
+	console.println("{\"workflow\":\"terminal\",\"state\":" + fmt.format_int(snap.state_code) + "}");
+	return 0;
+}
+
+// Operation pending (202/working) or participant unreachable: durably defer by
+// releasing the lease with a near-term next-attempt, so the workflow becomes
+// due again and re-polls. Reports only on a committed release (else a distinct
+// defer_failed outcome — never claim a transition that did not happen).
+fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int) -> Int {
+	// Schedule the next attempt PENDING_RETRY_SECONDS out (NOT the lease window):
+	// the DB clock returns this as an absolute next-attempt deadline.
+	val clock = host.clock_read(PENDING_RETRY_SECONDS);
+	match host.release(workflow_id, fencing_token, &clock.now, &clock.deadline) {
+		mf.ReleaseOutcome::Released => {
+			console.println("{\"workflow\":\"pending\",\"reason\":\"operation_pending\",\"defer_until\":\"" + _dup(&clock.deadline) + "\"}");
+			return 9;
+		},
+		mf.ReleaseOutcome::FenceLost => {
+			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_fence_lost\"}");
+			return 7;
+		},
+		mf.ReleaseOutcome::NotFound => {
+			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_not_found\"}");
+			return 8;
+		}
+	}
+}
+
+// Clock skew (non-increasing event_ts): release/defer the workflow until the
+// LAST ACCEPTED event time + margin (defer_until), rather than adjusting the
+// timestamp or retrying immediately. The deferral is only reported once the
+// release actually COMMITS; a failed release yields a distinct outcome (never
+// claim a durable transition that did not happen).
+fn _defer(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
+          defer_until: &String, reason: String) -> Int {
+	val clock = host.clock_read(LEASE_SECONDS);
+	match host.release(workflow_id, fencing_token, &clock.now, defer_until) {
+		mf.ReleaseOutcome::Released => {
+			console.println("{\"workflow\":\"deferred\",\"reason\":\"" + move reason + "\",\"defer_until\":\"" + _dup(defer_until) + "\"}");
+			return 6;
+		},
+		mf.ReleaseOutcome::FenceLost => {
+			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_fence_lost\"}");
+			return 7;
+		},
+		mf.ReleaseOutcome::NotFound => {
+			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_not_found\"}");
+			return 8;
+		}
+	}
+}
+
+// Durable non-retryable failure on a definite participant rejection. Without
+// this the runner would exit while still forward/requested AND holding the
+// lease; after lease expiry the workflow becomes claimable again and repeats
+// the rejected dispatch indefinitely. operation_fail atomically transitions
+// forward(1) -> blocked_resolution(3) (disposition failed) and clears the lease,
+// so the workflow stops advancing forward. Idempotent (AlreadyBlocked).
+fn _fail_operation(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
+                   operation_id: &Array<Byte>, reason: String) -> Int {
+	val t = _now(host);
+	val cont = "{\"pos\":\"op:1:failed\"}";
+	val payload = "{\"reason\":\"" + _dup(&reason) + "\",\"kind\":\"non_retryable_failure\"}";
+	match host.operation_fail(workflow_id, fencing_token, OPERATION_SEQ, operation_id, &cont, &t, &payload) {
+		mf.OperationFailOutcome::Blocked => {
+			console.println("{\"workflow\":\"failed\",\"reason\":\"" + move reason + "\",\"disposition\":\"blocked_resolution\"}");
+			return 3;
+		},
+		mf.OperationFailOutcome::AlreadyBlocked => {
+			// Idempotent replay of the same non-retryable failure.
+			console.println("{\"workflow\":\"failed\",\"reason\":\"" + move reason + "\",\"disposition\":\"blocked_resolution\"}");
+			return 3;
+		},
+		mf.OperationFailOutcome::FenceLost => {
+			console.println("{\"workflow\":\"fail_aborted\",\"reason\":\"fail_fence_lost\"}");
+			return 7;
+		},
+		mf.OperationFailOutcome::OperationConflict => {
+			console.println("{\"workflow\":\"fail_aborted\",\"reason\":\"fail_operation_conflict\"}");
+			return 7;
+		},
+		mf.OperationFailOutcome::NotFound => {
+			console.println("{\"workflow\":\"fail_aborted\",\"reason\":\"fail_workflow_not_found\"}");
+			return 8;
+		},
+		mf.OperationFailOutcome::OperationNotFound => {
+			console.println("{\"workflow\":\"fail_aborted\",\"reason\":\"fail_operation_not_found\"}");
+			return 8;
+		},
+		mf.OperationFailOutcome::EventTimeSkew(defer_until) => {
+			return _defer(host, workflow_id, fencing_token, &defer_until, "fail_event_time_skew");
+		}
+	}
+}
+
+// Extract the participant envelope's `result` object as compact JSON text.
+fn _extract_result(envelope: &String) -> String {
+	match _try_extract_result(envelope) {
+		Optional::Some(r) => { return move r; },
+		Optional::None => { throw RunnerError(message = "participant response has no result"); }
+	}
+}
+
+fn _try_extract_result(envelope: &String) nothrow -> Optional<String> {
+	match json.parse(envelope) {
+		core.Result::Ok(n) => {
+			match n.get(&"result") {
+				Optional::Some(r) => { return Optional<String>::Some(json.encode_compact(r)); },
+				Optional::None => { return Optional<String>::None(); }
+			}
+		},
+		core.Result::Err(_) => { return Optional<String>::None(); }
+	}
+}
+
+// ===== time =====
+
+fn _clock(host: &mf.MicroflowsHost) -> mf.ClockReading {
+	return host.clock_read(LEASE_SECONDS);
+}
+
+fn _now(host: &mf.MicroflowsHost) -> String {
+	return host.clock_read(LEASE_SECONDS).now;
+}
+
+// ===== identity / hashing =====
+
+fn _join3(a: &String, b: &String, c: &String) nothrow -> String {
+	return fmt.format_int(a.byte_length()) + ":" + _dup(a) + ";"
+	     + fmt.format_int(b.byte_length()) + ":" + _dup(b) + ";"
+	     + fmt.format_int(c.byte_length()) + ":" + _dup(c) + ";";
+}
+
+fn _operation_id(workflow_hex: &String, operation_seq: Int) nothrow -> Array<Byte> {
+	val rev = fmt.format_int(SCRIPT_REVISION);
+	val seq = fmt.format_int(operation_seq);
+	// invocation = 1 (first occurrence of this static call site).
+	val seed = _join3(workflow_hex, &rev, &seq) + "inv:1";
+	val u = uuid.v3_from_string(&seed);
+	return uuid.to_bytes(&u);
+}
+
+fn _input_hash(input_json: &String) -> String {
+	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
+	match json.parse(input_json) {
+		core.Result::Ok(n) => {
+			val compact = json.encode_compact_with_config(&n, &cfg);
+			val u = uuid.v3_from_string(&compact);
+			val bytes = uuid.to_bytes(&u);
+			return _bytes_to_hex(&bytes);
+		},
+		core.Result::Err(_) => { throw RunnerError(message = "input is not valid JSON"); }
+	}
+}
+
+// ===== config =====
+
+fn _build_host(b: mf.HostBuilder) -> arc.Arc<mf.MicroflowsHost> {
+	match mf.build_host(move b) {
+		core.Result::Ok(h) => { return move h; },
+		core.Result::Err(_) => { throw RunnerError(message = "microflows host build failed"); }
+	}
+}
+
+fn _require_db(cfg: &json.JsonNode) -> json.JsonNode {
+	match cfg.get(&"db") {
+		Optional::Some(n) => { return n.clone_deep(); },
+		Optional::None => { throw RunnerError(message = "config: missing 'db' subtree"); }
+	}
+}
+
+fn _load_config_json(path: &String) throws -> json.JsonNode {
+	val timeout = conc.Duration(millis = 5000);
+	match io.file_builder(_dup(path)).read(true).timeout(timeout).build() {
+		core.Result::Ok(file) => {
+			val text = _drain(move file);
+			match json.parse(&text) {
+				core.Result::Ok(n) => { return move n; },
+				core.Result::Err(_) => { throw RunnerError(message = "config: JSON parse failed"); }
+			}
+		},
+		core.Result::Err(_) => { throw RunnerError(message = "config: cannot open " + _dup(path)); }
+	}
+}
+
+fn _drain(var f: io.ConfiguredFile) throws -> String {
+	var out: String = "";
+	var buf = io.buffer(4096);
+	var done = false;
+	while !done {
+		match f.read(&mut buf) {
+			core.Result::Ok(n) => {
+				if n == 0 { done = true; }
+				else { out = out + core.string_from_utf8_bytes(io.buffer_ptr(&buf), n); }
+			},
+			core.Result::Err(_) => { val _ = f.close(); throw RunnerError(message = "config: read error"); }
+		}
+	}
+	val _ = f.close();
+	return move out;
+}
+
+fn _config_str(cfg: &json.JsonNode, key: &String, default_val: String) nothrow -> String {
+	match cfg.get(key) {
+		Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { if s.byte_length() > 0 { return move s; } }, Optional::None => {} } },
+		Optional::None => {}
+	}
+	return move default_val;
+}
+
+// ===== bytes / hex =====
+
+fn _hex_to_bytes(hex: &String) -> Array<Byte> {
+	match codec.hex_decode(hex) {
+		core.Result::Ok(b) => { if b.len == 16 { return move b; } throw RunnerError(message = "workflow-id must be 16 bytes"); },
+		core.Result::Err(_) => { throw RunnerError(message = "workflow-id not valid hex"); }
+	}
+}
+
+fn _bytes_to_hex(b: &Array<Byte>) nothrow -> String {
+	return codec.hex_encode(b);
+}
+
+fn _copy_bytes(b: &Array<Byte>) nothrow -> Array<Byte> {
+	var out: Array<Byte> = Array<type Byte>::with_capacity(b.len);
+	var i = 0;
+	while i < b.len { out.push(b[i]); i = i + 1; }
+	return move out;
+}
+
+fn _dup(s: &String) nothrow -> String {
+	val n = s.byte_length();
+	var buf = io.buffer(n);
+	var i = 0;
+	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
+	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), n);
+}
