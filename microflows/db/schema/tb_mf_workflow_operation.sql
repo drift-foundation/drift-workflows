@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS `tb_mf_operation` (
 	-- + pinned revision + call site + invocation; collision-resistant.
 	`operation_id` varbinary(16) NOT NULL,
 	`operation_name` varchar(128) NOT NULL,
+	-- Pinned input/output contract revision for this operation (design §2.5).
+	-- Persisted with the request so recovery dispatches against the SAME contract
+	-- the workflow was suspended on, never a renegotiated one.
+	`schema_version` int NOT NULL,
 	-- The typed input document (JSON OBJECT) and its canonical hash.
 	`input_json` mediumtext NOT NULL CHECK (json_valid(`input_json`) AND json_type(`input_json`) = 'OBJECT'),
 	`input_hash` varchar(64) NOT NULL,

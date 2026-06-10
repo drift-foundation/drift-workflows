@@ -192,41 +192,7 @@ procedures) are packaged in **Mariachi-compatible form** and deployed via
 Mariachi — never ad-hoc loaders, and the runtime never issues free SQL. See
 [doc/conventions_and_db_migration.md](microflows/doc/conventions_and_db_migration.md).
 
-## Milestone 1
-
-- Runtime and language implemented in **Drift**.
-- **MariaDB/InnoDB** persists only Microflows control state, via purpose-built
-  schema + stored procedures (Mariachi-packaged) using the existing
-  `mariadb-rpc` client.
-- Initial work runs from **manually constructed IR**; the parser/type checker
-  follow once the runtime contract is proven.
-- A **REST participant protocol + feasibility spike** precedes the full
-  dispatcher.
-
-### Implementation order
-
-The **protocol feasibility spike runs ahead of the operation schema** — its
-concrete requirements shape the request/result tables rather than finalizing
-them speculatively (see [doc/microflows_design.md](microflows/doc/microflows_design.md)
-§7).
-
-1. Workflow state machine and claimability (generalized `blocked_resolution`). ✅
-2a. Schema: remove record/journal stores; Mariachi packaging. ✅
-3. Lease acquisition and transactional fencing. ✅
-4. Minimum REST participant protocol + feasibility spike (manual versioned IR,
-   no frontend) — **next**, drives step 2b.
-5. Schema: operation request/result + definition tables (shaped by the spike).
-6. Durable remote-operation dispatch + result persistence (manual IR).
-7. Crash recovery and idempotent resumption.
-8. Reversal and blocked resolution.
-9. Generic REST dispatcher.
-10. Parser and type checker (after the runtime contract is proven).
-
-## Status
-
-**Early working design and implementation**, mid-pivot from the PhaseDrift
-local-transaction model to the Microflows coordinator model. Settled semantics
-are in [doc/microflows_design.md](microflows/doc/microflows_design.md) (current design of
-record); [doc/phase_drift_mile_design.md](microflows/doc/phase_drift_mile_design.md) is
-preserved as the superseded historical record explaining why the direction
-changed.
+The implementation plan and current sequencing live in
+[doc/microflows_design.md](microflows/doc/microflows_design.md) §7 (the design of
+record); [doc/phase_drift_mile_design.md](microflows/doc/phase_drift_mile_design.md)
+is the superseded PhaseDrift design, kept for historical rationale.

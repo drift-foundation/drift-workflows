@@ -43,6 +43,10 @@ const LEASE_SECONDS: Int = 30;
 // becomes due again. Independent of LEASE_SECONDS — retry scheduling must NOT be
 // coupled to lease duration. The DB clock turns this into an ABSOLUTE deadline.
 const PENDING_RETRY_SECONDS: Int = 1;
+// Backoff for a durable OPERATIONAL deferral (repairable config state, e.g. a
+// pinned binding temporarily unavailable). Longer than the pending poll: we are
+// waiting on an operator to repair configuration, not on a remote participant.
+const DISPATCH_DEFER_SECONDS: Int = 5;
 const PUT_IO_TIMEOUT_MS: Int = 3000;
 const RECONCILE_IO_TIMEOUT_MS: Int = 8000;
 
@@ -53,24 +57,30 @@ const STATE_RESOLVED_EXCEPTION: Int = 6;
 
 pub error RunnerError { message: String }
 
+// A resolved transport target for one operation. The dispatcher depends ONLY on
+// this — never on the config JSON shape, the participant registry, or workflow
+// input. `base_url` is the endpoint chosen by ordered selection.
+struct ResolvedOperation {
+	operation_name: String,
+	schema_version: Int,
+	base_url: String
+}
+
 fn main(argv: Array<String>) nothrow -> Int {
 	var p = cli.parser("microflows-runner", "0.1.0", "Microflows coordinator runner (first slice)");
-	val _ = p.option_string("config", "c", "FILE", "JSON config with a `db` subtree", true);
-	val _ = p.option_string("participant-url", "u", "URL", "participant base URL", true);
+	val _ = p.option_string("config", "c", "FILE", "JSON config: db + participants + operations registries", true);
 	val _ = p.option_string("workflow-id", "w", "HEX", "32-hex-char workflow id", true);
-	val _ = p.option_string("operation", "o", "NAME", "operation name (default echo-transform)", false);
-	val _ = p.option_string("input", "i", "JSON", "operation input (default {\"values\":[1,2,3]})", false);
+	val _ = p.option_string("operation", "o", "NAME", "operation to submit (required ONLY for a fresh workflow; a resume uses the durable request)", false);
+	val _ = p.option_string("input", "i", "JSON", "operation input (JSON object; default {}); fresh workflow only", false);
 
 	var config_path: String = "";
-	var participant_url: String = "";
 	var workflow_hex: String = "";
-	var operation_name: String = "echo-transform";
-	var input_json: String = "{\"values\":[1,2,3]}";
+	var operation_name: String = "";
+	var input_json: String = "{}";
 
 	match p.parse(argv) {
 		core.Result::Ok(parsed) => {
 			match parsed.get_string("config", p) { Some(v) => { config_path = _dup(v); }, None => {} }
-			match parsed.get_string("participant-url", p) { Some(v) => { participant_url = _dup(v); }, None => {} }
 			match parsed.get_string("workflow-id", p) { Some(v) => { workflow_hex = _dup(v); }, None => {} }
 			match parsed.get_string("operation", p) { Some(v) => { operation_name = _dup(v); }, None => {} }
 			match parsed.get_string("input", p) { Some(v) => { input_json = _dup(v); }, None => {} }
@@ -80,22 +90,28 @@ fn main(argv: Array<String>) nothrow -> Int {
 			return 2;
 		}
 	}
-	if config_path.byte_length() == 0 or participant_url.byte_length() == 0 or workflow_hex.byte_length() != 32 {
-		console.eprintln("runner: --config, --participant-url, and a 32-hex --workflow-id are required");
+	if config_path.byte_length() == 0 or workflow_hex.byte_length() != 32 {
+		console.eprintln("runner: --config and a 32-hex --workflow-id are required");
 		return 2;
 	}
 
-	return try _run(&config_path, &participant_url, &workflow_hex, &operation_name, &input_json) catch {
+	return try _run(&config_path, &workflow_hex, &operation_name, &input_json) catch {
 		console.eprintln("runner: fatal");
 		1
 	};
 }
 
-fn _run(config_path: &String, participant_url: &String, workflow_hex: &String,
+fn _run(config_path: &String, workflow_hex: &String,
         operation_name: &String, input_json: &String) throws -> Int {
 	val cfg = _load_config_json(config_path);
 	val db_sub = _require_db(&cfg);
 	val worker_id = _config_str(&cfg, &"worker_id", "runner-1");
+
+	// Validate the WHOLE participant/operation registry at startup, BEFORE any
+	// execution — duplicate ids/names, unknown participant refs, unsupported
+	// transport, empty endpoint lists, invalid URLs. Routing + credentials come
+	// ONLY from this trusted config, never from workflow input.
+	_validate_registry(&cfg);
 
 	val identity = mf.identity_from_worker_name(&worker_id);
 	var b = mf.new_host_builder();
@@ -109,20 +125,67 @@ fn _run(config_path: &String, participant_url: &String, workflow_hex: &String,
 	// of the same workflow yield the same operation id.
 	val workflow_canon_hex = _bytes_to_hex(&workflow_id);
 	// CLI-derived request fields are the DEFAULT for a FRESH workflow. On resume
-	// (step 2a) they are replaced by the durable persisted request, which is
-	// authoritative — a restarted standalone worker must NOT depend on CLI input.
+	// they are replaced by the durable persisted request, which is authoritative
+	// — a restarted standalone worker must NOT depend on CLI input.
 	var eff_operation_name: String = _dup(operation_name);
 	var eff_input_json: String = _dup(input_json);
+	var eff_schema_version: Int = 0;
 	var operation_id: Array<Byte> = _operation_id(&workflow_canon_hex, OPERATION_SEQ);
 	var operation_id_hex: String = _bytes_to_hex(&operation_id);
 	var input_hash: String = _input_hash(&eff_input_json);
 
-	// --- 1. create workflow (idempotent) ---
-	val t_create = _now(host.get());
-	match host.get().create_workflow(&workflow_id, &SCRIPT_NAME, SCRIPT_REVISION,
-	                                 &t_create, &t_create, &"{\"pos\":\"start\"}", &"{}") {
-		mf.CreateOutcome::Created => {},
-		mf.CreateOutcome::Exists => {}
+	// Is this a fresh SUBMISSION (--operation given) or a resume by id alone?
+	val fresh: Bool = operation_name.byte_length() > 0;
+
+	// --- pre-claim recovery probe (read-only; takes NO lease). BEST-EFFORT ONLY —
+	// NOT authoritative: a request can be persisted between this read and our claim
+	// (see the post-claim reload). It lets us skip create for a resume and
+	// pre-validate a fresh submission cheaply. ---
+	var recovered: Bool = false;
+	match host.get().operation_request_get(&workflow_id, OPERATION_SEQ) {
+		mf.OperationRequestGetOutcome::Found(rec) => {
+			recovered = true;
+			eff_operation_name = _dup(&rec.operation_name);
+			eff_input_json = _dup(&rec.input_json);
+			eff_schema_version = rec.schema_version;
+			operation_id = _copy_bytes(&rec.operation_id);
+			operation_id_hex = _bytes_to_hex(&operation_id);
+			input_hash = _dup(&rec.input_hash);
+		},
+		mf.OperationRequestGetOutcome::NotFound => {}
+	}
+
+	// --- FRESH submission: validate --operation resolves BEFORE create/claim so a
+	// bad submission takes no lease and creates no row. A RESUME by id does NOT
+	// pre-reject here — its authoritative decision is post-claim, which avoids the
+	// race where the durable request lands just after our probe. ---
+	var base_url: String = "";
+	if fresh and !recovered {
+		var ok = false;
+		try {
+			val r = _resolve_operation(&cfg, &eff_operation_name, Optional<Int>::None());
+			eff_schema_version = r.schema_version;
+			base_url = _dup(&r.base_url);
+			ok = true;
+		} catch RunnerError(e) {
+			console.eprintln(e.message);
+		}
+		if !ok {
+			console.println("{\"workflow\":\"aborted\",\"reason\":\"operation_unresolvable\"}");
+			return 2;
+		}
+	}
+
+	// --- 1. create workflow — ONLY for a fresh submission. A resume's workflow
+	// must already exist; claim_by_id authoritatively returns NotFound otherwise,
+	// so a resume-by-id of a non-existent workflow never creates a row. ---
+	if fresh {
+		val t_create = _now(host.get());
+		match host.get().create_workflow(&workflow_id, &SCRIPT_NAME, SCRIPT_REVISION,
+		                                 &t_create, &t_create, &"{\"pos\":\"start\"}", &"{}") {
+			mf.CreateOutcome::Created => {},
+			mf.CreateOutcome::Exists => {}
+		}
 	}
 
 	// --- 2. claim THIS workflow by id (never a different instance) ---
@@ -131,7 +194,14 @@ fn _run(config_path: &String, participant_url: &String, workflow_hex: &String,
 	match host.get().claim_workflow(&workflow_id, &clock.now, &clock.deadline) {
 		mf.ClaimByIdOutcome::Claimed(wf) => { fencing_token = wf.fencing_token; },
 		mf.ClaimByIdOutcome::NotFound => {
-			throw RunnerError(message = "workflow absent after create");
+			if fresh {
+				throw RunnerError(message = "workflow absent after create");
+			}
+			// Resume by id, but the workflow does not exist -> nothing to resume.
+			// Authoritative (a non-existent workflow has no in-flight request, so
+			// this is NOT the probe race). No lease was taken.
+			console.println("{\"workflow\":\"aborted\",\"reason\":\"operation_required\"}");
+			return 2;
 		},
 		mf.ClaimByIdOutcome::NotClaimable => {
 			// Not claimable: INSPECT to distinguish terminal / active / deferred.
@@ -139,15 +209,18 @@ fn _run(config_path: &String, participant_url: &String, workflow_hex: &String,
 		}
 	}
 
-	// --- 2a. recover the AUTHORITATIVE request on resume. If this workflow
-	// already persisted an operation request, use it verbatim — operation id,
-	// name, input, hash — so omitted or different CLI input cannot drive a
-	// spurious operation_conflict. A fresh workflow has no row yet and keeps the
-	// CLI-derived defaults set above. ---
+	// --- 2a. AUTHORITATIVE post-claim reload (closes the probe/claim race). Now
+	// that we hold the lease the durable request — if any — is authoritative: a
+	// request may have been persisted by another executor between our probe and
+	// our claim. Adopting it flips a would-be "fresh" run to a resume so CLI-derived
+	// fields cannot drive a spurious operation_conflict, AND prevents a resume-by-id
+	// from spuriously aborting operation_required. ---
 	match host.get().operation_request_get(&workflow_id, OPERATION_SEQ) {
 		mf.OperationRequestGetOutcome::Found(rec) => {
+			recovered = true;
 			eff_operation_name = _dup(&rec.operation_name);
 			eff_input_json = _dup(&rec.input_json);
+			eff_schema_version = rec.schema_version;
 			operation_id = _copy_bytes(&rec.operation_id);
 			operation_id_hex = _bytes_to_hex(&operation_id);
 			input_hash = _dup(&rec.input_hash);
@@ -155,10 +228,41 @@ fn _run(config_path: &String, participant_url: &String, workflow_hex: &String,
 		mf.OperationRequestGetOutcome::NotFound => {}
 	}
 
+	// --- 2b. Post-claim precondition: claimed, but there is no durable request and
+	// no --operation to submit. DURABLY DEFER (lease cleared + audit event) rather
+	// than hold the lease — a re-submit with --operation, or a concurrently
+	// persisting request, auto-recovers it on the next poll. ---
+	if !recovered and !fresh {
+		return _defer_dispatch(host.get(), &workflow_id, fencing_token, "operation_request_absent");
+	}
+
+	// --- 2c. RESUME resolution, AFTER claim (only when claimable). The durable
+	// schema_version is PINNED: the registry binding must still offer exactly that
+	// version, else the operation is unresolvable (binding removed or version
+	// changed under a persisted request). This is a REPAIRABLE configuration state,
+	// not a participant failure — DURABLY DEFER (state stays forward, status stays
+	// requested, continuation preserved, lease cleared, an
+	// 'operation_dispatch_deferred' audit event with reason
+	// pinned_contract_unavailable appended on entry), so restoring config
+	// auto-recovers it on the next poll. ---
+	if recovered {
+		var ok = false;
+		try {
+			val r = _resolve_operation(&cfg, &eff_operation_name, Optional<Int>::Some(eff_schema_version));
+			base_url = _dup(&r.base_url);
+			ok = true;
+		} catch RunnerError(e) {
+			console.eprintln(e.message);
+		}
+		if !ok {
+			return _defer_dispatch(host.get(), &workflow_id, fencing_token, "pinned_contract_unavailable");
+		}
+	}
+
 	// --- 3. persist operation request + suspended continuation BEFORE dispatch ---
 	val t_req = _now(host.get());
 	match host.get().operation_request(&workflow_id, fencing_token, OPERATION_SEQ, &operation_id,
-	                                   &eff_operation_name, &eff_input_json, &input_hash,
+	                                   &eff_operation_name, eff_schema_version, &eff_input_json, &input_hash,
 	                                   &"{\"pos\":\"op:1:dispatched\",\"operation_seq\":1}", &t_req, &"{}") {
 		mf.OperationRequestOutcome::Requested(_) => {},
 		mf.OperationRequestOutcome::Exists(_) => {},
@@ -186,7 +290,7 @@ fn _run(config_path: &String, participant_url: &String, workflow_hex: &String,
 	// the lease) until the next poll, never throw while holding it; 400/409 ->
 	// definite rejection (abort, no poll/resubmit); transport/5xx -> reconcile. ---
 	var result_json: String = "";
-	match _classify_dispatch(participant_url, &eff_operation_name, &operation_id_hex, &eff_input_json) {
+	match _classify_dispatch(&base_url, &eff_operation_name, &operation_id_hex, &eff_input_json) {
 		DispatchResult::Done(r) => { result_json = move r; },
 		DispatchResult::Pending => {
 			// Not terminal yet: release the lease and become due again to re-poll.
@@ -469,6 +573,30 @@ fn _defer(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: In
 	}
 }
 
+// Durable OPERATIONAL deferral of a dispatch for a REPAIRABLE reason (e.g. a
+// pinned binding temporarily unavailable in config). The workflow stays forward
+// and claimable; sp_mf_operation_dispatch_defer clears the lease, sets an
+// absolute future next_attempt, and appends an 'operation_dispatch_deferred'
+// audit event with the reason on ENTRY into the wait condition (deduped on
+// retry), so restoring config auto-recovers it — NOT a failure, NOT blocked.
+fn _defer_dispatch(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, reason: String) -> Int {
+	val clock = host.clock_read(DISPATCH_DEFER_SECONDS);
+	match host.defer_dispatch(workflow_id, fencing_token, &clock.now, &clock.deadline, &clock.now, &reason) {
+		mf.ReleaseOutcome::Released => {
+			console.println("{\"workflow\":\"deferred\",\"reason\":\"" + move reason + "\",\"defer_until\":\"" + _dup(&clock.deadline) + "\"}");
+			return 9;
+		},
+		mf.ReleaseOutcome::FenceLost => {
+			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"defer_fence_lost\"}");
+			return 7;
+		},
+		mf.ReleaseOutcome::NotFound => {
+			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"defer_not_found\"}");
+			return 8;
+		}
+	}
+}
+
 // Durable non-retryable failure on a definite participant rejection. Without
 // this the runner would exit while still forward/requested AND holding the
 // lease; after lease expiry the workflow becomes claimable again and repeats
@@ -570,6 +698,248 @@ fn _input_hash(input_json: &String) -> String {
 		},
 		core.Result::Err(_) => { throw RunnerError(message = "input is not valid JSON"); }
 	}
+}
+
+// ===== participant / operation registry (trusted deployment config) =====
+//
+// `participants` is the LASTING deployment boundary: a logical id -> transport
+// policy. `operations` is a TEMPORARY manual-IR registry: op -> participant +
+// schema_version, shaped like future compiler output. Resolution sits behind this
+// boundary — the dispatcher consumes only a ResolvedOperation. Routing and
+// credentials come ONLY from this trusted config, never from workflow input;
+// credentials are never persisted in operation requests.
+
+// Validate the WHOLE registry at startup, before any execution.
+fn _validate_registry(cfg: &json.JsonNode) -> Void {
+	val ids = _validate_participants(cfg);
+	_validate_operations(cfg, &ids);
+}
+
+// Validate every participant's transport; return the owned set of participant ids.
+fn _validate_participants(cfg: &json.JsonNode) -> Array<String> {
+	var ids: Array<String> = [];
+	match cfg.get(&"participants") {
+		Optional::Some(pn) => {
+			match pn.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						val pid = _req_str(&items[i], &"id", "participant.id");
+						if _contains(&ids, &pid) { throw RunnerError(message = "duplicate participant id: " + _dup(&pid)); }
+						_validate_transport(&items[i], &pid);
+						ids.push(move pid);
+						i = i + 1;
+					}
+				},
+				Optional::None => { throw RunnerError(message = "config: 'participants' must be a JSON array"); }
+			}
+		},
+		Optional::None => { throw RunnerError(message = "config: missing 'participants'"); }
+	}
+	return move ids;
+}
+
+fn _validate_operations(cfg: &json.JsonNode, ids: &Array<String>) -> Void {
+	var names: Array<String> = [];
+	match cfg.get(&"operations") {
+		Optional::Some(on) => {
+			match on.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						val nm = _req_str(&items[i], &"name", "operation.name");
+						if _contains(&names, &nm) { throw RunnerError(message = "duplicate operation binding: " + _dup(&nm)); }
+						val pref = _req_str(&items[i], &"participant", "operation.participant");
+						if !_contains(ids, &pref) { throw RunnerError(message = "operation '" + _dup(&nm) + "' references unknown participant '" + _dup(&pref) + "'"); }
+						val sv = _req_int(&items[i], &"schema_version", "operation.schema_version");
+						if sv < 1 { throw RunnerError(message = "operation '" + _dup(&nm) + "' has invalid schema_version"); }
+						names.push(move nm);
+						i = i + 1;
+					}
+				},
+				Optional::None => { throw RunnerError(message = "config: 'operations' must be a JSON array"); }
+			}
+		},
+		Optional::None => { throw RunnerError(message = "config: missing 'operations'"); }
+	}
+}
+
+fn _validate_transport(part: &json.JsonNode, pid: &String) -> Void {
+	match part.get(&"transport") {
+		Optional::Some(tr) => {
+			val kind = _req_str(tr, &"kind", "transport.kind");
+			if kind != "http" { throw RunnerError(message = "participant '" + _dup(pid) + "' unsupported transport kind: " + kind); }
+			val sel = _req_str(tr, &"selection", "transport.selection");
+			if sel != "ordered_failover" { throw RunnerError(message = "participant '" + _dup(pid) + "' unsupported selection: " + sel); }
+			match tr.get(&"endpoints") {
+				Optional::Some(epn) => {
+					match epn.as_array() {
+						Optional::Some(eps) => {
+							if eps.len == 0 { throw RunnerError(message = "participant '" + _dup(pid) + "' has an empty endpoint list"); }
+							var k = 0;
+							while k < eps.len {
+								match eps[k].as_string() {
+									Optional::Some(u) => { if !_is_http_url(&u) { throw RunnerError(message = "participant '" + _dup(pid) + "' invalid endpoint URL: " + u); } },
+									Optional::None => { throw RunnerError(message = "participant '" + _dup(pid) + "' endpoint is not a string"); }
+								}
+								k = k + 1;
+							}
+						},
+						Optional::None => { throw RunnerError(message = "participant '" + _dup(pid) + "' endpoints must be a JSON array"); }
+					}
+				},
+				Optional::None => { throw RunnerError(message = "participant '" + _dup(pid) + "' missing endpoints"); }
+			}
+		},
+		Optional::None => { throw RunnerError(message = "participant '" + _dup(pid) + "' missing transport"); }
+	}
+	// Only a null/absent auth_profile is supported in this slice; ANY non-null
+	// value (object, string, boolean, number, array) is an unsupported credential
+	// mechanism -> fail. Check is_null() directly so no JSON type slips through.
+	match part.get(&"auth_profile") {
+		Optional::Some(ap) => {
+			if !ap.is_null() { throw RunnerError(message = "participant '" + _dup(pid) + "' has an unsupported auth_profile (only null/absent supported in this slice)"); }
+		},
+		Optional::None => {}
+	}
+}
+
+// Resolve op_name -> {schema_version, base_url}. Ordered selection picks the first
+// endpoint. `pinned` is the durable contract version on RESUME: the registry's
+// binding MUST still offer exactly that version, else the pinned contract is
+// unavailable and we fail safely rather than dispatch a persisted request through
+// a different (e.g. upgraded) binding. Throws if the operation or its participant
+// is absent. Resolution is thus by (operation_name, schema_version) on resume.
+fn _resolve_operation(cfg: &json.JsonNode, op_name: &String, pinned: Optional<Int>) -> ResolvedOperation {
+	match cfg.get(&"operations") {
+		Optional::Some(on) => {
+			match on.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						val nm = _req_str(&items[i], &"name", "operation.name");
+						if _str_eq(&nm, op_name) {
+							val pref = _req_str(&items[i], &"participant", "operation.participant");
+							val sv = _req_int(&items[i], &"schema_version", "operation.schema_version");
+							match pinned {
+								Optional::Some(req) => {
+									if sv != req {
+										throw RunnerError(message = "pinned contract version " + fmt.format_int(req)
+											+ " for operation '" + _dup(op_name) + "' is unavailable (registry offers version "
+											+ fmt.format_int(sv) + ")");
+									}
+								},
+								Optional::None => {}
+							}
+							val base = _participant_base_url(cfg, &pref);
+							return ResolvedOperation(operation_name = _dup(op_name), schema_version = sv, base_url = move base);
+						}
+						i = i + 1;
+					}
+				},
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
+	throw RunnerError(message = "operation not registered: " + _dup(op_name));
+}
+
+fn _participant_base_url(cfg: &json.JsonNode, pid: &String) -> String {
+	match cfg.get(&"participants") {
+		Optional::Some(pn) => {
+			match pn.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						val id = _req_str(&items[i], &"id", "participant.id");
+						if _str_eq(&id, pid) {
+							return _first_endpoint(&items[i], pid);
+						}
+						i = i + 1;
+					}
+				},
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
+	throw RunnerError(message = "unknown participant: " + _dup(pid));
+}
+
+fn _first_endpoint(part: &json.JsonNode, pid: &String) -> String {
+	match part.get(&"transport") {
+		Optional::Some(tr) => {
+			match tr.get(&"endpoints") {
+				Optional::Some(epn) => {
+					match epn.as_array() {
+						Optional::Some(eps) => {
+							if eps.len == 0 { throw RunnerError(message = "participant '" + _dup(pid) + "' has no endpoints"); }
+							match eps[0].as_string() {
+								Optional::Some(u) => { return move u; },
+								Optional::None => { throw RunnerError(message = "participant '" + _dup(pid) + "' endpoint is not a string"); }
+							}
+						},
+						Optional::None => { throw RunnerError(message = "participant '" + _dup(pid) + "' endpoints must be a JSON array"); }
+					}
+				},
+				Optional::None => { throw RunnerError(message = "participant '" + _dup(pid) + "' missing endpoints"); }
+			}
+		},
+		Optional::None => { throw RunnerError(message = "participant '" + _dup(pid) + "' missing transport"); }
+	}
+}
+
+fn _req_str(n: &json.JsonNode, key: &String, what: String) -> String {
+	match n.get(key) {
+		Optional::Some(v) => {
+			match v.as_string() {
+				Optional::Some(s) => { return move s; },
+				Optional::None => { throw RunnerError(message = what + " must be a string"); }
+			}
+		},
+		Optional::None => { throw RunnerError(message = "missing " + what); }
+	}
+}
+
+fn _req_int(n: &json.JsonNode, key: &String, what: String) -> Int {
+	match n.get(key) {
+		Optional::Some(v) => {
+			match v.as_int() {
+				Optional::Some(x) => { return x; },
+				Optional::None => { throw RunnerError(message = what + " must be an integer"); }
+			}
+		},
+		Optional::None => { throw RunnerError(message = "missing " + what); }
+	}
+}
+
+fn _contains(arr: &Array<String>, s: &String) nothrow -> Bool {
+	var i = 0;
+	while i < arr.len { if _str_eq(&arr[i], s) { return true; } i = i + 1; }
+	return false;
+}
+
+fn _str_eq(a: &String, b: &String) nothrow -> Bool {
+	val n = a.byte_length();
+	if n != b.byte_length() { return false; }
+	var i = 0;
+	while i < n { if a.byte_at(i) != b.byte_at(i) { return false; } i = i + 1; }
+	return true;
+}
+
+fn _starts_with(s: &String, prefix: &String) nothrow -> Bool {
+	val pn = prefix.byte_length();
+	if s.byte_length() < pn { return false; }
+	var i = 0;
+	while i < pn { if s.byte_at(i) != prefix.byte_at(i) { return false; } i = i + 1; }
+	return true;
+}
+
+fn _is_http_url(s: &String) nothrow -> Bool {
+	if _starts_with(s, &"https://") and s.byte_length() > 8 { return true; }
+	if _starts_with(s, &"http://") and s.byte_length() > 7 { return true; }
+	return false;
 }
 
 // ===== config =====

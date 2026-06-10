@@ -22,6 +22,7 @@ CREATE PROCEDURE `sp_mf_operation_request`(
 	IN arg_operation_seq int,
 	IN arg_operation_id varbinary(16),
 	IN arg_operation_name varchar(128),
+	IN arg_schema_version int,
 	IN arg_input_json mediumtext,
 	IN arg_input_hash varchar(64),
 	IN arg_new_continuation mediumtext,
@@ -38,6 +39,7 @@ proc:BEGIN
 	DECLARE v_op_missing tinyint(1) DEFAULT 0;
 	DECLARE v_ex_op_id varbinary(16);
 	DECLARE v_ex_op_name varchar(128);
+	DECLARE v_ex_schema_version int;
 	DECLARE v_ex_input_hash varchar(64);
 
 	IF arg_workflow_id IS NULL OR LENGTH(arg_workflow_id) <> 16 THEN
@@ -57,6 +59,9 @@ proc:BEGIN
 	END IF;
 	IF arg_operation_name IS NULL OR arg_operation_name = '' THEN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfOperationNameInvalid';
+	END IF;
+	IF arg_schema_version IS NULL OR arg_schema_version < 1 THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfSchemaVersionInvalid';
 	END IF;
 	IF arg_input_hash IS NULL OR arg_input_hash = '' THEN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfInputHashInvalid';
@@ -104,8 +109,8 @@ proc:BEGIN
 	-- needed. Verify the supplied immutable fields match the stored request.
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_op_missing = 1;
-		SELECT `operation_id`, `operation_name`, `input_hash`
-		INTO v_ex_op_id, v_ex_op_name, v_ex_input_hash
+		SELECT `operation_id`, `operation_name`, `schema_version`, `input_hash`
+		INTO v_ex_op_id, v_ex_op_name, v_ex_schema_version, v_ex_input_hash
 		FROM `tb_mf_operation`
 		WHERE `workflow_id` = arg_workflow_id AND `operation_seq` = arg_operation_seq
 		LIMIT 1;
@@ -114,6 +119,7 @@ proc:BEGIN
 	IF v_op_missing = 0 THEN
 		IF NOT (v_ex_op_id <=> arg_operation_id
 		        AND v_ex_op_name <=> arg_operation_name
+		        AND v_ex_schema_version <=> arg_schema_version
 		        AND v_ex_input_hash <=> arg_input_hash) THEN
 			SELECT JSON_OBJECT('outcome', 'operation_conflict') AS result;
 			LEAVE proc;
@@ -135,10 +141,10 @@ proc:BEGIN
 	SET v_event_seq = v_event_seq + 1;
 
 	INSERT INTO `tb_mf_operation` (
-		`workflow_id`, `operation_seq`, `operation_id`, `operation_name`,
+		`workflow_id`, `operation_seq`, `operation_id`, `operation_name`, `schema_version`,
 		`input_json`, `input_hash`, `status`, `result_json`, `created_at`, `updated_at`
 	) VALUES (
-		arg_workflow_id, arg_operation_seq, arg_operation_id, arg_operation_name,
+		arg_workflow_id, arg_operation_seq, arg_operation_id, arg_operation_name, arg_schema_version,
 		arg_input_json, arg_input_hash, 1, NULL, arg_event_ts, arg_event_ts
 	);
 

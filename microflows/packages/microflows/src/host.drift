@@ -180,6 +180,7 @@ pub variant OperationFailOutcome {
 pub struct OperationRequestRecord {
 	pub operation_id: Array<Byte>,
 	pub operation_name: String,
+	pub schema_version: Int,
 	pub input_json: String,
 	pub input_hash: String,
 	pub status: Int
@@ -300,13 +301,20 @@ pub interface MicroflowsHost {
 	// the row, §24.5).
 	fn release(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
 	           db_now: &String, next_attempt_at: &String) -> ReleaseOutcome;
+	// Durable OPERATIONAL deferral of a dispatch (forward stays forward; lease
+	// cleared; next_attempt set; an 'operation_dispatch_deferred' audit event with
+	// `reason` is appended on ENTRY into the wait condition, deduped on retry). For
+	// repairable config states (e.g. pinned binding unavailable) — NOT a failure.
+	fn defer_dispatch(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                  db_now: &String, next_attempt_at: &String, event_ts: &String,
+	                  reason: &String) -> ReleaseOutcome;
 	// Persist an operation request + the suspended continuation, atomically,
 	// BEFORE dispatch. Fenced (fence-first). Idempotent by (workflow_id,
 	// operation_seq); command-identity-checked.
 	fn operation_request(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
 	                     operation_seq: Int, operation_id: &Array<Byte>, operation_name: &String,
-	                     input_json: &String, input_hash: &String, new_continuation: &String,
-	                     event_ts: &String, event_payload: &String) -> OperationRequestOutcome;
+	                     schema_version: Int, input_json: &String, input_hash: &String,
+	                     new_continuation: &String, event_ts: &String, event_payload: &String) -> OperationRequestOutcome;
 	// Record a durable operation SUCCESS + Checkpoint + advanced continuation,
 	// completing the workflow, atomically. Fenced; identify-first; idempotent
 	// (AlreadySettled.result is authoritative).
@@ -752,15 +760,51 @@ implement MicroflowsHost for HostImpl {
 		}
 	}
 
+	pub fn defer_dispatch(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                      db_now: &String, next_attempt_at: &String, event_ts: &String,
+	                      reason: &String) -> ReleaseOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		if fencing_token < 1 {
+			throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token"));
+		}
+		_validate_nonempty("db_now", db_now);
+		_validate_nonempty("next_attempt_at", next_attempt_at);
+		_validate_nonempty("event_ts", event_ts);
+		_validate_nonempty("reason", reason);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_string(_dup(db_now)));
+			args.push(rpc.arg_string(_dup(next_attempt_at)));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(rpc.arg_string(_dup(reason)));
+			val sp: String = "sp_mf_operation_dispatch_defer";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "deferred" { return ReleaseOutcome::Released(); }
+			if outcome == "fence_lost" { return ReleaseOutcome::FenceLost(); }
+			if outcome == "not_found" { return ReleaseOutcome::NotFound(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:defer_dispatch"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
 	pub fn operation_request(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
 	                         operation_seq: Int, operation_id: &Array<Byte>, operation_name: &String,
-	                         input_json: &String, input_hash: &String, new_continuation: &String,
-	                         event_ts: &String, event_payload: &String) -> OperationRequestOutcome {
+	                         schema_version: Int, input_json: &String, input_hash: &String,
+	                         new_continuation: &String, event_ts: &String, event_payload: &String) -> OperationRequestOutcome {
 		_validate_id16("workflow_id", workflow_id);
 		_validate_id16("operation_id", operation_id);
 		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
 		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
 		_validate_nonempty("operation_name", operation_name);
+		if schema_version < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "schema_version")); }
 		_validate_nonempty("input_hash", input_hash);
 		_validate_nonempty("event_ts", event_ts);
 		try {
@@ -773,6 +817,7 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_int(operation_seq));
 			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
 			args.push(rpc.arg_string(_dup(operation_name)));
+			args.push(rpc.arg_int(schema_version));
 			args.push(_json_object_arg("input_json", input_json));
 			args.push(rpc.arg_string(_dup(input_hash)));
 			args.push(_json_object_arg("continuation", new_continuation));
@@ -990,12 +1035,14 @@ implement MicroflowsHost for HostImpl {
 				val op_hex = _doc_str_req(&doc, &"operation_id", "reqget-no-opid");
 				val op_id = _hex16("reqget-opid-hex", &op_hex);
 				val op_name = _doc_str_req(&doc, &"operation_name", "reqget-no-name");
+				val schema_version = _doc_int_req(&doc, &"schema_version", "reqget-no-schema-version");
 				val input_json = _doc_object_text_req(&doc, &"input_json");
 				val input_hash = _doc_str_req(&doc, &"input_hash", "reqget-no-hash");
 				val status = _doc_int_req(&doc, &"status", "reqget-no-status");
 				return OperationRequestGetOutcome::Found(OperationRequestRecord(
 					operation_id = move op_id,
 					operation_name = move op_name,
+					schema_version = schema_version,
 					input_json = move input_json,
 					input_hash = move input_hash,
 					status = status

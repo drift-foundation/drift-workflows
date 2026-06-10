@@ -15,6 +15,7 @@ CREATE PROCEDURE `sp_mf_operation_request_get`(
 proc:BEGIN
 	DECLARE v_op_id varbinary(16);
 	DECLARE v_op_name varchar(128);
+	DECLARE v_schema_version int;
 	DECLARE v_input mediumtext;
 	DECLARE v_hash varchar(64);
 	DECLARE v_status tinyint;
@@ -29,8 +30,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `operation_id`, `operation_name`, `input_json`, `input_hash`, `status`
-		INTO v_op_id, v_op_name, v_input, v_hash, v_status
+		SELECT `operation_id`, `operation_name`, `schema_version`, `input_json`, `input_hash`, `status`
+		INTO v_op_id, v_op_name, v_schema_version, v_input, v_hash, v_status
 		FROM `tb_mf_operation`
 		WHERE `workflow_id` = arg_workflow_id AND `operation_seq` = arg_operation_seq;
 	END;
@@ -44,6 +45,7 @@ proc:BEGIN
 		'outcome', 'found',
 		'operation_id', LOWER(HEX(v_op_id)),
 		'operation_name', v_op_name,
+		'schema_version', CAST(v_schema_version AS SIGNED),
 		'input_json', JSON_EXTRACT(v_input, '$'),
 		'input_hash', v_hash,
 		'status', CAST(v_status AS SIGNED)
