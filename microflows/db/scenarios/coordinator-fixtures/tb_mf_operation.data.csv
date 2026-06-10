@@ -1,5 +1,6 @@
-# Operation fixtures. result_json uses the \N marker for SQL NULL
-# (status=1 'requested' forbids a non-NULL result).
-workflow_id,operation_seq,operation_id,operation_name,input_json,input_hash,status,result_json,created_at,updated_at
-a0000000000000000000000000000001,1,b0000000000000000000000000000001,echo-transform,"{""values"":[1,2,3],""_fault"":{""respond_pending"":true}}",00000000000000000000000000000001,1,\N,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000
-a0000000000000000000000000000002,1,b0000000000000000000000000000002,echo-transform,"{""values"":[1,2,3]}",00000000000000000000000000000002,1,\N,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000
+# Operation fixtures. \N => SQL NULL (status=1 'requested' forbids a result).
+# schema_version pins the contract revision the request was suspended on.
+workflow_id,operation_seq,operation_id,operation_name,schema_version,input_json,input_hash,status,result_json,created_at,updated_at
+a0000000000000000000000000000001,1,b0000000000000000000000000000001,echo-transform,1,"{""values"":[1,2,3],""_fault"":{""respond_pending"":true}}",00000000000000000000000000000001,1,\N,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000
+a0000000000000000000000000000002,1,b0000000000000000000000000000002,echo-transform,1,"{""values"":[1,2,3]}",00000000000000000000000000000002,1,\N,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000
+a0000000000000000000000000000004,1,b0000000000000000000000000000004,echo-transform,2,"{""values"":[1,2,3]}",00000000000000000000000000000004,1,\N,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000

@@ -56,7 +56,11 @@ struct StubApp {
 	request_count: conc.AtomicInt
 }
 
-const SUPPORTED_OPERATION: String = "echo-transform";
+// Two distinct operations, so the coordinator's GENERIC dispatch is exercised
+// (not a renamed single op): echo-transform sums an int array -> {"sum": N};
+// string-join joins a string array with a separator -> {"joined": "..."}.
+const OP_ECHO_TRANSFORM: String = "echo-transform";
+const OP_STRING_JOIN: String = "string-join";
 
 // ===== Entry point =====
 
@@ -204,10 +208,10 @@ implement StubApp {
 	fn handle_put_input(self: &StubApp, op: &String, op_id: &String, input: &json.JsonNode) throws -> rest.Response {
 		// Validate operation name + input schema BEFORE touching Singular: an
 		// invalid request must return 400 and create NO operation.
-		if op != SUPPORTED_OPERATION {
+		if !_supported_op(op) {
 			return _json(400, _envelope_error("unknown-operation"));
 		}
-		if !_validate_echo(input) {
+		if !_validate_input(op, input) {
 			return _json(400, _envelope_error("invalid-input"));
 		}
 
@@ -229,7 +233,7 @@ implement StubApp {
 				}
 				// First submit: run the operation body EXACTLY ONCE.
 				val _prev = self.exec_count.fetch_add(1, conc.MemoryOrder::SeqCst());
-				val result_json = _echo_transform(input);
+				val result_json = _execute_op(op, input);
 				match self.gateway.get().complete(&lease, &result_json) {
 					singular.SettleOutcome::Settled(tr) => {
 						// Fault injection: DROP-AFTER-COMMIT. The result is already
@@ -412,6 +416,86 @@ fn _validate_echo(input: &json.JsonNode) nothrow -> Bool {
 		},
 		Optional::None => { return false; }
 	}
+}
+
+// ===== Generic operation dispatch (by operation name) =====
+
+fn _supported_op(op: &String) nothrow -> Bool {
+	return op == OP_ECHO_TRANSFORM or op == OP_STRING_JOIN;
+}
+
+fn _validate_input(op: &String, input: &json.JsonNode) nothrow -> Bool {
+	if op == OP_ECHO_TRANSFORM { return _validate_echo(input); }
+	if op == OP_STRING_JOIN { return _validate_string_join(input); }
+	return false;
+}
+
+fn _execute_op(op: &String, input: &json.JsonNode) -> String {
+	if op == OP_STRING_JOIN { return _string_join(input); }
+	// default: echo-transform (op already validated/supported before dispatch).
+	return _echo_transform(input);
+}
+
+// Validate the string-join input schema: { "parts": [string, ...], "sep": string }.
+fn _validate_string_join(input: &json.JsonNode) nothrow -> Bool {
+	match input.get(&"sep") {
+		Optional::Some(s) => { match s.as_string() { Optional::Some(_) => {}, Optional::None => { return false; } } },
+		Optional::None => { return false; }
+	}
+	match input.get(&"parts") {
+		Optional::Some(arr) => {
+			match arr.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						match items[i].as_string() {
+							Optional::Some(_) => {},
+							Optional::None => { return false; }
+						}
+						i = i + 1;
+					}
+					return true;
+				},
+				Optional::None => { return false; }
+			}
+		},
+		Optional::None => { return false; }
+	}
+}
+
+fn _string_join(input: &json.JsonNode) -> String {
+	// Precondition: _validate_string_join(input) is true (checked before start()).
+	var sep: String = "";
+	match input.get(&"sep") {
+		Optional::Some(s) => { match s.as_string() { Optional::Some(v) => { sep = move v; }, Optional::None => {} } },
+		Optional::None => {}
+	}
+	var joined: String = "";
+	var first = true;
+	match input.get(&"parts") {
+		Optional::Some(arr) => {
+			match arr.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						match items[i].as_string() {
+							Optional::Some(p) => {
+								if first { joined = move p; first = false; }
+								else { joined = joined + _dup(&sep) + move p; }
+							},
+							Optional::None => {}
+						}
+						i = i + 1;
+					}
+				},
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
+	var o = json.new_object();
+	o.set("joined", json.JsonNode::String(move joined));
+	return json.encode(o.to_node());
 }
 
 // ===== Identity / hashing =====

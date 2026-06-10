@@ -1,8 +1,10 @@
-# Audit trail for the seeded workflows (append-only, §24.6 D4). event_seq
-# matches each workflow's current_event_seq; \N => SQL NULL (actor/request_id).
+# Audit trail for the seeded workflows. event_seq matches current_event_seq;
+# \N => SQL NULL (actor/request_id).
 workflow_id,event_seq,event_ts,kind,actor,request_id,payload
 a0000000000000000000000000000001,1,2000-01-01 00:00:00.000000,created,\N,\N,{}
 a0000000000000000000000000000001,2,2000-01-01 00:00:00.000000,operation_requested,c0000000000000000000000000000000,\N,{}
 a0000000000000000000000000000002,1,2000-01-01 00:00:00.000000,created,\N,\N,{}
 a0000000000000000000000000000002,2,2000-01-01 00:00:00.000000,operation_requested,c0000000000000000000000000000000,\N,{}
 a0000000000000000000000000000003,1,2000-01-01 00:00:00.000000,created,\N,\N,{}
+a0000000000000000000000000000004,1,2000-01-01 00:00:00.000000,created,\N,\N,{}
+a0000000000000000000000000000004,2,2000-01-01 00:00:00.000000,operation_requested,c0000000000000000000000000000000,\N,{}

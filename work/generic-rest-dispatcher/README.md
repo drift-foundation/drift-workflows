@@ -92,7 +92,10 @@ protocol envelopes. What is hardcoded / missing:
   recovery, inconsistent-terminal). `just test-integration` green; SP 28→ updated.
 
 ## Current status and next action
-**In progress — data layer DONE & verified.**
+**DONE — full root `just test` green; see the DONE summary below.**
+
+History (kept for the record):
+**Data layer DONE & verified.**
 - [x] Step 1: `schema_version` column on `tb_mf_operation`; threaded through
   `sp_mf_operation_request` (param + immutable-identity conflict check + insert)
   and `sp_mf_operation_request_get` (output). SP regression 29/29 (added
@@ -154,8 +157,33 @@ protocol envelopes. What is hardcoded / missing:
     lease), and the post-claim reload is authoritative. A claimed workflow with no
     request and no `--operation` durably defers (`operation_request_absent`).
 
-**Next:** stub `string-join` op (5); harness array-config + `string-join` case,
-keep all 12 regressions (6); build both from source + full verify (7).
+- [x] Step 5: stub `string-join` operation (route + validate + body + exec-count),
+  generic dispatch by operation name; distinct `{"joined": "..."}` result.
+- [x] Step 6: harness switched to the array-of-records registry config
+  (participants + operations for both ops); `--participant-url` dropped,
+  `--operation` passed for fresh submits, resumes run on workflow id alone; added
+  `string_join_dispatch` + `string_join_executed` (exec-count) proofs; fixture CSV
+  gained `schema_version`.
+- [x] Step 7: full verification — integration **14/14** (incl. the 2nd op),
+  `just test-sp` **35/35**, full root `just test` **EXIT 0** (singular 16, microflows
+  10 + SP 35, integration source-build + 14).
+
+- [x] Static review round 5 (compile-clean; integration 16/16):
+  - **Medium** — `ordered_failover` no longer silently ignores extra endpoints:
+    validation rejects >1 endpoint (multi-endpoint failover unimplemented this slice).
+  - **Medium** — operation names validated non-empty + URI-safe segment
+    (`A-Z a-z 0-9 . _ -`) before they're interpolated into the dispatch URL.
+  - **Medium** — pinned-version-unavailable path now tested END-TO-END: fixture
+    `WF_PINNED_MISMATCH` (request pins v2, config offers v1) → runner defers
+    (`pinned_contract_unavailable`); a v2 config then auto-recovers it to completion
+    (`pinned_contract_unavailable_defers` + `pinned_contract_recovers`).
+  - **Low** — runner header rewritten (generic data-driven op; no `--participant-url`).
+
+## DONE — generic dispatch proven end-to-end
+The runner is no longer echo-specific: it dispatches arbitrary operations from the
+persisted request + trusted registry config, proven by a second operation
+(`string-join`) flowing through the identical loop. Reversal/compensation (step 6
+of §7) is the next milestone and reuses this dispatcher.
 
 ## Open questions / blockers
 - Auth scheme shape (header/value vs bearer) — starting with a single

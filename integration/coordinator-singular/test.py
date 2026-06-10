@@ -80,8 +80,12 @@ def _wf_id():
     return uuid.uuid4().hex  # 32 hex chars
 
 
-def run_runner(runner_cfg, base_url, wf_hex, input_json=None):
-    cmd = [str(RUNNER_BIN), "--config", runner_cfg, "--participant-url", base_url, "--workflow-id", wf_hex]
+def run_runner(runner_cfg, wf_hex, operation=None, input_json=None):
+    # Routing comes from the config registry (no --participant-url). --operation is
+    # given only for a FRESH submission; a resume runs on the workflow id alone.
+    cmd = [str(RUNNER_BIN), "--config", runner_cfg, "--workflow-id", wf_hex]
+    if operation is not None:
+        cmd += ["--operation", operation]
     if input_json is not None:
         cmd += ["--input", input_json]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
@@ -99,6 +103,7 @@ def run_runner(runner_cfg, base_url, wf_hex, input_json=None):
 WF_RECOVERY = "a0000000000000000000000000000001"   # forward/requested, due; request persisted with a _fault input
 WF_COMPLETED_UNSETTLED = "a0000000000000000000000000000002"  # completed, but operation still 'requested' (no result)
 WF_COMPLETED_NO_OP = "a0000000000000000000000000000003"      # completed, with NO operation row at all
+WF_PINNED_MISMATCH = "a0000000000000000000000000000004"      # forward/requested; request pins schema_version=2
 
 
 def _request_count(base):
@@ -113,15 +118,30 @@ def main():
 
     sg = f"slice-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     port = _free_port()
+    base = f"http://127.0.0.1:{port}"
     stub_cfg = {"port": port, "service_group": sg, "worker_id": "stub-1", "singular": _mariadb_conn("singular")}
-    runner_cfg = {"worker_id": "runner-1", "db": _mariadb_conn("microflows")}
+    # Trusted deployment config: a participant registry (the lasting boundary) +
+    # an operations registry (op -> participant + pinned schema_version). Both ops
+    # route to the one stub endpoint via ordered selection; no auth this slice.
+    runner_cfg = {
+        "worker_id": "runner-1",
+        "db": _mariadb_conn("microflows"),
+        "participants": [
+            {"id": "ref",
+             "transport": {"kind": "http", "endpoints": [base], "selection": "ordered_failover"},
+             "auth_profile": None},
+        ],
+        "operations": [
+            {"name": "echo-transform", "participant": "ref", "schema_version": 1},
+            {"name": "string-join", "participant": "ref", "schema_version": 1},
+        ],
+    }
 
     scf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(stub_cfg, scf); scf.close()
     rcf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(runner_cfg, rcf); rcf.close()
 
     stub = subprocess.Popen([str(STUB_BIN), "--config", scf.name],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    base = f"http://127.0.0.1:{port}"
     deadline = time.time() + 15
     while time.time() < deadline:
         if stub.poll() is not None:
@@ -137,8 +157,9 @@ def main():
         wf_a = _wf_id()
         wf_b = _wf_id()
 
-        # 1. normal success
-        code, body = run_runner(rcf.name, base, wf_a)
+        # 1. normal success — FRESH echo-transform submission (operation + input
+        # via CLI; routing resolved from the config registry, never CLI).
+        code, body = run_runner(rcf.name, wf_a, "echo-transform", json.dumps({"values": [1, 2, 3]}))
         check("normal_success", code == 0 and body.get("workflow") == "completed"
               and body.get("result") == {"sum": 6}, (code, body))
 
@@ -146,12 +167,13 @@ def main():
         # (sleeps 5s, past the runner's 3s PUT timeout) -> real transport failure
         # -> GET reconcile. Operation executes exactly once.
         lost_input = json.dumps({"values": [1, 2, 3], "_fault": {"delay_after_commit_ms": 5000}})
-        code, body = run_runner(rcf.name, base, wf_b, input_json=lost_input)
+        code, body = run_runner(rcf.name, wf_b, "echo-transform", lost_input)
         check("lost_ack_recovery", code == 0 and body.get("workflow") == "completed"
               and body.get("result") == {"sum": 6}, (code, body))
 
-        # 3. idempotent re-run of an already-completed workflow (no re-execution)
-        code, body = run_runner(rcf.name, base, wf_a)
+        # 3. idempotent re-run of an already-completed workflow — RESUME by id alone
+        # (no --operation; the durable request drives it; no re-execution).
+        code, body = run_runner(rcf.name, wf_a)
         check("idempotent_rerun", code == 0
               and body.get("workflow") in ("completed", "already_terminal")
               and body.get("result") == {"sum": 6}, (code, body))
@@ -165,7 +187,7 @@ def main():
         # first pending deferral is durable, not end-to-end pending recovery.
         wf_c = _wf_id()
         pending_input = json.dumps({"values": [1, 2, 3], "_fault": {"respond_pending": True}})
-        code, body = run_runner(rcf.name, base, wf_c, input_json=pending_input)
+        code, body = run_runner(rcf.name, wf_c, "echo-transform", pending_input)
         check("initial_pending_deferral", code == 9 and body.get("workflow") == "pending", (code, body))
 
         # 4. effectively-once execution: exactly 2 distinct operations executed.
@@ -179,17 +201,16 @@ def main():
         # body never runs (exec-count unchanged at 2).
         wf_d = _wf_id()
         bad_input = json.dumps({"not_values": 1})
-        code, body = run_runner(rcf.name, base, wf_d, input_json=bad_input)
+        code, body = run_runner(rcf.name, wf_d, "echo-transform", bad_input)
         check("rejection_blocks", code == 3 and body.get("workflow") == "failed"
               and body.get("disposition") == "blocked_resolution", (code, body))
 
-        # 4c. the blocked workflow does NOT repeat the rejected dispatch: a re-run
-        # finds it non-claimable (blocked_resolution, a non-terminal blocked
-        # state) and reports it deferred WITHOUT making a single participant
-        # request. Assert the EXACT response and that the participant request
-        # count is unchanged across the re-run (no second dispatch occurred).
+        # 4c. the blocked workflow does NOT repeat the rejected dispatch: a RESUME
+        # finds it non-claimable (blocked_resolution, a non-terminal blocked state)
+        # and reports it deferred WITHOUT making a single participant request.
+        # Assert the EXACT response and an unchanged participant request count.
         rc_before = _request_count(base)
-        code, body = run_runner(rcf.name, base, wf_d, input_json=bad_input)
+        code, body = run_runner(rcf.name, wf_d)
         rc_after = _request_count(base)
         check("rejection_not_repeating",
               code == 5 and body.get("workflow") == "deferred"
@@ -202,31 +223,73 @@ def main():
             n2 = json.loads(r.read())["count"]
         check("rejection_no_execution", n2 == 2, f"exec_count={n2} (expected 2)")
 
-        # 4e. durable-request recovery (seeded fixture WF_RECOVERY): a forward/
+        # 4e. GENERIC DISPATCH — a SECOND, distinct operation type (string-join)
+        # proves dispatch is data-driven, not renamed echo. The result shape
+        # {"joined": ...} differs from echo's {"sum": N}, and the exec-count bump
+        # proves the string-join BODY actually ran (not a replayed fixed document).
+        wf_sj = _wf_id()
+        sj_input = json.dumps({"parts": ["a", "b", "c"], "sep": "-"})
+        code, body = run_runner(rcf.name, wf_sj, "string-join", sj_input)
+        check("string_join_dispatch", code == 0 and body.get("workflow") == "completed"
+              and body.get("result") == {"joined": "a-b-c"}, (code, body))
+        with urllib.request.urlopen(f"{base}/debug/exec-count", timeout=3) as r:
+            n3 = json.loads(r.read())["count"]
+        check("string_join_executed", n3 == 3, f"exec_count={n3} (expected 3)")
+
+        # 4f. durable-request recovery (seeded fixture WF_RECOVERY): a forward/
         # requested workflow whose persisted operation request carries a _fault
-        # flag, seeded due. A resumed worker MUST reuse that durable request, not
-        # re-derive it from CLI input — so resuming with a DIFFERENT input still
-        # dispatches the persisted (faulting) request and defers pending again
-        # (code 9). Re-deriving from CLI input would change the input_hash and
-        # raise operation_conflict (code 3). The differing CLI input is the test.
-        code, body = run_runner(rcf.name, base, WF_RECOVERY, input_json=json.dumps({"values": [9, 8, 7]}))
+        # flag, seeded due. A resume MUST reuse that durable request, not re-derive
+        # it from CLI input — so resuming with a DIFFERENT input still dispatches
+        # the persisted (faulting) request and defers pending again (code 9).
+        # Re-deriving from CLI input would change the input_hash -> operation_conflict.
+        code, body = run_runner(rcf.name, WF_RECOVERY, "echo-transform", json.dumps({"values": [9, 8, 7]}))
         check("durable_request_recovery", code == 9 and body.get("workflow") == "pending"
               and body.get("reason") != "operation_conflict", (code, body))
 
-        # 4f. inconsistent terminal state (seeded fixture): COMPLETED but the
+        # 4g. inconsistent terminal state (seeded fixture): COMPLETED but the
         # operation is still 'requested' (no settled result). The runner must
         # report an ERROR, not a spurious success.
-        code, body = run_runner(rcf.name, base, WF_COMPLETED_UNSETTLED)
+        code, body = run_runner(rcf.name, WF_COMPLETED_UNSETTLED)
         check("completed_operation_unsettled",
               code == 10 and body.get("workflow") == "error"
               and body.get("reason") == "completed_operation_unsettled", (code, body))
 
-        # 4g. inconsistent terminal state (seeded fixture): COMPLETED with NO
+        # 4h. inconsistent terminal state (seeded fixture): COMPLETED with NO
         # operation row at all. Also an ERROR, not success.
-        code, body = run_runner(rcf.name, base, WF_COMPLETED_NO_OP)
+        code, body = run_runner(rcf.name, WF_COMPLETED_NO_OP)
         check("completed_without_operation",
               code == 10 and body.get("workflow") == "error"
               and body.get("reason") == "completed_without_operation", (code, body))
+
+        # 4i. pinned-contract-unavailable -> durable OPERATIONAL deferral (NOT a
+        # failure/block). WF_PINNED_MISMATCH's persisted request pins
+        # schema_version=2, but the running config only offers echo-transform v1.
+        # The runner must DEFER with reason pinned_contract_unavailable (release the
+        # lease, preserve the request, stay forward) — not fail or block.
+        code, body = run_runner(rcf.name, WF_PINNED_MISMATCH)
+        check("pinned_contract_unavailable_defers",
+              code == 9 and body.get("workflow") == "deferred"
+              and body.get("reason") == "pinned_contract_unavailable", (code, body))
+
+        # 4j. AUTO-RECOVERY after configuration is restored: a config that offers
+        # echo-transform v2 lets the SAME workflow resume and complete on its next
+        # due poll. This proves the prior defer RELEASED the lease (re-claimable),
+        # PRESERVED the request (it dispatches the durable input -> sum 6), and kept
+        # it FORWARD. Poll past the defer backoff (robust to DISPATCH_DEFER_SECONDS).
+        cfg2 = json.loads(json.dumps(runner_cfg))
+        cfg2["operations"] = [{"name": "echo-transform", "participant": "ref", "schema_version": 2}]
+        rcf2 = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(cfg2, rcf2); rcf2.close()
+        recovered = None
+        rdeadline = time.time() + 12
+        while time.time() < rdeadline:
+            rcode, rbody = run_runner(rcf2.name, WF_PINNED_MISMATCH)
+            if rbody.get("workflow") == "completed":
+                recovered = rbody
+                break
+            time.sleep(0.5)
+        os.unlink(rcf2.name)
+        check("pinned_contract_recovers",
+              recovered is not None and recovered.get("result") == {"sum": 6}, recovered)
 
         # 5. terminal rerun with the participant DOWN: Microflows replays the
         # LOCAL authoritative result; no dependency on the participant.
@@ -235,7 +298,7 @@ def main():
             stub.wait(timeout=5)
         except Exception:
             stub.kill()
-        code, body = run_runner(rcf.name, base, wf_a)
+        code, body = run_runner(rcf.name, wf_a)
         check("terminal_rerun_participant_down", code == 0
               and body.get("workflow") == "already_terminal"
               and body.get("result") == {"sum": 6}, (code, body))
@@ -247,7 +310,7 @@ def main():
             stub.kill()
         os.unlink(scf.name); os.unlink(rcf.name)
 
-    total = 12
+    total = 16
     print(f"coordinator<->singular integration: {total - len(failures)}/{total} passed")
     return 1 if failures else 0
 

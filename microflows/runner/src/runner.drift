@@ -1,14 +1,17 @@
 // Microflows coordinator runner — first dispatch slice (manual IR).
 //
-// Drives ONE echo-transform operation through the dispatch-gap recovery loop,
-// proving the central property without the language frontend:
+// Drives ONE GENERIC operation through the dispatch-gap recovery loop, proving
+// the central property without the language frontend:
 //
-//   manual IR -> persist operation request + suspended continuation (BEFORE
-//   dispatch) -> HTTP PUT -> [lost response] -> GET by stable operation id
-//   -> persist success + Checkpoint + advanced continuation -> workflow done
+//   persist operation request + suspended continuation (BEFORE dispatch) ->
+//   HTTP PUT -> [lost response] -> GET by stable operation id -> persist success
+//   + Checkpoint + advanced continuation -> workflow done
 //
-// MANUAL IR (hardcoded; no parser): workflow `protocol_spike` rev 1, one
-// operation `echo-transform` whose input comes from --input.
+// The operation is DATA-DRIVEN: its name, input, and pinned schema_version come
+// from the persisted request (the durable authority on resume) or, for a fresh
+// submission, from --operation/--input. The participant transport is resolved
+// from the TRUSTED config registry (participants + operations), never from
+// workflow input. Manual IR: workflow `protocol_spike` rev 1, one operation seq.
 //
 // Two enforced runner requirements:
 //   1. on operation_settle AlreadySettled, the returned stored result is
@@ -16,8 +19,8 @@
 //   2. on operation_request FenceLost, STOP immediately — do NOT dispatch.
 //
 // One-shot CLI: runs the slice for one workflow id and prints a result JSON.
-//   --config FILE  (db subtree) --participant-url URL --workflow-id HEX
-//   [--operation NAME] [--input JSON] [--lose-put-response]
+//   --config FILE  (db + participants + operations registries)
+//   --workflow-id HEX  [--operation NAME (fresh submit only)]  [--input JSON]
 
 module microflows.runner;
 
@@ -748,6 +751,7 @@ fn _validate_operations(cfg: &json.JsonNode, ids: &Array<String>) -> Void {
 					var i = 0;
 					while i < items.len {
 						val nm = _req_str(&items[i], &"name", "operation.name");
+						if !_is_op_name_safe(&nm) { throw RunnerError(message = "operation name is empty or not a URI-safe segment: '" + _dup(&nm) + "' (allowed: A-Z a-z 0-9 . _ -)"); }
 						if _contains(&names, &nm) { throw RunnerError(message = "duplicate operation binding: " + _dup(&nm)); }
 						val pref = _req_str(&items[i], &"participant", "operation.participant");
 						if !_contains(ids, &pref) { throw RunnerError(message = "operation '" + _dup(&nm) + "' references unknown participant '" + _dup(&pref) + "'"); }
@@ -776,6 +780,10 @@ fn _validate_transport(part: &json.JsonNode, pid: &String) -> Void {
 					match epn.as_array() {
 						Optional::Some(eps) => {
 							if eps.len == 0 { throw RunnerError(message = "participant '" + _dup(pid) + "' has an empty endpoint list"); }
+							// This slice resolves a SINGLE endpoint (ordered selection over a
+							// one-element list). Multi-endpoint ordered_failover is not
+							// implemented yet, so reject >1 rather than silently ignore the rest.
+							if eps.len > 1 { throw RunnerError(message = "participant '" + _dup(pid) + "' declares " + fmt.format_int(eps.len) + " endpoints; multi-endpoint ordered_failover is not implemented in this slice (use exactly one)"); }
 							var k = 0;
 							while k < eps.len {
 								match eps[k].as_string() {
@@ -940,6 +948,30 @@ fn _is_http_url(s: &String) nothrow -> Bool {
 	if _starts_with(s, &"https://") and s.byte_length() > 8 { return true; }
 	if _starts_with(s, &"http://") and s.byte_length() > 7 { return true; }
 	return false;
+}
+
+// A non-empty URI path-SEGMENT-safe operation name (the name is interpolated raw
+// into the dispatch URL). Allowed: A-Z a-z 0-9 . _ - — no '/', spaces, or other
+// reserved/percent-requiring characters. Rejecting empty here also keeps an empty
+// registry name from ever matching an omitted --operation.
+fn _is_op_name_safe(s: &String) nothrow -> Bool {
+	val n = s.byte_length();
+	if n == 0 { return false; }
+	// Reject the dot-segments "." and ".." — even though their bytes are in the
+	// allowed set, as a whole URL path segment they are normalized away / climb the
+	// path, which would change the route.
+	if _str_eq(s, &".") or _str_eq(s, &"..") { return false; }
+	var i = 0;
+	while i < n {
+		val b = s.byte_at(i);
+		val ok: Bool = (b >= 48 and b <= 57)        // 0-9
+		            or (b >= 65 and b <= 90)        // A-Z
+		            or (b >= 97 and b <= 122)       // a-z
+		            or b == 46 or b == 95 or b == 45;   // . _ -
+		if !ok { return false; }
+		i = i + 1;
+	}
+	return true;
 }
 
 // ===== config =====
