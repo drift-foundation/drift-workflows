@@ -54,6 +54,7 @@ const PUT_IO_TIMEOUT_MS: Int = 3000;
 const RECONCILE_IO_TIMEOUT_MS: Int = 8000;
 
 // microflows.state terminal storage codes.
+const STATE_REVERSING: Int = 2;
 const STATE_COMPLETED: Int = 4;
 const STATE_REVERSED: Int = 5;
 const STATE_RESOLVED_EXCEPTION: Int = 6;
@@ -67,6 +68,21 @@ struct ResolvedOperation {
 	operation_name: String,
 	schema_version: Int,
 	base_url: String
+}
+
+// Manual-IR compensation binding: a forward operation's declared REVERSE operation
+// (name + pinned schema_version). The reverse INPUT for this slice is the forward
+// checkpoint payload (design §6).
+struct CompensationBinding {
+	op_name: String,
+	schema_version: Int
+}
+
+// One step of the reverse loop: Continue (descend to the next checkpoint) or
+// Terminal with the process exit code (reversed / deferred / blocked / fenced).
+variant CompStep {
+	Continue,
+	Terminal(exit_code: Int)
 }
 
 fn main(argv: Array<String>) nothrow -> Int {
@@ -194,8 +210,9 @@ fn _run(config_path: &String, workflow_hex: &String,
 	// --- 2. claim THIS workflow by id (never a different instance) ---
 	val clock = _clock(host.get());
 	var fencing_token: Int = 0;
+	var claimed_state: Int = 0;
 	match host.get().claim_workflow(&workflow_id, &clock.now, &clock.deadline) {
-		mf.ClaimByIdOutcome::Claimed(wf) => { fencing_token = wf.fencing_token; },
+		mf.ClaimByIdOutcome::Claimed(wf) => { fencing_token = wf.fencing_token; claimed_state = wf.state_code; },
 		mf.ClaimByIdOutcome::NotFound => {
 			if fresh {
 				throw RunnerError(message = "workflow absent after create");
@@ -210,6 +227,13 @@ fn _run(config_path: &String, workflow_hex: &String,
 			// Not claimable: INSPECT to distinguish terminal / active / deferred.
 			return _inspect_report(host.get(), &workflow_id, &operation_id_hex);
 		}
+	}
+
+	// A claimed REVERSING workflow (state 2) drives the compensation UNWIND, not the
+	// forward dispatch. claim_by_id claims state IN (1,2); the reverse loop reads the
+	// authoritative checkpoint stack (reverse_head), never the continuation.
+	if claimed_state == STATE_REVERSING {
+		return _run_reversal(host.get(), &cfg, &workflow_id, &workflow_canon_hex, fencing_token);
 	}
 
 	// --- 2a. AUTHORITATIVE post-claim reload (closes the probe/claim race). Now
@@ -643,6 +667,219 @@ fn _fail_operation(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_
 	}
 }
 
+// ===== reversal / compensation unwind (reverse direction) =====
+//
+// Stable reverse-invocation id, DERIVED deterministically from (workflow, seq) in a
+// space DISTINCT from forward operation ids, so recovery re-derives the same id.
+fn _reverse_id(workflow_hex: &String, seq: Int) nothrow -> Array<Byte> {
+	val rev = fmt.format_int(SCRIPT_REVISION);
+	val s = fmt.format_int(seq);
+	val seed = _join3(workflow_hex, &rev, &s) + "reverse:1";
+	val u = uuid.v3_from_string(&seed);
+	return uuid.to_bytes(&u);
+}
+
+// Manual-IR compensation binding for a forward operation (None if it declares no
+// compensation — then its checkpoint cannot be auto-unwound).
+fn _compensation_for(cfg: &json.JsonNode, fwd_op: &String) -> Optional<CompensationBinding> {
+	match cfg.get(&"operations") {
+		Optional::Some(on) => {
+			match on.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						val nm = _req_str(&items[i], &"name", "operation.name");
+						if _str_eq(&nm, fwd_op) {
+							match items[i].get(&"compensation") {
+								Optional::Some(c) => {
+									val cop = _req_str(c, &"operation", "compensation.operation");
+									val csv = _req_int(c, &"schema_version", "compensation.schema_version");
+									return Optional<CompensationBinding>::Some(CompensationBinding(op_name = move cop, schema_version = csv));
+								},
+								Optional::None => { return Optional<CompensationBinding>::None(); }
+							}
+						}
+						i = i + 1;
+					}
+				},
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
+	return Optional<CompensationBinding>::None();
+}
+
+// Enter blocked_resolution (reverse direction) when a compensation cannot continue.
+fn _reverse_block(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
+                  seq: Int, rev_id: &Array<Byte>, reason: String) -> Int {
+	val ts = _now(host);
+	match host.reverse_block(workflow_id, fencing_token, seq, rev_id, 2, &reason, &ts) {
+		mf.ReverseBlockOutcome::Blocked => {
+			console.println("{\"workflow\":\"blocked\",\"direction\":\"reverse\",\"reason\":\"" + move reason + "\"}");
+			return 3;
+		},
+		mf.ReverseBlockOutcome::AlreadyBlocked => {
+			console.println("{\"workflow\":\"blocked\",\"direction\":\"reverse\",\"reason\":\"" + move reason + "\"}");
+			return 3;
+		},
+		mf.ReverseBlockOutcome::FenceLost => {
+			console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"block_fence_lost\"}");
+			return 7;
+		},
+		mf.ReverseBlockOutcome::EventTimeSkew(defer_until) => {
+			// Time-disciplined like every transition: defer to the supplied deadline
+			// rather than reporting failure with the lease still held.
+			return _defer(host, workflow_id, fencing_token, &defer_until, "reverse_block_skew");
+		},
+		default => {
+			console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"reverse_block_failed\"}");
+			return 8;
+		}
+	}
+}
+
+// Dispatch ONE compensation (generic dispatcher) + settle/defer/block. Returns
+// Continue to descend to the next checkpoint, or Terminal with the exit code.
+fn _compensate(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
+               seq: Int, comp_op: &String, base: &String, rev_id: &Array<Byte>,
+               rev_id_hex: &String, rev_input: &String) -> CompStep {
+	match _classify_dispatch(base, comp_op, rev_id_hex, rev_input) {
+		DispatchResult::Done(result) => {
+			val ts = _now(host);
+			match host.reverse_settle(workflow_id, fencing_token, seq, rev_id, &result, &ts) {
+				mf.ReverseSettleOutcome::Reversed => {
+					console.println("{\"workflow\":\"reversed\"}");
+					return CompStep::Terminal(0);
+				},
+				mf.ReverseSettleOutcome::Reversing(_) => { return CompStep::Continue(); },
+				mf.ReverseSettleOutcome::AlreadyReversed => { return CompStep::Continue(); },
+				mf.ReverseSettleOutcome::FenceLost => {
+					console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"settle_fence_lost\"}");
+					return CompStep::Terminal(7);
+				},
+				mf.ReverseSettleOutcome::EventTimeSkew(defer_until) => {
+					return CompStep::Terminal(_defer(host, workflow_id, fencing_token, &defer_until, "reverse_settle_skew"));
+				},
+				default => {
+					console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"reverse_settle_failed\"}");
+					return CompStep::Terminal(8);
+				}
+			}
+		},
+		DispatchResult::Pending => {
+			return CompStep::Terminal(_defer_dispatch(host, workflow_id, fencing_token, "compensation_pending"));
+		},
+		DispatchResult::Rejected(reason) => {
+			// Persist the CLASSIFIED participant reason as blocked-resolution evidence.
+			return CompStep::Terminal(_reverse_block(host, workflow_id, fencing_token, seq, rev_id, move reason));
+		}
+	}
+}
+
+// Drive the compensation UNWIND of a reversing workflow: the checkpoint stack
+// (reverse_head) is authoritative. Top active checkpoint -> derive + persist the
+// compensation binding (pending) or reconcile the persisted one (dispatched) ->
+// dispatch via the generic dispatcher -> settle/descend, defer on pending, block on
+// definite rejection. Terminal reversed clears the lease.
+fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
+                 workflow_canon_hex: &String, fencing_token: Int) -> Int {
+	while true {
+		match host.reverse_head(workflow_id) {
+			mf.ReverseHeadOutcome::NoneActive => {
+				// A reversing workflow with NO active checkpoint is an inconsistency (a
+				// fully-compensated workflow would be reversed). Do NOT exit holding the
+				// lease with no record — that recurs after lease expiry. Durably DEFER
+				// with an audit reason: the lease is released, a deduped diagnostic event
+				// is recorded, and the state is observable rather than silently pinning a
+				// worker until expiry.
+				return _defer_dispatch(host, workflow_id, fencing_token, "reverse_no_active_checkpoint");
+			},
+			mf.ReverseHeadOutcome::Pending(seq, forward_operation_name, forward_payload) => {
+				val rev_id = _reverse_id(workflow_canon_hex, seq);
+				val rev_id_hex = _bytes_to_hex(&rev_id);
+				var comp_op: String = "";
+				var comp_sv: Int = 0;
+				match _compensation_for(cfg, &forward_operation_name) {
+					Optional::Some(c) => { comp_op = _dup(&c.op_name); comp_sv = c.schema_version; },
+					Optional::None => {
+						// PRE-dispatch resolution failure: nothing was dispatched, so
+						// reverse_block (which requires a persisted reverse id) cannot
+						// apply and would leave the lease held. Durably DEFER as a
+						// repairable config state — restoring the binding resumes the unwind.
+						return _defer_dispatch(host, workflow_id, fencing_token, "no_compensation_binding");
+					}
+				}
+				val rev_input = _dup(&forward_payload);
+				val rev_hash = _input_hash(&rev_input);
+				// resolve the pinned reverse contract (registry, not workflow input)
+				var base: String = "";
+				var rok = false;
+				try {
+					val r = _resolve_operation(cfg, &comp_op, Optional<Int>::Some(comp_sv));
+					base = _dup(&r.base_url);
+					rok = true;
+				} catch RunnerError(e) { console.eprintln(e.message); }
+				if !rok {
+					return _defer_dispatch(host, workflow_id, fencing_token, "pinned_contract_unavailable");
+				}
+				// persist the binding BEFORE dispatch (crash-safe)
+				val treq = _now(host);
+				var ready = false;
+				match host.reverse_request(workflow_id, fencing_token, seq, &rev_id, &comp_op, comp_sv,
+				                           &rev_input, &rev_hash, &treq) {
+					mf.ReverseRequestOutcome::Requested(_) => { ready = true; },
+					mf.ReverseRequestOutcome::AlreadyRequested(_, _, _, _, _) => { ready = true; },
+					mf.ReverseRequestOutcome::BindingConflict => {},   // persisted binding wins -> re-read head
+					mf.ReverseRequestOutcome::CheckpointInactive(_) => {},  // already advanced -> re-read head
+					mf.ReverseRequestOutcome::FenceLost => {
+						console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"reverse_request_fence_lost\"}");
+						return 7;
+					},
+					mf.ReverseRequestOutcome::EventTimeSkew(defer_until) => {
+						return _defer(host, workflow_id, fencing_token, &defer_until, "reverse_request_skew");
+					},
+					default => {
+						console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"reverse_request_failed\"}");
+						return 8;
+					}
+				}
+				if ready {
+					match _compensate(host, workflow_id, fencing_token, seq, &comp_op, &base, &rev_id, &rev_id_hex, &rev_input) {
+						CompStep::Continue => {},
+						CompStep::Terminal(code) => { return code; }
+					}
+				}
+			},
+			mf.ReverseHeadOutcome::Dispatched(seq, forward_operation_name, reverse_invocation_id, reverse_operation_name, reverse_schema_version, reverse_input_json, reverse_input_hash) => {
+				val _ = forward_operation_name; val _ = reverse_input_hash;
+				val rev_op = _dup(&reverse_operation_name);
+				val rev_sv = reverse_schema_version;
+				val rev_input = _dup(&reverse_input_json);
+				// USE the DURABLE persisted reverse id (decode it) for dispatch + settle,
+				// never a re-derived one — so recovery targets exactly the recorded
+				// invocation even if derivation changes or seeded state is inconsistent.
+				val rev_id = _hex_to_bytes(&reverse_invocation_id);
+				val rev_id_hex = _dup(&reverse_invocation_id);
+				var base: String = "";
+				var rok = false;
+				try {
+					val r = _resolve_operation(cfg, &rev_op, Optional<Int>::Some(rev_sv));
+					base = _dup(&r.base_url);
+					rok = true;
+				} catch RunnerError(e) { console.eprintln(e.message); }
+				if !rok {
+					return _defer_dispatch(host, workflow_id, fencing_token, "pinned_contract_unavailable");
+				}
+				match _compensate(host, workflow_id, fencing_token, seq, &rev_op, &base, &rev_id, &rev_id_hex, &rev_input) {
+					CompStep::Continue => {},
+					CompStep::Terminal(code) => { return code; }
+				}
+			}
+		}
+	}
+}
+
 // Extract the participant envelope's `result` object as compact JSON text.
 fn _extract_result(envelope: &String) -> String {
 	match _try_extract_result(envelope) {
@@ -744,6 +981,7 @@ fn _validate_participants(cfg: &json.JsonNode) -> Array<String> {
 
 fn _validate_operations(cfg: &json.JsonNode, ids: &Array<String>) -> Void {
 	var names: Array<String> = [];
+	var svs: Array<Int> = [];
 	match cfg.get(&"operations") {
 		Optional::Some(on) => {
 			match on.as_array() {
@@ -757,8 +995,39 @@ fn _validate_operations(cfg: &json.JsonNode, ids: &Array<String>) -> Void {
 						if !_contains(ids, &pref) { throw RunnerError(message = "operation '" + _dup(&nm) + "' references unknown participant '" + _dup(&pref) + "'"); }
 						val sv = _req_int(&items[i], &"schema_version", "operation.schema_version");
 						if sv < 1 { throw RunnerError(message = "operation '" + _dup(&nm) + "' has invalid schema_version"); }
+						svs.push(sv);
 						names.push(move nm);
 						i = i + 1;
+					}
+					// Second pass: validate optional compensation bindings now that all
+					// names are known (a compensation must reference a registered op).
+					var k = 0;
+					while k < items.len {
+						match items[k].get(&"compensation") {
+							Optional::Some(c) => {
+								val cop = _req_str(c, &"operation", "compensation.operation");
+								if !_contains(&names, &cop) {
+									throw RunnerError(message = "compensation references unknown operation '" + _dup(&cop) + "'");
+								}
+								val csv = _req_int(c, &"schema_version", "compensation.schema_version");
+								if csv < 1 { throw RunnerError(message = "compensation for an operation has invalid schema_version"); }
+								// The pinned compensation version must MATCH the referenced
+								// operation's registered version — reject an inconsistent
+								// registry at startup, not by deferring during execution.
+								var reg_sv = 0;
+								var fi = 0;
+								while fi < names.len {
+									if _str_eq(&names[fi], &cop) { reg_sv = svs[fi]; }
+									fi = fi + 1;
+								}
+								if reg_sv != csv {
+									throw RunnerError(message = "compensation pins schema_version " + fmt.format_int(csv)
+										+ " but operation '" + _dup(&cop) + "' offers version " + fmt.format_int(reg_sv));
+								}
+							},
+							Optional::None => {}
+						}
+						k = k + 1;
 					}
 				},
 				Optional::None => { throw RunnerError(message = "config: 'operations' must be a JSON array"); }

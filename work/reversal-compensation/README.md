@@ -264,7 +264,34 @@ reversal cannot safely continue. Manual IR; parser still deferred.
   - **Low** — host-test payloads asserted as EXACT documents via
     `json.encode_compact` against a parsed expected (Pending `{"reservation":"r2"}`,
     Dispatched input `{"undo":true}`, with `undo` also checked as boolean true).
-- [ ] **Next: runner reverse loop + stub compensation op + integration** (lost-ack reconcile
+- [x] **Runner reverse loop (compiles).** On claiming a `reversing(2)` workflow
+  the runner branches to `_run_reversal`: reads the authoritative `reverse_head`
+  (not the continuation) → on `pending`, looks up the manual-IR compensation
+  binding (`operations[].compensation = {operation, schema_version}`), uses the
+  forward checkpoint payload as the reverse input, persists via `reverse_request`,
+  resolves the pinned reverse contract, and dispatches via the GENERIC
+  `_classify_dispatch`; on `dispatched`, re-derives the id + reconciles. Result →
+  `reverse_settle` (Reversed=terminal / Reversing=descend), Pending→`defer_dispatch`,
+  Rejected→`reverse_block`. New: `CompensationBinding`/`CompStep` types,
+  `_reverse_id` (distinct id space), `_compensation_for`, `_reverse_block`,
+  `_compensate`; `_validate_operations` validates optional compensation bindings.
+  (Drift quirk: variant match binds fields BY NAME — see memory.)
+- [x] **Reverse-loop review round 1 (compiles).**
+  - **High** — Dispatched recovery now DECODES + uses the durable persisted
+    `reverse_invocation_id` (via `_hex_to_bytes`) for dispatch + settle, never a
+    re-derived id.
+  - **High** — a missing compensation binding (pre-dispatch resolution failure) now
+    durably DEFERS (`_defer_dispatch`, "no_compensation_binding") instead of calling
+    `reverse_block`, which would return `not_requested` and strand the lease.
+  - **Medium** — `_reverse_block` handles `EventTimeSkew` → `_defer` to the supplied
+    deadline (was reporting failure with the lease held).
+  - **Medium** — `_validate_operations` rejects a compensation whose pinned
+    `schema_version` ≠ the referenced operation's registered version (startup, not
+    runtime defer).
+  - **Low** — the classified participant rejection reason is persisted as
+    blocked-resolution evidence (was overwritten with "compensation_rejected").
+- [ ] **Next: stub compensation op + integration (seeded reversing fixture →
+  reverse → reversed, incl. lost-ack + restart)** (lost-ack reconcile
   + restart recovery against a SEEDED single-checkpoint reversing workflow; stub
   compensation op). Then sub-step C (multi-op forward IR) → D (full E2E).
 
