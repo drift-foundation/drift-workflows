@@ -16,6 +16,10 @@ CREATE PROCEDURE `sp_mf_checkpoint_reverse_request`(
 	IN arg_fencing_token bigint,
 	IN arg_seq int,
 	IN arg_reverse_id varbinary(16),
+	IN arg_reverse_operation_name varchar(128),
+	IN arg_reverse_schema_version int,
+	IN arg_reverse_input_json mediumtext,
+	IN arg_reverse_input_hash varchar(64),
 	IN arg_event_ts datetime(6)
 )
 proc:BEGIN
@@ -26,6 +30,10 @@ proc:BEGIN
 	DECLARE v_event_ts datetime(6);
 	DECLARE v_cp_state tinyint;
 	DECLARE v_cp_revid varbinary(16);
+	DECLARE v_cp_rname varchar(128);
+	DECLARE v_cp_rsv int;
+	DECLARE v_cp_rinput mediumtext;
+	DECLARE v_cp_rhash varchar(64);
 	DECLARE v_top_seq int DEFAULT NULL;
 	DECLARE v_missing tinyint(1) DEFAULT 0;
 	DECLARE v_cp_missing tinyint(1) DEFAULT 0;
@@ -44,6 +52,19 @@ proc:BEGIN
 	END IF;
 	IF arg_reverse_id IS NULL OR LENGTH(arg_reverse_id) <> 16 THEN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfReverseIdInvalid';
+	END IF;
+	-- Durable compensation binding (pinned contract + input identity).
+	IF arg_reverse_operation_name IS NULL OR arg_reverse_operation_name = '' THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfReverseOpNameInvalid';
+	END IF;
+	IF arg_reverse_schema_version IS NULL OR arg_reverse_schema_version < 1 THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfReverseSchemaVersionInvalid';
+	END IF;
+	IF arg_reverse_input_json IS NULL OR NOT JSON_VALID(arg_reverse_input_json) OR JSON_TYPE(arg_reverse_input_json) <> 'OBJECT' THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfReverseInputJsonInvalid';
+	END IF;
+	IF arg_reverse_input_hash IS NULL OR arg_reverse_input_hash = '' THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfReverseInputHashInvalid';
 	END IF;
 	IF arg_event_ts IS NULL THEN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfEventTsInvalid';
@@ -65,8 +86,9 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_cp_missing = 1;
-		SELECT `reversal_state`, `reverse_invocation_id`
-		INTO v_cp_state, v_cp_revid
+		SELECT `reversal_state`, `reverse_invocation_id`, `reverse_operation_name`,
+		       `reverse_schema_version`, `reverse_input_json`, `reverse_input_hash`
+		INTO v_cp_state, v_cp_revid, v_cp_rname, v_cp_rsv, v_cp_rinput, v_cp_rhash
 		FROM `tb_mf_workflow_checkpoint`
 		WHERE `workflow_id` = arg_workflow_id AND `seq` = arg_seq
 		FOR UPDATE;
@@ -78,14 +100,33 @@ proc:BEGIN
 	END IF;
 
 	-- Idempotent replays (lease-independent): already past active, or already
-	-- dispatched (recovery) — return the persisted id to reconcile against.
+	-- dispatched (recovery).
 	IF v_cp_state <> 1 THEN
 		SELECT JSON_OBJECT('outcome', 'checkpoint_inactive', 'reversal_state', CAST(v_cp_state AS SIGNED)) AS result;
 		LEAVE proc;
 	END IF;
 	IF v_cp_revid IS NOT NULL THEN
+		-- Binding is IMMUTABLE once persisted (like operation_request's identity):
+		-- the supplied binding must match the persisted one, else a racing runner
+		-- with a re-derived binding (e.g. registry/manual-IR changed) would dispatch
+		-- the wrong contract under the persisted id. The input is compared by its
+		-- actual JSON CONTENT (the caller-supplied hash is not DB-verified, so a
+		-- right-hash/wrong-json pair must not slip through). The persisted input is
+		-- returned so the runner dispatches THAT durable value, never its own.
+		IF NOT (v_cp_revid <=> arg_reverse_id)
+		   OR NOT (v_cp_rname <=> arg_reverse_operation_name)
+		   OR NOT (v_cp_rsv <=> arg_reverse_schema_version)
+		   OR NOT (v_cp_rhash <=> arg_reverse_input_hash)
+		   OR NOT (v_cp_rinput <=> arg_reverse_input_json) THEN
+			SELECT JSON_OBJECT('outcome', 'binding_conflict') AS result;
+			LEAVE proc;
+		END IF;
 		SELECT JSON_OBJECT('outcome', 'already_requested',
-			'reverse_invocation_id', LOWER(HEX(v_cp_revid))) AS result;
+			'reverse_invocation_id', LOWER(HEX(v_cp_revid)),
+			'reverse_operation_name', v_cp_rname,
+			'reverse_schema_version', CAST(v_cp_rsv AS SIGNED),
+			'reverse_input_json', JSON_EXTRACT(v_cp_rinput, '$'),
+			'reverse_input_hash', v_cp_rhash) AS result;
 		LEAVE proc;
 	END IF;
 
@@ -117,6 +158,10 @@ proc:BEGIN
 
 	UPDATE `tb_mf_workflow_checkpoint`
 	SET `reverse_invocation_id` = arg_reverse_id,
+	    `reverse_operation_name` = arg_reverse_operation_name,
+	    `reverse_schema_version` = arg_reverse_schema_version,
+	    `reverse_input_json` = arg_reverse_input_json,
+	    `reverse_input_hash` = arg_reverse_input_hash,
 	    `updated_at` = arg_event_ts
 	WHERE `workflow_id` = arg_workflow_id AND `seq` = arg_seq;
 
@@ -131,7 +176,8 @@ proc:BEGIN
 		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
 		arg_workflow_id, v_event_seq, arg_event_ts, 'compensation_requested', arg_executor, NULL,
-		JSON_OBJECT('seq', arg_seq, 'reverse_invocation_id', LOWER(HEX(arg_reverse_id)))
+		JSON_OBJECT('seq', arg_seq, 'reverse_invocation_id', LOWER(HEX(arg_reverse_id)),
+			'reverse_operation', arg_reverse_operation_name, 'reverse_schema_version', arg_reverse_schema_version)
 	);
 
 	SELECT JSON_OBJECT('outcome', 'requested',

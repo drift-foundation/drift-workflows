@@ -1,0 +1,270 @@
+// Microflows host e2e — reversal/compensation host methods against a real
+// MariaDB instance. EXECUTES every reversal host method and asserts the POSITIVE
+// outcome/field decodes (not only error paths), so an SP name/signature mistake or
+// a field-name / variant mapping defect is caught at runtime, not just at compile.
+//
+// A reversing workflow with an active checkpoint is not constructible through host
+// methods yet (settle completes the single-op workflow; multi-op forward is a
+// later sub-step), so the reversing fixture is SEEDED via the test-only proc
+// sp_mf_test_seed_reversing (loaded by the test gate's db-load-test-fixtures, NOT
+// part of the production schema). The host then CLAIMS it (claim_by_id claims
+// state IN (1,2)) and drives the REAL reverse_request / reverse_head / reverse_settle
+// / reverse_block.
+//
+// TIME IS FABRICATED (§24.4): synthetic datetimes, no sleeps.
+// Prereqs: MariaDB 127.0.0.1:34114 root/rootpw, schema + test fixtures loaded.
+
+module microflows.tests.e2e.live_reversal_test;
+
+import std.core as core;
+import std.core.arc as arc;
+import std.io as io;
+import std.json as json;
+import std.env as env;
+import std.uuid as uuid;
+import mariadb.rpc as rpc;
+import microflows.host as host;
+
+fn _config_json() -> json.JsonNode {
+	val text: String = "{\"backend\":\"mariadb\",\"host\":\"127.0.0.1\",\"port\":34114,\"user\":\"root\",\"password\":\"rootpw\",\"database\":\"microflows\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
+	return json.parse(&text).or_throw();
+}
+
+fn _ns() nothrow -> String {
+	match env.get("MICROFLOWS_E2E_NS") {
+		Optional::Some(v) => { if v.byte_length() > 0 { return move v; } },
+		Optional::None => {}
+	}
+	return "drift-test";
+}
+
+fn _concat(a: &String, b: &String) nothrow -> String {
+	val na = a.byte_length();
+	val nb = b.byte_length();
+	var buf = io.buffer(na + nb);
+	var i = 0;
+	while i < na { io.buffer_write(&mut buf, i, a.byte_at(i)); i = i + 1; }
+	var j = 0;
+	while j < nb { io.buffer_write(&mut buf, na + j, b.byte_at(j)); j = j + 1; }
+	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), na + nb);
+}
+
+fn _dup_str(s: &String) nothrow -> String { return _concat(s, &""); }
+
+fn _copy_bytes(b: &Array<Byte>) nothrow -> Array<Byte> {
+	var out: Array<Byte> = Array<type Byte>::with_capacity(b.len);
+	var i = 0;
+	while i < b.len { out.push(b[i]); i = i + 1; }
+	return move out;
+}
+
+fn _build_host(worker_name: &String) -> arc.Arc<host.MicroflowsHost> {
+	val cfg = _config_json();
+	val identity = host.identity_from_worker_name(worker_name);
+	var b = host.new_host_builder();
+	host.with_json(&mut b, &cfg);
+	host.with_identity(&mut b, move identity);
+	return host.build_host(move b).or_throw();
+}
+
+fn _wf_id(seed: &String) nothrow -> Array<Byte> {
+	val ns = _ns();
+	val combined = _concat(&ns, seed);
+	val u: uuid.Uuid = uuid.v3_from_string(&combined);
+	return uuid.to_bytes(&u);
+}
+
+// Seed a claimable reversing(2) workflow + one active checkpoint via the test-only
+// fixture proc (raw rpc, so the host then exercises the REAL reversal methods).
+fn _seed_reversing(wf: &Array<Byte>, cp_op: &Array<Byte>, trig: &Array<Byte>,
+                   script: &String, ts: &String) -> Void {
+	var builder = rpc.new_connection_config_builder();
+	builder.with_host("127.0.0.1");
+	builder.with_port(34114);
+	builder.with_user("root");
+	builder.with_password("rootpw");
+	builder.with_database("microflows");
+	builder.with_connect_timeout_ms(3000);
+	builder.with_read_timeout_ms(3000);
+	builder.with_write_timeout_ms(3000);
+	val cfg = rpc.build_connection_config(move builder).or_throw();
+	var conn = rpc.connect(move cfg).or_throw();
+	var args: Array<rpc.RpcArg> = [];
+	args.push(rpc.arg_bytes(_copy_bytes(wf)));
+	args.push(rpc.arg_string(_dup_str(script)));
+	args.push(rpc.arg_bytes(_copy_bytes(cp_op)));
+	args.push(rpc.arg_bytes(_copy_bytes(trig)));
+	args.push(rpc.arg_string(_dup_str(ts)));
+	var stmt = conn.call(&"sp_mf_test_seed_reversing", &args).or_throw();
+	rpc.skip_remaining(&mut stmt).or_throw();
+	rpc.commit(&mut conn).or_throw();
+	val _ = conn.close();
+}
+
+fn scenario_reversal() -> Int {
+	val h = _build_host(&"pd-rev-w1");
+	val script = _ns();
+	val absent = _wf_id(&"-rev-absent");
+	val op1 = _wf_id(&"-rev-op1");
+	val op2 = _wf_id(&"-rev-op2");
+
+	// --- begin_reversal on a non-existent workflow -> NotFound ---
+	match h.get().begin_reversal(&absent, 1, 1, &op1, &"2026-03-01 10:00:00.000000", &"x") {
+		host.BeginReversalOutcome::NotFound => {},
+		default => { return 301; }
+	}
+
+	// --- wf1: forward, one requested (failed) op, NO checkpoint -> Reversed ---
+	val wf1 = _wf_id(&"-rev-wf1");
+	match h.get().create_workflow(&wf1, &script, 1, &"2026-03-01 10:00:00.000000",
+		&"2026-03-01 10:00:00.000000", &"{\"pos\":\"start\"}", &"{}") {
+		host.CreateOutcome::Created => {},
+		host.CreateOutcome::Exists => { return 309; }
+	}
+	var tok1 = 0;
+	match h.get().claim_workflow(&wf1, &"2026-03-01 10:00:01.000000", &"2026-03-01 10:00:31.000000") {
+		host.ClaimByIdOutcome::Claimed(wf) => { tok1 = wf.fencing_token; },
+		default => { return 302; }
+	}
+	match h.get().operation_request(&wf1, tok1, 1, &op1, &"reserve", 1, &"{\"v\":1}", &"h1",
+		&"{\"pos\":\"op:1:dispatched\"}", &"2026-03-01 10:00:02.000000", &"{}") {
+		host.OperationRequestOutcome::Requested(_) => {},
+		default => { return 303; }
+	}
+	match h.get().begin_reversal(&wf1, tok1, 1, &op1, &"2026-03-01 10:00:03.000000", &"forward_rejected") {
+		host.BeginReversalOutcome::Reversed => {},
+		default => { return 304; }
+	}
+	match h.get().begin_reversal(&wf1, tok1, 1, &op1, &"2026-03-01 10:00:04.000000", &"forward_rejected") {
+		host.BeginReversalOutcome::AlreadyBegun(st) => { if st != 5 { return 305; } },
+		default => { return 306; }
+	}
+	match h.get().begin_reversal(&wf1, tok1, 2, &op2, &"2026-03-01 10:00:05.000000", &"x") {
+		host.BeginReversalOutcome::TriggerMismatch => {},
+		default => { return 307; }
+	}
+	match h.get().reverse_head(&wf1) {
+		host.ReverseHeadOutcome::NoneActive => {},
+		default => { return 308; }
+	}
+
+	// --- wf2: SEEDED reversing workflow -> the POSITIVE reverse decodes ---
+	val wf2 = _wf_id(&"-rev-wf2");
+	val cp2 = _wf_id(&"-rev-cp2");
+	val trig2 = _wf_id(&"-rev-trig2");
+	_seed_reversing(&wf2, &cp2, &trig2, &script, &"2026-03-01 11:00:00.000000");
+	var tok2 = 0;
+	match h.get().claim_workflow(&wf2, &"2026-03-01 11:00:01.000000", &"2026-03-01 11:00:31.000000") {
+		host.ClaimByIdOutcome::Claimed(wf) => {
+			if wf.state_code != 2 { return 330; }            // claimed a REVERSING workflow
+			if wf.execution_direction != 2 { return 331; }
+			tok2 = wf.fencing_token;
+		},
+		default => { return 332; }
+	}
+	// reverse_head Pending -> full forward identity + the complete payload document
+	match h.get().reverse_head(&wf2) {
+		host.ReverseHeadOutcome::Pending(seq, opname, payload) => {
+			if seq != 1 { return 333; }
+			if opname != "reserve" { return 334; }
+			// EXACT shape + value: a parsed payload must canonicalize identically to
+			// the expected document (extra/wrong fields would change the encoding).
+			val pj = json.parse(&payload).or_throw();
+			val exp_p = json.parse(&"{\"reservation\":\"r2\"}").or_throw();
+			if json.encode_compact(&pj) != json.encode_compact(&exp_p) { return 335; }
+		},
+		default => { return 338; }
+	}
+	val rid = _wf_id(&"-rev-rid2");
+	var rid_hex: String = "";
+	// reverse_request -> Requested(id)   [POSITIVE decode]
+	match h.get().reverse_request(&wf2, tok2, 1, &rid, &"release", 1, &"{\"undo\":true}", &"rh",
+		&"2026-03-01 11:00:02.000000") {
+		host.ReverseRequestOutcome::Requested(idhex) => { rid_hex = move idhex; },
+		default => { return 339; }
+	}
+	if rid_hex.byte_length() != 32 { return 340; }
+	// reverse_head Dispatched -> the complete durable binding   [POSITIVE decode]
+	match h.get().reverse_head(&wf2) {
+		host.ReverseHeadOutcome::Dispatched(seq, fwd, ridh, rname, rsv, rinput, rhash) => {
+			if seq != 1 { return 341; }
+			if fwd != "reserve" { return 342; }
+			if ridh != rid_hex { return 343; }
+			if rname != "release" { return 344; }
+			if rsv != 1 { return 345; }
+			if rhash != "rh" { return 346; }
+			// undo asserted as boolean true, AND the input is EXACTLY {"undo":true}.
+			val ij = json.parse(&rinput).or_throw();
+			match ij.get(&"undo") {
+				Optional::Some(u) => {
+					match u.as_bool() {
+						Optional::Some(b) => { if !b { return 347; } },
+						Optional::None => { return 354; }
+					}
+				},
+				Optional::None => { return 355; }
+			}
+			val exp_i = json.parse(&"{\"undo\":true}").or_throw();
+			if json.encode_compact(&ij) != json.encode_compact(&exp_i) { return 356; }
+		},
+		default => { return 348; }
+	}
+	// reverse_settle -> Reversed (single checkpoint -> terminal)   [POSITIVE decode]
+	match h.get().reverse_settle(&wf2, tok2, 1, &rid, &"{\"released\":true}", &"2026-03-01 11:00:03.000000") {
+		host.ReverseSettleOutcome::Reversed => {},
+		default => { return 349; }
+	}
+	match h.get().reverse_head(&wf2) {
+		host.ReverseHeadOutcome::NoneActive => {},
+		default => { return 350; }
+	}
+
+	// --- wf3: SEEDED reversing workflow -> reverse_block Blocked   [POSITIVE decode] ---
+	val wf3 = _wf_id(&"-rev-wf3");
+	val cp3 = _wf_id(&"-rev-cp3");
+	val trig3 = _wf_id(&"-rev-trig3");
+	_seed_reversing(&wf3, &cp3, &trig3, &script, &"2026-03-01 12:00:00.000000");
+	var tok3 = 0;
+	match h.get().claim_workflow(&wf3, &"2026-03-01 12:00:01.000000", &"2026-03-01 12:00:31.000000") {
+		host.ClaimByIdOutcome::Claimed(wf) => { tok3 = wf.fencing_token; },
+		default => { return 351; }
+	}
+	val rid3 = _wf_id(&"-rev-rid3");
+	match h.get().reverse_request(&wf3, tok3, 1, &rid3, &"release", 1, &"{\"undo\":true}", &"rh",
+		&"2026-03-01 12:00:02.000000") {
+		host.ReverseRequestOutcome::Requested(_) => {},
+		default => { return 352; }
+	}
+	match h.get().reverse_block(&wf3, tok3, 1, &rid3, 2, &"compensation_rejected", &"2026-03-01 12:00:03.000000") {
+		host.ReverseBlockOutcome::Blocked => {},
+		default => { return 353; }
+	}
+
+	// --- absent-workflow NotFound for request/settle/block (SP name + decode) ---
+	val rid0 = _wf_id(&"-rev-rid0");
+	match h.get().reverse_request(&absent, 1, 1, &rid0, &"release", 1, &"{\"undo\":true}", &"rh",
+		&"2026-03-01 13:00:00.000000") {
+		host.ReverseRequestOutcome::NotFound => {},
+		default => { return 320; }
+	}
+	match h.get().reverse_settle(&absent, 1, 1, &rid0, &"{\"released\":true}", &"2026-03-01 13:00:01.000000") {
+		host.ReverseSettleOutcome::NotFound => {},
+		default => { return 321; }
+	}
+	match h.get().reverse_block(&absent, 1, 1, &rid0, 2, &"x", &"2026-03-01 13:00:02.000000") {
+		host.ReverseBlockOutcome::NotFound => {},
+		default => { return 322; }
+	}
+
+	return 0;
+}
+
+fn main() nothrow -> Int {
+	try {
+		val r = scenario_reversal();
+		if r != 0 { return r; }
+		return 0;
+	} catch unexpected {
+		return 9;
+	}
+}

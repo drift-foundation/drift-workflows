@@ -193,7 +193,78 @@ reversal cannot safely continue. Manual IR; parser still deferred.
   `resolved_exception(6)`) returns `already_begun` with the current state instead of
   `fence_lost`. Unified outcome `already_begun{state}` replaces
   `already_reversing/already_reversed`.
-- [ ] **Next: host methods + runner reverse loop + integration** (lost-ack reconcile
+- [x] **Host methods (compile-clean).** `begin_reversal` / `reverse_request` /
+  `reverse_settle` / `reverse_block` / `reverse_head` exposed as typed
+  domain-outcome variants — domain outcomes, not DB codes.
+- [x] **Durable compensation BINDING + authoritative reverse cursor (SP 67/67).**
+  Pre-runner correction:
+  - `tb_mf_workflow_checkpoint` gains `reverse_operation_name`,
+    `reverse_schema_version`, `reverse_input_json`, `reverse_input_hash` (alongside
+    `reverse_invocation_id`). `reverse_request` persists the FULL compensation
+    binding BEFORE dispatch, so a later registry/manual-IR change cannot resume an
+    in-flight unwind through a different contract — on recovery the pinned
+    (reverse_operation_name, reverse_schema_version) resolves exactly like a forward
+    pinned operation.
+  - New `sp_mf_checkpoint_reverse_head` (read): the AUTHORITATIVE top active
+    checkpoint. The checkpoint stack decides what to compensate next; the
+    continuation is only a projection. Outcomes: none_active / pending (forward
+    identity to derive the binding) / dispatched (durable pinned binding to
+    reconcile). The runner resumes from THIS, not the continuation.
+- [x] **Binding review (SP 69/69) — pre-runner.**
+  - **High** — `reverse_request` replay is now bound to the persisted binding: it
+    compares the supplied (id, reverse op name, schema version, input hash) against
+    the persisted ones and returns `binding_conflict` on any mismatch (immutable
+    identity, like `operation_request`); `already_requested` returns the full
+    persisted binding. A racing runner with a re-derived binding can no longer
+    dispatch the wrong contract under the persisted id. New host `BindingConflict`;
+    `AlreadyRequested` carries the binding.
+  - **Medium** — `ck_mf_checkpoint_reverse_binding` CHECK enforces the binding as
+    ALL-OR-NONE (five fields all NULL or all non-NULL), so `reverse_head` can never
+    see a half-written binding classified as `dispatched`.
+- [x] **Binding review round 2 (SP 71/71).**
+  - **High** — replay compares the actual `reverse_input_json` CONTENT (not the
+    caller-asserted, DB-unverified hash) and `already_requested` returns the full
+    persisted binding incl. the input JSON, so a right-hash/wrong-json pair is
+    rejected (`binding_conflict`) and the runner dispatches the durable value.
+  - **Medium** — the all-or-none CHECK now also enforces VALIDITY on the complete
+    tuple (16-byte id, non-empty name/hash, schema_version ≥ 1).
+- [x] **Coverage review (SP 79/79 + host E2E).**
+  - **Medium** — added `live_reversal_test.drift` (registered in the e2e list): a
+    host E2E that EXECUTES all five reversal host methods against live MariaDB, so
+    SP-name/signature/outcome-decode errors are caught at runtime, not just at
+    compile. Reaches `begin_reversal {NotFound, Reversed, AlreadyBegun(state),
+    TriggerMismatch}` and `reverse_head {NoneActive, Pending(seq,name,payload)}`;
+    request/settle/block executed via fence_lost / NotRequested / NotFound. (The
+    dispatched/requested/settled field decodes need a reversing+checkpoint state,
+    not host-constructible until multi-op forward — covered at integration.)
+  - **Medium** — reversing-direction `dispatch_defer` now tested (state stays
+    reversing, lease clears, deadline persists).
+  - **Medium** — `reverse_head_dispatched` now asserts `reverse_input_json`.
+  - **Low** — conflict + CHECK tests split one-field-each (id/name/version/input/
+    hash conflicts; empty-name/empty-hash/bad-version/short-id validity).
+- [x] **Coverage review round 2.**
+  - **Medium** — POSITIVE host decodes now covered. Added a test-only fixture proc
+    `sp_mf_test_seed_reversing` (under `db/tests/`, loaded by the gate via
+    `db-load-test-fixtures`, never in the production schema apply) that seeds a
+    claimable reversing+checkpoint workflow. `live_reversal_test` now claims it and
+    drives the REAL `reverse_request` → `Requested`, `reverse_head` →
+    `Pending`(full payload) / `Dispatched`(full binding), `reverse_settle` →
+    `Reversed`, `reverse_block` → `Blocked` — so field-name/variant-mapping defects
+    are caught, not just SP names. (Raw `mariadb.rpc` used to call the seed proc.)
+  - **Medium** — `reverse_head` pending payload asserted as the COMPLETE document
+    (SP + host).
+  - **Low** — reversing-defer deadline asserted by exact datetime equality.
+  - **Low** — `live_reversal_test` requires `CreateOutcome::Created` (no `Exists`
+    masking stale-state reuse), matching `live_lease_test`.
+- [x] **Coverage review round 3.**
+  - **Medium** — `db-load-test-fixtures` is now a lock-acquiring PUBLIC wrapper +
+    private `_db-load-test-fixtures` (the load); `_test-locked` calls the private
+    one (already under the shared lock — flocker is not re-entrant). A direct
+    public invocation can no longer overlap another checkout's tests.
+  - **Low** — host-test payloads asserted as EXACT documents via
+    `json.encode_compact` against a parsed expected (Pending `{"reservation":"r2"}`,
+    Dispatched input `{"undo":true}`, with `undo` also checked as boolean true).
+- [ ] **Next: runner reverse loop + stub compensation op + integration** (lost-ack reconcile
   + restart recovery against a SEEDED single-checkpoint reversing workflow; stub
   compensation op). Then sub-step C (multi-op forward IR) → D (full E2E).
 

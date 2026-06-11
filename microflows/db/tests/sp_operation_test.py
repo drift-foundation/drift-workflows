@@ -12,6 +12,7 @@ Run via the mariachi venv python (has PyMySQL):
   ../../../mariachi/.venv/bin/python db/tests/sp_operation_test.py
 Requires the `microflows` schema loaded (`just db-load-schema`) and MDB_ROOT_PWD.
 """
+import datetime
 import json
 import os
 import sys
@@ -262,6 +263,12 @@ def main():
             "VALUES (%s,%s,%s,'reserve',1,'{}','h',%s,%s,%s,%s)",
             (wf, op_seq, op_id, status, result, T(2), T(2)))
 
+    # reverse_request with the durable compensation binding (pinned reverse contract
+    # + input identity) — 'release' is the compensation for the 'reserve' forward op.
+    def rev_req(wf, tok, seq, rid, ets):
+        return call(cur, "sp_mf_checkpoint_reverse_request",
+                    (wf, EXEC, tok, seq, rid, "release", 1, '{"undo":true}', "rh", ets))
+
     wf5 = os.urandom(16)
     cp1_op = bytes.fromhex("00000000000000000000000000000e51")
     cp2_op = bytes.fromhex("00000000000000000000000000000e52")
@@ -286,36 +293,79 @@ def main():
           r and r["outcome"] == "already_begun" and r["state"] == 2, r)
     _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf5, EXEC, tok5, 1, os.urandom(16), T(3), "x"))
     check("begin_reversal_trigger_mismatch", r and r["outcome"] == "trigger_mismatch", r)
+    # reverse_head is AUTHORITATIVE (not the continuation): top active checkpoint,
+    # not yet dispatched -> pending with the forward identity to derive the binding.
+    _, r = call(cur, "sp_mf_checkpoint_reverse_head", (wf5,))
+    check("reverse_head_pending",
+          r and r["outcome"] == "pending" and r["seq"] == 2 and r["operation_name"] == "reserve"
+          and r["payload"] == {"reservation": "r2"}, r)
     # reverse ORDER enforced: cannot compensate seq 1 while seq 2 is the top active
-    _, r = call(cur, "sp_mf_checkpoint_reverse_request", (wf5, EXEC, tok5, 1, rev1_id, T(4)))
+    _, r = rev_req(wf5, tok5, 1, rev1_id, T(4))
     check("reverse_request_out_of_order", r and r["outcome"] == "out_of_order" and r["top_seq"] == 2, r)
     # time discipline: a non-advancing event_ts is rejected
-    _, r = call(cur, "sp_mf_checkpoint_reverse_request", (wf5, EXEC, tok5, 2, rev2_id, T(3)))
+    _, r = rev_req(wf5, tok5, 2, rev2_id, T(3))
     check("reverse_request_skew", r and r["outcome"] == "event_time_skew", r)
-    # compensate the TOP checkpoint (seq 2) first
-    _, r = call(cur, "sp_mf_checkpoint_reverse_request", (wf5, EXEC, tok5, 2, rev2_id, T(4)))
+    # compensate the TOP checkpoint (seq 2) first — persists the durable binding
+    _, r = rev_req(wf5, tok5, 2, rev2_id, T(4))
     check("reverse_request_requested",
           r and r["outcome"] == "requested" and r["reverse_invocation_id"] == rev2_id.hex(), r)
-    # recovery: re-request returns the PERSISTED id (no second dispatch)
-    _, r = call(cur, "sp_mf_checkpoint_reverse_request", (wf5, EXEC, tok5, 2, os.urandom(16), T(5)))
+    # reverse_head now reports the DISPATCHED binding (pinned reverse contract)
+    _, r = call(cur, "sp_mf_checkpoint_reverse_head", (wf5,))
+    check("reverse_head_dispatched",
+          r and r["outcome"] == "dispatched" and r["seq"] == 2
+          and r["reverse_invocation_id"] == rev2_id.hex()
+          and r["reverse_operation_name"] == "release" and r["reverse_schema_version"] == 1
+          and r["reverse_input_json"] == {"undo": True} and r["reverse_input_hash"] == "rh", r)
+    # recovery: re-request with the SAME (deterministic) binding -> already_requested,
+    # returning the COMPLETE persisted binding (incl. the durable input JSON the
+    # runner must dispatch).
+    _, r = rev_req(wf5, tok5, 2, rev2_id, T(5))
     check("reverse_request_idempotent",
-          r and r["outcome"] == "already_requested" and r["reverse_invocation_id"] == rev2_id.hex(), r)
+          r and r["outcome"] == "already_requested" and r["reverse_invocation_id"] == rev2_id.hex()
+          and r["reverse_operation_name"] == "release" and r["reverse_schema_version"] == 1
+          and r["reverse_input_json"] == {"undo": True} and r["reverse_input_hash"] == "rh", r)
+    # each immutable binding field is pinned INDEPENDENTLY (persisted is
+    # rev2_id/"release"/1/{"undo":true}/"rh"): a difference in ANY one alone is a
+    # binding_conflict, so dropping a single comparison would be caught.
+    _, r = call(cur, "sp_mf_checkpoint_reverse_request",
+                (wf5, EXEC, tok5, 2, os.urandom(16), "release", 1, '{"undo":true}', "rh", T(5)))
+    check("reverse_request_conflict_id", r and r["outcome"] == "binding_conflict", r)
+    _, r = call(cur, "sp_mf_checkpoint_reverse_request",
+                (wf5, EXEC, tok5, 2, rev2_id, "release-v2", 1, '{"undo":true}', "rh", T(5)))
+    check("reverse_request_conflict_name", r and r["outcome"] == "binding_conflict", r)
+    _, r = call(cur, "sp_mf_checkpoint_reverse_request",
+                (wf5, EXEC, tok5, 2, rev2_id, "release", 2, '{"undo":true}', "rh", T(5)))
+    check("reverse_request_conflict_version", r and r["outcome"] == "binding_conflict", r)
+    # right hash + WRONG json must NOT slip through (hash is caller-asserted, not
+    # DB-verified): the JSON CONTENT is compared.
+    _, r = call(cur, "sp_mf_checkpoint_reverse_request",
+                (wf5, EXEC, tok5, 2, rev2_id, "release", 1, '{"undo":"WRONG"}', "rh", T(5)))
+    check("reverse_request_conflict_input", r and r["outcome"] == "binding_conflict", r)
+    _, r = call(cur, "sp_mf_checkpoint_reverse_request",
+                (wf5, EXEC, tok5, 2, rev2_id, "release", 1, '{"undo":true}', "rh2", T(5)))
+    check("reverse_request_conflict_hash", r and r["outcome"] == "binding_conflict", r)
     # time discipline on settle: a non-advancing event_ts is rejected
     _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 2, rev2_id, '{"released":true}', T(4)))
     check("reverse_settle_skew", r and r["outcome"] == "event_time_skew", r)
     # settle seq 2 -> stack DESCENDS to seq 1 (still reversing, lease retained)
     _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 2, rev2_id, '{"released":true}', T(6)))
     check("reverse_settle_descends", r and r["outcome"] == "reversing" and r["next_seq"] == 1, r)
+    # the head now projects the next active checkpoint (seq 1), pending
+    _, r = call(cur, "sp_mf_checkpoint_reverse_head", (wf5,))
+    check("reverse_head_descended", r and r["outcome"] == "pending" and r["seq"] == 1, r)
     # lost-ack retry of an intermediate settle is harmless (effectively-once)
     _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 2, rev2_id, '{"released":true}', T(7)))
     check("reverse_settle_idempotent", r and r["outcome"] == "already_reversed", r)
     # compensate the LAST checkpoint (seq 1) -> terminal reversed(5)
-    call(cur, "sp_mf_checkpoint_reverse_request", (wf5, EXEC, tok5, 1, rev1_id, T(8)))
+    rev_req(wf5, tok5, 1, rev1_id, T(8))
     _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 1, rev1_id, '{"released":true}', T(9)))
     check("reverse_settle_reversed", r and r["outcome"] == "reversed", r)
     cur.execute("SELECT w.state, MIN(c.reversal_state), MAX(c.reversal_state) FROM tb_mf_workflow w "
                 "JOIN tb_mf_workflow_checkpoint c USING (workflow_id) WHERE w.workflow_id=%s GROUP BY w.state", (wf5,))
     check("reverse_settle_terminal", cur.fetchone() == (5, 2, 2), "expected reversed + ALL checkpoints reversed")
+    # the whole stack compensated -> the head reports no active checkpoint
+    _, r = call(cur, "sp_mf_checkpoint_reverse_head", (wf5,))
+    check("reverse_head_none_active", r and r["outcome"] == "none_active", r)
     # finding 4: the terminal settle cleared the lease — a lost-ack retry must still
     # resolve to already_reversed (lease-independent), not fence_lost.
     _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 1, rev1_id, '{"released":true}', T(10)))
@@ -377,9 +427,9 @@ def main():
     _, r = call(cur, "sp_mf_checkpoint_reverse_block", (wf7, EXEC, tok7, 1, rev7_id, 2, "x", T(4)))
     check("reverse_block_not_requested", r and r["outcome"] == "not_requested", r)
     # a stale token cannot drive reversal (checkpoint still active)
-    _, r = call(cur, "sp_mf_checkpoint_reverse_request", (wf7, EXEC, 999, 1, os.urandom(16), T(4)))
+    _, r = rev_req(wf7, 999, 1, os.urandom(16), T(4))
     check("reverse_fence_lost", r and r["outcome"] == "fence_lost", r)
-    call(cur, "sp_mf_checkpoint_reverse_request", (wf7, EXEC, tok7, 1, rev7_id, T(4)))
+    rev_req(wf7, tok7, 1, rev7_id, T(4))
     # time discipline on block
     _, r = call(cur, "sp_mf_checkpoint_reverse_block", (wf7, EXEC, tok7, 1, rev7_id, 2, "x", T(4)))
     check("reverse_block_skew", r and r["outcome"] == "event_time_skew", r)
@@ -401,6 +451,66 @@ def main():
     for t in ("tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf7,))
 
+    # the durable dispatch deferral also works in the REVERSING direction (used for
+    # a Pending/uncertain COMPENSATION dispatch): state stays reversing(2), the lease
+    # clears, and the absolute backoff deadline persists.
+    wfB = os.urandom(16)
+    cpB_op = bytes.fromhex("00000000000000000000000000000eb1")
+    failedB = bytes.fromhex("00000000000000000000000000000eb3")
+    call(cur, "sp_mf_workflow_create", (wfB, SCRIPT, 1, T(0), T(0), '{"pos":"op:2:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfB, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    tokB = r["fencing_token"]
+    _seed_checkpoint(wfB, 1, cpB_op, '{"reservation":"rB"}')
+    _seed_op(wfB, 2, failedB, 1, None)
+    call(cur, "sp_mf_workflow_begin_reversal", (wfB, EXEC, tokB, 2, failedB, T(3), "forward_op_rejected"))
+    _, r = call(cur, "sp_mf_operation_dispatch_defer", (wfB, EXEC, tokB, T(4), T(9), T(4), "compensation_pending"))
+    check("reversing_dispatch_defer", r and r["outcome"] == "deferred", r)
+    cur.execute("SELECT state, lease_owner, next_attempt_at FROM tb_mf_workflow WHERE workflow_id=%s", (wfB,))
+    stB, loB, naB = cur.fetchone()
+    check("reversing_defer_state",
+          stB == 2 and loB is None and naB == datetime.datetime(2026, 2, 1, 13, 0, 9), (stB, loB, naB))
+    for t in ("tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+        cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wfB,))
+
+    # the reverse binding is ALL-OR-NONE: a partial binding (an invocation id with
+    # no pinned contract/input) is rejected by the schema CHECK, so reverse_head can
+    # never classify a half-written binding as 'dispatched'.
+    wf9 = os.urandom(16)
+    call(cur, "sp_mf_workflow_create", (wf9, SCRIPT, 1, T(0), T(0), '{"pos":"x"}', "{}"))
+    try:
+        cur.execute(
+            "INSERT INTO tb_mf_workflow_checkpoint (workflow_id, seq, operation_name, operation_id, "
+            "payload, reversal_state, reverse_invocation_id, created_at, updated_at) "
+            "VALUES (%s, 1, 'reserve', %s, '{}', 1, %s, %s, %s)",
+            (wf9, bytes.fromhex("00000000000000000000000000000e91"),
+             bytes.fromhex("00000000000000000000000000000e9a"), T(2), T(2)))
+        check("checkpoint_binding_all_or_none", False, "partial binding INSERT was accepted")
+    except pymysql.MySQLError as e:
+        check("checkpoint_binding_all_or_none", "ck_mf_checkpoint_reverse_binding" in str(e), e)
+    # each VALIDITY rule on the complete-tuple branch is pinned independently, so
+    # removing any single rule would be caught.
+    def _bad_binding(label, revid, rname, rsv, rhash):
+        try:
+            cur.execute(
+                "INSERT INTO tb_mf_workflow_checkpoint (workflow_id, seq, operation_name, operation_id, "
+                "payload, reversal_state, reverse_invocation_id, reverse_operation_name, "
+                "reverse_schema_version, reverse_input_json, reverse_input_hash, created_at, updated_at) "
+                "VALUES (%s, 1, 'reserve', %s, '{}', 1, %s, %s, %s, '{}', %s, %s, %s)",
+                (wf9, bytes.fromhex("00000000000000000000000000000e91"),
+                 revid, rname, rsv, rhash, T(2), T(2)))
+            check(label, False, "degenerate binding INSERT was accepted")
+            cur.execute("DELETE FROM tb_mf_workflow_checkpoint WHERE workflow_id=%s", (wf9,))
+        except pymysql.MySQLError as e:
+            check(label, "ck_mf_checkpoint_reverse_binding" in str(e), e)
+
+    good_id = bytes.fromhex("00000000000000000000000000000e9a")
+    _bad_binding("checkpoint_binding_empty_name", good_id, "", 1, "h")
+    _bad_binding("checkpoint_binding_empty_hash", good_id, "release", 1, "")
+    _bad_binding("checkpoint_binding_bad_version", good_id, "release", 0, "h")
+    _bad_binding("checkpoint_binding_short_id", bytes.fromhex("0011"), "release", 1, "h")
+    for t in ("tb_mf_workflow_checkpoint", "tb_mf_workflow_event", "tb_mf_workflow"):
+        cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf9,))
+
     # status/result table invariant: requested(1) + a non-NULL result must be
     # rejected. Include a valid schema_version so the row is well-formed on every
     # OTHER required column — the insert must fail on the status/result CHECK
@@ -420,7 +530,7 @@ def main():
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (WF,))
     conn.close()
 
-    total = 63
+    total = 79
     print(f"sp_operation regression: {total - len(failures)}/{total} passed")
     return 1 if failures else 0
 

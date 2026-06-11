@@ -56,7 +56,12 @@ export {
 	OperationResultOutcome,
 	OperationFailOutcome,
 	OperationRequestRecord,
-	OperationRequestGetOutcome
+	OperationRequestGetOutcome,
+	BeginReversalOutcome,
+	ReverseRequestOutcome,
+	ReverseSettleOutcome,
+	ReverseBlockOutcome,
+	ReverseHeadOutcome
 };
 
 // ===== Identity =====
@@ -172,6 +177,79 @@ pub variant OperationFailOutcome {
 	FenceLost,
 	NotFound,
 	OperationNotFound,
+	EventTimeSkew(defer_until: String)
+}
+
+// begin_reversal: forward(1) -> reversing(2) (cursor at the top active checkpoint)
+// or -> reversed(5) when nothing to compensate. AlreadyBegun is the trigger-bound
+// idempotent replay (carrying the current reverse-direction state).
+pub variant BeginReversalOutcome {
+	Reversing(top_seq: Int),
+	Reversed,
+	AlreadyBegun(state: Int),
+	TriggerMismatch,
+	OperationNotFound,
+	OperationConflict,
+	OperationNotFailed(status: Int),
+	FenceLost,
+	NotFound,
+	EventTimeSkew(defer_until: String)
+}
+
+// reverse_head: the authoritative top active checkpoint (the checkpoint stack,
+// not the continuation, decides what to compensate next). Pending = not yet
+// dispatched (forward identity to derive the binding); Dispatched = the durable
+// pinned reverse binding to reconcile/redispatch against.
+pub variant ReverseHeadOutcome {
+	NoneActive,
+	Pending(seq: Int, forward_operation_name: String, forward_payload: String),
+	Dispatched(seq: Int, forward_operation_name: String, reverse_invocation_id: String,
+	           reverse_operation_name: String, reverse_schema_version: Int,
+	           reverse_input_json: String, reverse_input_hash: String)
+}
+
+// checkpoint_reverse_request: persist the reverse-invocation id + the full
+// compensation binding before dispatch. AlreadyRequested returns the persisted id.
+pub variant ReverseRequestOutcome {
+	Requested(reverse_invocation_id: String),
+	AlreadyRequested(reverse_invocation_id: String, reverse_operation_name: String,
+	                 reverse_schema_version: Int, reverse_input_json: String, reverse_input_hash: String),
+	BindingConflict,
+	OutOfOrder(top_seq: Int),
+	CheckpointInactive(reversal_state: Int),
+	CheckpointNotFound,
+	FenceLost,
+	NotFound,
+	EventTimeSkew(defer_until: String)
+}
+
+// checkpoint_reverse_settle: mark a checkpoint reversed then descend (Reversing
+// next_seq) or reach terminal Reversed. AlreadyReversed is the lost-ack replay.
+pub variant ReverseSettleOutcome {
+	Reversed,
+	Reversing(next_seq: Int),
+	AlreadyReversed,
+	ReverseIdMismatch,
+	NotRequested,
+	CheckpointNotSettleable(reversal_state: Int),
+	OutOfOrder(top_seq: Int),
+	CheckpointNotFound,
+	FenceLost,
+	NotFound,
+	EventTimeSkew(defer_until: String)
+}
+
+// checkpoint_reverse_block: enter blocked_resolution (reverse direction).
+pub variant ReverseBlockOutcome {
+	Blocked,
+	AlreadyBlocked,
+	ReverseIdMismatch,
+	NotRequested,
+	CheckpointNotBlockable(reversal_state: Int),
+	OutOfOrder(top_seq: Int),
+	CheckpointNotFound,
+	FenceLost,
+	NotFound,
 	EventTimeSkew(defer_until: String)
 }
 
@@ -329,7 +407,28 @@ pub interface MicroflowsHost {
 	                  operation_seq: Int, operation_id: &Array<Byte>, new_continuation: &String,
 	                  event_ts: &String, event_payload: &String) -> OperationFailOutcome;
 	// Load the durable operation request (authoritative for recovery).
-	fn operation_request_get(self: &Self, workflow_id: &Array<Byte>, operation_seq: Int) -> OperationRequestGetOutcome
+	fn operation_request_get(self: &Self, workflow_id: &Array<Byte>, operation_seq: Int) -> OperationRequestGetOutcome;
+	// --- Reversal / compensation (reverse-direction aggregate transitions) ---
+	// Begin reversal on a definite forward failure (durable triggering op).
+	fn begin_reversal(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                  operation_seq: Int, operation_id: &Array<Byte>, event_ts: &String,
+	                  reason: &String) -> BeginReversalOutcome;
+	// The authoritative top active checkpoint (reverse cursor) + durable binding.
+	fn reverse_head(self: &Self, workflow_id: &Array<Byte>) -> ReverseHeadOutcome;
+	// Persist a checkpoint's reverse-invocation id + compensation binding before
+	// dispatch (pinned reverse contract + input identity).
+	fn reverse_request(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                   seq: Int, reverse_id: &Array<Byte>, reverse_operation_name: &String,
+	                   reverse_schema_version: Int, reverse_input_json: &String,
+	                   reverse_input_hash: &String, event_ts: &String) -> ReverseRequestOutcome;
+	// Settle a checkpoint's compensation on a durable reverse-success.
+	fn reverse_settle(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                  seq: Int, reverse_id: &Array<Byte>, result_json: &String,
+	                  event_ts: &String) -> ReverseSettleOutcome;
+	// Enter blocked_resolution when compensation cannot safely continue.
+	fn reverse_block(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                 seq: Int, reverse_id: &Array<Byte>, disposition: Int, reason: &String,
+	                 event_ts: &String) -> ReverseBlockOutcome
 }
 
 // ===== Builder =====
@@ -1049,6 +1148,213 @@ implement MicroflowsHost for HostImpl {
 				));
 			}
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_request_get"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn begin_reversal(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                      operation_seq: Int, operation_id: &Array<Byte>, event_ts: &String,
+	                      reason: &String) -> BeginReversalOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("operation_id", operation_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
+		_validate_nonempty("event_ts", event_ts);
+		_validate_nonempty("reason", reason);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(operation_seq));
+			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(rpc.arg_string(_dup(reason)));
+			val sp: String = "sp_mf_workflow_begin_reversal";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "reversing" { return BeginReversalOutcome::Reversing(_doc_int_req(&doc, &"top_seq", "begin-no-top-seq")); }
+			if outcome == "reversed" { return BeginReversalOutcome::Reversed(); }
+			if outcome == "already_begun" { return BeginReversalOutcome::AlreadyBegun(_doc_int_req(&doc, &"state", "begin-no-state")); }
+			if outcome == "trigger_mismatch" { return BeginReversalOutcome::TriggerMismatch(); }
+			if outcome == "operation_not_found" { return BeginReversalOutcome::OperationNotFound(); }
+			if outcome == "operation_conflict" { return BeginReversalOutcome::OperationConflict(); }
+			if outcome == "operation_not_failed" { return BeginReversalOutcome::OperationNotFailed(_doc_int_req(&doc, &"status", "begin-no-status")); }
+			if outcome == "fence_lost" { return BeginReversalOutcome::FenceLost(); }
+			if outcome == "not_found" { return BeginReversalOutcome::NotFound(); }
+			if outcome == "event_time_skew" { return BeginReversalOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "begin-no-defer-until")); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:begin_reversal"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn reverse_head(self: &HostImpl, workflow_id: &Array<Byte>) -> ReverseHeadOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			val sp: String = "sp_mf_checkpoint_reverse_head";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "none_active" { return ReverseHeadOutcome::NoneActive(); }
+			if outcome == "pending" {
+				return ReverseHeadOutcome::Pending(
+					_doc_int_req(&doc, &"seq", "revhead-no-seq"),
+					_doc_str_req(&doc, &"operation_name", "revhead-no-opname"),
+					_doc_object_text_req(&doc, &"payload"));
+			}
+			if outcome == "dispatched" {
+				return ReverseHeadOutcome::Dispatched(
+					_doc_int_req(&doc, &"seq", "revhead-no-seq"),
+					_doc_str_req(&doc, &"operation_name", "revhead-no-opname"),
+					_doc_str_req(&doc, &"reverse_invocation_id", "revhead-no-revid"),
+					_doc_str_req(&doc, &"reverse_operation_name", "revhead-no-rname"),
+					_doc_int_req(&doc, &"reverse_schema_version", "revhead-no-rsv"),
+					_doc_object_text_req(&doc, &"reverse_input_json"),
+					_doc_str_req(&doc, &"reverse_input_hash", "revhead-no-rhash"));
+			}
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:reverse_head"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn reverse_request(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                       seq: Int, reverse_id: &Array<Byte>, reverse_operation_name: &String,
+	                       reverse_schema_version: Int, reverse_input_json: &String,
+	                       reverse_input_hash: &String, event_ts: &String) -> ReverseRequestOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("reverse_id", reverse_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "seq")); }
+		_validate_nonempty("reverse_operation_name", reverse_operation_name);
+		if reverse_schema_version < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "reverse_schema_version")); }
+		_validate_nonempty("reverse_input_hash", reverse_input_hash);
+		_validate_nonempty("event_ts", event_ts);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(seq));
+			args.push(rpc.arg_bytes(_dup_bytes(reverse_id)));
+			args.push(rpc.arg_string(_dup(reverse_operation_name)));
+			args.push(rpc.arg_int(reverse_schema_version));
+			args.push(_json_object_arg("reverse_input_json", reverse_input_json));
+			args.push(rpc.arg_string(_dup(reverse_input_hash)));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			val sp: String = "sp_mf_checkpoint_reverse_request";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "requested" { return ReverseRequestOutcome::Requested(_doc_str_req(&doc, &"reverse_invocation_id", "revreq-no-id")); }
+			if outcome == "already_requested" {
+				return ReverseRequestOutcome::AlreadyRequested(
+					_doc_str_req(&doc, &"reverse_invocation_id", "revreq-no-id"),
+					_doc_str_req(&doc, &"reverse_operation_name", "revreq-no-rname"),
+					_doc_int_req(&doc, &"reverse_schema_version", "revreq-no-rsv"),
+					_doc_object_text_req(&doc, &"reverse_input_json"),
+					_doc_str_req(&doc, &"reverse_input_hash", "revreq-no-rhash"));
+			}
+			if outcome == "binding_conflict" { return ReverseRequestOutcome::BindingConflict(); }
+			if outcome == "out_of_order" { return ReverseRequestOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "revreq-no-top")); }
+			if outcome == "checkpoint_inactive" { return ReverseRequestOutcome::CheckpointInactive(_doc_int_req(&doc, &"reversal_state", "revreq-no-cpstate")); }
+			if outcome == "checkpoint_not_found" { return ReverseRequestOutcome::CheckpointNotFound(); }
+			if outcome == "fence_lost" { return ReverseRequestOutcome::FenceLost(); }
+			if outcome == "not_found" { return ReverseRequestOutcome::NotFound(); }
+			if outcome == "event_time_skew" { return ReverseRequestOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "revreq-no-defer-until")); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:reverse_request"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn reverse_settle(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                      seq: Int, reverse_id: &Array<Byte>, result_json: &String,
+	                      event_ts: &String) -> ReverseSettleOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("reverse_id", reverse_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "seq")); }
+		_validate_nonempty("event_ts", event_ts);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(seq));
+			args.push(rpc.arg_bytes(_dup_bytes(reverse_id)));
+			args.push(_json_object_arg("result_json", result_json));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			val sp: String = "sp_mf_checkpoint_reverse_settle";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "reversed" { return ReverseSettleOutcome::Reversed(); }
+			if outcome == "reversing" { return ReverseSettleOutcome::Reversing(_doc_int_req(&doc, &"next_seq", "revsettle-no-next")); }
+			if outcome == "already_reversed" { return ReverseSettleOutcome::AlreadyReversed(); }
+			if outcome == "reverse_id_mismatch" { return ReverseSettleOutcome::ReverseIdMismatch(); }
+			if outcome == "not_requested" { return ReverseSettleOutcome::NotRequested(); }
+			if outcome == "checkpoint_not_settleable" { return ReverseSettleOutcome::CheckpointNotSettleable(_doc_int_req(&doc, &"reversal_state", "revsettle-no-cpstate")); }
+			if outcome == "out_of_order" { return ReverseSettleOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "revsettle-no-top")); }
+			if outcome == "checkpoint_not_found" { return ReverseSettleOutcome::CheckpointNotFound(); }
+			if outcome == "fence_lost" { return ReverseSettleOutcome::FenceLost(); }
+			if outcome == "not_found" { return ReverseSettleOutcome::NotFound(); }
+			if outcome == "event_time_skew" { return ReverseSettleOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "revsettle-no-defer-until")); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:reverse_settle"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn reverse_block(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                     seq: Int, reverse_id: &Array<Byte>, disposition: Int, reason: &String,
+	                     event_ts: &String) -> ReverseBlockOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("reverse_id", reverse_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "seq")); }
+		_validate_nonempty("reason", reason);
+		_validate_nonempty("event_ts", event_ts);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(seq));
+			args.push(rpc.arg_bytes(_dup_bytes(reverse_id)));
+			args.push(rpc.arg_int(disposition));
+			args.push(rpc.arg_string(_dup(reason)));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			val sp: String = "sp_mf_checkpoint_reverse_block";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "blocked" { return ReverseBlockOutcome::Blocked(); }
+			if outcome == "already_blocked" { return ReverseBlockOutcome::AlreadyBlocked(); }
+			if outcome == "reverse_id_mismatch" { return ReverseBlockOutcome::ReverseIdMismatch(); }
+			if outcome == "not_requested" { return ReverseBlockOutcome::NotRequested(); }
+			if outcome == "checkpoint_not_blockable" { return ReverseBlockOutcome::CheckpointNotBlockable(_doc_int_req(&doc, &"reversal_state", "revblock-no-cpstate")); }
+			if outcome == "out_of_order" { return ReverseBlockOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "revblock-no-top")); }
+			if outcome == "checkpoint_not_found" { return ReverseBlockOutcome::CheckpointNotFound(); }
+			if outcome == "fence_lost" { return ReverseBlockOutcome::FenceLost(); }
+			if outcome == "not_found" { return ReverseBlockOutcome::NotFound(); }
+			if outcome == "event_time_skew" { return ReverseBlockOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "revblock-no-defer-until")); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:reverse_block"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
 			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));

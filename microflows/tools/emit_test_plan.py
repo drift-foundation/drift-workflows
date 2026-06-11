@@ -57,6 +57,7 @@ UNIT_ROOT = "packages/microflows/tests/unit"
 # DB-backed e2e tests — curated + ordered (order is significant: serial on the DB).
 LIVE_TESTS = [
     "packages/microflows/tests/e2e/live_lease_test.drift",
+    "packages/microflows/tests/e2e/live_reversal_test.drift",
 ]
 
 # Per-invocation nonce → fresh fixture namespace each `just test`.
