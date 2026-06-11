@@ -290,7 +290,7 @@ reversal cannot safely continue. Manual IR; parser still deferred.
     runtime defer).
   - **Low** — the classified participant rejection reason is persisted as
     blocked-resolution evidence (was overwritten with "compensation_rejected").
-- [x] **End-to-end proof — added reversal integration coverage (8 assertions).**
+- [x] **End-to-end proof — added reversal integration coverage.**
   Stub gained a `release` compensation op (+ a `_fault.reject` definite-400
   injector); the runner config carries the manual-IR compensation binding
   (`reserve` → `release`). Seeded reversing fixtures (a0..05–0a, new checkpoint
@@ -311,7 +311,7 @@ reversal cannot safely continue. Manual IR; parser still deferred.
     Singular op created, and a blocked workflow does not redispatch on rerun;
   - `reverse_no_compensation_binding` — checkpoint op with no compensation
     binding → durable operational deferral (lease released), not a block.
-- [x] **Reverse-loop review round 2 (integration 25/25).**
+- [x] **Reverse-loop review round 2.**
   - **Medium** — restart recovery is GET-first: `_compensate` takes a `recover`
     flag; the Dispatched branch reconciles via `_reconcile` (GET-first), never a
     blind re-PUT through `_classify_dispatch`. Stub gains a PUT-only `put_count`
@@ -327,8 +327,8 @@ reversal cannot safely continue. Manual IR; parser still deferred.
     `blocked_resolution(3)`/reverse workflow state — plus the classified reason in
     the runner response.
   - **Low** — removed stale duplicated next-step text after "Sub-step A complete";
-    integration README + counts updated to 25.
-- [x] **Reverse-loop review round 3 (integration 25/25).**
+    refreshed the integration README coverage.
+- [x] **Reverse-loop review round 3.**
   - **Medium** — WF7 checkpoint is now FULLY transition-faithful: `reverse_input_hash`
     is the exact runner-derived value `d932b54d…984f` (validated:
     `nameUUIDFromBytes` over the compact lex JSON `{"reservation":"r7"}` — matches
@@ -337,12 +337,37 @@ reversal cannot safely continue. Manual IR; parser still deferred.
   - **Low** — `reverse_restart_recovery` also asserts request-delta == 1, proving the
     recovery DID contact the participant (exactly one GET) — GET-first reconcile, not
     zero interaction.
-  - **Low** — reconciled the milestone count: the earlier log entry no longer asserts
-    a stale `24/24`; the round-2 entry carries the single authoritative `25/25`.
+  - **Low** — stopped hardcoding the running suite total in these notes (it goes
+    stale every round); the authoritative count is `test.py`'s own output. Entries
+    describe WHAT each round proves, not the tally.
+- [x] **Sub-step B — multi-checkpoint stack traversal, proven end-to-end.**
+  The runner's `_run_reversal` while-loop already unwinds
+  the whole stack in one drive (re-reads `reverse_head` → compensate → settle
+  descends to the next `MAX(seq)` active → terminal `reversed`); B is the
+  integration proof + mid-stack recovery fixtures. Seeded reversing stacks
+  (`a0..0b–0d`, two active checkpoints each with its own payload):
+  - `reverse_stack_unwind` — seq2 then seq1 → `reversed`; compensation runs
+    EXACTLY twice (exec +2, no checkpoint compensated twice), highest→lowest order
+    proven from the `compensation_settled` audit events (seq 2 descend before
+    seq 1 terminal), with DISTINCT per-seq invocation ids and each its own derived
+    `release` input (`b1`/`b2`).
+  - `reverse_stack_idempotent` — the fully-reversed stack is terminal on re-run:
+    no further compensation (exec/request unchanged).
+  - `reverse_stack_restart_midstack` — `a0..0c` seeded with seq 2 already reversed
+    (faithful persisted binding: derived reverse id + input + hash + settle
+    events) and seq 1 active: resume advances the authoritative head to seq 1 and
+    compensates ONLY it (exec +1) → both reversed. Proves intermediate-settle
+    stays reversing + head advances + restart between checkpoints.
+  - `reverse_stack_lost_ack` — `a0..0d` with the LOWER checkpoint (seq 1,
+    compensated second) dropping its ack after commit: seq 2 settles cleanly, then
+    seq 1 reconciles GET-first → `reversed`; effectively-once across the whole
+    stack (exec +2).
 
-## Sub-step A COMPLETE (proc + host + runner loop, proven end-to-end).
-Next: sub-step B (multi-checkpoint stack traversal end-to-end) → C (multi-op
-forward IR) → D (forward-success → later-failure → reverse-order proof).
+## Sub-steps A + B COMPLETE — single- and multi-checkpoint unwind proven end-to-end (proc + host + runner loop)
+Next: sub-step C (multi-op forward IR — forward path runs ≥2 ops so a checkpoint
+STACK is BUILT by the forward runner, today single-op) → D (forward op1 success →
+op2 definite fail → reverse-order compensation → `reversed`, incl. lost acks +
+restart).
 
 ## Relevant roadmap
 Step 2 of the revised §7 sequence (dispatcher ✓ → reversal → manual portable IR →

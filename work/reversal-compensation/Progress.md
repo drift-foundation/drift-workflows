@@ -4,24 +4,29 @@ Status snapshot for restart context. Design + the full per-round change log live
 in [README.md](./README.md); this file is the at-a-glance "where it stands +
 literal next action".
 
-## Status: **sub-step A COMPLETE** (proc + host + runner loop, proven E2E)
+## Status: **sub-steps A + B COMPLETE** (single- and multi-checkpoint unwind, proven E2E)
 
-Durable compensation dispatch works end-to-end against a single active
-checkpoint: a `reversing(2)` workflow unwinds by dispatching its bound REVERSE
-operation through the generic dispatcher, crash-safely and idempotently,
-reaching `reversed(5)` — or `blocked_resolution(3, reverse)` when automatic
-reversal can't continue.
+Durable compensation dispatch works end-to-end: a `reversing(2)` workflow unwinds
+its checkpoint STACK highest→lowest by dispatching each bound REVERSE operation
+through the generic dispatcher, crash-safely and idempotently, reaching
+`reversed(5)` — or `blocked_resolution(3, reverse)` when automatic reversal can't
+continue. The runner's `_run_reversal` while-loop drives the whole stack in one
+invocation and resumes correctly from any mid-stack point.
 
 ## Sub-step ledger
 - [x] **A — reversal transitions + reverse loop against ONE active checkpoint.**
   Proven E2E (normal unwind, terminal idempotency, lost-ack reconcile, restart
   recovery, no-active-checkpoint defer, definite-rejection block, no-binding
   defer).
-- [ ] **B — stack traversal** with multiple seeded checkpoints (reverse
-  highest→lowest; one fails → blocked). *(proc layer already proves descent in
-  SP tests; not yet proven through the runner loop end-to-end.)*
+- [x] **B — stack traversal** with multiple seeded checkpoints. Proven E2E
+  through the runner loop: full unwind highest→lowest (exec +2, order from the
+  audit events, distinct per-seq ids + own inputs), terminal idempotency
+  (no double compensation), mid-stack restart (head advances, resume compensates
+  only the remaining checkpoint), and lost-ack on the lower checkpoint
+  (effectively-once across the stack).
 - [ ] **C — minimal multi-operation manual IR** — forward path runs ≥2 ops so a
-  checkpoint STACK exists to reverse (today the forward runner is single-op).
+  checkpoint STACK is BUILT by the forward runner (today the forward runner is
+  single-op; B proved the *unwind* of a seeded stack, C builds a real one).
   Largest remaining piece.
 - [ ] **D — full E2E proof** — forward op1 success → op2 definite fail →
   reverse-order compensation → `reversed`, incl. lost acks + restart.
@@ -52,7 +57,8 @@ just test
 ```
 - singular: 16/16
 - microflows: 15/15 unit/e2e + `sp_operation` regression **79/79**
-- integration/coordinator-singular: **25/25** (16 forward + 9 reversal)
+- integration/coordinator-singular: **29/29** (16 forward + 9 single-checkpoint
+  reversal + 4 multi-checkpoint stack)
 
 The 9 reversal integration assertions: `reverse_to_reversed`,
 `reverse_terminal_idempotent`, `reverse_lost_ack` (exec delta == 1, req delta
@@ -64,7 +70,24 @@ the runner response), `reverse_block_durable_state` (DB read-back: workflow
 `compensation_blocked` event with the reason), `reverse_block_no_redispatch`,
 `reverse_no_compensation_binding`.
 
-## Review round 5 (this round — addressed)
+The 4 multi-checkpoint stack assertions: `reverse_stack_unwind` (seq2→seq1,
+exec +2, order from audit events, distinct ids, own inputs `b1`/`b2`),
+`reverse_stack_idempotent` (terminal re-run, no double compensation),
+`reverse_stack_restart_midstack` (seq2 pre-reversed, resume compensates only seq1,
+exec +1), `reverse_stack_lost_ack` (lower checkpoint drops ack → reconcile →
+reversed, effectively-once across the stack, exec +2).
+
+## Sub-step B (this round — multi-checkpoint stack traversal, integration 29/29)
+- Runner already supported full-stack unwind (`_run_reversal` re-reads
+  `reverse_head` until terminal); B added the integration proof + mid-stack
+  recovery fixtures `a0..0b–0d` (two active checkpoints each). No Drift source
+  changed — fixtures + `test.py` only.
+- Covers every sub-step-B requirement: highest→lowest order, own
+  binding/input/invocation-id per checkpoint, intermediate-settle stays reversing
+  + head advances, restart + lost-ack recovery between checkpoints, final settle →
+  `reversed`, no checkpoint compensated twice.
+
+## Review round 5 (prior round — addressed)
 - **Medium** — WF7 checkpoint is fully transition-faithful: `reverse_input_hash`
   is the exact runner-derived value (`d932b54d…984f`, validated against WF5's
   runner-persisted hash for the same algorithm), not the placeholder `rh7`;
@@ -89,27 +112,27 @@ the runner response), `reverse_block_durable_state` (DB read-back: workflow
 - **Low** — removed the stale duplicated next-step text after "Sub-step A
   complete" in `README.md`; integration README + counts updated to 25.
 
-## Uncommitted worktree (sub-step A E2E + review rounds)
-Not yet committed:
-- `microflows/runner/src/runner.drift` — `_compensate(recover)` GET-first recovery.
-- `microflows/participant-stub/src/app.drift` — `release` op, `_fault.reject`,
-  `put_count` + `/debug/put-count`.
-- `microflows/db/scenarios/coordinator-fixtures/tb_mf_workflow_checkpoint.data.csv`
-  (new) + `tb_mf_workflow.data.csv` + `tb_mf_workflow_event.data.csv` — reversing
-  fixtures `a0..05–0a` (WF7 transition-faithful).
-- `integration/coordinator-singular/test.py` + `README.md` — 9 reversal
-  assertions (total 25), GET-first + durable-state proofs, README coverage.
+## Uncommitted worktree (sub-step B only)
+Sub-step A + all its review rounds landed in `2e57e4a`. Not yet committed (the
+sub-step B stack-traversal proof — fixtures + tests + docs, no Drift source):
+- `microflows/db/scenarios/coordinator-fixtures/tb_mf_workflow.data.csv`
+  + `tb_mf_workflow_checkpoint.data.csv` + `tb_mf_workflow_event.data.csv` —
+  multi-checkpoint stack fixtures `a0..0b–0d`.
+- `integration/coordinator-singular/test.py` + `README.md` — 4 stack-traversal
+  assertions (total 29).
 - `work/reversal-compensation/README.md` + `Progress.md` — progress log + status.
 
-Last landed commits (proc/host/runner layers): `f3ef6b5` (transition layer),
-`88df06c` (checkpoint primitives), `e6983d2` (crash-safe compensation execution).
+Last landed commits: `f3ef6b5` (transition layer), `88df06c` (checkpoint
+primitives), `e6983d2` (crash-safe compensation execution), `2e57e4a` (execute
+durable workflow compensation — sub-step A E2E + review rounds).
 
 ## Next action
-**Begin sub-step B**: drive multi-checkpoint stack traversal through the runner
-reverse loop end-to-end — seed a reversing workflow with ≥2 active checkpoints,
-prove highest→lowest descent to `reversed`, and prove one mid-stack definite
-failure → `blocked_resolution` with the lower checkpoints left active. (The proc
-layer already enforces reverse-order descent; this proves it through the loop.)
+**Begin sub-step C** (multi-op forward IR — the largest remaining piece): make the
+forward runner execute ≥2 operations in sequence so a checkpoint STACK is BUILT by
+the real forward path (today `OPERATION_SEQ=1`, single-op). Add per-operation
+compensation bindings + input derivation. This sets up sub-step D (forward op1
+success → op2 definite fail → reverse-order compensation → `reversed`, the full
+end-to-end proof). B already proved the *unwind* side against seeded stacks.
 
 ## Boundaries (unchanged)
 - Reversal owns only ENTRY into `blocked_resolution`; authorized administration

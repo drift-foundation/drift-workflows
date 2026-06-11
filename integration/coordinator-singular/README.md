@@ -40,24 +40,34 @@ This directory owns only cross-component **orchestration + assertions**
 3. Reset + seed the `microflows` schema via the `coordinator-fixtures` Mariachi
    scenario.
 4. Run `test.py` (with `STUB_BIN`/`RUNNER_BIN` pointing at the work-dir
-   binaries), which launches both processes and asserts **25** properties:
-   - **Forward path (16):** normal success, lost-ack recovery, idempotent
-     re-run, effectively-once execution, initial pending deferral, non-retryable
-     rejection (× 3), generic string-join dispatch (× 2), durable-request
-     recovery, two inconsistent-terminal-state cases, pinned-contract
-     defer/recover (× 2), and terminal rerun with the participant down.
-   - **Reversal / compensation (9):** a reversing workflow unwinds its
-     checkpoint stack by dispatching the bound compensation (`release`) through
-     the generic dispatcher — normal unwind to `reversed`, terminal idempotency
-     (no re-compensation), lost-ack on the reverse dispatch (effectively-once,
-     PUT→GET reconcile), restart recovery from a durably-dispatched checkpoint
-     (GET-first reconcile — no re-execution **and** no re-PUT, asserted via the
-     participant's put-count), the no-active-checkpoint inconsistency defer,
-     definite compensation rejection → `blocked_resolution` (reverse) with the
-     classified reason, the durable blocked-entry invariants (workflow
-     `blocked_resolution`/reverse, checkpoint `resolution_required`, a
+   binaries), which launches both processes and asserts the properties below.
+   (The authoritative pass count is `test.py`'s own `N/N passed` line — not
+   restated here, to keep this prose from going stale.)
+   - **Forward path:** normal success, lost-ack recovery, idempotent re-run,
+     effectively-once execution, initial pending deferral, non-retryable
+     rejection, generic string-join dispatch, durable-request recovery,
+     inconsistent-terminal-state handling, pinned-contract defer/recover, and
+     terminal rerun with the participant down.
+   - **Reversal / compensation (single checkpoint):** a reversing workflow
+     unwinds its checkpoint stack by dispatching the bound compensation
+     (`release`) through the generic dispatcher — normal unwind to `reversed`,
+     terminal idempotency (no re-compensation), lost-ack on the reverse dispatch
+     (effectively-once, PUT→GET reconcile), restart recovery from a
+     durably-dispatched checkpoint (GET-first reconcile — no re-execution **and**
+     no re-PUT, asserted via the participant's put-count), the no-active-checkpoint
+     inconsistency defer, definite compensation rejection → `blocked_resolution`
+     (reverse) with the classified reason, the durable blocked-entry invariants
+     (workflow `blocked_resolution`/reverse, checkpoint `resolution_required`, a
      `compensation_blocked` event — read back from the DB), no redispatch while
      blocked, and the missing-compensation-binding deferral.
+   - **Multi-checkpoint stack reversal:** a reversing workflow with two active
+     checkpoints unwinds highest-seq → lowest, each compensation via its own
+     durable binding/input/invocation-id — full unwind to `reversed` (exec
+     exactly twice, order proven from the audit events), terminal idempotency (no
+     checkpoint compensated twice), mid-stack restart (one checkpoint pre-reversed
+     → head advances → only the remainder compensates), and lost-ack on the lower
+     checkpoint (effectively-once across the whole stack, proven via exact PUT and
+     request deltas through the GET reconcile).
 
 Steps 2–4 run under **one** acquisition of the shared host-global DB lock
 (`flocker --key serial-mariadb-mdb114-a -j 1` — the same key the executor uses

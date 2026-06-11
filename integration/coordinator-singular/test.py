@@ -110,6 +110,10 @@ WF_REVERSE_DISPATCHED = "a0000000000000000000000000000007"   # reversing; compen
 WF_REVERSE_NO_ACTIVE = "a0000000000000000000000000000008"    # reversing; checkpoint already reversed (inconsistency)
 WF_REVERSE_REJECT = "a0000000000000000000000000000009"       # reversing; compensation is definitely rejected (400)
 WF_REVERSE_NOBINDING = "a000000000000000000000000000000a"    # reversing; checkpoint op has no compensation binding
+# Sub-step B: multi-checkpoint reversing stacks (two active checkpoints).
+WF_REVERSE_STACK = "a000000000000000000000000000000b"        # reversing; seq1+seq2 both active
+WF_REVERSE_STACK_MID = "a000000000000000000000000000000c"    # reversing; seq2 reversed, seq1 active (mid-stack restart)
+WF_REVERSE_STACK_LOSTACK = "a000000000000000000000000000000d"  # reversing; seq1 (compensated 2nd) drops its ack
 
 
 def _request_count(base):
@@ -429,6 +433,66 @@ def main():
               code == 9 and body.get("workflow") == "deferred"
               and body.get("reason") == "no_compensation_binding", (code, body))
 
+        # --- SUB-STEP B: multi-checkpoint stack reversal. A reversing workflow with
+        # TWO active checkpoints unwinds highest-seq -> lowest, each compensation via
+        # its OWN durable binding/input/invocation-id, reaching reversed; recovery
+        # works mid-stack and no checkpoint is compensated twice. ---
+        # 7a. full unwind in one drive: seq2 then seq1 -> reversed. Compensation runs
+        # EXACTLY twice (exec +2, no checkpoint compensated twice), in reverse-seq
+        # order, with distinct invocation ids and each its own derived input.
+        ex0 = _exec_count(base)
+        code, body = run_runner(rcf.name, WF_REVERSE_STACK)
+        ex_d = _exec_count(base) - ex0
+        cps = _mdb(f"SELECT seq, reversal_state, LOWER(HEX(reverse_invocation_id)), "
+                   f"JSON_UNQUOTE(JSON_EXTRACT(reverse_input_json,'$.reservation')) "
+                   f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{WF_REVERSE_STACK}') "
+                   f"ORDER BY seq")
+        # settle order, read from the audit trail: seq 2 settled (descend, next_seq 1)
+        # BEFORE seq 1 (terminal) — proving highest -> lowest compensation order.
+        order = _mdb(f"SELECT JSON_UNQUOTE(JSON_EXTRACT(payload,'$.seq')) FROM tb_mf_workflow_event "
+                     f"WHERE workflow_id = UNHEX('{WF_REVERSE_STACK}') "
+                     f"AND kind = 'compensation_settled' ORDER BY event_seq")
+        both_reversed = len(cps) == 2 and cps[0][1] == "2" and cps[1][1] == "2"
+        ids_distinct = len(cps) == 2 and cps[0][2] != cps[1][2] and "" not in (cps[0][2], cps[1][2])
+        inputs_ok = len(cps) == 2 and cps[0][3] == "b1" and cps[1][3] == "b2"
+        check("reverse_stack_unwind",
+              code == 0 and body.get("workflow") == "reversed" and ex_d == 2
+              and both_reversed and ids_distinct and inputs_ok and order == [["2"], ["1"]],
+              (code, body, ex_d, cps, order))
+        # 7b. terminal re-run: the fully-reversed stack is terminal — no further
+        # compensation (no checkpoint compensated twice across drives).
+        ex1, rq1 = _exec_count(base), _request_count(base)
+        code, body = run_runner(rcf.name, WF_REVERSE_STACK)
+        check("reverse_stack_idempotent",
+              code == 0 and body.get("workflow") == "reversed"
+              and _exec_count(base) == ex1 and _request_count(base) == rq1, (code, body))
+
+        # 7c. RESTART mid-stack: seq2 was already reversed (a worker settled it then
+        # crashed). The authoritative head advances to seq1; resume compensates ONLY
+        # seq1 (exec +1) -> reversed. Both checkpoints end reversed.
+        ex0 = _exec_count(base)
+        code, body = run_runner(rcf.name, WF_REVERSE_STACK_MID)
+        mid = _mdb(f"SELECT seq, reversal_state FROM tb_mf_workflow_checkpoint "
+                   f"WHERE workflow_id = UNHEX('{WF_REVERSE_STACK_MID}') ORDER BY seq")
+        check("reverse_stack_restart_midstack",
+              code == 0 and body.get("workflow") == "reversed"
+              and _exec_count(base) - ex0 == 1 and mid == [["1", "2"], ["2", "2"]],
+              (code, body, _exec_count(base) - ex0, mid))
+
+        # 7d. LOST ACK mid-unwind: seq2 compensates cleanly, then seq1's release
+        # commits and drops the ack (5s > 3s PUT timeout) -> GET reconcile -> reversed.
+        # Effectively-once across the WHOLE stack (exec +2), and the exact wire shape
+        # proves the reconcile actually happened: 2 PUTs (seq2, seq1) + 3 operation
+        # requests (seq2 PUT, seq1 PUT-that-lost-its-ack, seq1 GET reconcile). Asserting
+        # the counts pins the GET path — ignored fault injection would show 2 requests.
+        ex0, pu0, rq0 = _exec_count(base), _put_count(base), _request_count(base)
+        code, body = run_runner(rcf.name, WF_REVERSE_STACK_LOSTACK)
+        ex_d, pu_d, rq_d = _exec_count(base) - ex0, _put_count(base) - pu0, _request_count(base) - rq0
+        check("reverse_stack_lost_ack",
+              code == 0 and body.get("workflow") == "reversed"
+              and ex_d == 2 and pu_d == 2 and rq_d == 3,
+              (code, body, f"exec+{ex_d} put+{pu_d} req+{rq_d}"))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the
         # LOCAL authoritative result; no dependency on the participant.
         stub.terminate()
@@ -448,7 +512,7 @@ def main():
             stub.kill()
         os.unlink(scf.name); os.unlink(rcf.name)
 
-    total = 25
+    total = 29
     print(f"coordinator<->singular integration: {total - len(failures)}/{total} passed")
     return 1 if failures else 0
 
