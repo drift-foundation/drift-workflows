@@ -1,0 +1,202 @@
+# reversal-compensation  (milestone-1 step: reversal + blocked_resolution)
+
+## Short-term objective
+Implement durable **compensation dispatch**: a forward-path failure unwinds the
+committed checkpoint stack by dispatching each checkpoint's bound REVERSE
+operation (via the generic dispatcher), in reverse order, crash-safely and
+idempotently — reaching `reversed`, or `blocked_resolution` only when automatic
+reversal cannot safely continue. Manual IR; parser still deferred.
+
+## What already exists (reuse, don't rebuild)
+- **State machine**: `state` 1=forward 2=reversing 3=blocked_resolution
+  4=completed 5=reversed 6=resolved_exception; orthogonal `execution_direction`
+  (1=forward 2=reverse) with the state/direction CHECK; `current_disposition`
+  (0=none 1=completed 2=failed 3=cancelled 4=indeterminate). (`state.drift` +
+  `tb_mf_workflow`.)
+- **Checkpoint stack** (`tb_mf_workflow_checkpoint`): 1-based `seq` (reverse from
+  highest active downward), `operation_name`, `operation_id`, `payload`,
+  `reversal_state` (1=active 2=reversed 3=resolution_required 4=resolved),
+  `reverse_invocation_id`, `reversed_at`, `resolution_event_seq`. A forward
+  success already creates an active checkpoint (`sp_mf_operation_settle`).
+- **Generic dispatcher** (runner): persist-request → PUT → lost-ack GET reconcile
+  → settle; classification into Done / Pending(defer) / Rejected; registry-based
+  participant resolution; `sp_mf_operation_dispatch_defer` durable deferral.
+
+## Design (the 6 scope points, made concrete)
+1. **Persist reversal intent + continuation.** A forward operation's DEFINITE
+   failure (participant 400/409, or an authorized resolve-as-failed) transitions
+   `forward(1) → reversing(2)`, `direction → reverse`, disposition `failed`,
+   continuation → a reverse-cursor `{pos:"reverse", seq:<top active>}`, and
+   appends a `reversal_begun` event. If there are NO active checkpoints, go
+   straight to `reversed(5)` (trivial unwind — nothing to compensate). This
+   REPLACES today's `operation_fail → blocked_resolution` for definite forward
+   failures (a definite forward failure now reverses, not blocks). A forward
+   INDETERMINATE outcome still → `blocked(forward)` (§3.1), unchanged.
+2. **Dispatch compensation in reverse order.** While reversing, take the highest
+   `seq` active checkpoint and dispatch its bound REVERSE operation through the
+   GENERIC dispatcher; on durable reverse-success mark the checkpoint
+   `reversed(2)` and descend; when the last active checkpoint is reversed →
+   workflow `reversed(5)`. The reverse op's `(name, participant, input)` is bound
+   in manual IR per forward operation (input derived from the checkpoint payload);
+   the reverse op is a normal registered operation resolved via the registry.
+3. **Crash-safe + idempotently resumable.** Per checkpoint: persist
+   `reverse_invocation_id` on the checkpoint BEFORE dispatch (the stable
+   participant key); dispatch; a lost ack reconciles by GET on that id; settle
+   marks `reversed(2)`. Recovery resumes from the stack: highest active
+   checkpoint; if it already has a `reverse_invocation_id`, reconcile (don't
+   re-dispatch blindly); else dispatch. Idempotent via the id + `reversal_state`.
+4. **Retryable deferral vs definite compensation failure.** Reverse dispatch
+   reuses the dispatcher's classification: Pending / transport-uncertain →
+   RETRYABLE deferral (release lease, retry later; workflow stays `reversing`);
+   DEFINITE rejection, or indeterminate after reconcile exhaustion → point 5.
+5. **`blocked_resolution` only when automatic reversal can't continue.** A
+   compensation that fails nonretryably (or is indeterminate) sets the checkpoint
+   `resolution_required(3)` and the workflow `blocked_resolution(3, dir=reverse)`
+   with a diagnostic event. (Authorized resolution OUT of blocked — resolve/retry/
+   accept-exception → reversing / resolved_exception — is admin machinery; scope
+   minimally now: enter blocked correctly + record evidence; the resolve actions
+   can be a follow-up.)
+6. **Prove forward failure → reversal → reversed**, including lost acks on the
+   reverse dispatch and restart recovery mid-stack.
+
+## New procs (sketch)
+- `sp_mf_workflow_begin_reversal` — `forward(1)+definite-fail → reversing(2)` (or
+  `reversed(5)` if no active checkpoints); fenced; event `reversal_begun`.
+- `sp_mf_checkpoint_reverse_request` — set the top active checkpoint's
+  `reverse_invocation_id` + advance the reverse cursor BEFORE dispatch; fenced;
+  idempotent; event `compensation_requested`.
+- `sp_mf_checkpoint_reverse_settle` — checkpoint `reversed(2)` + `reversed_at`;
+  last active → workflow `reversed(5)`; else advance cursor; fenced; idempotent;
+  event `compensation_settled`.
+- `sp_mf_checkpoint_reverse_block` — checkpoint `resolution_required(3)` +
+  workflow `blocked_resolution(3,reverse)`; fenced; event `compensation_blocked`.
+- Reverse retryable deferral: generalize `sp_mf_operation_dispatch_defer` to fence
+  on forward(1) OR reversing(2) (today it requires forward), or a reverse variant.
+- `sp_mf_checkpoint_inspect` / extend `sp_mf_workflow_inspect` so the runner can
+  read the stack cursor on resume.
+
+## Host + runner + stub + IR
+- Host: methods for the new procs + reverse-checkpoint reads.
+- Runner: a REVERSE loop reusing `_classify_dispatch` — drive compensations down
+  the stack with the same persist→dispatch→reconcile→settle discipline; map
+  Pending→defer, Rejected/indeterminate→block.
+- Stub: a compensation operation (e.g. a `reserve`/`release` pair, or a generic
+  reverse op that records the compensation), so a reverse dispatch is observable.
+- **Manual IR (prerequisite):** the forward path must run ≥2 operations so a
+  checkpoint STACK exists to reverse — today the runner is single-op
+  (`OPERATION_SEQ=1`, `CHECKPOINT_SEQ=1`). Add multi-operation forward execution
+  + per-operation compensation bindings (forward op → reverse op + input
+  derivation). This is the largest piece and the first sub-step.
+
+## Verification criteria
+- forward op1 success (checkpoint) → op2 DEFINITE fail → reversing → compensate
+  checkpoint1 → `reversed(5)`; checkpoint `reversal_state=2`.
+- lost-ack on the reverse dispatch → GET reconcile → still `reversed` (compensation
+  effectively-once).
+- restart mid-reversal (crash after reverse_request, before settle) → resume
+  reconciles by `reverse_invocation_id`, completes the unwind.
+- compensation DEFINITE failure → `blocked_resolution(3,reverse)` + checkpoint
+  `resolution_required`, with a diagnostic event.
+- SP regressions for each new proc (fence, idempotency, terminal/stack invariants);
+  integration cases for the above. Full root `just test` green.
+
+## Confirmed sub-step sequencing (separates reversal correctness from the
+## forward-runner refactor)
+- **A. Reversal transitions + reverse loop against ONE active checkpoint.**
+  Implement `begin_reversal` + `checkpoint_reverse_request/settle/block` + the
+  runner reverse loop; prove against a SEEDED single-checkpoint reversing workflow
+  (no forward refactor yet). Lost-ack reconcile + restart recovery for one
+  checkpoint.
+- **B. Stack traversal** with multiple SEEDED checkpoints (reverse highest→lowest;
+  one fails → blocked).
+- **C. Minimal multi-operation manual IR** — the forward path runs ≥2 ops creating
+  a checkpoint stack + per-op compensation bindings.
+- **D. Full end-to-end proof**: forward op1 success → op2 definite fail → reverse-
+  order compensation → `reversed`, incl. lost acks + restart.
+
+## Confirmed boundaries
+- **Reversal owns ENTRY into `blocked_resolution`** only: correct direction,
+  checkpoint `resolution_required`, durable reason, lease release, audit evidence.
+  Authorized administration OUT of blocked (retry / resolve / accept exception) is
+  a FOLLOW-UP milestone.
+- **Reversal begins only after a DURABLE operation request exists**, and only on a
+  DEFINITE forward participant rejection. A forward outcome that is UNCERTAIN
+  (execution may have occurred but cannot be determined) must **stay blocked in
+  the FORWARD direction** — never compensate from an uncertain forward outcome.
+  So: `DispatchResult::Rejected` (definite 400/409, request already durable) →
+  begin reversal; transport-uncertain/indeterminate → forward defer/retry, and on
+  genuine indeterminacy → `blocked(forward)` (NOT reversal).
+
+## Settled decisions (were open questions)
+- Generalize `sp_mf_operation_dispatch_defer` to fence on forward(1) OR
+  reversing(2) (one durable-deferral mechanism for both directions).
+- The CHECKPOINT row is the reverse-op tracker (`reverse_invocation_id` +
+  `reversal_state` + the unique-invocation key) — no new `tb_mf_operation` rows.
+- Compensation input = the whole checkpoint payload for this slice.
+
+## Progress
+- [x] **Proc layer (sub-step A + B at the DB level), SP 48/48.** Four fenced,
+  time-disciplined, idempotent procs + a generalization:
+  - `sp_mf_workflow_begin_reversal` — forward(1)→reversing(2) (cursor at the top
+    active checkpoint) or forward(1)→reversed(5) when nothing to compensate; lease
+    retained while reversing, cleared on terminal. Idempotent on already-reversing/
+    reversed.
+  - `sp_mf_checkpoint_reverse_request` — persists `reverse_invocation_id` BEFORE
+    dispatch; recovery re-request returns the persisted id (reconcile, not a second
+    dispatch).
+  - `sp_mf_checkpoint_reverse_settle` — checkpoint reversed(2) then DESCEND to the
+    next active (stay reversing, lease retained) or reach terminal reversed(5)
+    (lease cleared); idempotent on lost-ack retry of an intermediate settle.
+  - `sp_mf_checkpoint_reverse_block` — checkpoint resolution_required(3) + workflow
+    blocked_resolution(3) RETAINING reverse direction, lease released, audit event
+    (entry-into-blocked only).
+  - `sp_mf_operation_dispatch_defer` generalized to fence forward(1) OR reversing(2)
+    (claim_by_id already re-claims state IN (1,2), so a reverse-defer resumes).
+  - SP coverage proves: begin→reversing/reversed, stack traversal highest→lowest
+    (2 checkpoints descend then terminal), request idempotency, settle idempotency,
+    block → blocked(reverse)+resolution_required+lease release, fence.
+- [x] **Review round 1 — preconditions enforced INSIDE the locked transition
+  (SP 55/55).** Per the storage-portability principle (SPs enforce semantics, don't
+  trust the runner):
+  - **Reverse order** enforced: request/settle/block require `arg_seq` == the
+    current TOP active checkpoint, else `out_of_order` (a runner bug can't
+    compensate out of stack order).
+  - **Time discipline** added to all three checkpoint procs (`arg_event_ts` must
+    strictly exceed `current_event_ts`, else `event_time_skew`).
+  - **Durable triggering op verified**: `begin_reversal` now takes
+    `(operation_seq, operation_id)` and validates inside the lock — exists, id
+    matches, status still `requested` (a settled op can't drive reversal); else
+    `operation_not_found` / `operation_conflict` / `operation_not_failed`.
+  - **Lease-independent terminal replay**: `already_reversed` / `already_blocked`
+    are checked BEFORE the fence, so a lost-ack retry after the terminal settle/
+    block (which cleared the lease) resolves correctly instead of `fence_lost`.
+- [x] **Review round 2 — replay/idempotency bound to durable IDENTITY (SP 61/61).**
+  - **High** — `reverse_settle` verifies `reverse_id` (and not-NULL revid) BEFORE the
+    `already_reversed` replay, so after settlement a wrong/any id is
+    `reverse_id_mismatch`, not accepted as the same command.
+  - **High** — `reverse_block` now takes `reverse_id` and requires the checkpoint
+    had a persisted `reverse_invocation_id` (a compensation was actually
+    dispatched) matching it — can't block an undispatched checkpoint
+    (`not_requested`) or under a foreign id.
+  - **Medium** — `begin_reversal` persists the trigger op id in a new
+    `tb_mf_workflow.reversal_trigger_operation_id` column; replay
+    (`already_reversing/reversed`) is bound to it, so a different op row yields
+    `trigger_mismatch` instead of masquerading as the same begin-reversal.
+  - **Low** — added `event_time_skew` coverage for `reverse_settle` + `reverse_block`
+    (previously only `reverse_request`).
+  - Uniform proc order now: identity → lease-independent replay → fence → reverse
+    order → time discipline → atomic mutate+audit.
+- [x] **Review round 3 — begin_reversal replay recognized across ALL reverse states
+  (SP 63/63).** Keyed the idempotent replay on the persisted trigger
+  (`reversal_trigger_operation_id IS NOT NULL`) rather than `state IN (2,5)`, so a
+  retry of the committed begin command while `blocked_resolution(3)` (or
+  `resolved_exception(6)`) returns `already_begun` with the current state instead of
+  `fence_lost`. Unified outcome `already_begun{state}` replaces
+  `already_reversing/already_reversed`.
+- [ ] **Next: host methods + runner reverse loop + integration** (lost-ack reconcile
+  + restart recovery against a SEEDED single-checkpoint reversing workflow; stub
+  compensation op). Then sub-step C (multi-op forward IR) → D (full E2E).
+
+## Relevant roadmap
+Step 2 of the revised §7 sequence (dispatcher ✓ → reversal → manual portable IR →
+ScriptRegistry → parser). Reuses the generic dispatcher per direction.

@@ -245,6 +245,162 @@ def main():
     for t in ("tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf4,))
 
+    # --- reversal transitions (sub-step A): the TRANSITION LAYER enforces its own
+    # preconditions (durable failed op, reverse order, fence, time discipline,
+    # lease-independent replay). Checkpoints + the failed forward op are inserted
+    # directly so reversal correctness is isolated from the forward path.
+    def _seed_checkpoint(wf, seq, op_id, payload):
+        cur.execute(
+            "INSERT INTO tb_mf_workflow_checkpoint (workflow_id, seq, operation_name, operation_id, "
+            "payload, reversal_state, created_at, updated_at) VALUES (%s,%s,'reserve',%s,%s,1,%s,%s)",
+            (wf, seq, op_id, payload, T(2), T(2)))
+
+    def _seed_op(wf, op_seq, op_id, status, result):
+        cur.execute(
+            "INSERT INTO tb_mf_operation (workflow_id, operation_seq, operation_id, operation_name, "
+            "schema_version, input_json, input_hash, status, result_json, created_at, updated_at) "
+            "VALUES (%s,%s,%s,'reserve',1,'{}','h',%s,%s,%s,%s)",
+            (wf, op_seq, op_id, status, result, T(2), T(2)))
+
+    wf5 = os.urandom(16)
+    cp1_op = bytes.fromhex("00000000000000000000000000000e51")
+    cp2_op = bytes.fromhex("00000000000000000000000000000e52")
+    failed5 = bytes.fromhex("00000000000000000000000000000e53")
+    rev1_id = bytes.fromhex("00000000000000000000000000000e5a")
+    rev2_id = bytes.fromhex("00000000000000000000000000000e5b")
+    call(cur, "sp_mf_workflow_create", (wf5, SCRIPT, 1, T(0), T(0), '{"pos":"op:3:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wf5, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    tok5 = r["fencing_token"]
+    _seed_checkpoint(wf5, 1, cp1_op, '{"reservation":"r1"}')
+    _seed_checkpoint(wf5, 2, cp2_op, '{"reservation":"r2"}')
+    _seed_op(wf5, 3, failed5, 1, None)  # the durably-requested op that was rejected
+    # begin_reversal verifies the durable failed op + opens at the TOP checkpoint
+    _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf5, EXEC, tok5, 3, failed5, T(3), "forward_op_rejected"))
+    check("begin_reversal_reversing", r and r["outcome"] == "reversing" and r["top_seq"] == 2, r)
+    cur.execute("SELECT state, execution_direction, current_disposition FROM tb_mf_workflow WHERE workflow_id=%s", (wf5,))
+    check("begin_reversal_state", cur.fetchone() == (2, 2, 2), "expected reversing/reverse/failed")
+    # replay BOUND to the durable trigger: the SAME op replays as already_reversing;
+    # a DIFFERENT op must not masquerade as the same begin-reversal command.
+    _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf5, EXEC, tok5, 3, failed5, T(3), "forward_op_rejected"))
+    check("begin_reversal_replay_same_trigger",
+          r and r["outcome"] == "already_begun" and r["state"] == 2, r)
+    _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf5, EXEC, tok5, 1, os.urandom(16), T(3), "x"))
+    check("begin_reversal_trigger_mismatch", r and r["outcome"] == "trigger_mismatch", r)
+    # reverse ORDER enforced: cannot compensate seq 1 while seq 2 is the top active
+    _, r = call(cur, "sp_mf_checkpoint_reverse_request", (wf5, EXEC, tok5, 1, rev1_id, T(4)))
+    check("reverse_request_out_of_order", r and r["outcome"] == "out_of_order" and r["top_seq"] == 2, r)
+    # time discipline: a non-advancing event_ts is rejected
+    _, r = call(cur, "sp_mf_checkpoint_reverse_request", (wf5, EXEC, tok5, 2, rev2_id, T(3)))
+    check("reverse_request_skew", r and r["outcome"] == "event_time_skew", r)
+    # compensate the TOP checkpoint (seq 2) first
+    _, r = call(cur, "sp_mf_checkpoint_reverse_request", (wf5, EXEC, tok5, 2, rev2_id, T(4)))
+    check("reverse_request_requested",
+          r and r["outcome"] == "requested" and r["reverse_invocation_id"] == rev2_id.hex(), r)
+    # recovery: re-request returns the PERSISTED id (no second dispatch)
+    _, r = call(cur, "sp_mf_checkpoint_reverse_request", (wf5, EXEC, tok5, 2, os.urandom(16), T(5)))
+    check("reverse_request_idempotent",
+          r and r["outcome"] == "already_requested" and r["reverse_invocation_id"] == rev2_id.hex(), r)
+    # time discipline on settle: a non-advancing event_ts is rejected
+    _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 2, rev2_id, '{"released":true}', T(4)))
+    check("reverse_settle_skew", r and r["outcome"] == "event_time_skew", r)
+    # settle seq 2 -> stack DESCENDS to seq 1 (still reversing, lease retained)
+    _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 2, rev2_id, '{"released":true}', T(6)))
+    check("reverse_settle_descends", r and r["outcome"] == "reversing" and r["next_seq"] == 1, r)
+    # lost-ack retry of an intermediate settle is harmless (effectively-once)
+    _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 2, rev2_id, '{"released":true}', T(7)))
+    check("reverse_settle_idempotent", r and r["outcome"] == "already_reversed", r)
+    # compensate the LAST checkpoint (seq 1) -> terminal reversed(5)
+    call(cur, "sp_mf_checkpoint_reverse_request", (wf5, EXEC, tok5, 1, rev1_id, T(8)))
+    _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 1, rev1_id, '{"released":true}', T(9)))
+    check("reverse_settle_reversed", r and r["outcome"] == "reversed", r)
+    cur.execute("SELECT w.state, MIN(c.reversal_state), MAX(c.reversal_state) FROM tb_mf_workflow w "
+                "JOIN tb_mf_workflow_checkpoint c USING (workflow_id) WHERE w.workflow_id=%s GROUP BY w.state", (wf5,))
+    check("reverse_settle_terminal", cur.fetchone() == (5, 2, 2), "expected reversed + ALL checkpoints reversed")
+    # finding 4: the terminal settle cleared the lease — a lost-ack retry must still
+    # resolve to already_reversed (lease-independent), not fence_lost.
+    _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 1, rev1_id, '{"released":true}', T(10)))
+    check("reverse_settle_terminal_idempotent", r and r["outcome"] == "already_reversed", r)
+    # finding 1: identity is verified BEFORE the replay — a WRONG reverse id after
+    # terminal is reverse_id_mismatch, never accepted as the same already_reversed.
+    _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 1, os.urandom(16), '{"released":true}', T(10)))
+    check("reverse_settle_terminal_wrong_id", r and r["outcome"] == "reverse_id_mismatch", r)
+    for t in ("tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+        cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf5,))
+
+    # begin_reversal with NO active checkpoints -> straight to terminal reversed
+    wf6 = os.urandom(16)
+    failed6 = bytes.fromhex("00000000000000000000000000000e61")
+    call(cur, "sp_mf_workflow_create", (wf6, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wf6, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    tok6 = r["fencing_token"]
+    _seed_op(wf6, 1, failed6, 1, None)
+    _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf6, EXEC, tok6, 1, failed6, T(2), "nothing_to_compensate"))
+    check("begin_reversal_no_checkpoint", r and r["outcome"] == "reversed", r)
+    cur.execute("SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id=%s", (wf6,))
+    check("begin_reversal_no_checkpoint_state", cur.fetchone() == (5, 2), "expected reversed/reverse")
+    # replay after TERMINAL reversed -> already_begun with state=5 (lease cleared)
+    _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf6, EXEC, tok6, 1, failed6, T(3), "x"))
+    check("begin_reversal_already_begun_reversed",
+          r and r["outcome"] == "already_begun" and r["state"] == 5, r)
+    for t in ("tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+        cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf6,))
+
+    # begin_reversal must prove the durable failed op
+    wf8 = os.urandom(16)
+    op8 = bytes.fromhex("00000000000000000000000000000e81")
+    call(cur, "sp_mf_workflow_create", (wf8, SCRIPT, 1, T(0), T(0), '{"pos":"x"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wf8, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    tok8 = r["fencing_token"]
+    _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf8, EXEC, tok8, 1, os.urandom(16), T(2), "x"))
+    check("begin_reversal_op_not_found", r and r["outcome"] == "operation_not_found", r)
+    _seed_op(wf8, 1, op8, 2, '{"ok":1}')  # a SETTLED (succeeded) op did not fail
+    _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf8, EXEC, tok8, 1, op8, T(2), "x"))
+    check("begin_reversal_op_not_failed", r and r["outcome"] == "operation_not_failed", r)
+    _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf8, EXEC, tok8, 1, os.urandom(16), T(2), "x"))
+    check("begin_reversal_op_conflict", r and r["outcome"] == "operation_conflict", r)
+    for t in ("tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+        cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf8,))
+
+    # compensation that cannot continue -> blocked_resolution(3, reverse) + checkpoint
+    # resolution_required(3), lease released, audit event. (Entry into blocked only.)
+    wf7 = os.urandom(16)
+    cp7_op = bytes.fromhex("00000000000000000000000000000e71")
+    failed7 = bytes.fromhex("00000000000000000000000000000e73")
+    rev7_id = bytes.fromhex("00000000000000000000000000000e7a")
+    call(cur, "sp_mf_workflow_create", (wf7, SCRIPT, 1, T(0), T(0), '{"pos":"op:2:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wf7, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    tok7 = r["fencing_token"]
+    _seed_checkpoint(wf7, 1, cp7_op, '{"reservation":"r7"}')
+    _seed_op(wf7, 2, failed7, 1, None)
+    call(cur, "sp_mf_workflow_begin_reversal", (wf7, EXEC, tok7, 2, failed7, T(3), "forward_op_rejected"))
+    # finding 2: cannot block a compensation that was never DISPATCHED (revid NULL)
+    _, r = call(cur, "sp_mf_checkpoint_reverse_block", (wf7, EXEC, tok7, 1, rev7_id, 2, "x", T(4)))
+    check("reverse_block_not_requested", r and r["outcome"] == "not_requested", r)
+    # a stale token cannot drive reversal (checkpoint still active)
+    _, r = call(cur, "sp_mf_checkpoint_reverse_request", (wf7, EXEC, 999, 1, os.urandom(16), T(4)))
+    check("reverse_fence_lost", r and r["outcome"] == "fence_lost", r)
+    call(cur, "sp_mf_checkpoint_reverse_request", (wf7, EXEC, tok7, 1, rev7_id, T(4)))
+    # time discipline on block
+    _, r = call(cur, "sp_mf_checkpoint_reverse_block", (wf7, EXEC, tok7, 1, rev7_id, 2, "x", T(4)))
+    check("reverse_block_skew", r and r["outcome"] == "event_time_skew", r)
+    _, r = call(cur, "sp_mf_checkpoint_reverse_block", (wf7, EXEC, tok7, 1, rev7_id, 2, "compensation_rejected", T(5)))
+    check("reverse_block", r and r["outcome"] == "blocked", r)
+    cur.execute("SELECT w.state, w.execution_direction, w.current_disposition, w.lease_owner, c.reversal_state "
+                "FROM tb_mf_workflow w JOIN tb_mf_workflow_checkpoint c USING (workflow_id) WHERE w.workflow_id=%s", (wf7,))
+    check("reverse_block_state", cur.fetchone() == (3, 2, 2, None, 3),
+          "expected blocked/reverse/failed/no-lease + checkpoint resolution_required")
+    # finding 4: blocking cleared the lease -> replay is lease-independent already_blocked
+    _, r = call(cur, "sp_mf_checkpoint_reverse_block", (wf7, EXEC, tok7, 1, rev7_id, 2, "compensation_rejected", T(6)))
+    check("reverse_block_idempotent", r and r["outcome"] == "already_blocked", r)
+    # the committed begin command is recognized across LATER reverse states: a retry
+    # while blocked_resolution returns already_begun(state=3) via the persisted
+    # trigger, NOT fence_lost (the reversal began even though the lease is gone).
+    _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf7, EXEC, tok7, 2, failed7, T(7), "forward_op_rejected"))
+    check("begin_reversal_already_begun_blocked",
+          r and r["outcome"] == "already_begun" and r["state"] == 3, r)
+    for t in ("tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+        cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf7,))
+
     # status/result table invariant: requested(1) + a non-NULL result must be
     # rejected. Include a valid schema_version so the row is well-formed on every
     # OTHER required column — the insert must fail on the status/result CHECK
@@ -264,7 +420,7 @@ def main():
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (WF,))
     conn.close()
 
-    total = 35
+    total = 63
     print(f"sp_operation regression: {total - len(failures)}/{total} passed")
     return 1 if failures else 0
 

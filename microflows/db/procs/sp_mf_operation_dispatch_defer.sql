@@ -84,9 +84,11 @@ proc:BEGIN
 		LEAVE proc;
 	END IF;
 
-	-- Fence: must hold the lease on a FORWARD workflow (deferral is a forward-path
-	-- scheduling action, never a transition out of forward).
-	IF v_owner IS NULL OR v_owner <> arg_executor OR v_token <> arg_fencing_token OR v_state <> 1 THEN
+	-- Fence: must hold the lease on a FORWARD(1) or REVERSING(2) workflow. Deferral
+	-- is a pure scheduling/lease action that never changes state, so it serves both
+	-- a forward dispatch and a reverse (compensation) dispatch retry; claim_by_id
+	-- re-claims state IN (1,2), so a deferred reversing workflow resumes its unwind.
+	IF v_owner IS NULL OR v_owner <> arg_executor OR v_token <> arg_fencing_token OR v_state NOT IN (1, 2) THEN
 		SELECT JSON_OBJECT('outcome', 'fence_lost') AS result;
 		LEAVE proc;
 	END IF;

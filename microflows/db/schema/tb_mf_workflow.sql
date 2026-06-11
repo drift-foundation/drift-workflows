@@ -72,6 +72,11 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow` (
 	-- ordinary typed locals that survive the boundary. JSON DOCUMENT: non-NULL,
 	-- valid, OBJECT (the empty document is `{}`).
 	`continuation` mediumtext NOT NULL CHECK (json_valid(`continuation`) AND json_type(`continuation`) = 'OBJECT'),
+	-- Stable identity of the forward operation whose DEFINITE rejection began
+	-- reversal (§6). Set when forward->reversing/reversed; NULL on the forward
+	-- path. Binds begin_reversal's idempotent replay to the ORIGINAL trigger so a
+	-- different operation cannot masquerade as the same begin-reversal command.
+	`reversal_trigger_operation_id` varbinary(16) NULL,
 	`created_at` datetime(6) NOT NULL,
 	`updated_at` datetime(6) NOT NULL,
 	PRIMARY KEY (`workflow_id`),
