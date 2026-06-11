@@ -290,10 +290,59 @@ reversal cannot safely continue. Manual IR; parser still deferred.
     runtime defer).
   - **Low** — the classified participant rejection reason is persisted as
     blocked-resolution evidence (was overwritten with "compensation_rejected").
-- [ ] **Next: stub compensation op + integration (seeded reversing fixture →
-  reverse → reversed, incl. lost-ack + restart)** (lost-ack reconcile
-  + restart recovery against a SEEDED single-checkpoint reversing workflow; stub
-  compensation op). Then sub-step C (multi-op forward IR) → D (full E2E).
+- [x] **End-to-end proof — added reversal integration coverage (8 assertions).**
+  Stub gained a `release` compensation op (+ a `_fault.reject` definite-400
+  injector); the runner config carries the manual-IR compensation binding
+  (`reserve` → `release`). Seeded reversing fixtures (a0..05–0a, new checkpoint
+  CSV) prove, through the REAL runner reverse loop dispatching `release` via the
+  generic dispatcher:
+  - `reverse_to_reversed` — one active checkpoint → compensation → `reversed`;
+  - `reverse_terminal_idempotent` — re-run is terminal, makes no new request;
+  - `reverse_lost_ack` — compensation commits then drops the ack → GET reconcile →
+    still `reversed`, with exec-count delta == 1 (effectively-once) and request
+    delta ≥ 2 (the PUT-that-lost-the-ack + the GET reconcile);
+  - `reverse_restart_recovery` — a CONSISTENT post-request seed (binding +
+    `compensation_requested` event + `reverse:dispatched` continuation) with the
+    participant op pre-submitted under the durable id → `reverse_head` dispatched
+    → reconcile (exec-count delta == 0, no re-execution) → `reversed`;
+  - `reverse_no_active_checkpoint` — inconsistency → durable defer;
+  - `reverse_block_on_rejection` / `reverse_block_no_redispatch` — definite
+    compensation rejection (400) → `blocked_resolution` (reverse direction), no
+    Singular op created, and a blocked workflow does not redispatch on rerun;
+  - `reverse_no_compensation_binding` — checkpoint op with no compensation
+    binding → durable operational deferral (lease released), not a block.
+- [x] **Reverse-loop review round 2 (integration 25/25).**
+  - **Medium** — restart recovery is GET-first: `_compensate` takes a `recover`
+    flag; the Dispatched branch reconciles via `_reconcile` (GET-first), never a
+    blind re-PUT through `_classify_dispatch`. Stub gains a PUT-only `put_count`
+    (`/debug/put-count`); `reverse_restart_recovery` now asserts put-delta == 0
+    (real GET-first), not just exec-delta == 0 (participant idempotency).
+  - **Medium** — WF7 seed is transition-faithful: the `compensation_requested`
+    event carries the full proc payload (`reverse_invocation_id`,
+    `reverse_operation`, `reverse_schema_version`) with a strictly-increasing
+    timestamp; workflow `current_event_ts` matches.
+  - **Medium** — the rejection case asserts DURABLE evidence via a read-only
+    `_mdb()` helper (new `reverse_block_durable_state`): checkpoint
+    `resolution_required(3)`, the `compensation_blocked` event reason, and the
+    `blocked_resolution(3)`/reverse workflow state — plus the classified reason in
+    the runner response.
+  - **Low** — removed stale duplicated next-step text after "Sub-step A complete";
+    integration README + counts updated to 25.
+- [x] **Reverse-loop review round 3 (integration 25/25).**
+  - **Medium** — WF7 checkpoint is now FULLY transition-faithful: `reverse_input_hash`
+    is the exact runner-derived value `d932b54d…984f` (validated:
+    `nameUUIDFromBytes` over the compact lex JSON `{"reservation":"r7"}` — matches
+    WF5's runner-persisted hash for `r5`), not the placeholder `rh7`; checkpoint
+    `updated_at` advanced to the request event ts (`00:00:01`).
+  - **Low** — `reverse_restart_recovery` also asserts request-delta == 1, proving the
+    recovery DID contact the participant (exactly one GET) — GET-first reconcile, not
+    zero interaction.
+  - **Low** — reconciled the milestone count: the earlier log entry no longer asserts
+    a stale `24/24`; the round-2 entry carries the single authoritative `25/25`.
+
+## Sub-step A COMPLETE (proc + host + runner loop, proven end-to-end).
+Next: sub-step B (multi-checkpoint stack traversal end-to-end) → C (multi-op
+forward IR) → D (forward-success → later-failure → reverse-order proof).
 
 ## Relevant roadmap
 Step 2 of the revised §7 sequence (dispatcher ✓ → reversal → manual portable IR →

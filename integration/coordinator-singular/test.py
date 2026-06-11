@@ -104,11 +104,53 @@ WF_RECOVERY = "a0000000000000000000000000000001"   # forward/requested, due; req
 WF_COMPLETED_UNSETTLED = "a0000000000000000000000000000002"  # completed, but operation still 'requested' (no result)
 WF_COMPLETED_NO_OP = "a0000000000000000000000000000003"      # completed, with NO operation row at all
 WF_PINNED_MISMATCH = "a0000000000000000000000000000004"      # forward/requested; request pins schema_version=2
+WF_REVERSING = "a0000000000000000000000000000005"            # reversing; 1 active checkpoint, not yet dispatched
+WF_REVERSE_LOSTACK = "a0000000000000000000000000000006"      # reversing; compensation input carries a drop-after-commit fault
+WF_REVERSE_DISPATCHED = "a0000000000000000000000000000007"   # reversing; compensation binding already persisted (recovery)
+WF_REVERSE_NO_ACTIVE = "a0000000000000000000000000000008"    # reversing; checkpoint already reversed (inconsistency)
+WF_REVERSE_REJECT = "a0000000000000000000000000000009"       # reversing; compensation is definitely rejected (400)
+WF_REVERSE_NOBINDING = "a000000000000000000000000000000a"    # reversing; checkpoint op has no compensation binding
 
 
 def _request_count(base):
     with urllib.request.urlopen(f"{base}/debug/request-count", timeout=3) as r:
         return json.loads(r.read())["count"]
+
+
+def _exec_count(base):
+    with urllib.request.urlopen(f"{base}/debug/exec-count", timeout=3) as r:
+        return json.loads(r.read())["count"]
+
+
+def _put_count(base):
+    # PUT-only subset of request-count. A GET-first reconcile leaves this
+    # unchanged, so a delta of 0 over a recovery proves no re-PUT occurred.
+    with urllib.request.urlopen(f"{base}/debug/put-count", timeout=3) as r:
+        return json.loads(r.read())["count"]
+
+
+def _mdb(sql):
+    """Read-only DB introspection for durable-state assertions (NOT seeding — the
+    fixtures are still seeded declaratively by the Mariachi scenario). Returns the
+    rows as a list of field-lists (tab-separated, batch mode, NULL preserved)."""
+    cmd = ["/usr/bin/mariadb", "-h", MDB["host"], "-P", str(MDB["port"]),
+           "-u", MDB["user"], f"-p{MDB['password']}", "-N", "-B",
+           "microflows", "-e", sql]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    if out.returncode != 0:
+        raise RuntimeError(f"mariadb query failed: {out.stderr.strip()}")
+    return [line.split("\t") for line in out.stdout.splitlines()]
+
+
+def _put_op(base, operation, op_id_hex, body_obj):
+    """Pre-submit an operation to the participant under a durable id (simulate a
+    committed dispatch before a crash, so the runner reconciles on recovery)."""
+    req = urllib.request.Request(
+        f"{base}/microflows/v1/operations/{operation}/{op_id_hex}",
+        data=json.dumps(body_obj).encode(), method="PUT",
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status
 
 
 def main():
@@ -134,6 +176,12 @@ def main():
         "operations": [
             {"name": "echo-transform", "participant": "ref", "schema_version": 1},
             {"name": "string-join", "participant": "ref", "schema_version": 1},
+            # 'reserve' (a forward op present only as a checkpoint operation_name in the
+            # reversing fixtures) declares its compensation -> 'release'; both resolve
+            # to the same stub. The runner uses this manual-IR binding to unwind.
+            {"name": "reserve", "participant": "ref", "schema_version": 1,
+             "compensation": {"operation": "release", "schema_version": 1}},
+            {"name": "release", "participant": "ref", "schema_version": 1},
         ],
     }
 
@@ -291,6 +339,96 @@ def main():
         check("pinned_contract_recovers",
               recovered is not None and recovered.get("result") == {"sum": 6}, recovered)
 
+        # --- REVERSAL / compensation (sub-step A): a reversing workflow unwinds its
+        # checkpoint stack by dispatching the bound compensation ('release') through
+        # the GENERIC dispatcher, reaching reversed. ---
+        # 6a. normal unwind: one active checkpoint -> dispatch 'release' -> reversed.
+        code, body = run_runner(rcf.name, WF_REVERSING)
+        check("reverse_to_reversed", code == 0 and body.get("workflow") == "reversed", (code, body))
+        # durable: a re-run finds it terminal (reversed) and makes NO new participant
+        # request (no re-compensation).
+        rc_before = _request_count(base)
+        code, body = run_runner(rcf.name, WF_REVERSING)
+        check("reverse_terminal_idempotent",
+              code == 0 and body.get("workflow") == "reversed"
+              and _request_count(base) == rc_before, (code, body, "request count changed"))
+
+        # 6b. LOST ACK on the reverse dispatch: 'release' commits then drops the
+        # response (5s, past the 3s PUT timeout) -> GET reconcile -> still reversed.
+        # Assert the compensation executed EXACTLY ONCE and that >1 request was made
+        # (the PUT-that-lost-the-ack followed by the GET reconcile).
+        ex0, rq0 = _exec_count(base), _request_count(base)
+        code, body = run_runner(rcf.name, WF_REVERSE_LOSTACK)
+        ex1, rq1 = _exec_count(base), _request_count(base)
+        check("reverse_lost_ack",
+              code == 0 and body.get("workflow") == "reversed"
+              and ex1 - ex0 == 1 and rq1 - rq0 >= 2, (code, body, f"exec+{ex1-ex0} req+{rq1-rq0}"))
+
+        # 6c. RESTART recovery: a CONSISTENT post-request state — the compensation was
+        # already dispatched + committed at the participant under its durable id. The
+        # runner must RECONCILE GET-FIRST (no re-execution AND no re-PUT), not perform
+        # a fresh dispatch. The pre-submit below is the participant's record of that
+        # committed dispatch; the runner then resumes from the durable binding.
+        _put_op(base, "release", "0000000000000000000000000000b0d7", {"reservation": "r7"})
+        ex0, pu0, rq0 = _exec_count(base), _put_count(base), _request_count(base)
+        code, body = run_runner(rcf.name, WF_REVERSE_DISPATCHED)
+        ex_d, pu_d, rq_d = _exec_count(base) - ex0, _put_count(base) - pu0, _request_count(base) - rq0
+        # put-delta == 0 proves no re-PUT, and request-delta == 1 proves the recovery
+        # DID contact the participant — exactly one GET. Together: GET-first
+        # reconciliation, not a PUT-first re-dispatch and not zero interaction (which
+        # would only prove the runner skipped the participant, not that it reconciled).
+        check("reverse_restart_recovery",
+              code == 0 and body.get("workflow") == "reversed"
+              and ex_d == 0 and pu_d == 0 and rq_d == 1,
+              (code, body, f"exec+{ex_d} put+{pu_d} req+{rq_d}"))
+
+        # 6d. INCONSISTENCY: a reversing workflow with no active checkpoint durably
+        # DEFERS with an audit reason (lease released) rather than exiting lease-held.
+        code, body = run_runner(rcf.name, WF_REVERSE_NO_ACTIVE)
+        check("reverse_no_active_checkpoint",
+              code == 9 and body.get("workflow") == "deferred"
+              and body.get("reason") == "reverse_no_active_checkpoint", (code, body))
+
+        # 6e. DEFINITE compensation failure: the participant rejects 'release' (400).
+        # The runner enters blocked_resolution (reverse direction) with the classified
+        # reason; the body never runs and no Singular op is created.
+        ex0, rq0 = _exec_count(base), _request_count(base)
+        code, body = run_runner(rcf.name, WF_REVERSE_REJECT)
+        check("reverse_block_on_rejection",
+              code == 3 and body.get("workflow") == "blocked"
+              and body.get("direction") == "reverse"
+              and body.get("reason") == "participant_invalid_request"
+              and _exec_count(base) == ex0, (code, body))
+        # DURABLE evidence of the block (not just the runner's response): the workflow
+        # is blocked_resolution(3) retaining reverse direction(2), the checkpoint is
+        # resolution_required(3), and a compensation_blocked event records the
+        # classified reason. These are the documented blocked-entry invariants.
+        wf9 = "a0000000000000000000000000000009"
+        wf_row = _mdb(f"SELECT state, execution_direction, current_disposition "
+                      f"FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wf9}')")
+        ck_row = _mdb(f"SELECT reversal_state FROM tb_mf_workflow_checkpoint "
+                      f"WHERE workflow_id = UNHEX('{wf9}') AND seq = 1")
+        ev_row = _mdb(f"SELECT JSON_UNQUOTE(JSON_EXTRACT(payload, '$.reason')) "
+                      f"FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wf9}') "
+                      f"AND kind = 'compensation_blocked'")
+        check("reverse_block_durable_state",
+              wf_row == [["3", "2", "2"]] and ck_row == [["3"]]
+              and ev_row == [["participant_invalid_request"]],
+              (wf_row, ck_row, ev_row))
+        # blocked workflow does NOT redispatch on rerun (non-claimable) -> no new request.
+        rq1 = _request_count(base)
+        code, body = run_runner(rcf.name, WF_REVERSE_REJECT)
+        check("reverse_block_no_redispatch",
+              code == 5 and body.get("workflow") == "deferred"
+              and _request_count(base) == rq1, (code, body, "redispatched while blocked"))
+
+        # 6f. PRE-dispatch resolution failure: the checkpoint's forward op declares NO
+        # compensation -> durable operational DEFERRAL (not a block), lease released.
+        code, body = run_runner(rcf.name, WF_REVERSE_NOBINDING)
+        check("reverse_no_compensation_binding",
+              code == 9 and body.get("workflow") == "deferred"
+              and body.get("reason") == "no_compensation_binding", (code, body))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the
         # LOCAL authoritative result; no dependency on the participant.
         stub.terminate()
@@ -310,7 +448,7 @@ def main():
             stub.kill()
         os.unlink(scf.name); os.unlink(rcf.name)
 
-    total = 16
+    total = 25
     print(f"coordinator<->singular integration: {total - len(failures)}/{total} passed")
     return 1 if failures else 0
 

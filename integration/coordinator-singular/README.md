@@ -40,10 +40,24 @@ This directory owns only cross-component **orchestration + assertions**
 3. Reset + seed the `microflows` schema via the `coordinator-fixtures` Mariachi
    scenario.
 4. Run `test.py` (with `STUB_BIN`/`RUNNER_BIN` pointing at the work-dir
-   binaries), which launches both processes and asserts 12 properties: normal
-   success, lost-ack recovery, idempotent re-run, effectively-once execution,
-   initial pending deferral, non-retryable rejection (× 3), durable-request
-   recovery, and two inconsistent-terminal-state cases.
+   binaries), which launches both processes and asserts **25** properties:
+   - **Forward path (16):** normal success, lost-ack recovery, idempotent
+     re-run, effectively-once execution, initial pending deferral, non-retryable
+     rejection (× 3), generic string-join dispatch (× 2), durable-request
+     recovery, two inconsistent-terminal-state cases, pinned-contract
+     defer/recover (× 2), and terminal rerun with the participant down.
+   - **Reversal / compensation (9):** a reversing workflow unwinds its
+     checkpoint stack by dispatching the bound compensation (`release`) through
+     the generic dispatcher — normal unwind to `reversed`, terminal idempotency
+     (no re-compensation), lost-ack on the reverse dispatch (effectively-once,
+     PUT→GET reconcile), restart recovery from a durably-dispatched checkpoint
+     (GET-first reconcile — no re-execution **and** no re-PUT, asserted via the
+     participant's put-count), the no-active-checkpoint inconsistency defer,
+     definite compensation rejection → `blocked_resolution` (reverse) with the
+     classified reason, the durable blocked-entry invariants (workflow
+     `blocked_resolution`/reverse, checkpoint `resolution_required`, a
+     `compensation_blocked` event — read back from the DB), no redispatch while
+     blocked, and the missing-compensation-binding deferral.
 
 Steps 2–4 run under **one** acquisition of the shared host-global DB lock
 (`flocker --key serial-mariadb-mdb114-a -j 1` — the same key the executor uses

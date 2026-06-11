@@ -741,10 +741,22 @@ fn _reverse_block(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 
 // Dispatch ONE compensation (generic dispatcher) + settle/defer/block. Returns
 // Continue to descend to the next checkpoint, or Terminal with the exit code.
+// A persisted-and-dispatched checkpoint is RECOVERED GET-first: the request was
+// already durably issued, so reconcile its outcome by GET on the stable id and
+// only re-PUT if the participant has no record (404). A fresh (pending) checkpoint
+// is dispatched PUT-first. Selecting here keeps recovery from blindly re-PUTting.
+fn _dispatch_compensation(recover: Bool, base: &String, comp_op: &String,
+                          rev_id_hex: &String, rev_input: &String) -> DispatchResult {
+	if recover {
+		return _reconcile(base, comp_op, rev_id_hex, rev_input);
+	}
+	return _classify_dispatch(base, comp_op, rev_id_hex, rev_input);
+}
+
 fn _compensate(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
                seq: Int, comp_op: &String, base: &String, rev_id: &Array<Byte>,
-               rev_id_hex: &String, rev_input: &String) -> CompStep {
-	match _classify_dispatch(base, comp_op, rev_id_hex, rev_input) {
+               rev_id_hex: &String, rev_input: &String, recover: Bool) -> CompStep {
+	match _dispatch_compensation(recover, base, comp_op, rev_id_hex, rev_input) {
 		DispatchResult::Done(result) => {
 			val ts = _now(host);
 			match host.reverse_settle(workflow_id, fencing_token, seq, rev_id, &result, &ts) {
@@ -845,7 +857,8 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 					}
 				}
 				if ready {
-					match _compensate(host, workflow_id, fencing_token, seq, &comp_op, &base, &rev_id, &rev_id_hex, &rev_input) {
+					// Fresh dispatch of a just-persisted binding: PUT-first.
+					match _compensate(host, workflow_id, fencing_token, seq, &comp_op, &base, &rev_id, &rev_id_hex, &rev_input, false) {
 						CompStep::Continue => {},
 						CompStep::Terminal(code) => { return code; }
 					}
@@ -871,7 +884,9 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				if !rok {
 					return _defer_dispatch(host, workflow_id, fencing_token, "pinned_contract_unavailable");
 				}
-				match _compensate(host, workflow_id, fencing_token, seq, &rev_op, &base, &rev_id, &rev_id_hex, &rev_input) {
+				// Durable binding already dispatched (recovery): GET-first reconcile,
+				// never a blind re-PUT.
+				match _compensate(host, workflow_id, fencing_token, seq, &rev_op, &base, &rev_id, &rev_id_hex, &rev_input, true) {
 					CompStep::Continue => {},
 					CompStep::Terminal(code) => { return code; }
 				}

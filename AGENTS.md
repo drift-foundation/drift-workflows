@@ -29,6 +29,27 @@ Drift dependency policy:
 ## Announcements
 - Read and publish cross-team announcements from/to /tmp/drift-announce/<iso-utc-datetime>-<repo>-release-notes.md
 
+## Working notes / progress (required)
+
+Every active effort lives under `work/<work-name>/` (see `work/README.md`). Each
+such folder MUST carry two files:
+
+- **`README.md`** — the durable charter: the plan, the bug/problem being solved,
+  the work involved, and the end goal (objective, accepted design decisions,
+  implementation plan, verification criteria, boundaries). It also holds the
+  detailed per-round change log. This answers "what is this effort and why".
+- **`Progress.md`** — the at-a-glance status: "where it stands + literal next
+  action" (status/sub-step ledger, what landed, verification result, uncommitted
+  worktree, next step). This answers "what is the current state".
+
+- **Update `work/<work-name>/Progress.md` on every completed phase, step, or
+  review-feedback round for that effort** — before considering the unit of work
+  done. Treat the update as part of the task, not an afterthought.
+- Each update reflects current reality: status/sub-step ledger, what landed,
+  verification result (command + counts), the uncommitted worktree, and the
+  literal next action. Keep it short and current; prune stale text.
+- If an effort has no `Progress.md` yet, create one when you first touch it.
+
 ## Defect policy (strict)
 
 - If behavior indicates a core defect (protocol parsing, state machine, concurrency, memory/lifetime, I/O correctness, or runtime integration), classify it immediately as `CORE_BUG`.
