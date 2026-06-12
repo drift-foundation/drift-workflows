@@ -1,6 +1,4 @@
-# security-model
-
-## Purpose and status
+# Microflows security model (forward-looking architectural guidance)
 
 This note records forward-looking security concepts for Microflows so current
 work remains compatible with the intended model. It is architectural guidance,
@@ -132,9 +130,10 @@ These choices should be made when the authorization boundary becomes an active
 implementation effort, informed by the generic dispatcher and participant
 protocol rather than fixed prematurely.
 
-## Current status and next action
+## Compatibility note for current work
 
-**Recorded for alignment; not scheduled for implementation.** The active generic
-REST dispatcher effort should preserve this boundary: operation payloads remain
+This boundary must be preserved as the executor evolves: operation payloads stay
 credential-free, participant auth stays behind a resolver/provider abstraction,
-and no temporary config shape should make credentials durable workflow data.
+and no temporary config shape should make credentials durable workflow data. The
+generic dispatcher (landed) and the manual-IR registry already keep routing and
+credentials in trusted deployment config, never in workflow input.

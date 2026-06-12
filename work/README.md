@@ -3,12 +3,16 @@
 A lightweight convention so restart context is **explicit**, not reconstructed
 from conversation history and a dirty worktree.
 
-- One folder per active effort: `work/<short-kebab-name>/`.
-- Each folder has a `README.md` capturing the sections below.
-- Keep it short and current. When an effort lands, set its status to **Done**
-  (with the landing commit) and either delete the folder or leave it as a record.
-- These are working notes, not design docs. Authoritative design lives in
-  `microflows/doc/microflows_design.md`; durable facts go to commit messages.
+- `work/*` holds ONLY **active or scheduled** efforts: one folder per effort,
+  `work/<short-kebab-name>/`.
+- When an effort LANDS, **delete its folder** — the commit history is the record
+  (the working notes are scaffolding, not an archive). Do not leave landed efforts
+  as a log; that just duplicates history and goes stale.
+- Each folder has a `README.md` (the charter — sections below) and a `Progress.md`
+  (at-a-glance status + literal next action). Keep both short and current.
+- These are working notes, not design docs. Authoritative architecture lives in
+  `microflows/doc/` (e.g. `microflows_design.md`, `security_model.md`); durable
+  facts go to commit messages.
 
 Each effort `README.md` records:
 
