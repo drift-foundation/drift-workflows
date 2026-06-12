@@ -1,8 +1,17 @@
-# Forward-plan pins for the mid-plan restart seeds (sub-step C/D). plan_hash is the
-# runner-derived hash over each step's (operation, input, resolved schema_version +
-# participant id, compensation op + version + participant id); plan_length=2 makes
-# operation finality durable. The hashes match the plan configs the C2/D2/C3 tests pass.
-workflow_id,plan_hash,plan_length,created_at
-a0000000000000000000000000000020,bd0c7191aaf9384c938e53462b5ba75b,2,2000-01-01 00:00:00.000000
-a0000000000000000000000000000021,6cfbdf40c4603e328a76173fefacdef4,2,2000-01-01 00:00:00.000000
-a0000000000000000000000000000022,bd0c7191aaf9384c938e53462b5ba75b,2,2000-01-01 00:00:00.000000
+# Durable plan pins for the mid-plan restart seeds (sub-step C/D). The pin is
+# (script_name [on tb_mf_workflow], plan_version, content_hash, plan_length). plan_version
+# is the immutable semantic version (here the default generation 1.0.0). content_hash is
+# the runner-derived 33-byte digest (0x01 scheme + SHA-256 over the canonical revision IR:
+# each step's operation, CANONICAL key-ordered input, resolved schema_version + participant,
+# compensation op + version + participant); plan_length=2. Hashes match the plan configs
+# C2/D2/C3 pass (wf21's input is multi-key, so its hash reflects key-ordered canonicalization).
+# Resolution is EXACT-MATCH on (plan_version AND content_hash): wf25 is identical to wf22
+# but is driven with a config generation of 2.0.0, so the VERSION alone mismatches.
+workflow_id,plan_version,content_hash,plan_length,created_at
+a0000000000000000000000000000020,1.0.0,01057a659508805462dc05a36f32ec67c677856d888c75fd30ee950f50afb11680,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000021,1.0.0,0123cb1a022f94258ca26d7fb7a7ea7608a0b35af28eb145bd322a7cb504d06758,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000022,1.0.0,01057a659508805462dc05a36f32ec67c677856d888c75fd30ee950f50afb11680,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000023,1.0.0,01057a659508805462dc05a36f32ec67c677856d888c75fd30ee950f50afb11680,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000024,1.0.0,01057a659508805462dc05a36f32ec67c677856d888c75fd30ee950f50afb11680,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000025,1.0.0,01057a659508805462dc05a36f32ec67c677856d888c75fd30ee950f50afb11680,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000026,1.0.0,01057a659508805462dc05a36f32ec67c677856d888c75fd30ee950f50afb11680,2,2000-01-01 00:00:00.000000

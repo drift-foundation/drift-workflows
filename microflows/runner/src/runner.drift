@@ -34,11 +34,17 @@ import std.io as io;
 import std.cli as cli;
 import std.codec as codec;
 import std.uuid as uuid;
+import std.crypto as crypto;
 import microflows.host as mf;
 import web.client as client;
 
 const SCRIPT_NAME: String = "protocol_spike";
+// Legacy single-op pin (tb_mf_workflow.script_revision); the plan model keys on a
+// semantic version instead (PLAN_VERSION_DEFAULT, overridable via config "plan_version").
 const SCRIPT_REVISION: Int = 1;
+// Default immutable plan version (major.minor.patch) for the configured generation when
+// config omits "plan_version". A process loads ONE generation; selection is exact-match.
+const PLAN_VERSION_DEFAULT: String = "1.0.0";
 const OPERATION_SEQ: Int = 1;
 const CHECKPOINT_SEQ: Int = 1;
 const LEASE_SECONDS: Int = 30;
@@ -91,6 +97,37 @@ struct PlanStep {
 	input_json: String
 }
 
+// ===== ScriptRegistry (milestone-1: in-process, immutable, manually-built IR) =====
+//
+// A plan REVISION is the immutable unit a workflow pins, identified by a SEMANTIC
+// VERSION (major.minor.patch). Its `content_hash` is a versioned, collision-resistant
+// digest (0x01 ‖ SHA-256 over the canonical IR) the runner verifies against the durable
+// pin — it never substitutes a different plan. v1 loads ONE configured generation per
+// process and selects by EXACT MATCH on (version AND content_hash); semver RANGES,
+// multi-version retention, and activation/reload are a future evolution, not built here.
+struct ScriptRevision {
+	name: String,
+	version: String,             // immutable semver: major.minor.patch
+	plan: Array<PlanStep>,
+	content_hash: Array<Byte>,   // 33 bytes: scheme tag + SHA-256
+	plan_length: Int
+}
+
+struct ScriptRegistry {
+	revisions: Array<ScriptRevision>
+}
+
+// The durable pin as the runner carries it past the storage read (item-1 storage-first):
+// the workflow's MODE (planned when present) and its pinned identity come from STORAGE,
+// not current config. `present=false` means no durable pin (fresh or legacy).
+struct PinView {
+	present: Bool,
+	name: String,
+	version: String,
+	hash_hex: String,
+	plan_length: Int
+}
+
 // One step of the reverse loop: Continue (descend to the next checkpoint) or
 // Terminal with the process exit code (reversed / deferred / blocked / fenced).
 variant CompStep {
@@ -139,14 +176,11 @@ fn _run(config_path: &String, workflow_hex: &String,
 	val db_sub = _require_db(&cfg);
 	val worker_id = _config_str(&cfg, &"worker_id", "runner-1");
 
-	// Validate the WHOLE participant/operation registry at startup, BEFORE any
-	// execution — duplicate ids/names, unknown participant refs, unsupported
-	// transport, empty endpoint lists, invalid URLs. Routing + credentials come
-	// ONLY from this trusted config, never from workflow input.
-	_validate_registry(&cfg);
-	// Validate the forward PLAN too (if any): every step's operation must resolve in
-	// the registry, before any execution.
-	_validate_plan(&cfg);
+	// NOTE: the participant/operation registry is validated LAZILY — only on a path that
+	// actually needs it (fresh create, a claimed forward/reverse dispatch, or the legacy
+	// single-op path). It is deliberately NOT validated here so that TERMINAL REPLAY of a
+	// completed/planned workflow (which reports from durable state) stays registry- and
+	// config-independent.
 
 	val identity = mf.identity_from_worker_name(&worker_id);
 	var b = mf.new_host_builder();
@@ -160,14 +194,36 @@ fn _run(config_path: &String, workflow_hex: &String,
 	// of the same workflow yield the same operation id.
 	val workflow_canon_hex = _bytes_to_hex(&workflow_id);
 
-	// Manual-IR forward PLAN (config "plan"): ordered MULTI-operation execution. When
-	// present it supersedes the single --operation path entirely (a restarted worker
-	// re-reads the same plan and recovers per-seq from durable state). The legacy
-	// single-op path below remains for configs without a plan.
+	// STORAGE-FIRST mode selection (static-review item 1): the workflow's MODE
+	// (planned vs legacy) and its pinned plan come from the DURABLE pin, NOT from
+	// whatever plan the current config happens to carry. So an existing planned
+	// workflow whose pinned plan is absent/changed in this generation is still routed
+	// to the planned path (→ resolve → revision_unavailable defer), never misrouted to
+	// the legacy single-op path. Only a workflow with NO durable pin consults config to
+	// decide fresh-planned (config has a plan) vs legacy (no plan).
+	var pin = PinView(present = false, name = "", version = "", hash_hex = "", plan_length = 0);
+	match host.get().plan_get(&workflow_id) {
+		mf.PlanGetOutcome::Found(p) => {
+			pin = PinView(present = true, name = _dup(&p.script_name), version = _dup(&p.plan_version),
+			              hash_hex = _dup(&p.content_hash), plan_length = p.plan_length);
+		},
+		mf.PlanGetOutcome::NotFound => {}
+	}
+	if pin.present {
+		return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin);
+	}
+	// No durable pin: fresh-or-legacy. A config "plan" => a fresh PLANNED workflow
+	// (_run_planned validates the registry + plan and creates+pins the active
+	// generation); otherwise the legacy single-op path below.
 	match _build_plan(&cfg) {
-		Optional::Some(plan) => { return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &plan); },
+		Optional::Some(_) => {
+			return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin);
+		},
 		Optional::None => {}
 	}
+
+	// Legacy single-op path: validate the registry now (it routes the single dispatch).
+	_validate_registry(&cfg);
 
 	// CLI-derived request fields are the DEFAULT for a FRESH workflow. On resume
 	// they are replaced by the durable persisted request, which is authoritative
@@ -385,33 +441,64 @@ fn _run(config_path: &String, workflow_hex: &String,
 
 // ===== manual-IR forward PLAN execution (multi-operation) =====
 
-// Run a workflow whose forward path is a manual-IR PLAN: create + claim, then drive
-// the ordered operation sequence. Workflow lifecycle (create/claim/reversing) is
-// handled once here; per-operation request/dispatch/settle + recovery live in the
-// loop. A claimed REVERSING workflow unwinds instead (claim returns state 2).
+// Run a workflow whose forward path is a manual-IR PLAN, loading the IR from the
+// ScriptRegistry by the workflow's PINNED plan. State-sensitive ordering: the DURABLE
+// pin was read STORAGE-FIRST by the caller; a FRESH submission validates+builds the
+// registry to create+pin the active generation; then claim. TERMINAL REPLAY (a
+// NotClaimable existing workflow) reports from durable state and is RESOLVED BEFORE the
+// registry is ever built or validated — so a completed workflow replays its result even
+// when current participant/operation config is absent or malformed. Only a CLAIMED
+// workflow builds+validates the registry to resolve+verify its pinned plan; a claimed
+// REVERSING workflow unwinds instead.
 fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
-                workflow_canon_hex: &String, plan: &Array<PlanStep>) -> Int {
-	val plan_hash = _plan_hash(cfg, plan);
-	// CREATE + PIN the plan ATOMICALLY, as ONE command, BEFORE any state branch. The
-	// pin is decided by the workflow's CREATION (not by whichever worker claims first),
-	// and validated on EVERY path — fresh, resume, terminal-replay, reversing — so a
-	// config change to the plan can never bypass conflict detection (it can't run
-	// unrequested steps, return the wrong terminal result, or compensate a pending
-	// checkpoint under a changed contract). The pin records plan_length, from which the
-	// settle proc DERIVES finality.
-	val t_create = _now(host);
-	match host.create_planned(workflow_id, &SCRIPT_NAME, SCRIPT_REVISION,
-	                          &t_create, &t_create, &"{\"pos\":\"start\"}", &"{}", &plan_hash, plan.len) {
-		mf.CreatePlannedOutcome::Created => {},
-		mf.CreatePlannedOutcome::Exists => {},
-		mf.CreatePlannedOutcome::PlanConflict(_) => {
-			// The workflow exists under a DIFFERENT plan. No lease was taken; report and
-			// stop. Restoring the original config plan resumes it on the next poll.
-			console.println("{\"workflow\":\"deferred\",\"reason\":\"plan_conflict\"}");
-			return 9;
+                workflow_canon_hex: &String, storage_pin: &PinView) -> Int {
+	var pin_name: String = _dup(&storage_pin.name);
+	var pin_version: String = _dup(&storage_pin.version);
+	var pin_hash_hex: String = _dup(&storage_pin.hash_hex);
+	var pin_len: Int = storage_pin.plan_length;
+
+	// The registry is built LAZILY — never before terminal replay. `reg_ready` tracks
+	// whether `reg` holds the validated generation.
+	var reg_empty: Array<ScriptRevision> = [];
+	var reg = ScriptRegistry(revisions = move reg_empty);
+	var reg_ready = false;
+
+	// 1. ABSENT -> fresh submission: validate + build the registry (a fresh submit
+	//    legitimately requires valid config) and create + pin the ACTIVE generation. The
+	//    create RESOLVES THE RACE — a concurrent creator that won returns the WINNING
+	//    durable pin (Exists), which we adopt verbatim and then exact-match-resolve below.
+	if !storage_pin.present {
+		_validate_registry(cfg);
+		_validate_plan(cfg);
+		reg = _registry_build(cfg);
+		reg_ready = true;
+		// Resolve the active generation by the CONFIGURED plan name (not a constant), so
+		// any configured name (e.g. checkout-v1) can create workflows.
+		val active_name = _config_str(cfg, &"script_name", _dup(&SCRIPT_NAME));
+		var has_active = false;
+		var aidx = 0;
+		match _registry_active(&reg, &active_name) { Optional::Some(i) => { aidx = i; has_active = true; }, Optional::None => {} }
+		if !has_active {
+			console.println("{\"workflow\":\"aborted\",\"reason\":\"no_active_revision\"}");
+			return 2;
+		}
+		val t_create = _now(host);
+		match host.create_planned(workflow_id, &reg.revisions[aidx].name, &reg.revisions[aidx].version,
+		                          &t_create, &t_create, &"{\"pos\":\"start\"}", &"{}",
+		                          &reg.revisions[aidx].content_hash, reg.revisions[aidx].plan_length) {
+			mf.CreatePlannedOutcome::Created(p) => { pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version); pin_hash_hex = _dup(&p.content_hash); pin_len = p.plan_length; },
+			mf.CreatePlannedOutcome::Exists(p) => { pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version); pin_hash_hex = _dup(&p.content_hash); pin_len = p.plan_length; },
+			mf.CreatePlannedOutcome::PlanConflict(_) => {
+				// The workflow_id exists under a CONTRADICTORY identity — a legacy non-plan
+				// workflow, OR a DIFFERENT plan name (id collision across plans). No pin to
+				// adopt; no lease taken; report + stop.
+				console.println("{\"workflow\":\"deferred\",\"reason\":\"plan_conflict\"}");
+				return 9;
+			}
 		}
 	}
 
+	// 2. claim — now we hold a fence for any durable defer below.
 	val clock = _clock(host);
 	var fencing_token: Int = 0;
 	var claimed_state: Int = 0;
@@ -419,32 +506,162 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		mf.ClaimByIdOutcome::Claimed(wf) => { fencing_token = wf.fencing_token; claimed_state = wf.state_code; },
 		mf.ClaimByIdOutcome::NotFound => { throw RunnerError(message = "workflow absent after create"); },
 		mf.ClaimByIdOutcome::NotClaimable => {
-			// Terminal / active-elsewhere / deferred: inspect + report. A completed
-			// plan's authoritative result is the LAST operation's, not op 1.
-			val last_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, plan.len));
-			return _inspect_report(host, workflow_id, &last_hex, plan.len);
+			// TERMINAL REPLAY / leased / deferred: report from DURABLE state — the pinned
+			// `plan_length` gives the final operation seq. Reached BEFORE any registry build
+			// or `_validate_registry`, so it never depends on current participant/operation
+			// config being present or valid.
+			val last_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, pin_len));
+			return _inspect_report(host, workflow_id, &last_hex, pin_len);
 		}
 	}
 
-	// A claimed REVERSING workflow drives the compensation unwind from the checkpoint
-	// stack (the plan pin above already validated the config matches).
+	// 3. CLAIMED: NOW build + validate the registry (deferred past terminal replay). For a
+	//    fresh create we already did; this covers the existing-claimed path. We hold the
+	//    lease, so a MALFORMED/incomplete registry config MUST NOT leak it: catch the
+	//    failure and durably defer `revision_unavailable` (lease released, recoverable),
+	//    exactly as an absent pinned plan does — never exit still holding the lease.
+	if !reg_ready {
+		var ok = false;
+		try {
+			_validate_registry(cfg);
+			reg = _registry_build(cfg);
+			ok = true;
+		} catch RunnerError(e) {
+			console.eprintln(e.message);
+		}
+		if !ok {
+			return _defer_dispatch(host, workflow_id, fencing_token, "revision_unavailable");
+		}
+		reg_ready = true;
+	}
+
+	// 4. EXACT-MATCH resolve + verify the PINNED plan BEFORE choosing a direction
+	//    (static-review item 3): resolve (name, plan_version) and verify content_hash AND
+	//    length against the pin. Absent / mismatched -> durable revision_unavailable defer
+	//    (we hold a fence), NEVER substitute — for BOTH forward and reverse, so a
+	//    reversing workflow can never unwind compensation under a plan that isn't its
+	//    pinned one. Under v1's single verified generation, cfg IS the pinned plan, so the
+	//    forward dispatcher + reverse unwind below read compensation from the plan the pin
+	//    guarantees.
+	var has_rev = false;
+	var ridx = 0;
+	match _registry_resolve(&reg, &pin_name, &pin_version) { Optional::Some(i) => { ridx = i; has_rev = true; }, Optional::None => {} }
+	if !has_rev {
+		return _defer_dispatch(host, workflow_id, fencing_token, "revision_unavailable");
+	}
+	val rev_hash_hex = _bytes_to_hex(&reg.revisions[ridx].content_hash);
+	if !_str_eq(&rev_hash_hex, &pin_hash_hex) or reg.revisions[ridx].plan_length != pin_len {
+		return _defer_dispatch(host, workflow_id, fencing_token, "revision_unavailable");
+	}
+
+	// Pinned plan verified. A claimed REVERSING workflow unwinds; otherwise dispatch
+	// forward. Both bind their operations from the verified pinned plan.
 	if claimed_state == STATE_REVERSING {
 		return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token);
 	}
-
-	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, plan);
+	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].plan);
 }
 
-// Stable hash over the plan's FULL executable semantics — its durable identity. Per
-// step: operation name + input + the RESOLVED operation (schema_version + logical
-// participant id) + the compensation binding (operation + version + participant id).
-// Length-prefixed per field so distinct plans never collide. A registry change to a
-// schema_version, a participant binding, or a compensation op/version/participant
-// yields a different hash -> plan_conflict, so an in-flight workflow never runs
-// unrequested steps or compensates pending checkpoints under a changed contract or a
-// different participant. (Endpoint/auth resolution stays dynamic — only the LOGICAL
-// participant id is pinned.)
-fn _plan_hash(cfg: &json.JsonNode, plan: &Array<PlanStep>) -> Array<Byte> {
+// ===== ScriptRegistry build + lookup (v1: one configured generation per process) =====
+
+// Build the in-process registry from config: ONE generation, a single revision
+// `(script_name, plan_version)` whose IR is the config plan. The name + version come
+// from config ("script_name" / "plan_version", defaulting to SCRIPT_NAME /
+// PLAN_VERSION_DEFAULT) so different deployments genuinely carry different generations.
+// The version is validated as an immutable semver (major.minor.patch). v1 does NOT
+// retain multiple revisions — that, plus activation/reload, is a future evolution.
+fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
+	var revs: Array<ScriptRevision> = [];
+	match _build_plan(cfg) {
+		Optional::Some(plan) => {
+			val name = _config_str(cfg, &"script_name", _dup(&SCRIPT_NAME));
+			val version = _config_str(cfg, &"plan_version", _dup(&PLAN_VERSION_DEFAULT));
+			_validate_semver(&version);
+			val ch = _content_hash(cfg, &plan);
+			val len = plan.len;
+			revs.push(ScriptRevision(name = move name, version = move version,
+			                         plan = move plan, content_hash = ch, plan_length = len));
+		},
+		Optional::None => {}
+	}
+	return ScriptRegistry(revisions = move revs);
+}
+
+// The active generation for a script (v1: the single built revision matching the name).
+fn _registry_active(reg: &ScriptRegistry, name: &String) -> Optional<Int> {
+	var i = 0;
+	while i < reg.revisions.len {
+		if _str_eq(&reg.revisions[i].name, name) { return Optional<Int>::Some(i); }
+		i = i + 1;
+	}
+	return Optional<Int>::None();
+}
+
+// EXACT-MATCH resolve a pinned plan by (name, version). v1 selection is exact-match on
+// the version string (no semver ranges yet); the caller additionally verifies
+// content_hash + length. None -> revision_unavailable.
+fn _registry_resolve(reg: &ScriptRegistry, name: &String, version: &String) -> Optional<Int> {
+	var i = 0;
+	while i < reg.revisions.len {
+		if _str_eq(&reg.revisions[i].name, name) and _str_eq(&reg.revisions[i].version, version) {
+			return Optional<Int>::Some(i);
+		}
+		i = i + 1;
+	}
+	return Optional<Int>::None();
+}
+
+// Validate an immutable plan version is a well-formed semantic version
+// major.minor.patch: exactly three dot-separated, non-empty, all-numeric components (no
+// pre-release / build-metadata labels in v1). Throws RunnerError on a malformed version.
+fn _validate_semver(version: &String) -> Void {
+	val n = version.byte_length();
+	var dots = 0;
+	var comp_len = 0;   // bytes in the current component
+	var i = 0;
+	while i < n {
+		val c = version.byte_at(i);
+		if c == 46 {        // '.'
+			if comp_len == 0 { throw RunnerError(message = "invalid plan_version (empty component): " + _dup(version)); }
+			dots = dots + 1;
+			comp_len = 0;
+		} else if c >= 48 and c <= 57 {   // '0'..'9'
+			comp_len = comp_len + 1;
+		} else {
+			throw RunnerError(message = "invalid plan_version (non-numeric component): " + _dup(version));
+		}
+		i = i + 1;
+	}
+	if dots != 2 or comp_len == 0 {
+		throw RunnerError(message = "invalid plan_version (need major.minor.patch): " + _dup(version));
+	}
+}
+
+// `content_hash` = collision-resistant, versioned digest of a revision's IR: a 1-byte
+// scheme tag (0x01) followed by SHA-256 over the canonical encoding = 33 bytes. This is
+// the immutable identity the runner verifies against the durable pin ("never
+// substitute"). NOT the per-operation `input_hash` (UUID-v3, participant idempotency).
+fn _content_hash(cfg: &json.JsonNode, plan: &Array<PlanStep>) -> Array<Byte> {
+	val canonical = _plan_canonical(cfg, plan);
+	val msg = _str_bytes(&canonical);
+	val digest = crypto.sha256(&msg);   // 32 bytes
+	var out: Array<Byte> = [];
+	// Scheme tag 0x01 (versioned digest scheme), built via hex_decode so we never push
+	// an Int literal into Array<Byte>.
+	match codec.hex_decode(&"01") {
+		core.Result::Ok(tag) => { out.push(tag[0]); },
+		core.Result::Err(_) => { throw RunnerError(message = "content-hash scheme tag decode failed"); }
+	}
+	var i = 0;
+	while i < digest.len { out.push(digest[i]); i = i + 1; }
+	return move out;
+}
+
+// Canonical encoding of the plan's FULL executable semantics. Per step: operation name
+// + CANONICAL input + the RESOLVED operation (schema_version + logical participant id) +
+// the compensation binding (operation + version + participant id). Length-prefixed per
+// field so distinct revisions never collide.
+fn _plan_canonical(cfg: &json.JsonNode, plan: &Array<PlanStep>) -> String {
 	var s: String = "";
 	var i = 0;
 	while i < plan.len {
@@ -461,13 +678,34 @@ fn _plan_hash(cfg: &json.JsonNode, plan: &Array<PlanStep>) -> Array<Byte> {
 		}
 		val sv_str = fmt.format_int(r.schema_version);
 		val comp_sv_str = fmt.format_int(comp_sv);
-		s = s + _lp(&plan[i].operation) + _lp(&plan[i].input_json)
+		// CANONICAL input (static-review item 4): hash the recursively key-ordered compact
+		// form, so JSON objects that differ only in key ORDER produce the SAME content_hash
+		// (no false revision_unavailable). Same ordering `_input_hash` uses.
+		val canon_input = _canonical_json(&plan[i].input_json);
+		s = s + _lp(&plan[i].operation) + _lp(&canon_input)
 		      + _lp(&sv_str) + _lp(&r.participant_id)
 		      + _lp(&comp_op) + _lp(&comp_sv_str) + _lp(&comp_part);
 		i = i + 1;
 	}
-	val u = uuid.v3_from_string(&s);
-	return uuid.to_bytes(&u);
+	return move s;
+}
+
+// Canonical compact JSON: parse + re-encode with lexicographic UTF-8 key ordering, so a
+// value's identity is independent of key spelling/order in config.
+fn _canonical_json(input_json: &String) -> String {
+	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
+	match json.parse(input_json) {
+		core.Result::Ok(n) => { return json.encode_compact_with_config(&n, &cfg); },
+		core.Result::Err(_) => { throw RunnerError(message = "plan step input is not valid JSON"); }
+	}
+}
+
+fn _str_bytes(s: &String) nothrow -> Array<Byte> {
+	val n = s.byte_length();
+	var out: Array<Byte> = [];
+	var i = 0;
+	while i < n { out.push(s.byte_at(i)); i = i + 1; }
+	return move out;
 }
 
 // Length-prefix one field: "{byte_length}:{value};" — so concatenated fields can't

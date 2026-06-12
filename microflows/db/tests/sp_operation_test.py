@@ -16,6 +16,7 @@ import datetime
 import json
 import os
 import sys
+import threading
 import uuid
 
 import pymysql
@@ -33,10 +34,13 @@ WRONG_OPID = bytes.fromhex("0000000000000000000000000000ffff")
 SCRIPT = f"sp-op-test-{uuid.uuid4().hex[:8]}"
 
 failures = []
+passed = 0
 
 
 def check(name, cond, detail=""):
+    global passed
     if cond:
+        passed += 1
         print(f"  PASS  {name}")
     else:
         failures.append(name)
@@ -202,22 +206,106 @@ def main():
     wf5 = os.urandom(16)
     op5a = bytes.fromhex("00000000000000000000000000000e51")
     op5b = bytes.fromhex("00000000000000000000000000000e52")
-    plan_h = bytes.fromhex("a1" * 16)
+    # content_hash is a 33-byte pin (0x01 scheme + 32-byte digest); plan_version is an
+    # immutable semantic version (major.minor.patch). The pin is
+    # (script_name, plan_version, content_hash, plan_length).
+    plan_h = bytes.fromhex("01" + "a1" * 32)
+    plan_h_hex = plan_h.hex()
+    VER = "1.4.2"
     for t in ("tb_mf_workflow_plan", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf5,))
-    # CREATE + PIN the 2-step plan ATOMICALLY. Re-creating the SAME identity is
-    # idempotent (exists); a DIFFERENT plan hash is plan_conflict (a config change can't
-    # silently adopt a new plan under an existing workflow).
-    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
-    check("create_planned", r and r["outcome"] == "created", r)
-    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
-    check("create_planned_idempotent", r and r["outcome"] == "exists", r)
-    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}", bytes.fromhex("b2" * 16), 2))
-    check("create_planned_conflict", r and r["outcome"] == "plan_conflict" and r["plan_length"] == 2, r)
-    # The immutable SCRIPT identity also participates: same plan, different revision is
-    # a plan_conflict, not exists.
-    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, 2, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
-    check("create_planned_script_conflict", r and r["outcome"] == "plan_conflict", r)
+    # CREATE + PIN the plan ATOMICALLY; Created/Exists RETURN the committed pin.
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    check("create_planned", r and r["outcome"] == "created" and r["content_hash"] == plan_h_hex
+          and r["plan_version"] == VER and r["plan_length"] == 2, r)
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    check("create_planned_idempotent", r and r["outcome"] == "exists" and r["plan_version"] == VER
+          and r["content_hash"] == plan_h_hex and r["plan_length"] == 2, r)
+    # plan_get returns the durable pin (registry-independent).
+    _, r = call(cur, "sp_mf_plan_get", (wf5,))
+    check("plan_get", r and r["outcome"] == "found" and r["script_name"] == SCRIPT
+          and r["plan_version"] == VER and r["content_hash"] == plan_h_hex and r["plan_length"] == 2, r)
+    _, r = call(cur, "sp_mf_plan_get", (os.urandom(16),))
+    check("plan_get_not_found", r and r["outcome"] == "not_found", r)
+    # CREATION-RACE resolution (static-review item 2): a later create with a DIFFERENT
+    # plan does NOT conflict — it RETURNS THE WINNING durable pin (the first create's).
+    # The caller adopts the winner and exact-match-resolves it against its own generation.
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", bytes.fromhex("01" + "b2" * 32), 2))
+    check("create_planned_race_adopts_winner_hash", r and r["outcome"] == "exists"
+          and r["content_hash"] == plan_h_hex and r["plan_version"] == VER, r)
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, "2.0.0", T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    check("create_planned_race_adopts_winner_version", r and r["outcome"] == "exists"
+          and r["plan_version"] == VER, r)
+    # But a DIFFERENT plan NAME for the same workflow_id is an id COLLISION across plans,
+    # not a version race — it must plan_conflict, never silently adopt the other plan.
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT + "-other", VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    check("create_planned_name_conflict", r and r["outcome"] == "plan_conflict", r)
+    # GENUINELY CONCURRENT creation race (two connections), exercising the CALLER-OWNED
+    # transaction contract the host uses: autocommit=False, COMMIT after the call. Atomicity
+    # comes from the caller's transaction — the workflow PK INSERT holds its lock until the
+    # winner COMMITs, so the racing creator never observes a workflow row before its plan
+    # row. Exactly one wins 'created'; the other blocks until the winner's full pin is
+    # durable, then returns 'exists' with the WINNING pin — never a spurious plan_conflict.
+    wf_race = os.urandom(16)
+    h_a = bytes.fromhex("01" + "c1" * 32)
+    h_b = bytes.fromhex("01" + "c2" * 32)
+    barrier = threading.Barrier(2)
+    race_res = [None, None]
+
+    def _racer(idx, ch):
+        cn = pymysql.connect(host=HOST, port=PORT, user=USER, password=PWD,
+                             database="microflows", autocommit=False)
+        try:
+            cc = cn.cursor()
+            barrier.wait()
+            race_res[idx] = call(cc, "sp_mf_workflow_create_planned",
+                                 (wf_race, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", ch, 2))
+            cn.commit()   # caller-owned publication, exactly like host rpc.commit
+        finally:
+            cn.close()
+
+    ta = threading.Thread(target=_racer, args=(0, h_a))
+    tb = threading.Thread(target=_racer, args=(1, h_b))
+    ta.start(); tb.start(); ta.join(); tb.join()
+    docs = [r[1] for r in race_res if r and r[0] and r[1]]
+    outs = sorted(d.get("outcome") for d in docs)
+    created = [d for d in docs if d.get("outcome") == "created"]
+    exists = [d for d in docs if d.get("outcome") == "exists"]
+    check("create_planned_concurrent_race_atomic",
+          outs == ["created", "exists"] and len(created) == 1 and len(exists) == 1
+          and exists[0]["content_hash"] == created[0]["content_hash"]
+          and exists[0]["plan_version"] == VER, race_res)
+    # Malformed semantic version is rejected at the boundary (SIGNAL, no row).
+    ok, _ = call(cur, "sp_mf_workflow_create_planned", (os.urandom(16), SCRIPT, "1.2", T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    check("create_planned_bad_semver", not ok, "expected SIGNAL on non-semver plan_version")
+    # The ONLY plan_conflict: a workflow_id that already exists as a LEGACY (non-plan)
+    # workflow — no pin to return, cannot be reinterpreted as planned.
+    wf_legacy = os.urandom(16)
+    call(cur, "sp_mf_workflow_create", (wf_legacy, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf_legacy, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    check("create_planned_legacy_conflict", r and r["outcome"] == "plan_conflict", r)
+    # Inspection SP: a workflow durably deferred with reason 'revision_unavailable' is
+    # OBSERVABLE (and stays recoverable: forward, lease cleared). Exposes the full pin +
+    # state + timing + reason.
+    wf_stall = os.urandom(16)
+    call(cur, "sp_mf_workflow_create_planned", (wf_stall, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    _, rc = call(cur, "sp_mf_workflow_claim_by_id", (wf_stall, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    call(cur, "sp_mf_operation_dispatch_defer", (wf_stall, EXEC, rc["fencing_token"], T(1), T(9), T(2), "revision_unavailable"))
+    _, r = call(cur, "sp_mf_plan_stalled", ())
+    rows = r if isinstance(r, list) else []
+    hit = next((x for x in rows if x["workflow_id"] == wf_stall.hex()), None)
+    check("plan_stalled_lists", hit is not None and hit["plan_version"] == VER
+          and hit["content_hash"] == plan_h_hex and hit["plan_length"] == 2
+          and hit["state"] == 1 and hit["execution_direction"] == 1
+          and hit["reason"] == "revision_unavailable", hit)
+    # A defer for a DIFFERENT reason is not a revision_unavailable stall.
+    wf_other = os.urandom(16)
+    call(cur, "sp_mf_workflow_create_planned", (wf_other, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    _, rc = call(cur, "sp_mf_workflow_claim_by_id", (wf_other, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    call(cur, "sp_mf_operation_dispatch_defer", (wf_other, EXEC, rc["fencing_token"], T(1), T(9), T(2), "pinned_contract_unavailable"))
+    _, r = call(cur, "sp_mf_plan_stalled", ())
+    rows = r if isinstance(r, list) else []
+    check("plan_stalled_excludes_other_reason", all(x["workflow_id"] != wf_other.hex() for x in rows), rows)
     _, r = call(cur, "sp_mf_workflow_claim_by_id", (wf5, EXEC, T(1), "2026-02-01 13:30:00.000000"))
     tok5 = r["fencing_token"]
     # Request op2 BEFORE op1 is settled: the durable request ordering rejects it
@@ -608,8 +696,14 @@ def main():
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (WF,))
     conn.close()
 
-    total = 93
-    print(f"sp_operation regression: {total - len(failures)}/{total} passed")
+    # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
+    # NOT the display denominator: if a check is accidentally deleted or bypassed, the
+    # ran-count drifts from this manifest and the run FAILS (so N/N can't hide a gap).
+    EXPECTED_CHECKS = 103
+    total = passed + len(failures)
+    if total != EXPECTED_CHECKS:
+        failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")
+    print(f"sp_operation regression: {passed}/{total} passed (expected {EXPECTED_CHECKS})")
     return 1 if failures else 0
 
 

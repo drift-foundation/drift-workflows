@@ -56,10 +56,13 @@ MDB = {
     "password": os.environ.get("MDB_ROOT_PWD", "rootpw"),
 }
 failures = []
+passed = 0
 
 
 def check(name, cond, detail=""):
+    global passed
     if cond:
+        passed += 1
         print(f"  PASS  {name}")
     else:
         failures.append(name)
@@ -117,7 +120,11 @@ WF_REVERSE_STACK_LOSTACK = "a000000000000000000000000000000d"  # reversing; seq1
 # Sub-step C/D: forward MID-PLAN restart seeds (op1 already settled + checkpoint).
 WF_FWD_RESUME = "a0000000000000000000000000000020"           # forward; op2 not started (resume runs it)
 WF_FWD_FAIL_RESTART = "a0000000000000000000000000000021"     # forward; op2 requested w/ reject fault (restart -> reversal)
-WF_FWD_PLAN_PINNED = "a0000000000000000000000000000022"      # forward; pinned to [e1,e2] plan (running a changed plan -> conflict)
+WF_FWD_PLAN_PINNED = "a0000000000000000000000000000022"      # forward; pinned to revision-1 [e1,e2] (changed input -> revision_unavailable)
+WF_FWD_PLAN_PINNED_B = "a0000000000000000000000000000023"    # ditto (changed schema_version -> revision_unavailable)
+WF_FWD_PLAN_PINNED_C = "a0000000000000000000000000000024"    # ditto (changed participant -> revision_unavailable)
+WF_FWD_PLAN_VERSION_MISMATCH = "a0000000000000000000000000000025"  # pinned 1.0.0; run as gen 2.0.0 -> revision_unavailable (version alone)
+WF_FWD_PLAN_MALFORMED_CFG = "a0000000000000000000000000000026"   # claimable; malformed registry post-claim -> defer + release lease
 
 
 def _request_count(base):
@@ -200,8 +207,13 @@ def main():
     # the single --operation path; resume re-reads the same plan + recovers per-seq
     # from durable state. Same registry as rcf, plus the ordered steps.
     plan_cfgs = []
-    def plan_cfg(steps):
+    def plan_cfg(steps, version=None):
         c = dict(runner_cfg); c["plan"] = steps
+        # The loaded plan generation's immutable semantic version (default 1.0.0). A
+        # process loads ONE generation; resolution is EXACT-MATCH on (plan_version AND
+        # content_hash).
+        if version is not None:
+            c["plan_version"] = version
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(c, f); f.close()
         plan_cfgs.append(f.name)
         return f.name
@@ -547,21 +559,23 @@ def main():
               and wf == [["4"]] and ck == [["1", "e1"], ["2", "e2"]],
               (code, body, ex_d, wf, ck))
 
-        # C3. PLAN PINNING (durable IR): the seeded wf22 is pinned to a [e1,e2] plan.
-        # Running it with a CHANGED plan is a plan_conflict -> durable defer; the runner
-        # refuses to execute a different plan against an in-flight workflow (no op runs).
+        # C3. REVISION PINNING (durable IR): wf22 is pinned to revision-1's content_hash
+        # (the [e1,e2] IR). Resolving revision 1 from a registry whose IR has CHANGED (a
+        # different input) yields a content_hash that no longer matches the pin -> the
+        # runner durably defers `revision_unavailable`, NEVER substituting (no op runs).
+        # (Editing a live revision's IR is itself a deployment error — §10 revisions are
+        # immutable; you add a new revision.)
         wrongplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "e1"}},
                               {"operation": "reserve", "input": {"reservation": "ZZZ"}}])
         ex0 = _exec_count(base)
         code, body = run_runner(wrongplan, WF_FWD_PLAN_PINNED)
         check("forward_plan_conflict",
               code == 9 and body.get("workflow") == "deferred"
-              and body.get("reason") == "plan_conflict" and _exec_count(base) - ex0 == 0, (code, body))
+              and body.get("reason") == "revision_unavailable" and _exec_count(base) - ex0 == 0, (code, body))
 
-        # C4. PLAN CONTRACT PINNING: wf22's pin covers the RESOLVED contract, not just
-        # names/inputs. Re-running the SAME operation names + inputs under a registry that
-        # bumps reserve's schema_version (1 -> 2) is STILL a plan_conflict — an unrequested
-        # step or pending checkpoint can never execute under a changed contract.
+        # C4. CONTRACT in the content_hash: wf23 (pinned to revision-1 @ reserve sv=1).
+        # Resolving revision 1 from a registry that bumps reserve's schema_version (1->2)
+        # — same names/inputs — changes the content_hash -> revision_unavailable.
         bumped = dict(runner_cfg)
         bumped["operations"] = [
             {"name": "echo-transform", "participant": "ref", "schema_version": 1},
@@ -575,15 +589,14 @@ def main():
         _bf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         json.dump(bumped, _bf); _bf.close(); plan_cfgs.append(_bf.name)
         ex0 = _exec_count(base)
-        code, body = run_runner(_bf.name, WF_FWD_PLAN_PINNED)
+        code, body = run_runner(_bf.name, WF_FWD_PLAN_PINNED_B)
         check("forward_plan_contract_conflict",
               code == 9 and body.get("workflow") == "deferred"
-              and body.get("reason") == "plan_conflict" and _exec_count(base) - ex0 == 0, (code, body))
+              and body.get("reason") == "revision_unavailable" and _exec_count(base) - ex0 == 0, (code, body))
 
-        # C4b. PARTICIPANT PINNING: the pin covers the LOGICAL participant id. Routing
-        # reserve to a DIFFERENT participant (ref2, same endpoint) — identical names,
-        # inputs, and schema_versions — is STILL a plan_conflict (a forward or
-        # compensation op can't be re-routed to a different participant silently).
+        # C4b. PARTICIPANT in the content_hash: wf24. Routing reserve to a DIFFERENT
+        # participant (ref2, same endpoint) — identical names/inputs/versions — changes
+        # the content_hash -> revision_unavailable (no silent re-routing).
         rerouted = dict(runner_cfg)
         rerouted["participants"] = [
             {"id": "ref", "transport": {"kind": "http", "endpoints": [base], "selection": "ordered_failover"}, "auth_profile": None},
@@ -601,10 +614,43 @@ def main():
         _rf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         json.dump(rerouted, _rf); _rf.close(); plan_cfgs.append(_rf.name)
         ex0 = _exec_count(base)
-        code, body = run_runner(_rf.name, WF_FWD_PLAN_PINNED)
+        code, body = run_runner(_rf.name, WF_FWD_PLAN_PINNED_C)
         check("forward_plan_participant_conflict",
               code == 9 and body.get("workflow") == "deferred"
-              and body.get("reason") == "plan_conflict" and _exec_count(base) - ex0 == 0, (code, body))
+              and body.get("reason") == "revision_unavailable" and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C4c. VERSION in the exact-match: wf25 is pinned at plan_version 1.0.0 with the
+        # IDENTICAL [e1,e2] content_hash. A process loading the SAME plan content but as
+        # generation 2.0.0 cannot satisfy the pin — exact-match fails on the VERSION alone
+        # (semver does NOT authorize substituting another version) -> revision_unavailable,
+        # no op runs. This is the breaking-change-via-new-version safety: started workflows
+        # stay pinned to their exact version.
+        vmplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "e1"}},
+                           {"operation": "reserve", "input": {"reservation": "e2"}}], version="2.0.0")
+        ex0 = _exec_count(base)
+        code, body = run_runner(vmplan, WF_FWD_PLAN_VERSION_MISMATCH)
+        check("forward_plan_version_conflict",
+              code == 9 and body.get("workflow") == "deferred"
+              and body.get("reason") == "revision_unavailable" and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C4d. MALFORMED registry config AFTER claim must DEFER + RELEASE the lease (no
+        # leak): a claimable pinned workflow run with an invalid operations registry claims
+        # first, then the post-claim registry build/validate throws — the runner catches it
+        # and durably defers revision_unavailable (lease cleared), never exiting still
+        # holding the lease. (Unknown participant 'ghost' fails _validate_registry.)
+        broken_claim = dict(runner_cfg)
+        broken_claim["participants"] = []
+        broken_claim["operations"] = [{"name": "reserve", "participant": "ghost", "schema_version": 1}]
+        _bcf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(broken_claim, _bcf); _bcf.close(); plan_cfgs.append(_bcf.name)
+        ex0 = _exec_count(base)
+        code, body = run_runner(_bcf.name, WF_FWD_PLAN_MALFORMED_CFG)
+        # batch-mode mariadb renders SQL NULL as the literal "NULL".
+        lease = _mdb(f"SELECT lease_owner FROM tb_mf_workflow WHERE workflow_id = UNHEX('{WF_FWD_PLAN_MALFORMED_CFG}')")
+        check("forward_malformed_registry_defers_no_lease_leak",
+              code == 9 and body.get("workflow") == "deferred"
+              and body.get("reason") == "revision_unavailable"
+              and lease == [["NULL"]] and _exec_count(base) - ex0 == 0, (code, body, lease))
 
         # C5. A SINGLE-operation plan whose only step is NON-compensable is valid (the
         # final step never needs compensation) and completes.
@@ -616,6 +662,21 @@ def main():
         check("forward_plan_single_noncompensable",
               code == 0 and body.get("workflow") == "completed"
               and _exec_count(base) - ex0 == 1 and wf == [["4"]], (code, body, wf))
+
+        # C5b. NON-DEFAULT plan NAME (static-review item 1): a process configured with
+        # script_name 'checkout-v1' must create + run workflows. A fresh workflow under that
+        # name pins (checkout-v1, 1.0.0, ...) and completes — proving the active lookup uses
+        # the CONFIGURED plan name, not a hardcoded constant.
+        named = dict(runner_cfg)
+        named["script_name"] = "checkout-v1"
+        named["plan"] = [{"operation": "echo-transform", "input": {"values": [4, 5, 6]}}]
+        _named_f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(named, _named_f); _named_f.close(); plan_cfgs.append(_named_f.name)
+        wfnm = _wf_id()
+        code, body = run_runner(_named_f.name, wfnm)
+        nm = _mdb(f"SELECT script_name FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wfnm}')")
+        check("forward_named_plan_completes",
+              code == 0 and body.get("workflow") == "completed" and nm == [["checkout-v1"]], (code, body, nm))
 
         # C6. FIRST-operation rejection begins reversal: a definite forward failure of op1
         # (no prior checkpoint) reverses straight to `reversed` — never blocks. The second
@@ -711,6 +772,20 @@ def main():
         check("terminal_rerun_multiop_final_result", code == 0
               and body.get("workflow") == "already_terminal"
               and body.get("result") == {"reserved": "c2"}, (code, body))
+        # Terminal replay is registry-CONFIG-independent (static-review item 3): the same
+        # completed plan workflow replays its final result even when the current
+        # operations/participants config is MALFORMED (an unknown participant ref that
+        # _validate_registry would reject). Terminal replay reads only durable state — it
+        # never builds or validates the registry.
+        broken = dict(runner_cfg)
+        broken["participants"] = []
+        broken["operations"] = [{"name": "reserve", "participant": "ghost", "schema_version": 1}]
+        _bf2 = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(broken, _bf2); _bf2.close(); plan_cfgs.append(_bf2.name)
+        code, body = run_runner(_bf2.name, wfc)
+        check("terminal_replay_registry_config_independent", code == 0
+              and body.get("workflow") == "already_terminal"
+              and body.get("result") == {"reserved": "c2"}, (code, body))
     finally:
         stub.terminate()
         try:
@@ -721,8 +796,14 @@ def main():
         for p in plan_cfgs:
             os.unlink(p)
 
-    total = 41
-    print(f"coordinator<->singular integration: {total - len(failures)}/{total} passed")
+    # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
+    # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
+    # manifest and FAILS the run (so N/N can't hide a gap).
+    EXPECTED_CHECKS = 45
+    total = passed + len(failures)
+    if total != EXPECTED_CHECKS:
+        failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")
+    print(f"coordinator<->singular integration: {passed}/{total} passed (expected {EXPECTED_CHECKS})")
     return 1 if failures else 0
 
 

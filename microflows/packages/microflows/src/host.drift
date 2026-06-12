@@ -62,7 +62,9 @@ export {
 	ReverseSettleOutcome,
 	ReverseBlockOutcome,
 	ReverseHeadOutcome,
-	CreatePlannedOutcome
+	CreatePlannedOutcome,
+	PinnedScript,
+	PlanGetOutcome
 };
 
 // ===== Identity =====
@@ -290,12 +292,34 @@ pub variant OperationSettleOutcome {
 	EventTimeSkew(defer_until: String)
 }
 
-// create_planned: create a workflow + pin its manual-IR plan atomically.
+// A workflow's durable pinned PLAN identity: `(script_name, plan_version,
+// content_hash, plan_length)`. plan_version is the immutable semantic version
+// (major.minor.patch); content_hash is the 33-byte digest, hex-encoded. The runner
+// resolves the IR for (script_name, plan_version) and verifies content_hash exactly;
+// it never substitutes a different plan.
+pub struct PinnedScript {
+	pub script_name: String,
+	pub plan_version: String,   // immutable semver: major.minor.patch
+	pub content_hash: String,   // 66 hex chars (1 scheme byte + 32-byte SHA-256)
+	pub plan_length: Int
+}
+
+// create_planned: create a workflow + pin its plan atomically. Created and Exists both
+// RETURN the committed pin (the supplied generation on Created, the WINNING durable pin
+// on Exists — creation races adopt the winner, never conflict on a differing plan).
 pub variant CreatePlannedOutcome {
-	Created,
-	Exists,
-	// The workflow exists under a DIFFERENT plan (a config change altered it).
+	Created(pin: PinnedScript),
+	Exists(pin: PinnedScript),
+	// The workflow_id exists under a CONTRADICTORY identity: a DIFFERENT stored plan name
+	// (id collision — must not adopt the other plan), or a NON-plan (legacy) workflow with
+	// no pin to return. It cannot be (re)interpreted as this plan.
 	PlanConflict(plan_length: Int)
+}
+
+// plan_get: read a workflow's durable pinned identity (registry-independent).
+pub variant PlanGetOutcome {
+	Found(pin: PinnedScript),
+	NotFound
 }
 
 // ===== Error surface =====
@@ -378,12 +402,16 @@ pub interface MicroflowsHost {
 	fn create_workflow(self: &Self, workflow_id: &Array<Byte>, script_name: &String,
 	                   script_revision: Int, event_ts: &String, next_attempt_at: &String,
 	                   continuation_json: &String, event_payload_json: &String) -> CreateOutcome;
-	// Create a workflow AND pin its manual-IR plan (hash + length) atomically.
-	// Idempotent; PlanConflict if the workflow exists under a different plan.
+	// Create a workflow AND pin its plan (plan_version + content_hash + length)
+	// atomically. Idempotent; Created/Exists return the committed pin (Exists returns
+	// the WINNING durable pin); PlanConflict on a contradictory identity — a different
+	// stored plan name (id collision) or a legacy non-plan workflow.
 	fn create_planned(self: &Self, workflow_id: &Array<Byte>, script_name: &String,
-	                  script_revision: Int, event_ts: &String, next_attempt_at: &String,
+	                  plan_version: &String, event_ts: &String, next_attempt_at: &String,
 	                  continuation_json: &String, event_payload_json: &String,
-	                  plan_hash: &Array<Byte>, plan_length: Int) -> CreatePlannedOutcome;
+	                  content_hash: &Array<Byte>, plan_length: Int) -> CreatePlannedOutcome;
+	// Read a workflow's durable pinned script-revision identity (registry-independent).
+	fn plan_get(self: &Self, workflow_id: &Array<Byte>) -> PlanGetOutcome;
 	// Claim the next due instance of one script (§24.2). db_now and
 	// lease_expires_at come from clock_read, fixed for this command.
 	fn claim_next(self: &Self, script_name: &String, db_now: &String,
@@ -770,13 +798,13 @@ implement MicroflowsHost for HostImpl {
 	}
 
 	pub fn create_planned(self: &HostImpl, workflow_id: &Array<Byte>, script_name: &String,
-	                      script_revision: Int, event_ts: &String, next_attempt_at: &String,
+	                      plan_version: &String, event_ts: &String, next_attempt_at: &String,
 	                      continuation_json: &String, event_payload_json: &String,
-	                      plan_hash: &Array<Byte>, plan_length: Int) -> CreatePlannedOutcome {
+	                      content_hash: &Array<Byte>, plan_length: Int) -> CreatePlannedOutcome {
 		_validate_id16("workflow_id", workflow_id);
-		_validate_id16("plan_hash", plan_hash);
+		if content_hash.len != 33 { throw HostException(kind = HostErrorKind::InvalidArg(field = "content_hash")); }
 		_validate_nonempty("script_name", script_name);
-		if script_revision < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "script_revision")); }
+		_validate_nonempty("plan_version", plan_version);
 		if plan_length < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "plan_length")); }
 		_validate_nonempty("event_ts", event_ts);
 		_validate_nonempty("next_attempt_at", next_attempt_at);
@@ -786,18 +814,18 @@ implement MicroflowsHost for HostImpl {
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
 			args.push(rpc.arg_string(_dup(script_name)));
-			args.push(rpc.arg_int(script_revision));
+			args.push(rpc.arg_string(_dup(plan_version)));
 			args.push(rpc.arg_string(_dup(event_ts)));
 			args.push(rpc.arg_string(_dup(next_attempt_at)));
 			args.push(_json_object_arg("continuation", continuation_json));
 			args.push(_meta_object_arg("event_payload", event_payload_json));
-			args.push(rpc.arg_bytes(_dup_bytes(plan_hash)));
+			args.push(rpc.arg_bytes(_dup_bytes(content_hash)));
 			args.push(rpc.arg_int(plan_length));
 			val sp: String = "sp_mf_workflow_create_planned";
 			val doc = _call_sp_doc(conn, &sp, move args);
 			val outcome = _doc_outcome(&doc);
-			if outcome == "created" { return CreatePlannedOutcome::Created(); }
-			if outcome == "exists" { return CreatePlannedOutcome::Exists(); }
+			if outcome == "created" { return CreatePlannedOutcome::Created(_decode_pin(&doc)); }
+			if outcome == "exists" { return CreatePlannedOutcome::Exists(_decode_pin(&doc)); }
 			if outcome == "plan_conflict" { return CreatePlannedOutcome::PlanConflict(_doc_int_req(&doc, &"plan_length", "create-planned-no-plan-length")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:create_planned"));
 		} catch managed:ManagedError(e) {
@@ -805,6 +833,26 @@ implement MicroflowsHost for HostImpl {
 			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
 		}
 	}
+
+	pub fn plan_get(self: &HostImpl, workflow_id: &Array<Byte>) -> PlanGetOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			val sp: String = "sp_mf_plan_get";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "found" { return PlanGetOutcome::Found(_decode_pin(&doc)); }
+			if outcome == "not_found" { return PlanGetOutcome::NotFound(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:plan_get"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
 
 	pub fn claim_next(self: &HostImpl, script_name: &String, db_now: &String,
 	                  lease_expires_at: &String) -> ClaimOutcome {
@@ -1647,6 +1695,15 @@ fn _doc_str_req(doc: &json.JsonNode, key: &String, detail: String) -> String {
 		},
 		Optional::None => { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = move detail)); }
 	}
+}
+
+// Decode the durable pin from a create_planned / plan_get result document.
+fn _decode_pin(doc: &json.JsonNode) -> PinnedScript {
+	return PinnedScript(
+		script_name = _doc_str_req(doc, &"script_name", "pin-no-script-name"),
+		plan_version = _doc_str_req(doc, &"plan_version", "pin-no-plan-version"),
+		content_hash = _doc_str_req(doc, &"content_hash", "pin-no-content-hash"),
+		plan_length = _doc_int_req(doc, &"plan_length", "pin-no-plan-length"));
 }
 
 fn _doc_int_req(doc: &json.JsonNode, key: &String, detail: String) -> Int {
