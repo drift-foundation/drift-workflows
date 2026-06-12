@@ -114,6 +114,10 @@ WF_REVERSE_NOBINDING = "a000000000000000000000000000000a"    # reversing; checkp
 WF_REVERSE_STACK = "a000000000000000000000000000000b"        # reversing; seq1+seq2 both active
 WF_REVERSE_STACK_MID = "a000000000000000000000000000000c"    # reversing; seq2 reversed, seq1 active (mid-stack restart)
 WF_REVERSE_STACK_LOSTACK = "a000000000000000000000000000000d"  # reversing; seq1 (compensated 2nd) drops its ack
+# Sub-step C/D: forward MID-PLAN restart seeds (op1 already settled + checkpoint).
+WF_FWD_RESUME = "a0000000000000000000000000000020"           # forward; op2 not started (resume runs it)
+WF_FWD_FAIL_RESTART = "a0000000000000000000000000000021"     # forward; op2 requested w/ reject fault (restart -> reversal)
+WF_FWD_PLAN_PINNED = "a0000000000000000000000000000022"      # forward; pinned to [e1,e2] plan (running a changed plan -> conflict)
 
 
 def _request_count(base):
@@ -191,6 +195,16 @@ def main():
 
     scf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(stub_cfg, scf); scf.close()
     rcf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(runner_cfg, rcf); rcf.close()
+
+    # A runner config that carries a forward PLAN (manual IR). The plan supersedes
+    # the single --operation path; resume re-reads the same plan + recovers per-seq
+    # from durable state. Same registry as rcf, plus the ordered steps.
+    plan_cfgs = []
+    def plan_cfg(steps):
+        c = dict(runner_cfg); c["plan"] = steps
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(c, f); f.close()
+        plan_cfgs.append(f.name)
+        return f.name
 
     stub = subprocess.Popen([str(STUB_BIN), "--config", scf.name],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -493,6 +507,192 @@ def main():
               and ex_d == 2 and pu_d == 2 and rq_d == 3,
               (code, body, f"exec+{ex_d} put+{pu_d} req+{rq_d}"))
 
+        # === SUB-STEP C: multi-operation forward PLAN (manual IR). A workflow runs an
+        # ordered plan; each compensable success persists its own request/result (own
+        # seq + stable id) and creates an active checkpoint. The forward runner BUILDS
+        # the checkpoint stack that sub-step B unwound from a seed. ===
+        # C1. two-op forward plan -> completed, with a 2-checkpoint stack whose payloads
+        # are each op's OWN input, DISTINCT per-seq operation ids, exec exactly twice.
+        cplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "c1"}},
+                          {"operation": "reserve", "input": {"reservation": "c2"}}])
+        wfc = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(cplan, wfc)
+        ex_d = _exec_count(base) - ex0
+        ck = _mdb(f"SELECT seq, LOWER(HEX(operation_id)), "
+                  f"JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reservation')) "
+                  f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wfc}') ORDER BY seq")
+        wf = _mdb(f"SELECT state, current_disposition FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wfc}')")
+        ids_distinct = len(ck) == 2 and ck[0][1] != ck[1][1]
+        check("forward_plan_builds_stack",
+              code == 0 and body.get("workflow") == "completed" and ex_d == 2
+              and wf == [["4", "1"]] and len(ck) == 2
+              and ck[0][0] == "1" and ck[1][0] == "2"
+              and ck[0][2] == "c1" and ck[1][2] == "c2" and ids_distinct,
+              (code, body, ex_d, wf, ck))
+
+        # C2. RESUME mid-plan: op1 was already settled (+ checkpoint) by a worker that
+        # crashed; the restart re-reads the plan, SKIPS op1 from durable state, runs ONLY
+        # op2 (exec +1), and completes with the full 2-checkpoint stack.
+        rplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "e1"}},
+                          {"operation": "reserve", "input": {"reservation": "e2"}}])
+        ex0 = _exec_count(base)
+        code, body = run_runner(rplan, WF_FWD_RESUME)
+        ex_d = _exec_count(base) - ex0
+        ck = _mdb(f"SELECT seq, JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reservation')) "
+                  f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{WF_FWD_RESUME}') ORDER BY seq")
+        wf = _mdb(f"SELECT state FROM tb_mf_workflow WHERE workflow_id = UNHEX('{WF_FWD_RESUME}')")
+        check("forward_plan_resume",
+              code == 0 and body.get("workflow") == "completed" and ex_d == 1
+              and wf == [["4"]] and ck == [["1", "e1"], ["2", "e2"]],
+              (code, body, ex_d, wf, ck))
+
+        # C3. PLAN PINNING (durable IR): the seeded wf22 is pinned to a [e1,e2] plan.
+        # Running it with a CHANGED plan is a plan_conflict -> durable defer; the runner
+        # refuses to execute a different plan against an in-flight workflow (no op runs).
+        wrongplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "e1"}},
+                              {"operation": "reserve", "input": {"reservation": "ZZZ"}}])
+        ex0 = _exec_count(base)
+        code, body = run_runner(wrongplan, WF_FWD_PLAN_PINNED)
+        check("forward_plan_conflict",
+              code == 9 and body.get("workflow") == "deferred"
+              and body.get("reason") == "plan_conflict" and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C4. PLAN CONTRACT PINNING: wf22's pin covers the RESOLVED contract, not just
+        # names/inputs. Re-running the SAME operation names + inputs under a registry that
+        # bumps reserve's schema_version (1 -> 2) is STILL a plan_conflict — an unrequested
+        # step or pending checkpoint can never execute under a changed contract.
+        bumped = dict(runner_cfg)
+        bumped["operations"] = [
+            {"name": "echo-transform", "participant": "ref", "schema_version": 1},
+            {"name": "string-join", "participant": "ref", "schema_version": 1},
+            {"name": "reserve", "participant": "ref", "schema_version": 2,
+             "compensation": {"operation": "release", "schema_version": 1}},
+            {"name": "release", "participant": "ref", "schema_version": 1},
+        ]
+        bumped["plan"] = [{"operation": "reserve", "input": {"reservation": "e1"}},
+                          {"operation": "reserve", "input": {"reservation": "e2"}}]
+        _bf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(bumped, _bf); _bf.close(); plan_cfgs.append(_bf.name)
+        ex0 = _exec_count(base)
+        code, body = run_runner(_bf.name, WF_FWD_PLAN_PINNED)
+        check("forward_plan_contract_conflict",
+              code == 9 and body.get("workflow") == "deferred"
+              and body.get("reason") == "plan_conflict" and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C4b. PARTICIPANT PINNING: the pin covers the LOGICAL participant id. Routing
+        # reserve to a DIFFERENT participant (ref2, same endpoint) — identical names,
+        # inputs, and schema_versions — is STILL a plan_conflict (a forward or
+        # compensation op can't be re-routed to a different participant silently).
+        rerouted = dict(runner_cfg)
+        rerouted["participants"] = [
+            {"id": "ref", "transport": {"kind": "http", "endpoints": [base], "selection": "ordered_failover"}, "auth_profile": None},
+            {"id": "ref2", "transport": {"kind": "http", "endpoints": [base], "selection": "ordered_failover"}, "auth_profile": None},
+        ]
+        rerouted["operations"] = [
+            {"name": "echo-transform", "participant": "ref", "schema_version": 1},
+            {"name": "string-join", "participant": "ref", "schema_version": 1},
+            {"name": "reserve", "participant": "ref2", "schema_version": 1,
+             "compensation": {"operation": "release", "schema_version": 1}},
+            {"name": "release", "participant": "ref", "schema_version": 1},
+        ]
+        rerouted["plan"] = [{"operation": "reserve", "input": {"reservation": "e1"}},
+                            {"operation": "reserve", "input": {"reservation": "e2"}}]
+        _rf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(rerouted, _rf); _rf.close(); plan_cfgs.append(_rf.name)
+        ex0 = _exec_count(base)
+        code, body = run_runner(_rf.name, WF_FWD_PLAN_PINNED)
+        check("forward_plan_participant_conflict",
+              code == 9 and body.get("workflow") == "deferred"
+              and body.get("reason") == "plan_conflict" and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C5. A SINGLE-operation plan whose only step is NON-compensable is valid (the
+        # final step never needs compensation) and completes.
+        ncplan = plan_cfg([{"operation": "echo-transform", "input": {"values": [1, 2, 3]}}])
+        wfnc = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(ncplan, wfnc)
+        wf = _mdb(f"SELECT state FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wfnc}')")
+        check("forward_plan_single_noncompensable",
+              code == 0 and body.get("workflow") == "completed"
+              and _exec_count(base) - ex0 == 1 and wf == [["4"]], (code, body, wf))
+
+        # C6. FIRST-operation rejection begins reversal: a definite forward failure of op1
+        # (no prior checkpoint) reverses straight to `reversed` — never blocks. The second
+        # step never runs.
+        frplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "fr1", "_fault": {"reject": True}}},
+                           {"operation": "reserve", "input": {"reservation": "fr2"}}])
+        wffr = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(frplan, wffr)
+        wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wffr}')")
+        ncp = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wffr}')")
+        check("forward_first_reject_reverses",
+              code == 0 and body.get("workflow") == "reversed"
+              and _exec_count(base) - ex0 == 0 and wf == [["5", "2"]] and ncp == [["0"]],
+              (code, body, wf, ncp))
+
+        # === SUB-STEP D: forward failure -> automatic reversal. op1 succeeds (checkpoint),
+        # op2 is DEFINITELY rejected; the runner BEGINS reversal and unwinds op1 in the
+        # SAME drive, reaching reversed. Incl. restart + lost-ack. ===
+        # D1. op1 reserve succeeds, op2 reserve is rejected (400) -> begin_reversal ->
+        # compensate op1 (release) -> reversed. exec: reserve d1 + release d1 = 2 (op2
+        # rejected before Singular, no exec).
+        dplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "d1"}},
+                          {"operation": "reserve", "input": {"reservation": "d2", "_fault": {"reject": True}}}])
+        wfd = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(dplan, wfd)
+        ex_d = _exec_count(base) - ex0
+        check("forward_fail_begins_reversal",
+              code == 0 and body.get("workflow") == "reversed" and ex_d == 2, (code, body, ex_d))
+        # D1b. DURABLE evidence: workflow reversed(5) RETAINING reverse direction(2), op1's
+        # checkpoint reversed(2), and the audit trail shows reversal_begun then
+        # compensation_settled — the forward failure drove the whole transition.
+        wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wfd}')")
+        cks = _mdb(f"SELECT reversal_state FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wfd}')")
+        evs = _mdb(f"SELECT kind FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wfd}') "
+                   f"AND kind IN ('reversal_begun','compensation_settled') ORDER BY event_seq")
+        check("forward_fail_reverses_durable",
+              wf == [["5", "2"]] and cks == [["2"]]
+              and evs == [["reversal_begun"], ["compensation_settled"]], (wf, cks, evs))
+
+        # D2. RESTART across the forward->reversal transition: a worker settled op1 and
+        # requested op2 (a reject-faulted op) then crashed BEFORE beginning reversal. The
+        # restart re-dispatches op2 from durable state, hits the rejection, begins reversal,
+        # and unwinds op1 -> reversed. exec: release f1 = 1 (op2 rejected, op1 seeded).
+        frplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "f1"}},
+                           {"operation": "reserve", "input": {"reservation": "f2", "_fault": {"reject": True}}}])
+        ex0 = _exec_count(base)
+        code, body = run_runner(frplan, WF_FWD_FAIL_RESTART)
+        ex_d = _exec_count(base) - ex0
+        wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{WF_FWD_FAIL_RESTART}')")
+        check("forward_fail_restart",
+              code == 0 and body.get("workflow") == "reversed" and ex_d == 1
+              and wf == [["5", "2"]], (code, body, ex_d, wf))
+
+        # D3. LOST ACK across forward AND compensation: op1's reserve commits then drops
+        # its ack (its input also drives the release, which ALSO drops its ack); both
+        # reconcile via GET. op2 is rejected -> reversal -> reversed. We assert the
+        # invariant that proves the reconciles HAPPENED (not just that exec stayed at 2):
+        # effectively-once (exec +2), at least the 3 base dispatches (put >= 3), and
+        # reconcile GETs in excess of PUTs (req - put >= 2 — op1 and the release each
+        # reconcile). If the delay fault were ignored every dispatch would return 200 on
+        # the PUT with NO GETs (req == put), so req - put >= 2 catches it. Exact counts
+        # are not pinned: a delayed FORWARD op's reconcile GET may race ahead of commit
+        # visibility and take the 404 -> re-PUT path, so the wire shape varies by a PUT/GET
+        # while staying effectively-once (the clean-prior reverse-stack lost-ack is exact).
+        laplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "la1", "_fault": {"delay_after_commit_ms": 5000}}},
+                           {"operation": "reserve", "input": {"reservation": "la2", "_fault": {"reject": True}}}])
+        wfla = _wf_id()
+        ex0, pu0, rq0 = _exec_count(base), _put_count(base), _request_count(base)
+        code, body = run_runner(laplan, wfla)
+        ex_d, pu_d, rq_d = _exec_count(base) - ex0, _put_count(base) - pu0, _request_count(base) - rq0
+        check("forward_fail_lost_ack",
+              code == 0 and body.get("workflow") == "reversed"
+              and ex_d == 2 and pu_d >= 3 and (rq_d - pu_d) >= 2,
+              (code, body, f"exec+{ex_d} put+{pu_d} req+{rq_d}"))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the
         # LOCAL authoritative result; no dependency on the participant.
         stub.terminate()
@@ -504,6 +704,13 @@ def main():
         check("terminal_rerun_participant_down", code == 0
               and body.get("workflow") == "already_terminal"
               and body.get("result") == {"sum": 6}, (code, body))
+        # Same for a completed MULTI-operation PLAN workflow (wfc from C1): the
+        # terminal replay returns the FINAL operation's local result (c2), not the
+        # first (c1), with no dependency on the now-down participant.
+        code, body = run_runner(cplan, wfc)
+        check("terminal_rerun_multiop_final_result", code == 0
+              and body.get("workflow") == "already_terminal"
+              and body.get("result") == {"reserved": "c2"}, (code, body))
     finally:
         stub.terminate()
         try:
@@ -511,8 +718,10 @@ def main():
         except Exception:
             stub.kill()
         os.unlink(scf.name); os.unlink(rcf.name)
+        for p in plan_cfgs:
+            os.unlink(p)
 
-    total = 29
+    total = 41
     print(f"coordinator<->singular integration: {total - len(failures)}/{total} passed")
     return 1 if failures else 0
 

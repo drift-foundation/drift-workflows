@@ -363,11 +363,122 @@ reversal cannot safely continue. Manual IR; parser still deferred.
     seq 1 reconciles GET-first → `reversed`; effectively-once across the whole
     stack (exec +2).
 
-## Sub-steps A + B COMPLETE — single- and multi-checkpoint unwind proven end-to-end (proc + host + runner loop)
-Next: sub-step C (multi-op forward IR — forward path runs ≥2 ops so a checkpoint
-STACK is BUILT by the forward runner, today single-op) → D (forward op1 success →
-op2 definite fail → reverse-order compensation → `reversed`, incl. lost acks +
-restart).
+- [x] **Sub-step C — multi-operation forward PLAN (manual IR), proven end-to-end.**
+  The forward runner now executes an ordered, durable PLAN that BUILDS the
+  checkpoint stack (B unwound a seeded one).
+  - **`operation_settle` generalized** with `arg_is_final`: the last plan op
+    completes (forward → completed, lease cleared); an intermediate op records its
+    result + checkpoint but stays forward(1) RETAINING the lease, so the same drive
+    proceeds to the next op (and a crash leaves it claimable from durable state).
+    A single-op plan settles final — the original behavior. (SP coverage added.)
+  - **Runner plan path** (`_run_planned` + `_run_forward`): a config `plan` array
+    (ordered `{operation, input}` steps, no loops/branches) supersedes the single
+    `--operation` path. Each step has its own `operation_seq` + stable
+    `_operation_id(wf, seq)`; checkpoint payload = the op INPUT (what compensation
+    needs). Per-seq recovery: `operation_result` Succeeded → skip; a durable
+    request → resume; else fresh from the plan. Reuses the generic dispatcher +
+    `operation_request`/`operation_settle`. Plan validated at startup.
+  - Stub gained a `reserve` forward op (compensable via `reserve→release`).
+  - `forward_plan_builds_stack` — fresh 2-op plan → `completed`, a 2-checkpoint
+    stack with each op's own input + distinct per-seq ids, exec exactly twice.
+  - `forward_plan_resume` — seeded mid-plan (`a0..20`: op1 settled + checkpoint, op2
+    not started): restart re-reads the plan, SKIPS op1 from durable state, runs only
+    op2 (exec +1) → completed.
+- [x] **Sub-step D — forward failure → automatic reversal, proven end-to-end.**
+  A definite forward rejection of a later op (a prior compensable checkpoint exists)
+  calls `begin_reversal` and unwinds in the SAME drive (`_begin_reversal_unwind`);
+  the first op rejecting still blocks (nothing to compensate).
+  - `forward_fail_begins_reversal` — op1 `reserve` succeeds (checkpoint), op2
+    `reserve` rejected (400) → reversal → compensate op1 (`release`) → `reversed`
+    (exec +2: reserve d1 + release d1; op2 rejected pre-Singular).
+  - `forward_fail_reverses_durable` — DB evidence: workflow `reversed(5)` retaining
+    reverse direction(2), op1 checkpoint `reversed(2)`, audit `reversal_begun` then
+    `compensation_settled`.
+  - `forward_fail_restart` — seeded post-op1 forward state (`a0..21`: op1 settled, op2
+    requested with a reject fault) crashed before beginning reversal: restart
+    re-dispatches op2 → rejection → reversal → `reversed`.
+  - `forward_fail_lost_ack` — op1 reserve AND the op1 compensation both drop their
+    acks after commit; both reconcile; op2 rejected → reversal → `reversed`
+    (effectively-once on the forward op and the compensation alike, exec +2).
+- [x] **Sub-step C/D review round 1 — durable IR hardening.**
+  - **High** — **forward plan is now durably PINNED.** New `tb_mf_workflow_plan`
+    (plan_hash + plan_length) + `sp_mf_plan_pin` (idempotent; `plan_conflict` on a
+    changed plan). The runner derives `_plan_hash` and pins before executing; a config
+    change to an in-flight workflow's plan → `plan_conflict` → durable defer, never
+    executing a different workflow (`forward_plan_conflict`).
+  - **High** — **operation finality is DERIVED, not trusted.** `operation_settle`
+    reads the pinned `plan_length` and enforces `is_final == (seq == plan_length)`
+    (checked before the idempotent replay) → a runner defect can't complete early
+    (`finality_mismatch`; SP coverage).
+  - **High** — **terminal replay returns the FINAL op**, not op 1 (`_report_terminal`
+    + `_inspect_report` take the result seq; the plan path passes `plan.len`).
+  - **High** — **every plan step must declare a compensation binding**
+    (`_validate_plan`), so `seq > 1` soundly implies a compensable checkpoint exists
+    (no stranding on `no_compensation_binding`).
+  - **Medium** — **recovered forward requests reconcile GET-first** (`_run_forward`
+    uses `_dispatch_or_reconcile(recovered)`), matching reverse recovery — no blind
+    re-PUT of an already-durable request.
+  - **Medium** — mid-plan seeds are transition-faithful: `created → operation_requested
+    → operation_settled` events + real runner-derived input hashes + the pinned plan
+    rows.
+  - **Medium** — `forward_fail_lost_ack` asserts the reconcile invariant
+    (exec +2, put ≥ 3, req − put ≥ 2 → GETs occurred) rather than an exact count: a
+    delayed FORWARD op's reconcile GET can race commit visibility and take the
+    404→re-PUT path, so the exact wire shape varies while staying effectively-once.
+- [x] **Sub-step C/D review round 2 — pin completeness + creation atomicity.**
+  - **High** — the plan hash now pins the FULL executable semantics: per step it
+    includes the RESOLVED operation `schema_version` and the compensation
+    (operation + version), not just names/inputs. A registry contract change (sv bump
+    or compensation change) → `plan_conflict` (`forward_plan_contract_conflict`).
+  - **High** — pin validation is no longer bypassable. Replaced `sp_mf_plan_pin` with
+    `sp_mf_workflow_create_planned` — creation + pin are ONE atomic command, validated
+    BEFORE every state branch (fresh / resume / terminal-replay / reversing). A changed
+    plan can't slip past via a non-claimable or reversing workflow. (Removed the
+    separate pin proc + host method.)
+  - **Medium** — `operation_settle` rejects out-of-plan settles: `plan_violation`
+    when `seq ∉ [1, plan_length]`, `checkpoint_seq ≠ seq`, or finality disagrees with
+    `plan_length` (the seq/checkpoint/finality checks run before the operation load, so
+    a seq outside the plan reads as `plan_violation`, not `operation_not_found`).
+  - **Medium** — pinning is structurally tied to creation: the plan row is written
+    ONLY by `create_planned`, in the workflow-creation transaction, so it can't be
+    orphaned and the plan is decided by the creator (not the first claimant).
+  - **Medium** — `_build_plan` rejects a non-object step input at STARTUP (before any
+    claim), so a scalar/array can't fail post-claim and strand the lease.
+- [x] **Sub-step C/D review round 3 — ordering, routing, model fidelity.**
+  - **High** — request ordering is enforced DURABLY: `operation_request` rejects
+    (`plan_violation`) a seq outside `[1, plan_length]` or (seq > 1) whose predecessor
+    has not settled — BEFORE the remote side effect, not later at settle.
+  - **High** — the plan hash also pins the LOGICAL participant id (forward op +
+    compensation op); endpoint/auth stay dynamic. Re-routing an op to a different
+    participant → `plan_conflict` (`forward_plan_participant_conflict`).
+  - **High** — first-operation rejection now follows the model: every definite forward
+    failure begins reversal; with no checkpoints it reaches `reversed` immediately —
+    never `blocked_resolution` (`forward_first_reject_reverses`). (The legacy single-op
+    `--operation` path, pre-IR, still blocks; the plan/IR path is the reversal-correct
+    one.)
+  - **Medium** — `create_planned` includes the immutable SCRIPT identity (name +
+    revision) in committed-command resolution: same plan hash but a different
+    script_revision is `plan_conflict`, not `exists`.
+  - **Medium** — compensation is required only for steps that can PRECEDE a failing
+    step (all but the final); a single-operation or non-compensable-final plan is valid
+    (`forward_plan_single_noncompensable`).
+- [x] **Sub-step C/D review round 4 — schema FK + multi-op replay coverage.**
+  - **Medium** — `tb_mf_workflow_plan` now has a FOREIGN KEY to `tb_mf_workflow`
+    (like operations/checkpoints/events), so "the plan can't be orphaned" is a
+    STRUCTURAL invariant, not just a procedure convention.
+  - **Medium** — added a multi-operation terminal-replay test
+    (`terminal_rerun_multiop_final_result`): re-running a completed PLAN workflow with
+    the participant DOWN replays the FINAL operation's local result (`c2`), not the
+    first — proving the multi-op terminal path, not just the legacy single-op one.
+  - **Low** — corrected the `_run_forward` header comment (first-op rejection now
+    reverses, it does not block).
+
+## Sub-steps A–D COMPLETE — full reversal/compensation slice proven end-to-end (proc + host + forward & reverse runner loops)
+The manual-IR forward plan builds a checkpoint stack; a definite forward failure
+automatically reverses it to `reversed`, crash-safely and idempotently; explicit
+`blocked_resolution` only when automatic reversal cannot continue.
+Next (roadmap §7): a portable ScriptRegistry, then the parser — replacing the
+config `plan`/`operations` manual IR with compiled script output.
 
 ## Relevant roadmap
 Step 2 of the revised §7 sequence (dispatcher ✓ → reversal → manual portable IR →

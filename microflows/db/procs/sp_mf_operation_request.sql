@@ -41,6 +41,8 @@ proc:BEGIN
 	DECLARE v_ex_op_name varchar(128);
 	DECLARE v_ex_schema_version int;
 	DECLARE v_ex_input_hash varchar(64);
+	DECLARE v_plan_length int DEFAULT NULL;
+	DECLARE v_pred_status tinyint DEFAULT NULL;
 
 	IF arg_workflow_id IS NULL OR LENGTH(arg_workflow_id) <> 16 THEN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfWorkflowIdInvalid';
@@ -101,6 +103,37 @@ proc:BEGIN
 	IF v_owner IS NULL OR v_owner <> arg_executor OR v_token <> arg_fencing_token OR v_state <> 1 THEN
 		SELECT JSON_OBJECT('outcome', 'fence_lost') AS result;
 		LEAVE proc;
+	END IF;
+
+	-- DURABLE plan ordering (for a pinned plan): a request persists a durable record
+	-- and authorizes the REMOTE side effect, so it must be rejected HERE — before
+	-- dispatch — if it is out of plan, not later at settle. The operation must lie in
+	-- [1, plan_length], and (for seq > 1) its PREDECESSOR must already be SETTLED
+	-- (status 2). Enforced before replay so a stale out-of-order request can't dispatch.
+	-- Legacy (unpinned) workflows have no plan row and skip this.
+	BEGIN
+		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_plan_length = NULL;
+		SELECT `plan_length` INTO v_plan_length FROM `tb_mf_workflow_plan`
+		WHERE `workflow_id` = arg_workflow_id;
+	END;
+	IF v_plan_length IS NOT NULL THEN
+		IF arg_operation_seq < 1 OR arg_operation_seq > v_plan_length THEN
+			SELECT JSON_OBJECT('outcome', 'plan_violation', 'reason', 'seq_out_of_range',
+				'plan_length', CAST(v_plan_length AS SIGNED)) AS result;
+			LEAVE proc;
+		END IF;
+		IF arg_operation_seq > 1 THEN
+			BEGIN
+				DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_pred_status = NULL;
+				SELECT `status` INTO v_pred_status FROM `tb_mf_operation`
+				WHERE `workflow_id` = arg_workflow_id AND `operation_seq` = arg_operation_seq - 1;
+			END;
+			IF v_pred_status IS NULL OR v_pred_status <> 2 THEN
+				SELECT JSON_OBJECT('outcome', 'plan_violation', 'reason', 'predecessor_incomplete',
+					'plan_length', CAST(v_plan_length AS SIGNED)) AS result;
+				LEAVE proc;
+			END IF;
+		END IF;
 	END IF;
 
 	-- Idempotent replay on the stable command identity (workflow_id,

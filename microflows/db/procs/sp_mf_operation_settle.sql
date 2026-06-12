@@ -1,8 +1,8 @@
 DELIMITER $$
 -- Settle a remote operation on durable SUCCESS, atomically (microflows_design.md
--- §2.5): one transaction records the result, creates the Checkpoint, advances
--- the continuation, and completes the workflow. The Checkpoint exists ONLY
--- after a success is durably recorded (§3).
+-- §2.5): one transaction records the result, creates the Checkpoint, and
+-- advances the continuation. The Checkpoint exists ONLY after a success is
+-- durably recorded (§3).
 --
 -- Fenced by the executor lease (§24.3). Idempotent: a replay after a
 -- crash-before-settle (or a lost-ack reconcile) finds the operation already
@@ -10,8 +10,16 @@ DELIMITER $$
 -- the operation is settled exactly once. Time discipline (§24.4): caller
 -- event_ts strictly greater than current_event_ts; ordering is event_seq.
 --
--- First-slice scope: the workflow has one operation, so settle also drives the
--- workflow to completed (forward -> completed) and clears the lease.
+-- arg_is_final distinguishes the LAST operation of a (manual-IR) plan from an
+-- intermediate one:
+--   final (1)        -> drive the workflow to completed (forward -> completed),
+--                       clear the lease, emit 'workflow_completed'.
+--   intermediate (0) -> stay forward(1) RETAINING the lease (the same drive
+--                       proceeds to the next operation; on crash the lease
+--                       expires and another worker resumes from the durable
+--                       operation/checkpoint state), advance the continuation,
+--                       emit 'operation_settled'.
+-- A single-operation plan settles with is_final=1 (the original behavior).
 CREATE PROCEDURE `sp_mf_operation_settle`(
 	IN arg_workflow_id varbinary(16),
 	IN arg_executor varbinary(16),
@@ -23,7 +31,8 @@ CREATE PROCEDURE `sp_mf_operation_settle`(
 	IN arg_checkpoint_payload mediumtext,
 	IN arg_new_continuation mediumtext,
 	IN arg_event_ts datetime(6),
-	IN arg_event_payload mediumtext
+	IN arg_event_payload mediumtext,
+	IN arg_is_final tinyint(1)
 )
 proc:BEGIN
 	DECLARE v_owner varbinary(16);
@@ -37,6 +46,7 @@ proc:BEGIN
 	DECLARE v_existing_result mediumtext;
 	DECLARE v_missing tinyint(1) DEFAULT 0;
 	DECLARE v_op_missing tinyint(1) DEFAULT 0;
+	DECLARE v_plan_length int DEFAULT NULL;
 
 	IF arg_workflow_id IS NULL OR LENGTH(arg_workflow_id) <> 16 THEN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfWorkflowIdInvalid';
@@ -71,6 +81,9 @@ proc:BEGIN
 	IF arg_event_ts IS NULL THEN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfEventTsInvalid';
 	END IF;
+	IF arg_is_final IS NULL OR arg_is_final NOT IN (0, 1) THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfIsFinalInvalid';
+	END IF;
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
@@ -84,6 +97,36 @@ proc:BEGIN
 	IF v_missing = 1 THEN
 		SELECT JSON_OBJECT('outcome', 'not_found') AS result;
 		LEAVE proc;
+	END IF;
+
+	-- DURABLE plan conformance (for a pinned plan): the operation must lie WITHIN the
+	-- committed plan and map to its own checkpoint, and finality is DERIVED from
+	-- plan_length — none trusted from the caller, so a runner defect cannot settle an
+	-- out-of-plan step or complete the workflow early. These depend only on the plan +
+	-- the supplied args, so they run BEFORE the operation load (a seq outside the plan
+	-- has no operation row, and must read as a plan_violation, not operation_not_found).
+	-- Legacy (unpinned) workflows have no plan row and keep caller-supplied finality.
+	BEGIN
+		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_plan_length = NULL;
+		SELECT `plan_length` INTO v_plan_length FROM `tb_mf_workflow_plan`
+		WHERE `workflow_id` = arg_workflow_id;
+	END;
+	IF v_plan_length IS NOT NULL THEN
+		IF arg_operation_seq < 1 OR arg_operation_seq > v_plan_length THEN
+			SELECT JSON_OBJECT('outcome', 'plan_violation', 'reason', 'seq_out_of_range',
+				'plan_length', CAST(v_plan_length AS SIGNED)) AS result;
+			LEAVE proc;
+		END IF;
+		IF arg_checkpoint_seq <> arg_operation_seq THEN
+			SELECT JSON_OBJECT('outcome', 'plan_violation', 'reason', 'checkpoint_mismatch',
+				'plan_length', CAST(v_plan_length AS SIGNED)) AS result;
+			LEAVE proc;
+		END IF;
+		IF (arg_is_final = 1) <> (arg_operation_seq = v_plan_length) THEN
+			SELECT JSON_OBJECT('outcome', 'plan_violation', 'reason', 'finality',
+				'plan_length', CAST(v_plan_length AS SIGNED)) AS result;
+			LEAVE proc;
+		END IF;
 	END IF;
 
 	-- Load the operation row.
@@ -146,23 +189,41 @@ proc:BEGIN
 		1, arg_event_ts, arg_event_ts
 	);
 
-	-- Complete the workflow (forward -> completed) and clear the lease.
-	UPDATE `tb_mf_workflow`
-	SET `continuation` = arg_new_continuation,
-	    `state` = 4,
-	    `current_disposition` = 1,
-	    `current_event_seq` = v_event_seq,
-	    `current_event_ts` = arg_event_ts,
-	    `lease_owner` = NULL,
-	    `lease_expires_at` = NULL,
-	    `updated_at` = arg_event_ts
-	WHERE `workflow_id` = arg_workflow_id;
+	IF arg_is_final = 1 THEN
+		-- Last operation: complete the workflow (forward -> completed), clear lease.
+		UPDATE `tb_mf_workflow`
+		SET `continuation` = arg_new_continuation,
+		    `state` = 4,
+		    `current_disposition` = 1,
+		    `current_event_seq` = v_event_seq,
+		    `current_event_ts` = arg_event_ts,
+		    `lease_owner` = NULL,
+		    `lease_expires_at` = NULL,
+		    `updated_at` = arg_event_ts
+		WHERE `workflow_id` = arg_workflow_id;
 
-	INSERT INTO `tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
-	) VALUES (
-		arg_workflow_id, v_event_seq, arg_event_ts, 'workflow_completed', arg_executor, NULL, arg_event_payload
-	);
+		INSERT INTO `tb_mf_workflow_event` (
+			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		) VALUES (
+			arg_workflow_id, v_event_seq, arg_event_ts, 'workflow_completed', arg_executor, NULL, arg_event_payload
+		);
+	ELSE
+		-- Intermediate operation: stay forward(1), advance the continuation, RETAIN
+		-- the lease (the same drive proceeds to the next operation). Disposition
+		-- stays unchanged (the workflow is not yet completed).
+		UPDATE `tb_mf_workflow`
+		SET `continuation` = arg_new_continuation,
+		    `current_event_seq` = v_event_seq,
+		    `current_event_ts` = arg_event_ts,
+		    `updated_at` = arg_event_ts
+		WHERE `workflow_id` = arg_workflow_id;
+
+		INSERT INTO `tb_mf_workflow_event` (
+			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		) VALUES (
+			arg_workflow_id, v_event_seq, arg_event_ts, 'operation_settled', arg_executor, NULL, arg_event_payload
+		);
+	END IF;
 
 	SELECT JSON_OBJECT('outcome', 'settled', 'result', JSON_EXTRACT(arg_result_json, '$')) AS result;
 END $$

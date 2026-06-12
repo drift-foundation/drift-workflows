@@ -111,16 +111,16 @@ def main():
     # Settle with the WRONG operation_id must conflict (never settle op 1 with
     # another operation's response).
     _, r = call(cur, "sp_mf_operation_settle",
-                (WF, EXEC, token, 1, WRONG_OPID, 1, '{"sum":1}', '{"sum":1}', '{"pos":"done"}', ts(7), "{}"))
+                (WF, EXEC, token, 1, WRONG_OPID, 1, '{"sum":1}', '{"sum":1}', '{"pos":"done"}', ts(7), "{}", 1))
     check("settle_wrong_opid_conflict", r and r["outcome"] == "operation_conflict", r)
 
-    # Settle (correct id), then repeated settle is idempotent.
+    # Settle (correct id, final), then repeated settle is idempotent.
     _, r = call(cur, "sp_mf_operation_settle",
-                (WF, EXEC, token, 1, OPID, 1, '{"sum":1}', '{"sum":1}', '{"pos":"done"}', ts(8), "{}"))
+                (WF, EXEC, token, 1, OPID, 1, '{"sum":1}', '{"sum":1}', '{"pos":"done"}', ts(8), "{}", 1))
     check("settle", r and r["outcome"] == "settled" and r["result"] == {"sum": 1}, r)
 
     _, r = call(cur, "sp_mf_operation_settle",
-                (WF, EXEC, token, 1, OPID, 1, '{"sum":1}', '{"sum":1}', '{"pos":"done"}', ts(9), "{}"))
+                (WF, EXEC, token, 1, OPID, 1, '{"sum":1}', '{"sum":1}', '{"pos":"done"}', ts(9), "{}", 1))
     check("settle_idempotent", r and r["outcome"] == "already_settled" and r["result"] == {"sum": 1}, r)
 
     # Final invariants: workflow completed (state 4, disp 1, lease cleared), op succeeded, checkpoint present.
@@ -184,7 +184,7 @@ def main():
     check("request_skew_defer_until", r and r["outcome"] == "event_time_skew"
           and r["defer_until"] == "2026-02-01 13:00:07.000000", r)
     _, r = call(cur, "sp_mf_operation_settle",
-                (wf3, EXEC, tok3, 1, OPID3, 1, '{"sum":2}', '{"sum":2}', '{"pos":"done"}', T(2), "{}"))
+                (wf3, EXEC, tok3, 1, OPID3, 1, '{"sum":2}', '{"sum":2}', '{"pos":"done"}', T(2), "{}", 1))
     check("settle_skew_defer_until", r and r["outcome"] == "event_time_skew"
           and r["defer_until"] == "2026-02-01 13:00:07.000000", r)
 
@@ -194,6 +194,84 @@ def main():
     check("release_fence_lost", r and r["outcome"] == "fence_lost", r)
     for t in ("tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf3,))
+
+    # --- multi-operation plan: INTERMEDIATE vs FINAL settle (sub-step C). is_final=0
+    # records the result + checkpoint but stays forward(1) RETAINING the lease, so the
+    # same drive proceeds to the next operation (and a crash leaves it claimable from
+    # the durable operation/checkpoint state); is_final=1 on the last op completes.
+    wf5 = os.urandom(16)
+    op5a = bytes.fromhex("00000000000000000000000000000e51")
+    op5b = bytes.fromhex("00000000000000000000000000000e52")
+    plan_h = bytes.fromhex("a1" * 16)
+    for t in ("tb_mf_workflow_plan", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+        cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf5,))
+    # CREATE + PIN the 2-step plan ATOMICALLY. Re-creating the SAME identity is
+    # idempotent (exists); a DIFFERENT plan hash is plan_conflict (a config change can't
+    # silently adopt a new plan under an existing workflow).
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    check("create_planned", r and r["outcome"] == "created", r)
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    check("create_planned_idempotent", r and r["outcome"] == "exists", r)
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}", bytes.fromhex("b2" * 16), 2))
+    check("create_planned_conflict", r and r["outcome"] == "plan_conflict" and r["plan_length"] == 2, r)
+    # The immutable SCRIPT identity also participates: same plan, different revision is
+    # a plan_conflict, not exists.
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, 2, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    check("create_planned_script_conflict", r and r["outcome"] == "plan_conflict", r)
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wf5, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    tok5 = r["fencing_token"]
+    # Request op2 BEFORE op1 is settled: the durable request ordering rejects it
+    # (predecessor incomplete) — the remote side effect cannot occur out of order.
+    _, r = call(cur, "sp_mf_operation_request",
+                (wf5, EXEC, tok5, 2, op5b, "reserve", 1, '{"reservation":"m2"}', "h2", '{"pos":"d"}', T(2), "{}"))
+    check("request_predecessor_incomplete", r and r["outcome"] == "plan_violation"
+          and r["reason"] == "predecessor_incomplete", r)
+    # A seq beyond the plan is rejected at REQUEST too (before any side effect).
+    _, r = call(cur, "sp_mf_operation_request",
+                (wf5, EXEC, tok5, 3, op5b, "reserve", 1, '{"reservation":"m3"}', "h3", '{"pos":"d"}', T(2), "{}"))
+    check("request_seq_out_of_range", r and r["outcome"] == "plan_violation"
+          and r["reason"] == "seq_out_of_range", r)
+    # op1: request, then a settle claiming FINALITY (is_final=1) is REJECTED — the
+    # pinned plan_length=2 makes seq 1 NOT final; a runner defect can't complete early.
+    call(cur, "sp_mf_operation_request",
+         (wf5, EXEC, tok5, 1, op5a, "reserve", 1, '{"reservation":"m1"}', "h1", '{"pos":"op:1:dispatched"}', T(2), "{}"))
+    _, r = call(cur, "sp_mf_operation_settle",
+                (wf5, EXEC, tok5, 1, op5a, 1, '{"reserved":"m1"}', '{"reservation":"m1"}', '{"pos":"x"}', T(3), "{}", 1))
+    check("settle_finality_violation", r and r["outcome"] == "plan_violation" and r["reason"] == "finality", r)
+    # A seq OUTSIDE the pinned plan (seq 3 of a 2-step plan) is rejected.
+    _, r = call(cur, "sp_mf_operation_settle",
+                (wf5, EXEC, tok5, 3, op5a, 3, '{"reserved":"m1"}', '{"reservation":"m1"}', '{"pos":"x"}', T(3), "{}", 0))
+    check("settle_seq_out_of_range", r and r["outcome"] == "plan_violation" and r["reason"] == "seq_out_of_range", r)
+    # A checkpoint_seq that does not map to the operation_seq is rejected.
+    _, r = call(cur, "sp_mf_operation_settle",
+                (wf5, EXEC, tok5, 1, op5a, 2, '{"reserved":"m1"}', '{"reservation":"m1"}', '{"pos":"x"}', T(3), "{}", 0))
+    check("settle_checkpoint_mismatch", r and r["outcome"] == "plan_violation" and r["reason"] == "checkpoint_mismatch", r)
+    # The correct INTERMEDIATE settle (is_final=0, checkpoint_seq=seq) for seq 1 succeeds.
+    _, r = call(cur, "sp_mf_operation_settle",
+                (wf5, EXEC, tok5, 1, op5a, 1, '{"reserved":"m1"}', '{"reservation":"m1"}', '{"pos":"op:1:settled"}', T(3), "{}", 0))
+    check("settle_intermediate", r and r["outcome"] == "settled", r)
+    cur.execute("SELECT state, current_disposition, lease_owner, fencing_token FROM tb_mf_workflow WHERE workflow_id=%s", (wf5,))
+    st, disp, owner, ftok = cur.fetchone()
+    check("intermediate_stays_forward_lease_retained",
+          st == 1 and disp == 0 and owner == EXEC and ftok == tok5, (st, disp, owner, ftok))
+    cur.execute("SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id=%s AND kind='operation_settled'", (wf5,))
+    check("intermediate_emits_operation_settled", cur.fetchone()[0] == 1)
+    cur.execute("SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id=%s AND kind='workflow_completed'", (wf5,))
+    check("intermediate_not_completed", cur.fetchone()[0] == 0)
+    # op2 under the SAME retained token (proves still forward + leased), FINAL settle.
+    _, r = call(cur, "sp_mf_operation_request",
+                (wf5, EXEC, tok5, 2, op5b, "reserve", 1, '{"reservation":"m2"}', "h2", '{"pos":"op:2:dispatched"}', T(4), "{}"))
+    check("intermediate_next_request_same_token", r and r["outcome"] == "requested", r)
+    _, r = call(cur, "sp_mf_operation_settle",
+                (wf5, EXEC, tok5, 2, op5b, 2, '{"reserved":"m2"}', '{"reservation":"m2"}', '{"pos":"complete"}', T(5), "{}", 1))
+    check("settle_final", r and r["outcome"] == "settled", r)
+    cur.execute("SELECT state, current_disposition, lease_owner FROM tb_mf_workflow WHERE workflow_id=%s", (wf5,))
+    st, disp, owner = cur.fetchone()
+    cur.execute("SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id=%s", (wf5,))
+    ncp = cur.fetchone()[0]
+    check("final_completes_with_stack", st == 4 and disp == 1 and owner is None and ncp == 2, (st, disp, owner, ncp))
+    for t in ("tb_mf_workflow_plan", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+        cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf5,))
 
     # --- durable OPERATIONAL dispatch deferral (sp_mf_operation_dispatch_defer):
     # a repairable config state (e.g. pinned binding unavailable). Forward stays
@@ -530,7 +608,7 @@ def main():
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (WF,))
     conn.close()
 
-    total = 79
+    total = 93
     print(f"sp_operation regression: {total - len(failures)}/{total} passed")
     return 1 if failures else 0
 

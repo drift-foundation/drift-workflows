@@ -1,0 +1,8 @@
+# Forward-plan pins for the mid-plan restart seeds (sub-step C/D). plan_hash is the
+# runner-derived hash over each step's (operation, input, resolved schema_version +
+# participant id, compensation op + version + participant id); plan_length=2 makes
+# operation finality durable. The hashes match the plan configs the C2/D2/C3 tests pass.
+workflow_id,plan_hash,plan_length,created_at
+a0000000000000000000000000000020,bd0c7191aaf9384c938e53462b5ba75b,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000021,6cfbdf40c4603e328a76173fefacdef4,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000022,bd0c7191aaf9384c938e53462b5ba75b,2,2000-01-01 00:00:00.000000

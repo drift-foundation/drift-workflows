@@ -65,6 +65,9 @@ struct StubApp {
 // string-join joins a string array with a separator -> {"joined": "..."}.
 const OP_ECHO_TRANSFORM: String = "echo-transform";
 const OP_STRING_JOIN: String = "string-join";
+// Forward operation: reserves a resource. Input {"reservation": id}; result
+// {"reserved": id}. Compensable — its REVERSE is `release`.
+const OP_RESERVE: String = "reserve";
 // Compensation operation: reverses a `reserve` checkpoint. Input is the forward
 // checkpoint payload ({"reservation": id}); result {"compensated": 1, ...}.
 const OP_RELEASE: String = "release";
@@ -463,21 +466,47 @@ fn _validate_echo(input: &json.JsonNode) nothrow -> Bool {
 // ===== Generic operation dispatch (by operation name) =====
 
 fn _supported_op(op: &String) nothrow -> Bool {
-	return op == OP_ECHO_TRANSFORM or op == OP_STRING_JOIN or op == OP_RELEASE;
+	return op == OP_ECHO_TRANSFORM or op == OP_STRING_JOIN or op == OP_RELEASE or op == OP_RESERVE;
 }
 
 fn _validate_input(op: &String, input: &json.JsonNode) nothrow -> Bool {
 	if op == OP_ECHO_TRANSFORM { return _validate_echo(input); }
 	if op == OP_STRING_JOIN { return _validate_string_join(input); }
 	if op == OP_RELEASE { return _validate_release(input); }
+	if op == OP_RESERVE { return _validate_reserve(input); }
 	return false;
 }
 
 fn _execute_op(op: &String, input: &json.JsonNode) -> String {
 	if op == OP_STRING_JOIN { return _string_join(input); }
 	if op == OP_RELEASE { return _release(input); }
+	if op == OP_RESERVE { return _reserve(input); }
 	// default: echo-transform (op already validated/supported before dispatch).
 	return _echo_transform(input);
+}
+
+// Validate the forward reserve input: { "reservation": "<id>" }. Extra keys (e.g.
+// _fault) are ignored, so a fault-injected reservation still validates.
+fn _validate_reserve(input: &json.JsonNode) nothrow -> Bool {
+	match input.get(&"reservation") {
+		Optional::Some(n) => {
+			match n.as_string() { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
+		},
+		Optional::None => { return false; }
+	}
+}
+
+fn _reserve(input: &json.JsonNode) -> String {
+	// Precondition: _validate_reserve(input) is true. Echo the reservation id into
+	// the result so a forward success carries an observable, distinct value.
+	var reservation: String = "";
+	match input.get(&"reservation") {
+		Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { reservation = move v; }, Optional::None => {} } },
+		Optional::None => {}
+	}
+	var o = json.new_object();
+	o.set("reserved", json.JsonNode::String(move reservation));
+	return json.encode(o.to_node());
 }
 
 // Validate the compensation input: { "reservation": "<id>" } (the forward

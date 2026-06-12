@@ -61,7 +61,8 @@ export {
 	ReverseRequestOutcome,
 	ReverseSettleOutcome,
 	ReverseBlockOutcome,
-	ReverseHeadOutcome
+	ReverseHeadOutcome,
+	CreatePlannedOutcome
 };
 
 // ===== Identity =====
@@ -156,6 +157,9 @@ pub variant OperationRequestOutcome {
 	OperationConflict,
 	FenceLost,
 	NotFound,
+	// The request is out of the pinned plan: seq out of range, or (seq > 1) the
+	// predecessor has not settled. `reason` names which.
+	PlanViolation(reason: String),
 	// defer_until = current_event_ts + margin (the deferral deadline).
 	EventTimeSkew(defer_until: String)
 }
@@ -280,7 +284,18 @@ pub variant OperationSettleOutcome {
 	FenceLost,
 	NotFound,
 	OperationNotFound,
+	// The settle violates the pinned plan: seq out of range, checkpoint_seq != seq, or
+	// finality disagreeing with plan_length. `reason` names which.
+	PlanViolation(reason: String),
 	EventTimeSkew(defer_until: String)
+}
+
+// create_planned: create a workflow + pin its manual-IR plan atomically.
+pub variant CreatePlannedOutcome {
+	Created,
+	Exists,
+	// The workflow exists under a DIFFERENT plan (a config change altered it).
+	PlanConflict(plan_length: Int)
 }
 
 // ===== Error surface =====
@@ -363,6 +378,12 @@ pub interface MicroflowsHost {
 	fn create_workflow(self: &Self, workflow_id: &Array<Byte>, script_name: &String,
 	                   script_revision: Int, event_ts: &String, next_attempt_at: &String,
 	                   continuation_json: &String, event_payload_json: &String) -> CreateOutcome;
+	// Create a workflow AND pin its manual-IR plan (hash + length) atomically.
+	// Idempotent; PlanConflict if the workflow exists under a different plan.
+	fn create_planned(self: &Self, workflow_id: &Array<Byte>, script_name: &String,
+	                  script_revision: Int, event_ts: &String, next_attempt_at: &String,
+	                  continuation_json: &String, event_payload_json: &String,
+	                  plan_hash: &Array<Byte>, plan_length: Int) -> CreatePlannedOutcome;
 	// Claim the next due instance of one script (§24.2). db_now and
 	// lease_expires_at come from clock_read, fixed for this command.
 	fn claim_next(self: &Self, script_name: &String, db_now: &String,
@@ -399,7 +420,7 @@ pub interface MicroflowsHost {
 	fn operation_settle(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
 	                    operation_seq: Int, operation_id: &Array<Byte>, checkpoint_seq: Int,
 	                    result_json: &String, checkpoint_payload: &String, new_continuation: &String,
-	                    event_ts: &String, event_payload: &String) -> OperationSettleOutcome;
+	                    event_ts: &String, event_payload: &String, is_final: Bool) -> OperationSettleOutcome;
 	// Read the LOCAL authoritative operation result (participant-independent).
 	fn operation_result(self: &Self, workflow_id: &Array<Byte>, operation_seq: Int) -> OperationResultOutcome;
 	// Durable non-retryable failure: forward -> blocked_resolution (fenced).
@@ -748,6 +769,43 @@ implement MicroflowsHost for HostImpl {
 		}
 	}
 
+	pub fn create_planned(self: &HostImpl, workflow_id: &Array<Byte>, script_name: &String,
+	                      script_revision: Int, event_ts: &String, next_attempt_at: &String,
+	                      continuation_json: &String, event_payload_json: &String,
+	                      plan_hash: &Array<Byte>, plan_length: Int) -> CreatePlannedOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("plan_hash", plan_hash);
+		_validate_nonempty("script_name", script_name);
+		if script_revision < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "script_revision")); }
+		if plan_length < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "plan_length")); }
+		_validate_nonempty("event_ts", event_ts);
+		_validate_nonempty("next_attempt_at", next_attempt_at);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_string(_dup(script_name)));
+			args.push(rpc.arg_int(script_revision));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(rpc.arg_string(_dup(next_attempt_at)));
+			args.push(_json_object_arg("continuation", continuation_json));
+			args.push(_meta_object_arg("event_payload", event_payload_json));
+			args.push(rpc.arg_bytes(_dup_bytes(plan_hash)));
+			args.push(rpc.arg_int(plan_length));
+			val sp: String = "sp_mf_workflow_create_planned";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "created" { return CreatePlannedOutcome::Created(); }
+			if outcome == "exists" { return CreatePlannedOutcome::Exists(); }
+			if outcome == "plan_conflict" { return CreatePlannedOutcome::PlanConflict(_doc_int_req(&doc, &"plan_length", "create-planned-no-plan-length")); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:create_planned"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
 	pub fn claim_next(self: &HostImpl, script_name: &String, db_now: &String,
 	                  lease_expires_at: &String) -> ClaimOutcome {
 		_validate_nonempty("script_name", script_name);
@@ -936,6 +994,9 @@ implement MicroflowsHost for HostImpl {
 			if outcome == "operation_conflict" { return OperationRequestOutcome::OperationConflict(); }
 			if outcome == "fence_lost" { return OperationRequestOutcome::FenceLost(); }
 			if outcome == "not_found" { return OperationRequestOutcome::NotFound(); }
+			if outcome == "plan_violation" {
+				return OperationRequestOutcome::PlanViolation(_doc_str_req(&doc, &"reason", "request-no-plan-violation-reason"));
+			}
 			if outcome == "event_time_skew" {
 				return OperationRequestOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "request-no-defer-until"));
 			}
@@ -949,7 +1010,7 @@ implement MicroflowsHost for HostImpl {
 	pub fn operation_settle(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
 	                        operation_seq: Int, operation_id: &Array<Byte>, checkpoint_seq: Int,
 	                        result_json: &String, checkpoint_payload: &String, new_continuation: &String,
-	                        event_ts: &String, event_payload: &String) -> OperationSettleOutcome {
+	                        event_ts: &String, event_payload: &String, is_final: Bool) -> OperationSettleOutcome {
 		_validate_id16("workflow_id", workflow_id);
 		_validate_id16("operation_id", operation_id);
 		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
@@ -971,6 +1032,9 @@ implement MicroflowsHost for HostImpl {
 			args.push(_json_object_arg("continuation", new_continuation));
 			args.push(rpc.arg_string(_dup(event_ts)));
 			args.push(_meta_object_arg("event_payload", event_payload));
+			var is_final_int: Int = 0;
+			if is_final { is_final_int = 1; }
+			args.push(rpc.arg_int(is_final_int));
 			val sp: String = "sp_mf_operation_settle";
 			val doc = _call_sp_doc(conn, &sp, move args);
 			val outcome = _doc_outcome(&doc);
@@ -984,6 +1048,9 @@ implement MicroflowsHost for HostImpl {
 			if outcome == "fence_lost" { return OperationSettleOutcome::FenceLost(); }
 			if outcome == "not_found" { return OperationSettleOutcome::NotFound(); }
 			if outcome == "operation_not_found" { return OperationSettleOutcome::OperationNotFound(); }
+			if outcome == "plan_violation" {
+				return OperationSettleOutcome::PlanViolation(_doc_str_req(&doc, &"reason", "settle-no-plan-violation-reason"));
+			}
 			if outcome == "event_time_skew" {
 				return OperationSettleOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "settle-no-defer-until"));
 			}
