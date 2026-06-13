@@ -8,7 +8,7 @@ from conversation history and a dirty worktree.
 - When an effort LANDS, **delete its folder** — the commit history is the record
   (the working notes are scaffolding, not an archive). Do not leave landed efforts
   as a log; that just duplicates history and goes stale.
-- Each folder has a `README.md` (the charter — sections below) and a `Progress.md`
+- Each folder has a `README.md` (the charter — sections below) and a `PROGRESS.md`
   (at-a-glance status + literal next action). Keep both short and current.
 - These are working notes, not design docs. Authoritative architecture lives in
   `microflows/doc/` (e.g. `microflows_design.md`, `security_model.md`); durable
