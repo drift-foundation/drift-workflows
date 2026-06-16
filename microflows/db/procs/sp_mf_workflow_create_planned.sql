@@ -8,6 +8,10 @@ DELIMITER $$
 -- ONLY here, in the same transaction as the workflow row, so it can never be orphaned
 -- and the create command is its sole author.
 --
+-- The instance ARGUMENTS (one canonical JSON object) are pinned here too, written to
+-- tb_mf_workflow_args in this SAME transaction. They are per-instance VALUES (the declared
+-- argument TYPE lives in content_hash, not here).
+--
 -- CREATION-RACE resolution (committed-command, §24.6), scoped to the SAME plan NAME: on
 -- 'exists' for the same script_name, RETURN THE WINNING DURABLE PIN — the first create
 -- fixed it, every later create just observes it. We do NOT conflict when only the version
@@ -17,6 +21,9 @@ DELIMITER $$
 -- identity on the workflow_id: (a) it exists under a DIFFERENT plan name (an id collision
 -- across plans — must not silently adopt the other plan), or (b) it exists as a NON-plan
 -- (legacy) workflow with no pin to return and cannot be reinterpreted as planned.
+-- 'workflow_conflict' is returned when the SAME plan name is reused with DIFFERENT argument
+-- VALUES — compared BYTE-FOR-BYTE on the stored canonical document (binary, not collated
+-- text). Same name + same canonical args = idempotent 'exists'.
 --
 -- Idempotent by workflow_id (the PK INSERT serializes). Discipline (§24.4): all time
 -- values caller-supplied + stored unchanged; the dup handler is an EXPLICIT 1062
@@ -31,15 +38,18 @@ CREATE PROCEDURE `sp_mf_workflow_create_planned`(
 	IN arg_continuation mediumtext,
 	IN arg_event_payload mediumtext,
 	IN arg_content_hash varbinary(33),
-	IN arg_plan_length int
+	IN arg_plan_length int,
+	IN arg_args mediumblob
 )
 proc:BEGIN
 	DECLARE v_exists tinyint(1) DEFAULT 0;
 	DECLARE v_pin_missing tinyint(1) DEFAULT 0;
+	DECLARE v_args_missing tinyint(1) DEFAULT 0;
 	DECLARE v_hash varbinary(33);
 	DECLARE v_length int;
 	DECLARE v_version varchar(32);
 	DECLARE v_script_name varchar(128);
+	DECLARE v_args mediumblob;
 
 	-- Atomicity is CALLER-OWNED (uniform with every other SP): the workflow + plan + event
 	-- inserts run in the caller's transaction and publish together at the caller's COMMIT
@@ -75,6 +85,13 @@ proc:BEGIN
 	END IF;
 	IF arg_plan_length IS NULL OR arg_plan_length < 1 THEN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfPlanLengthInvalid';
+	END IF;
+	-- Arguments: a JSON OBJECT, supplied as canonical UTF-8 bytes (the runner canonicalizes
+	-- to ordered-key compact form before the call). Validated as JSON here; stored + compared
+	-- as bytes.
+	IF arg_args IS NULL OR JSON_VALID(CONVERT(arg_args USING utf8mb4)) = 0
+	   OR JSON_TYPE(CONVERT(arg_args USING utf8mb4)) <> 'OBJECT' THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfArgsInvalid';
 	END IF;
 
 	BEGIN
@@ -115,15 +132,32 @@ proc:BEGIN
 				'plan_length', CAST(COALESCE(v_length, 0) AS SIGNED)) AS result;
 			LEAVE proc;
 		END IF;
+		-- Same plan name: instance arguments must match BYTE-FOR-BYTE (binary column, no
+		-- collation). A missing args row (a planned workflow created without arguments — e.g.
+		-- a pre-args fixture) or differing canonical bytes is a workflow_conflict.
+		BEGIN
+			DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_args_missing = 1;
+			SELECT `args_canonical` INTO v_args
+			FROM `tb_mf_workflow_args` WHERE `workflow_id` = arg_workflow_id;
+		END;
+		IF v_args_missing = 1 OR NOT (v_args <=> arg_args) THEN
+			SELECT JSON_OBJECT('outcome', 'workflow_conflict',
+				'plan_length', CAST(v_length AS SIGNED)) AS result;
+			LEAVE proc;
+		END IF;
 		SELECT JSON_OBJECT('outcome', 'exists',
 			'script_name', v_script_name, 'plan_version', v_version,
 			'content_hash', LOWER(HEX(v_hash)), 'plan_length', CAST(v_length AS SIGNED)) AS result;
 		LEAVE proc;
 	END IF;
 
-	-- Fresh: pin the plan + append the 'created' event in this same transaction.
+	-- Fresh: pin the plan + the instance arguments + append the 'created' event in this same
+	-- transaction.
 	INSERT INTO `tb_mf_workflow_plan` (`workflow_id`, `plan_version`, `content_hash`, `plan_length`, `created_at`)
 	VALUES (arg_workflow_id, arg_plan_version, arg_content_hash, arg_plan_length, arg_event_ts);
+
+	INSERT INTO `tb_mf_workflow_args` (`workflow_id`, `args_canonical`, `created_at`)
+	VALUES (arg_workflow_id, arg_args, arg_event_ts);
 
 	INSERT INTO `tb_mf_workflow_event` (
 		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`

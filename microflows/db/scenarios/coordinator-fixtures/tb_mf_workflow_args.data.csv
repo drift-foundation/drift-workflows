@@ -1,0 +1,13 @@
+# Durable per-instance arguments for the planned seeds. Production creation
+# (sp_mf_workflow_create_planned) ALWAYS writes an args row atomically with the workflow +
+# plan pin, so every planned workflow has one — these fixtures must too. args_canonical is the
+# ordered-key compact canonical JSON as BYTES (hex-decoded like every binary column); here the
+# empty object {} = 0x7b7d. The flat plan declares no argument type, so {} is the value.
+workflow_id,args_canonical,created_at
+a0000000000000000000000000000020,7b7d,2000-01-01 00:00:00.000000
+a0000000000000000000000000000021,7b7d,2000-01-01 00:00:00.000000
+a0000000000000000000000000000022,7b7d,2000-01-01 00:00:00.000000
+a0000000000000000000000000000023,7b7d,2000-01-01 00:00:00.000000
+a0000000000000000000000000000024,7b7d,2000-01-01 00:00:00.000000
+a0000000000000000000000000000025,7b7d,2000-01-01 00:00:00.000000
+a0000000000000000000000000000026,7b7d,2000-01-01 00:00:00.000000

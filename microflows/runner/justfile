@@ -18,5 +18,22 @@ build:
 	mkdir -p "{{BIN_DIR}}"
 	"$DRIFT" build --package-root "$PKG_LOCAL" --package-root "{{_pkg-root}}" -o "{{BIN_DIR}}/microflows-runner"
 
+# Unit tests for runner-owned modules — currently the V1 control-flow graph IR (types +
+# canonical hashing + flat-plan builder) in src/ir.drift. DB-free and dependency-free: ir
+# imports only std.*, so each test is compiled standalone with its module + ir.drift. base + asan.
+test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DC="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/driftc"
+	OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
+	for variant in base asan; do
+		san=""; [[ "$variant" == asan ]] && san="--sanitize=address"
+		"$DC" --target-word-bits 64 $san \
+			--entry microflows.runner.tests.ir_graph_test::main \
+			src/ir.drift tests/unit/ir_graph_test.drift -o "$OUT/ir_graph_test.$variant"
+		"$OUT/ir_graph_test.$variant"
+		echo "[runner] ir_graph_test#$variant ok"
+	done
+
 clean:
 	rm -rf build

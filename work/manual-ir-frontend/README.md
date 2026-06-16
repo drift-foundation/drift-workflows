@@ -263,6 +263,20 @@ immutable args child written atomically with the workflow + plan pin (`create_pl
 `args_get` + host variants, with `workflow_conflict` on differing canonical content).
 
 ## Open questions / blockers
+- **✅ RESOLVED on Drift 0.33.35 — recursive-IR clean form landed.** `core.Box<T>` + the
+  typed-catch SIGSEGV fix shipped certified (ABI 17, `cbf32feb`). `ir.drift` migrated to
+  `core.Box<IrType>` recursion (`core.box`/`.get()`), `_one`/`_assert_well_formed` dropped, and
+  a real TYPED `catch IrError(e)` reconstructing `IrError(message = e.message)` (all-scalar
+  schema → projection supported). Repro re-run confirms old `move e` is now a compile error,
+  not a SIGSEGV. See Progress.md.
+- **✅ RESOLVED — typed-catch non-scalar limitation handled via errors-as-values.** The 0.33.35
+  rebuild rejected pre-existing config code (`build_gateway`/`build_host` re-raised a caught
+  `ConfigError`/`HostConfigError` whose `kind` is a non-scalar variant field). The toolchain
+  team confirmed this is an intentional v1 limitation, not a defect, and blessed
+  **errors-as-values** as the long-term design. Applied: config parsers now return
+  `Result<_, …ConfigError>` (movable native error, no throw/catch round-trip), and `pool.open`'s
+  Result is matched directly. Full `just test` is GREEN on certified **0.33.36** (and 0.33.35).
+  See Progress.md and the toolchain response in `/tmp/drift-announce/2026-06-15T12-45-56Z-response-*.md`.
 - **How far back does replay start?** Re-deriving the pure path from the last settled op
   vs from the workflow start — confirm the interpreter can cheaply replay to the next
   remote-op boundary and that this is the simplest correct cursor (no per-construct

@@ -36,6 +36,7 @@ import std.codec as codec;
 import std.uuid as uuid;
 import std.crypto as crypto;
 import microflows.host as mf;
+import microflows.runner.ir as ir;
 import web.client as client;
 
 const SCRIPT_NAME: String = "protocol_spike";
@@ -109,6 +110,7 @@ struct ScriptRevision {
 	name: String,
 	version: String,             // immutable semver: major.minor.patch
 	plan: Array<PlanStep>,
+	arg_type: ir.IrType,         // declared closed-object argument type (part of content_hash)
 	content_hash: Array<Byte>,   // 33 bytes: scheme tag + SHA-256
 	plan_length: Int
 }
@@ -139,13 +141,16 @@ fn main(argv: Array<String>) nothrow -> Int {
 	var p = cli.parser("microflows-runner", "0.1.0", "Microflows coordinator runner (first slice)");
 	val _ = p.option_string("config", "c", "FILE", "JSON config: db + participants + operations registries", true);
 	val _ = p.option_string("workflow-id", "w", "HEX", "32-hex-char workflow id", true);
-	val _ = p.option_string("operation", "o", "NAME", "operation to submit (required ONLY for a fresh workflow; a resume uses the durable request)", false);
-	val _ = p.option_string("input", "i", "JSON", "operation input (JSON object; default {}); fresh workflow only", false);
+	val _ = p.option_string("operation", "o", "NAME", "operation to submit (required ONLY for a fresh LEGACY workflow; a resume uses the durable request)", false);
+	val _ = p.option_string("input", "i", "JSON", "operation input (JSON object; default {}); fresh legacy workflow only", false);
+	val _ = p.option_string("arguments", "a", "JSON", "instance arguments (JSON object) for a PLANNED workflow SUBMISSION; supplying it creates/reasserts (and conflicts on changed args), omitting it RESUMES", false);
 
 	var config_path: String = "";
 	var workflow_hex: String = "";
 	var operation_name: String = "";
 	var input_json: String = "{}";
+	var arguments_json: String = "";
+	var has_arguments: Bool = false;
 
 	match p.parse(argv) {
 		core.Result::Ok(parsed) => {
@@ -153,6 +158,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 			match parsed.get_string("workflow-id", p) { Some(v) => { workflow_hex = _dup(v); }, None => {} }
 			match parsed.get_string("operation", p) { Some(v) => { operation_name = _dup(v); }, None => {} }
 			match parsed.get_string("input", p) { Some(v) => { input_json = _dup(v); }, None => {} }
+			match parsed.get_string("arguments", p) { Some(v) => { arguments_json = _dup(v); has_arguments = true; }, None => {} }
 		},
 		core.Result::Err(_) => {
 			console.eprintln("runner: bad arguments");
@@ -164,14 +170,15 @@ fn main(argv: Array<String>) nothrow -> Int {
 		return 2;
 	}
 
-	return try _run(&config_path, &workflow_hex, &operation_name, &input_json) catch {
+	return try _run(&config_path, &workflow_hex, &operation_name, &input_json, &arguments_json, has_arguments) catch {
 		console.eprintln("runner: fatal");
 		1
 	};
 }
 
 fn _run(config_path: &String, workflow_hex: &String,
-        operation_name: &String, input_json: &String) throws -> Int {
+        operation_name: &String, input_json: &String,
+        arguments_json: &String, has_arguments: Bool) throws -> Int {
 	val cfg = _load_config_json(config_path);
 	val db_sub = _require_db(&cfg);
 	val worker_id = _config_str(&cfg, &"worker_id", "runner-1");
@@ -209,15 +216,35 @@ fn _run(config_path: &String, workflow_hex: &String,
 		},
 		mf.PlanGetOutcome::NotFound => {}
 	}
+	// SUBMISSION vs RESUME is signalled by --arguments: supplied => a planned SUBMISSION
+	// (create/reassert the workflow with those instance arguments — and conflict if a
+	// reused id carries different args); omitted => a RESUME (drive from durable state, never
+	// re-create, never re-check args).
+	val is_submission = has_arguments;
 	if pin.present {
-		return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin);
+		// Existing planned workflow: resume, or REASSERT if this is a submission (so a reused
+		// id with changed arguments surfaces workflow_conflict instead of silently resuming).
+		return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, is_submission, arguments_json);
 	}
-	// No durable pin: fresh-or-legacy. A config "plan" => a fresh PLANNED workflow
-	// (_run_planned validates the registry + plan and creates+pins the active
-	// generation); otherwise the legacy single-op path below.
+	if is_submission {
+		// Fresh planned SUBMISSION: requires a config plan (the legacy single-op path takes
+		// --operation, not --arguments).
+		match _build_plan(&cfg) {
+			Optional::Some(_) => {
+				return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, true, arguments_json);
+			},
+			Optional::None => {
+				console.println("{\"workflow\":\"aborted\",\"reason\":\"arguments_require_planned_config\"}");
+				return 2;
+			}
+		}
+	}
+	// No durable pin and no --arguments: a RESUME (or legacy). A config "plan" => a resume of
+	// a planned workflow (which, absent a pin, claim resolves to not_found); otherwise the
+	// legacy single-op path below.
 	match _build_plan(&cfg) {
 		Optional::Some(_) => {
-			return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin);
+			return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, false, arguments_json);
 		},
 		Optional::None => {}
 	}
@@ -443,19 +470,25 @@ fn _run(config_path: &String, workflow_hex: &String,
 
 // Run a workflow whose forward path is a manual-IR PLAN, loading the IR from the
 // ScriptRegistry by the workflow's PINNED plan. State-sensitive ordering: the DURABLE
-// pin was read STORAGE-FIRST by the caller; a FRESH submission validates+builds the
-// registry to create+pin the active generation; then claim. TERMINAL REPLAY (a
-// NotClaimable existing workflow) reports from durable state and is RESOLVED BEFORE the
-// registry is ever built or validated — so a completed workflow replays its result even
-// when current participant/operation config is absent or malformed. Only a CLAIMED
-// workflow builds+validates the registry to resolve+verify its pinned plan; a claimed
-// REVERSING workflow unwinds instead.
+// pin was read STORAGE-FIRST by the caller. A SUBMISSION (--arguments supplied) validates+
+// builds the registry and CREATES/REASSERTS the workflow with those instance arguments
+// (an existing id with changed args → workflow_conflict). A RESUME (no --arguments) drives
+// from the durable pin and never re-creates. TERMINAL REPLAY (a NotClaimable workflow)
+// reports from durable state and is RESOLVED BEFORE the registry is ever built or validated
+// — so a completed workflow replays its result even when current config is absent/malformed.
+// Only a CLAIMED workflow builds+validates the registry to resolve+verify its pinned plan;
+// a claimed REVERSING workflow unwinds instead.
 fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
-                workflow_canon_hex: &String, storage_pin: &PinView) -> Int {
+                workflow_canon_hex: &String, storage_pin: &PinView,
+                is_submission: Bool, args_json: &String) -> Int {
 	var pin_name: String = _dup(&storage_pin.name);
 	var pin_version: String = _dup(&storage_pin.version);
 	var pin_hash_hex: String = _dup(&storage_pin.hash_hex);
 	var pin_len: Int = storage_pin.plan_length;
+	// The pin is AUTHORITATIVE once it comes from a submission's create_planned (set below) or
+	// a resume's storage-first read. A resume whose initial read found NO pin must RELOAD it
+	// after claim (the plan_get→claim race), never resolve/report on an empty pin.
+	var pin_loaded: Bool = is_submission or storage_pin.present;
 
 	// The registry is built LAZILY — never before terminal replay. `reg_ready` tracks
 	// whether `reg` holds the validated generation.
@@ -463,14 +496,32 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 	var reg = ScriptRegistry(revisions = move reg_empty);
 	var reg_ready = false;
 
-	// 1. ABSENT -> fresh submission: validate + build the registry (a fresh submit
-	//    legitimately requires valid config) and create + pin the ACTIVE generation. The
-	//    create RESOLVES THE RACE — a concurrent creator that won returns the WINNING
-	//    durable pin (Exists), which we adopt verbatim and then exact-match-resolve below.
-	if !storage_pin.present {
-		_validate_registry(cfg);
-		_validate_plan(cfg);
-		reg = _registry_build(cfg);
+	// 1. SUBMISSION -> create/reassert: validate + build the registry (a submit legitimately
+	//    requires valid config) and create + pin the ACTIVE generation with the supplied
+	//    instance arguments. create_planned RESOLVES THE RACE (a concurrent winner returns its
+	//    pin on Exists) AND enforces argument identity (workflow_conflict on changed args). A
+	//    RESUME skips this entirely and drives from the durable pin.
+	if is_submission {
+		// Build + validate the active generation. A malformed deployment config (bad registry,
+		// invalid plan, invalid/unknown-key argument_type, bad semver, ...) is reported as a
+		// clean `invalid_config` (no durable state written) rather than a process-fatal crash —
+		// distinguishable from unrelated faults.
+		var cfg_ok = false;
+		try {
+			_validate_registry(cfg);
+			_validate_plan(cfg);
+			reg = _registry_build(cfg);
+			cfg_ok = true;
+		} catch RunnerError(e) {
+			// EXPECTED config-validation failure (bad registry/plan/argument_type/semver). An
+			// UNEXPECTED defect is NOT a RunnerError, so it propagates and fails loudly rather
+			// than masquerading as invalid_config.
+			console.eprintln(e.message);
+		}
+		if !cfg_ok {
+			console.println("{\"workflow\":\"aborted\",\"reason\":\"invalid_config\"}");
+			return 2;
+		}
 		reg_ready = true;
 		// Resolve the active generation by the CONFIGURED plan name (not a constant), so
 		// any configured name (e.g. checkout-v1) can create workflows.
@@ -482,10 +533,37 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 			console.println("{\"workflow\":\"aborted\",\"reason\":\"no_active_revision\"}");
 			return 2;
 		}
+		// VALIDATE the submitted instance arguments against the script's DECLARED argument type
+		// BEFORE creating any durable state — but ONLY when creation may actually occur, i.e. a
+		// FRESH submission (no durable pin). For an EXISTING workflow (reassertion), the
+		// workflow is pinned to its OWN — possibly older — revision; validating against the
+		// ACTIVE type would wrongly reject valid arguments after a rollout (v1 args vs v2 type).
+		// Identity for an existing workflow is instead create_planned's byte-for-byte compare
+		// against the DURABLE arguments (workflow_conflict on change).
+		if !storage_pin.present {
+			var args_err: Optional<String> = Optional<String>::None();
+			// STRICT: a lenient parse keeps-last duplicate keys (so a duplicate could bypass the
+			// type's field/closed-object checks) and accepts non-standard numbers.
+			match json.parse_strict(args_json) {
+				core.Result::Ok(node) => { args_err = ir.validate(&node, &reg.revisions[aidx].arg_type); },
+				core.Result::Err(_) => { args_err = Optional<String>::Some("arguments are not valid JSON"); }
+			}
+			match args_err {
+				Optional::Some(_) => {
+					console.println("{\"workflow\":\"aborted\",\"reason\":\"invalid_arguments\"}");
+					return 2;
+				},
+				Optional::None => {}
+			}
+		}
 		val t_create = _now(host);
+		// The submitted instance arguments (a validated JSON object). The host canonicalizes
+		// them at the command boundary before storage/compare; their declared TYPE is already
+		// folded into content_hash (the argument contract is part of revision identity).
 		match host.create_planned(workflow_id, &reg.revisions[aidx].name, &reg.revisions[aidx].version,
 		                          &t_create, &t_create, &"{\"pos\":\"start\"}", &"{}",
-		                          &reg.revisions[aidx].content_hash, reg.revisions[aidx].plan_length) {
+		                          &reg.revisions[aidx].content_hash, reg.revisions[aidx].plan_length,
+		                          args_json) {
 			mf.CreatePlannedOutcome::Created(p) => { pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version); pin_hash_hex = _dup(&p.content_hash); pin_len = p.plan_length; },
 			mf.CreatePlannedOutcome::Exists(p) => { pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version); pin_hash_hex = _dup(&p.content_hash); pin_len = p.plan_length; },
 			mf.CreatePlannedOutcome::PlanConflict(_) => {
@@ -493,6 +571,12 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// workflow, OR a DIFFERENT plan name (id collision across plans). No pin to
 				// adopt; no lease taken; report + stop.
 				console.println("{\"workflow\":\"deferred\",\"reason\":\"plan_conflict\"}");
+				return 9;
+			},
+			mf.CreatePlannedOutcome::WorkflowConflict(_) => {
+				// Same plan name reused with DIFFERENT instance arguments — a different
+				// instance, not an adoptable winner. No lease taken; report + stop.
+				console.println("{\"workflow\":\"deferred\",\"reason\":\"workflow_conflict\"}");
 				return 9;
 			}
 		}
@@ -502,17 +586,52 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 	val clock = _clock(host);
 	var fencing_token: Int = 0;
 	var claimed_state: Int = 0;
+	var not_claimable = false;
 	match host.claim_workflow(workflow_id, &clock.now, &clock.deadline) {
 		mf.ClaimByIdOutcome::Claimed(wf) => { fencing_token = wf.fencing_token; claimed_state = wf.state_code; },
-		mf.ClaimByIdOutcome::NotFound => { throw RunnerError(message = "workflow absent after create"); },
-		mf.ClaimByIdOutcome::NotClaimable => {
-			// TERMINAL REPLAY / leased / deferred: report from DURABLE state — the pinned
-			// `plan_length` gives the final operation seq. Reached BEFORE any registry build
-			// or `_validate_registry`, so it never depends on current participant/operation
-			// config being present or valid.
-			val last_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, pin_len));
-			return _inspect_report(host, workflow_id, &last_hex, pin_len);
+		mf.ClaimByIdOutcome::NotFound => {
+			// A submission just created (or adopted) the workflow, so absence here is a real
+			// fault. A RESUME (no --arguments) of a workflow that does not exist is simply
+			// not-found — report + stop, never create.
+			if is_submission { throw RunnerError(message = "workflow absent after create"); }
+			console.println("{\"workflow\":\"aborted\",\"reason\":\"not_found\"}");
+			return 2;
+		},
+		mf.ClaimByIdOutcome::NotClaimable => { not_claimable = true; }
+	}
+
+	// RELOAD the authoritative pin when our initial read found none (the plan_get→claim race):
+	// another executor may have created the workflow between our plan_get and our claim, so the
+	// workflow now exists (we claimed it or saw it NotClaimable) but our pin is still empty.
+	// Re-read it before any resolve/report — never use plan_length=0 or an empty pin.
+	if !pin_loaded {
+		match host.plan_get(workflow_id) {
+			mf.PlanGetOutcome::Found(p) => {
+				pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version);
+				pin_hash_hex = _dup(&p.content_hash); pin_len = p.plan_length; pin_loaded = true;
+			},
+			mf.PlanGetOutcome::NotFound => {
+				// The workflow exists but carries no plan pin — a concurrently-created legacy /
+				// non-plan workflow on this id. We cannot drive it as planned. If we hold a lease
+				// from a SUCCESSFUL claim, RELEASE it (best-effort, with a near-term next-attempt
+				// so a legacy worker reclaims it promptly) — never leak it. (A NotClaimable
+				// observation took no lease.)
+				if !not_claimable {
+					val rclk = host.clock_read(PENDING_RETRY_SECONDS);
+					match host.release(workflow_id, fencing_token, &rclk.now, &rclk.deadline) { default => {} }
+				}
+				console.println("{\"workflow\":\"aborted\",\"reason\":\"not_found\"}");
+				return 2;
+			}
 		}
+	}
+
+	if not_claimable {
+		// TERMINAL REPLAY / leased / deferred: report from DURABLE state — the (now reloaded)
+		// pinned `plan_length` gives the final operation seq. Reached BEFORE any registry build
+		// or `_validate_registry`, so it never depends on current participant/operation config.
+		val last_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, pin_len));
+		return _inspect_report(host, workflow_id, &last_hex, pin_len);
 	}
 
 	// 3. CLAIMED: NOW build + validate the registry (deferred past terminal replay). For a
@@ -527,6 +646,10 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 			reg = _registry_build(cfg);
 			ok = true;
 		} catch RunnerError(e) {
+			// EXPECTED config-validation failure (malformed registry, bad semver, invalid
+			// argument_type, ...) — we hold the lease, so durably defer revision_unavailable
+			// (recoverable) rather than leak it. An UNEXPECTED defect is not a RunnerError and
+			// propagates (fails loudly) instead of becoming an indefinite retry.
 			console.eprintln(e.message);
 		}
 		if !ok {
@@ -577,14 +700,34 @@ fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
 			val name = _config_str(cfg, &"script_name", _dup(&SCRIPT_NAME));
 			val version = _config_str(cfg, &"plan_version", _dup(&PLAN_VERSION_DEFAULT));
 			_validate_semver(&version);
-			val ch = _content_hash(cfg, &plan);
+			// The script's declared closed-object argument type (default the empty object).
+			// It ALWAYS participates in content_hash (the argument contract is part of the
+			// revision identity — never elided/conditional).
+			val arg_type = _arg_type(cfg);
+			val ch = _content_hash(cfg, &plan, &arg_type);
 			val len = plan.len;
 			revs.push(ScriptRevision(name = move name, version = move version,
-			                         plan = move plan, content_hash = ch, plan_length = len));
+			                         plan = move plan, arg_type = move arg_type,
+			                         content_hash = ch, plan_length = len));
 		},
 		Optional::None => {}
 	}
 	return ScriptRegistry(revisions = move revs);
+}
+
+// The script's declared closed-object argument type, from config "argument_type" (a type
+// encoding). Absent -> the empty closed object `{}`. A malformed declaration becomes a
+// RunnerError (so the existing build catch surfaces/defers it, never leaking a lease).
+fn _arg_type(cfg: &json.JsonNode) -> ir.IrType {
+	match cfg.get(&"argument_type") {
+		Optional::Some(n) => {
+			match ir.parse_object_type(n) {
+				core.Result::Ok(ty) => { return move ty; },
+				core.Result::Err(_) => { throw RunnerError(message = "invalid argument_type"); }
+			}
+		},
+		Optional::None => { return ir.empty_object_type(); }
+	}
 }
 
 // The active generation for a script (v1: the single built revision matching the name).
@@ -641,8 +784,10 @@ fn _validate_semver(version: &String) -> Void {
 // scheme tag (0x01) followed by SHA-256 over the canonical encoding = 33 bytes. This is
 // the immutable identity the runner verifies against the durable pin ("never
 // substitute"). NOT the per-operation `input_hash` (UUID-v3, participant idempotency).
-fn _content_hash(cfg: &json.JsonNode, plan: &Array<PlanStep>) -> Array<Byte> {
-	val canonical = _plan_canonical(cfg, plan);
+// The DECLARED ARGUMENT TYPE's canonical encoding is part of the hashed material, so the
+// argument contract always participates in revision identity.
+fn _content_hash(cfg: &json.JsonNode, plan: &Array<PlanStep>, arg_type: &ir.IrType) -> Array<Byte> {
+	val canonical = _plan_canonical(cfg, plan) + ir.canonical(arg_type);
 	val msg = _str_bytes(&canonical);
 	val digest = crypto.sha256(&msg);   // 32 bytes
 	var out: Array<Byte> = [];
@@ -694,7 +839,7 @@ fn _plan_canonical(cfg: &json.JsonNode, plan: &Array<PlanStep>) -> String {
 // value's identity is independent of key spelling/order in config.
 fn _canonical_json(input_json: &String) -> String {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
-	match json.parse(input_json) {
+	match json.parse_strict(input_json) {
 		core.Result::Ok(n) => { return json.encode_compact_with_config(&n, &cfg); },
 		core.Result::Err(_) => { throw RunnerError(message = "plan step input is not valid JSON"); }
 	}
@@ -1501,7 +1646,7 @@ fn _operation_id(workflow_hex: &String, operation_seq: Int) nothrow -> Array<Byt
 
 fn _input_hash(input_json: &String) -> String {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
-	match json.parse(input_json) {
+	match json.parse_strict(input_json) {
 		core.Result::Ok(n) => {
 			val compact = json.encode_compact_with_config(&n, &cfg);
 			val u = uuid.v3_from_string(&compact);
@@ -1905,7 +2050,9 @@ fn _load_config_json(path: &String) throws -> json.JsonNode {
 	match io.file_builder(_dup(path)).read(true).timeout(timeout).build() {
 		core.Result::Ok(file) => {
 			val text = _drain(move file);
-			match json.parse(&text) {
+			// STRICT: reject duplicate keys + non-standard number forms (a lenient parse would
+			// keep-last duplicates and weaken canonical identity / the unknown-key guarantee).
+			match json.parse_strict(&text) {
 				core.Result::Ok(n) => { return move n; },
 				core.Result::Err(_) => { throw RunnerError(message = "config: JSON parse failed"); }
 			}

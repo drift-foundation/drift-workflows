@@ -62,7 +62,7 @@ def main():
                            database="microflows", autocommit=True)
     cur = conn.cursor()
     # clean slate
-    for t in ("tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (WF,))
 
     ts = lambda s: f"2026-02-01 12:00:{s:02d}.000000"  # noqa: E731
@@ -158,7 +158,7 @@ def main():
     _, r = call(cur, "sp_mf_workflow_inspect", (wf2, ts(1)))
     check("inspect_active_leased", r and r["outcome"] == "found"
           and r["is_terminal"] == 0 and r["leased"] == 1, r)
-    for t in ("tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf2,))
 
     # operation_result on the completed main workflow (local authoritative result).
@@ -196,7 +196,7 @@ def main():
     # defer_failed, never reporting a committed defer).
     _, r = call(cur, "sp_mf_workflow_release", (wf3, EXEC, 999, T(3), T(4)))
     check("release_fence_lost", r and r["outcome"] == "fence_lost", r)
-    for t in ("tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf3,))
 
     # --- multi-operation plan: INTERMEDIATE vs FINAL settle (sub-step C). is_final=0
@@ -212,13 +212,14 @@ def main():
     plan_h = bytes.fromhex("01" + "a1" * 32)
     plan_h_hex = plan_h.hex()
     VER = "1.4.2"
-    for t in ("tb_mf_workflow_plan", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    ARGS = b"{}"   # canonical (ordered-key compact) empty instance arguments
+    for t in ("tb_mf_workflow_args", "tb_mf_workflow_plan", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf5,))
     # CREATE + PIN the plan ATOMICALLY; Created/Exists RETURN the committed pin.
-    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, ARGS))
     check("create_planned", r and r["outcome"] == "created" and r["content_hash"] == plan_h_hex
           and r["plan_version"] == VER and r["plan_length"] == 2, r)
-    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, ARGS))
     check("create_planned_idempotent", r and r["outcome"] == "exists" and r["plan_version"] == VER
           and r["content_hash"] == plan_h_hex and r["plan_length"] == 2, r)
     # plan_get returns the durable pin (registry-independent).
@@ -230,16 +231,37 @@ def main():
     # CREATION-RACE resolution (static-review item 2): a later create with a DIFFERENT
     # plan does NOT conflict — it RETURNS THE WINNING durable pin (the first create's).
     # The caller adopts the winner and exact-match-resolves it against its own generation.
-    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", bytes.fromhex("01" + "b2" * 32), 2))
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", bytes.fromhex("01" + "b2" * 32), 2, ARGS))
     check("create_planned_race_adopts_winner_hash", r and r["outcome"] == "exists"
           and r["content_hash"] == plan_h_hex and r["plan_version"] == VER, r)
-    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, "2.0.0", T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT, "2.0.0", T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, ARGS))
     check("create_planned_race_adopts_winner_version", r and r["outcome"] == "exists"
           and r["plan_version"] == VER, r)
     # But a DIFFERENT plan NAME for the same workflow_id is an id COLLISION across plans,
     # not a version race — it must plan_conflict, never silently adopt the other plan.
-    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT + "-other", VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf5, SCRIPT + "-other", VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, ARGS))
     check("create_planned_name_conflict", r and r["outcome"] == "plan_conflict", r)
+    # DURABLE INSTANCE ARGUMENTS: an instance's one JSON object is pinned atomically with the
+    # plan; args_get returns it; same canonical content is idempotent; DIFFERENT argument
+    # content (same plan name) is workflow_conflict, compared BYTE-FOR-BYTE on the canonical
+    # document (binary, not collation). The declared arg TYPE is in content_hash (not tested
+    # here — that lands with the graph IR); only these instance VALUES are compared.
+    wf_args = os.urandom(16)
+    args_a = b'{"a":1,"b":2}'   # ordered-key compact canonical bytes
+    args_b = b'{"a":1,"b":3}'   # different content
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf_args, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, args_a))
+    check("create_planned_args_created", r and r["outcome"] == "created", r)
+    _, r = call(cur, "sp_mf_args_get", (wf_args,))
+    check("args_get", r and r["outcome"] == "found" and r["args"] == {"a": 1, "b": 2}, r)
+    _, r = call(cur, "sp_mf_args_get", (os.urandom(16),))
+    check("args_get_not_found", r and r["outcome"] == "not_found", r)
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf_args, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, args_a))
+    check("create_planned_args_idempotent", r and r["outcome"] == "exists", r)
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf_args, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, args_b))
+    check("create_planned_workflow_conflict", r and r["outcome"] == "workflow_conflict", r)
+    # Non-object args (valid JSON array) is rejected at the boundary (SIGNAL).
+    ok, _ = call(cur, "sp_mf_workflow_create_planned", (os.urandom(16), SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, b'[1,2]'))
+    check("create_planned_args_not_object", not ok, "expected SIGNAL on non-object args")
     # GENUINELY CONCURRENT creation race (two connections), exercising the CALLER-OWNED
     # transaction contract the host uses: autocommit=False, COMMIT after the call. Atomicity
     # comes from the caller's transaction — the workflow PK INSERT holds its lock until the
@@ -259,7 +281,7 @@ def main():
             cc = cn.cursor()
             barrier.wait()
             race_res[idx] = call(cc, "sp_mf_workflow_create_planned",
-                                 (wf_race, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", ch, 2))
+                                 (wf_race, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", ch, 2, ARGS))
             cn.commit()   # caller-owned publication, exactly like host rpc.commit
         finally:
             cn.close()
@@ -275,20 +297,47 @@ def main():
           outs == ["created", "exists"] and len(created) == 1 and len(exists) == 1
           and exists[0]["content_hash"] == created[0]["content_hash"]
           and exists[0]["plan_version"] == VER, race_res)
+    # CONCURRENT same-ID / DIFFERENT-arguments race: the args child is committed atomically
+    # with the workflow + plan (caller-owned txn), so a racing creator with different args
+    # never observes a workflow without its args row. Exactly one wins 'created'; the other
+    # blocks until the winner is durable, then byte-compares the args and returns
+    # 'workflow_conflict' — pinning atomic visibility of the args child.
+    wf_arace = os.urandom(16)
+    barrier2 = threading.Barrier(2)
+    arace_res = [None, None]
+
+    def _arace(idx, av):
+        cn = pymysql.connect(host=HOST, port=PORT, user=USER, password=PWD,
+                             database="microflows", autocommit=False)
+        try:
+            cc = cn.cursor()
+            barrier2.wait()
+            arace_res[idx] = call(cc, "sp_mf_workflow_create_planned",
+                                  (wf_arace, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, av))
+            cn.commit()
+        finally:
+            cn.close()
+
+    t_aa = threading.Thread(target=_arace, args=(0, b'{"x":1}'))
+    t_ab = threading.Thread(target=_arace, args=(1, b'{"x":2}'))
+    t_aa.start(); t_ab.start(); t_aa.join(); t_ab.join()
+    adocs = [r[1] for r in arace_res if r and r[0] and r[1]]
+    check("create_planned_concurrent_diff_args_conflict",
+          sorted(d.get("outcome") for d in adocs) == ["created", "workflow_conflict"], arace_res)
     # Malformed semantic version is rejected at the boundary (SIGNAL, no row).
-    ok, _ = call(cur, "sp_mf_workflow_create_planned", (os.urandom(16), SCRIPT, "1.2", T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    ok, _ = call(cur, "sp_mf_workflow_create_planned", (os.urandom(16), SCRIPT, "1.2", T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, ARGS))
     check("create_planned_bad_semver", not ok, "expected SIGNAL on non-semver plan_version")
     # The ONLY plan_conflict: a workflow_id that already exists as a LEGACY (non-plan)
     # workflow — no pin to return, cannot be reinterpreted as planned.
     wf_legacy = os.urandom(16)
     call(cur, "sp_mf_workflow_create", (wf_legacy, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}"))
-    _, r = call(cur, "sp_mf_workflow_create_planned", (wf_legacy, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    _, r = call(cur, "sp_mf_workflow_create_planned", (wf_legacy, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, ARGS))
     check("create_planned_legacy_conflict", r and r["outcome"] == "plan_conflict", r)
     # Inspection SP: a workflow durably deferred with reason 'revision_unavailable' is
     # OBSERVABLE (and stays recoverable: forward, lease cleared). Exposes the full pin +
     # state + timing + reason.
     wf_stall = os.urandom(16)
-    call(cur, "sp_mf_workflow_create_planned", (wf_stall, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    call(cur, "sp_mf_workflow_create_planned", (wf_stall, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, ARGS))
     _, rc = call(cur, "sp_mf_workflow_claim_by_id", (wf_stall, EXEC, T(1), "2026-02-01 13:30:00.000000"))
     call(cur, "sp_mf_operation_dispatch_defer", (wf_stall, EXEC, rc["fencing_token"], T(1), T(9), T(2), "revision_unavailable"))
     _, r = call(cur, "sp_mf_plan_stalled", ())
@@ -300,7 +349,7 @@ def main():
           and hit["reason"] == "revision_unavailable", hit)
     # A defer for a DIFFERENT reason is not a revision_unavailable stall.
     wf_other = os.urandom(16)
-    call(cur, "sp_mf_workflow_create_planned", (wf_other, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2))
+    call(cur, "sp_mf_workflow_create_planned", (wf_other, SCRIPT, VER, T(0), T(0), '{"pos":"start"}', "{}", plan_h, 2, ARGS))
     _, rc = call(cur, "sp_mf_workflow_claim_by_id", (wf_other, EXEC, T(1), "2026-02-01 13:30:00.000000"))
     call(cur, "sp_mf_operation_dispatch_defer", (wf_other, EXEC, rc["fencing_token"], T(1), T(9), T(2), "pinned_contract_unavailable"))
     _, r = call(cur, "sp_mf_plan_stalled", ())
@@ -358,7 +407,7 @@ def main():
     cur.execute("SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id=%s", (wf5,))
     ncp = cur.fetchone()[0]
     check("final_completes_with_stack", st == 4 and disp == 1 and owner is None and ncp == 2, (st, disp, owner, ncp))
-    for t in ("tb_mf_workflow_plan", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_workflow_plan", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf5,))
 
     # --- durable OPERATIONAL dispatch deferral (sp_mf_operation_dispatch_defer):
@@ -368,7 +417,7 @@ def main():
     # reason (deduped on retry). NOT a failure, NOT blocked_resolution.
     wf4 = os.urandom(16)
     op4 = bytes.fromhex("00000000000000000000000000000d41")
-    for t in ("tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf4,))
     call(cur, "sp_mf_workflow_create", (wf4, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}"))
     _, r = call(cur, "sp_mf_workflow_claim_by_id", (wf4, EXEC, T(1), "2026-02-01 13:30:00.000000"))
@@ -409,7 +458,7 @@ def main():
     _, r = call(cur, "sp_mf_operation_dispatch_defer",
                 (wf4, EXEC, 999, T(25), T(26), T(25), "pinned_contract_unavailable"))
     check("dispatch_defer_fence_lost", r and r["outcome"] == "fence_lost", r)
-    for t in ("tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf4,))
 
     # --- reversal transitions (sub-step A): the TRANSITION LAYER enforces its own
@@ -540,7 +589,7 @@ def main():
     # terminal is reverse_id_mismatch, never accepted as the same already_reversed.
     _, r = call(cur, "sp_mf_checkpoint_reverse_settle", (wf5, EXEC, tok5, 1, os.urandom(16), '{"released":true}', T(10)))
     check("reverse_settle_terminal_wrong_id", r and r["outcome"] == "reverse_id_mismatch", r)
-    for t in ("tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf5,))
 
     # begin_reversal with NO active checkpoints -> straight to terminal reversed
@@ -558,7 +607,7 @@ def main():
     _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf6, EXEC, tok6, 1, failed6, T(3), "x"))
     check("begin_reversal_already_begun_reversed",
           r and r["outcome"] == "already_begun" and r["state"] == 5, r)
-    for t in ("tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf6,))
 
     # begin_reversal must prove the durable failed op
@@ -574,7 +623,7 @@ def main():
     check("begin_reversal_op_not_failed", r and r["outcome"] == "operation_not_failed", r)
     _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf8, EXEC, tok8, 1, os.urandom(16), T(2), "x"))
     check("begin_reversal_op_conflict", r and r["outcome"] == "operation_conflict", r)
-    for t in ("tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf8,))
 
     # compensation that cannot continue -> blocked_resolution(3, reverse) + checkpoint
@@ -614,7 +663,7 @@ def main():
     _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf7, EXEC, tok7, 2, failed7, T(7), "forward_op_rejected"))
     check("begin_reversal_already_begun_blocked",
           r and r["outcome"] == "already_begun" and r["state"] == 3, r)
-    for t in ("tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf7,))
 
     # the durable dispatch deferral also works in the REVERSING direction (used for
@@ -635,7 +684,7 @@ def main():
     stB, loB, naB = cur.fetchone()
     check("reversing_defer_state",
           stB == 2 and loB is None and naB == datetime.datetime(2026, 2, 1, 13, 0, 9), (stB, loB, naB))
-    for t in ("tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wfB,))
 
     # the reverse binding is ALL-OR-NONE: a partial binding (an invocation id with
@@ -674,7 +723,7 @@ def main():
     _bad_binding("checkpoint_binding_empty_hash", good_id, "release", 1, "")
     _bad_binding("checkpoint_binding_bad_version", good_id, "release", 0, "h")
     _bad_binding("checkpoint_binding_short_id", bytes.fromhex("0011"), "release", 1, "h")
-    for t in ("tb_mf_workflow_checkpoint", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_workflow_checkpoint", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf9,))
 
     # status/result table invariant: requested(1) + a non-NULL result must be
@@ -692,14 +741,14 @@ def main():
         check("status_result_invariant", "ck_mf_operation_status_result" in str(e), e)
 
     # cleanup
-    for t in ("tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+    for t in ("tb_mf_workflow_args", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (WF,))
     conn.close()
 
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: if a check is accidentally deleted or bypassed, the
     # ran-count drifts from this manifest and the run FAILS (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 103
+    EXPECTED_CHECKS = 110
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

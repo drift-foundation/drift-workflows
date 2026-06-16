@@ -46,6 +46,8 @@ test:
 	echo "[integration] compile participant-stub + microflows-runner from source"
 	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
 	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
+	# (Runner-owned unit tests for the IR live in the Microflows COMPONENT gate —
+	# `microflows/justfile` test -> `cd runner && just test` — not here.)
 
 	# 2+3. Schema reset + harness, held under ONE acquisition of the shared
 	# host-global DB lock so no destructive reset overlaps another gate's DB use.

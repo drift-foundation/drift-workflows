@@ -1,0 +1,640 @@
+module microflows.runner.ir;
+
+import std.core as core;
+import std.json as json;
+import std.format as fmt;
+import std.io as io;
+import std.float as float;
+
+export {
+	IrType,
+	IrField,
+	IrError,
+	empty_object_type,
+	parse_type,
+	parse_object_type,
+	validate,
+	canonical,
+	// ----- control-flow graph IR (Step 1b(ii): types + canonical hashing + flat-plan compat) -----
+	IrExpr,
+	LoopKind,
+	IrCaseArm,
+	IrNode,
+	IrGraph,
+	FlatStep,
+	flat_to_graph,
+	graph_canonical,
+	canonical_json
+};
+
+// ===== V1 closed value-type model (manual-IR frontend, Step 1b: argument types) =====
+//
+// The closed, minimal V1 type set: scalars (Null/Bool/Int/Float/String) + Array<T> +
+// closed-field Object + Optional<T>. A script revision declares a closed-OBJECT argument
+// TYPE; submitted instance arguments are validated against it before creation, and the
+// type's deterministic canonical encoding participates in the script content_hash (so the
+// argument contract is part of the revision identity — unconditionally).
+//
+// Control-flow graph IR (Step 1b(ii)) lives in the second half of this file: graph node
+// TYPES, their deterministic `graph_canonical` encoding, and a `flat_to_graph` builder that
+// re-expresses today's flat operation plan as a degenerate straight-line graph. Interpretation
+// (execution) and structural validation are a SEPARATE chunk; this chunk does not touch the
+// runner's live content_hash or runtime behavior.
+
+// Recursive arms (TArray/TOptional) hold their child through `core.Box<IrType>` — a move-only,
+// unique-ownership heap indirection giving the value type a FINITE layout. Construct with
+// `core.box(child)` and read the borrow with `.get()` (Box does NOT auto-deref).
+//
+// Direct recursive value layouts (e.g. `TArray(elem: IrType)`) remain invalid — driftc rejects
+// them with `E_RECURSIVE_VALUE_TYPE` and a source span. `Box<Self>` is the sanctioned
+// indirection (driftc 0.33.35 / ABI 17). `TObject(fields: Array<IrField>)` is a genuine list,
+// not a recursion indirection, so it stays an Array. (`Arc<IrType>` would be shared ownership —
+// not what we want here; the type tree is uniquely owned.)
+pub variant IrType {
+	TNull,
+	TBool,
+	TInt,
+	TFloat,
+	TString,
+	TArray(elem: core.Box<IrType>),
+	TObject(fields: Array<IrField>),   // fields kept SORTED by name (deterministic canonical)
+	TOptional(inner: core.Box<IrType>)
+}
+
+pub struct IrField {
+	name: String,
+	ty: IrType
+}
+
+pub error IrError { message: String }
+
+// The empty closed-object type `{}` — the default argument type for a script that declares
+// none. Its canonical form ("O{}") still participates in content_hash (never elided).
+pub fn empty_object_type() nothrow -> IrType {
+	var fields: Array<IrField> = [];
+	return IrType::TObject(fields = move fields);
+}
+
+// ----- parse a declared type from its config JSON encoding -----
+//
+// Encoding (a JSON object with a "type" discriminant):
+//   {"type":"null"|"bool"|"int"|"float"|"string"}
+//   {"type":"array","elem": <type>}
+//   {"type":"optional","inner": <type>}
+//   {"type":"object","fields":[ {"name":"a","type":<type>}, ... ]}   // fields as an ARRAY
+//
+// A script's argument type MUST be an object type (enforced by the caller via
+// parse_object_type).
+pub fn parse_type(node: &json.JsonNode) -> IrType {
+	// UNKNOWN-KEY rejection: a declaration carries exactly its allowed keys. The required keys
+	// are fetched below; any count above the allowed set is a typo (e.g. "tpye"/"elment") that
+	// would otherwise be silently dropped — and dropped data would also be absent from
+	// content_hash, yielding a valid-but-unintended contract. We reject it.
+	val nkeys = _obj_len(node);
+	val kind = _req_str(node, &"type");
+	if _str_eq(&kind, &"null") { _reject_extra(nkeys, 1); return IrType::TNull(); }
+	if _str_eq(&kind, &"bool") { _reject_extra(nkeys, 1); return IrType::TBool(); }
+	if _str_eq(&kind, &"int") { _reject_extra(nkeys, 1); return IrType::TInt(); }
+	if _str_eq(&kind, &"float") { _reject_extra(nkeys, 1); return IrType::TFloat(); }
+	if _str_eq(&kind, &"string") { _reject_extra(nkeys, 1); return IrType::TString(); }
+	if _str_eq(&kind, &"array") {
+		match node.get(&"elem") {
+			Optional::Some(e) => { val inner = parse_type(e); _reject_extra(nkeys, 2); return IrType::TArray(elem = core.box(move inner)); },
+			Optional::None => { throw IrError(message = "array type missing 'elem'"); }
+		}
+	}
+	if _str_eq(&kind, &"optional") {
+		match node.get(&"inner") {
+			Optional::Some(e) => { val inner = parse_type(e); _reject_extra(nkeys, 2); return IrType::TOptional(inner = core.box(move inner)); },
+			Optional::None => { throw IrError(message = "optional type missing 'inner'"); }
+		}
+	}
+	if _str_eq(&kind, &"object") {
+		var fields: Array<IrField> = [];
+		match node.get(&"fields") {
+			Optional::Some(fnode) => {
+				match fnode.as_array() {
+					Optional::Some(arr) => {
+						var i = 0;
+						while i < arr.len {
+							fields.push(_parse_field(&arr[i]));
+							i = i + 1;
+						}
+					},
+					Optional::None => { throw IrError(message = "object 'fields' must be an array"); }
+				}
+			},
+			Optional::None => { throw IrError(message = "object type missing 'fields'"); }
+		}
+		_reject_extra(nkeys, 2);
+		_sort_fields(&mut fields);
+		_check_no_dup_fields(&fields);
+		return IrType::TObject(fields = move fields);
+	}
+	throw IrError(message = "unknown type kind: " + _dup(&kind));
+}
+
+// One object field: exactly {"name", "type"} — extra keys rejected.
+fn _parse_field(fnode: &json.JsonNode) -> IrField {
+	val nkeys = _obj_len(fnode);
+	val nm = _req_str(fnode, &"name");
+	match fnode.get(&"type") {
+		Optional::Some(ft) => {
+			val fty = parse_type(ft);
+			_reject_extra(nkeys, 2);
+			return IrField(name = move nm, ty = move fty);
+		},
+		Optional::None => { throw IrError(message = "object field missing 'type'"); }
+	}
+}
+
+// Parse + require a closed-OBJECT argument type. Returns a Result (IrError caught HERE, where
+// it is a local type) so callers in other modules need no error-type-qualified `catch` and can
+// distinguish this expected validation failure from unexpected defects.
+pub fn parse_object_type(node: &json.JsonNode) -> core.Result<IrType, IrError> {
+	// The inner parse only ever throws IrError (a declaration validation failure). Catch it
+	// TYPED and reconstruct the native error from its fields: a typed-catch binder is a
+	// read-only view over the in-flight error, not a movable `IrError` value (moving the whole
+	// binder is rejected with E_TYPED_CATCH_BINDER_NOT_VALUE), so we copy `e.message` into a
+	// fresh IrError. Unexpected (non-IrError) defects propagate — they are not silently mapped
+	// to a validation failure.
+	try {
+		val ty = _parse_object_type_throwing(node);
+		return core.Result<IrType, IrError>::Ok(move ty);
+	} catch IrError(e) {
+		return core.Result<IrType, IrError>::Err(IrError(message = e.message));
+	}
+}
+
+fn _parse_object_type_throwing(node: &json.JsonNode) -> IrType {
+	val ty = parse_type(node);
+	var is_obj = false;
+	match &ty { IrType::TObject(_) => { is_obj = true; }, default => {} }
+	if !is_obj { throw IrError(message = "argument_type must be an object type"); }
+	return move ty;
+}
+
+// ----- validate a JSON value against a type. Returns None on success, or Some(message). -----
+pub fn validate(value: &json.JsonNode, ty: &IrType) nothrow -> Optional<String> {
+	match ty {
+		IrType::TNull() => {
+			if value.is_null() { return Optional<String>::None(); }
+			return Optional<String>::Some("expected null");
+		},
+		IrType::TBool() => {
+			match value.as_bool() { Optional::Some(_) => { return Optional<String>::None(); }, Optional::None => {} }
+			return Optional<String>::Some("expected bool");
+		},
+		IrType::TInt() => {
+			// EXACT: an INTEGER-shaped JSON number (no '.'/'e'/'E') within signed range. A
+			// float-shaped literal (1.0, 1e3) or an out-of-range magnitude (overflow) is NOT an
+			// int — no implicit coercion.
+			match value.as_number_raw() {
+				Optional::Some(raw) => {
+					if _is_float_shaped(&raw) { return Optional<String>::Some("expected int (got a float-shaped number)"); }
+					match value.as_int() { Optional::Some(_) => { return Optional<String>::None(); }, Optional::None => {} }
+					return Optional<String>::Some("expected int (out of range)");
+				},
+				Optional::None => { return Optional<String>::Some("expected int"); }
+			}
+		},
+		IrType::TFloat() => {
+			// EXACT: a FLOAT-shaped JSON number ('.' or exponent) that parses FINITE. An
+			// integer-shaped literal (1) is an int, not a float (no implicit coercion); a
+			// non-finite magnitude (e.g. 1e400) is rejected.
+			match value.as_number_raw() {
+				Optional::Some(raw) => {
+					if !_is_float_shaped(&raw) { return Optional<String>::Some("expected float (got an integer-shaped number)"); }
+					match value.as_float() {
+						Optional::Some(v) => {
+							if float.is_finite(v) { return Optional<String>::None(); }
+							return Optional<String>::Some("expected float (non-finite)");
+						},
+						Optional::None => {}
+					}
+					return Optional<String>::Some("expected float");
+				},
+				Optional::None => { return Optional<String>::Some("expected float"); }
+			}
+		},
+		IrType::TString() => {
+			match value.as_string() { Optional::Some(_) => { return Optional<String>::None(); }, Optional::None => {} }
+			return Optional<String>::Some("expected string");
+		},
+		IrType::TArray(elem) => {
+			match value.as_array() {
+				Optional::Some(arr) => {
+					var i = 0;
+					while i < arr.len {
+						match validate(&arr[i], elem.get()) {
+							Optional::Some(m) => { return Optional<String>::Some("array[" + fmt.format_int(i) + "]: " + m); },
+							Optional::None => {}
+						}
+						i = i + 1;
+					}
+					return Optional<String>::None();
+				},
+				Optional::None => { return Optional<String>::Some("expected array"); }
+			}
+		},
+		IrType::TOptional(inner) => {
+			if value.is_null() { return Optional<String>::None(); }
+			return validate(value, inner.get());
+		},
+		IrType::TObject(fields) => {
+			match value.as_object() {
+				Optional::Some(obj) => {
+					var matched = 0;
+					var i = 0;
+					while i < fields.len {
+						val nm = &fields[i].name;
+						match value.get(nm) {
+							Optional::Some(fv) => {
+								match validate(fv, &fields[i].ty) {
+									Optional::Some(m) => { return Optional<String>::Some("field '" + _dup(nm) + "': " + m); },
+									Optional::None => {}
+								}
+								matched = matched + 1;
+							},
+							Optional::None => {
+								// Absent is allowed ONLY for an optional field.
+								if !_is_optional(&fields[i].ty) {
+									return Optional<String>::Some("missing field '" + _dup(nm) + "'");
+								}
+							}
+						}
+						i = i + 1;
+					}
+					// CLOSED object: no field present that wasn't declared. Every present
+					// declared field was counted in `matched`; if the value carries more fields
+					// than we matched, at least one is undeclared.
+					if obj.len() > matched {
+						return Optional<String>::Some("unexpected extra field(s)");
+					}
+					return Optional<String>::None();
+				},
+				Optional::None => { return Optional<String>::Some("expected object"); }
+			}
+		}
+	}
+}
+
+// ----- deterministic canonical encoding (for content_hash). Field order is normalized to
+// sorted-by-name at parse time, so the encoding is independent of declaration order. -----
+pub fn canonical(ty: &IrType) nothrow -> String {
+	match ty {
+		IrType::TNull() => { return "n"; },
+		IrType::TBool() => { return "b"; },
+		IrType::TInt() => { return "i"; },
+		IrType::TFloat() => { return "f"; },
+		IrType::TString() => { return "s"; },
+		IrType::TArray(elem) => { return "a(" + canonical(elem.get()) + ")"; },
+		IrType::TOptional(inner) => { return "o(" + canonical(inner.get()) + ")"; },
+		IrType::TObject(fields) => {
+			var s: String = "O{";
+			var i = 0;
+			while i < fields.len {
+				s = s + _lp(&fields[i].name) + canonical(&fields[i].ty) + ";";
+				i = i + 1;
+			}
+			return s + "}";
+		}
+	}
+}
+
+// ===== V1 control-flow graph IR (Step 1b(ii) — types + canonical hashing + flat-plan compat) =====
+//
+// The plan is a FLAT NODE TABLE (`IrGraph.nodes`) keyed by stable, unique node ids; control
+// flow is expressed as node-id edges (`next`, branch targets), NOT nested nodes — so `IrNode`
+// is not self-recursive through control flow, and the graph stays a finite value. Only remote
+// `NOperation` nodes are durable suspension points; every other node is pure control flow that
+// a restarted worker re-derives by replay. Structural validation (unique ids, valid targets, no
+// remote op inside a loop, finite-loop shape, result-by-id) is a SEPARATE chunk; so is execution.
+
+// An EXPRESSION — the closed V1 leaf source set. Determinism is structural: the only sources are
+// pinned constants, durable arguments, settled Operation results (by node id), and Let/loop-bound
+// locals. No clock/random/env/fs/net/live-config. (Derived operators — comparisons, arithmetic —
+// are a deliberate follow-up introduced with the interpreter; V1 keeps the source set closed.)
+// `path` projects into a JSON object/array by successive keys ([] = the whole value).
+//
+// EConst's `canonical_json` MUST already be canonical (key-ordered compact, per `canonical_json`):
+// `graph_canonical` hashes it VERBATIM, so a non-canonical literal (reordered keys / whitespace)
+// would create a false revision change once the graph is authoritative. Producers canonicalize at
+// construction — `flat_to_graph` does so; any other constructor (loop init, return value, NCase
+// `match_const`) must pass a `canonical_json`-normalized string.
+pub variant IrExpr {
+	EConst(canonical_json: String),                  // pinned constant: a CANONICAL JSON literal (see above)
+	EArg(path: Array<String>),                       // durable arguments, projected by path
+	EResult(node: String, path: Array<String>),      // a prior Operation node's settled result
+	ELocal(name: String, path: Array<String>)        // a Let-bound local / loop element / accumulator
+}
+
+// V1 loops are FINITE array transforms over a finite collection — never a `while` cycle.
+pub variant LoopKind { LMap, LFilter, LFold }
+
+// One arm of an NCase: branch to `target` when the scrutinee equals `match_const` (a CANONICAL
+// JSON literal — same contract as EConst; producer-normalized via `canonical_json`). Arms are
+// encoded order-independently (sorted by `match_const`).
+pub struct IrCaseArm {
+	pub match_const: String,
+	pub target: String
+}
+
+// A graph NODE. `id` is this node's stable unique key; edges (`next`, `then_node`, `else_node`,
+// arm `target`s, `default_node`) reference other nodes by id. A loop's body is a pure `IrExpr`
+// over its element/accumulator locals — which structurally forbids a remote operation inside a
+// loop (no `IrExpr` arm can be an operation). For NLoop, `acc`/`init` are used by `LFold` only
+// (map/filter leave `acc = ""` and `init = EConst("null")`).
+pub variant IrNode {
+	NOperation(id: String, operation: String, input: IrExpr, next: String),   // remote op; result bound to `id`
+	NLet(id: String, name: String, value: IrExpr, next: String),              // bind a pure derived local
+	NIf(id: String, cond: IrExpr, then_node: String, else_node: String),      // `cond` is Bool-valued
+	NCase(id: String, scrutinee: IrExpr, arms: Array<IrCaseArm>, default_node: String),
+	NLoop(id: String, kind: LoopKind, source: IrExpr, elem: String, acc: String, init: IrExpr, body: IrExpr, next: String),
+	NReturn(id: String, value: IrExpr)                                        // terminal: the workflow result
+}
+
+pub struct IrGraph {
+	pub nodes: Array<IrNode>,   // flat node table (ids unique — validated in the execution chunk)
+	pub entry: String           // entry node id
+}
+
+// One flat plan step (operation + its literal input), as the runner's flat plan carries it —
+// the input domain to `flat_to_graph`. Kept here so ir owns the flat→graph mapping without
+// importing runner types.
+pub struct FlatStep {
+	pub operation: String,
+	pub input_json: String
+}
+
+// Re-express today's flat operation plan as a DEGENERATE straight-line graph: each step becomes
+// an `NOperation` whose input is the step's literal JSON constant, chained `n0 -> n1 -> … -> nN`,
+// terminating in an `NReturn` (the flat plan declares no explicit result, so it returns unit
+// `null`). Behavior-preserving: the same ordered operation sequence, just graph-shaped.
+//
+// Each step's input is CANONICALIZED (key-ordered compact) so the `EConst` literal is genuinely
+// canonical and key order/whitespace in config can never produce a false revision change. A
+// malformed input constant -> Err (the only expected failure); unexpected encode defects fail
+// loudly (not mapped to Err).
+pub fn flat_to_graph(steps: &Array<FlatStep>) -> core.Result<IrGraph, IrError> {
+	var nodes: Array<IrNode> = [];
+	val n = steps.len;
+	var i = 0;
+	while i < n {
+		var canon: String = "";
+		match canonical_json(&steps[i].input_json) {
+			core.Result::Ok(c) => { canon = move c; },
+			core.Result::Err(e) => { return core.Result<IrGraph, IrError>::Err(move e); }
+		}
+		nodes.push(IrNode::NOperation(
+			id = _nid(i),
+			operation = _dup(&steps[i].operation),
+			input = IrExpr::EConst(canonical_json = move canon),
+			next = _nid(i + 1)
+		));
+		i = i + 1;
+	}
+	nodes.push(IrNode::NReturn(id = _nid(n), value = IrExpr::EConst(canonical_json = "null")));
+	return core.Result<IrGraph, IrError>::Ok(IrGraph(nodes = move nodes, entry = _nid(0)));
+}
+
+fn _nid(i: Int) nothrow -> String { return "n" + fmt.format_int(i); }
+
+// Canonical compact JSON: parse strictly + re-encode with lexicographic UTF-8 key ordering, so a
+// value's identity is independent of key spelling/order/whitespace. The IR home's definition of
+// "canonical JSON literal" (EConst / IrCaseArm.match_const); the runner's `_canonical_json` uses
+// the same scheme and may later delegate here. Err(IrError) on malformed input.
+pub fn canonical_json(text: &String) -> core.Result<String, IrError> {
+	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
+	match json.parse_strict(text) {
+		core.Result::Ok(n) => { return core.Result<String, IrError>::Ok(json.encode_compact_with_config(&n, &cfg)); },
+		core.Result::Err(_) => { return core.Result<String, IrError>::Err(IrError(message = "constant is not valid JSON")); }
+	}
+}
+
+// ----- deterministic canonical encoding of a graph (for the FUTURE content_hash). Captures the
+// full graph shape: entry, every node (kind + id + fields + edges by id), branch targets, loop
+// bodies, and per-operation node name + input expression. Node order is normalized to sorted-by-id
+// and NCase arms to sorted-by-match_const, so declaration order never affects identity. The
+// runner composes this with its per-operation RESOLVED bindings (schema_version + participant)
+// and compensation bindings + the declared argument type when it adopts the graph as authoritative
+// (a separate chunk). All fields are length-prefixed so distinct graphs never collide. -----
+pub fn graph_canonical(g: &IrGraph) nothrow -> String {
+	val order = _node_order_by_id(&g.nodes);
+	var s: String = "G{" + _lp(&g.entry) + "|";
+	var k = 0;
+	while k < order.len {
+		s = s + _node_canonical(&g.nodes[order[k]]) + ";";
+		k = k + 1;
+	}
+	return s + "}";
+}
+
+fn _node_canonical(n: &IrNode) nothrow -> String {
+	match n {
+		IrNode::NOperation(id, operation, input, next) => {
+			return "P" + _lp(id) + _lp(operation) + _expr_canonical(input) + _lp(next);
+		},
+		IrNode::NLet(id, name, value, next) => {
+			return "L" + _lp(id) + _lp(name) + _expr_canonical(value) + _lp(next);
+		},
+		IrNode::NIf(id, cond, then_node, else_node) => {
+			return "I" + _lp(id) + _expr_canonical(cond) + _lp(then_node) + _lp(else_node);
+		},
+		IrNode::NCase(id, scrutinee, arms, default_node) => {
+			return "C" + _lp(id) + _expr_canonical(scrutinee) + _arms_canonical(arms) + _lp(default_node);
+		},
+		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
+			return "O" + _lp(id) + _loopkind_tag(kind) + _expr_canonical(source)
+			     + _lp(elem) + _lp(acc) + _expr_canonical(init) + _expr_canonical(body) + _lp(next);
+		},
+		IrNode::NReturn(id, value) => {
+			return "R" + _lp(id) + _expr_canonical(value);
+		}
+	}
+}
+
+fn _expr_canonical(e: &IrExpr) nothrow -> String {
+	match e {
+		IrExpr::EConst(canonical_json) => { return "k" + _lp(canonical_json); },
+		IrExpr::EArg(path) => { return "a" + _path_canonical(path); },
+		IrExpr::EResult(node, path) => { return "r" + _lp(node) + _path_canonical(path); },
+		IrExpr::ELocal(name, path) => { return "l" + _lp(name) + _path_canonical(path); }
+	}
+}
+
+fn _path_canonical(p: &Array<String>) nothrow -> String {
+	var s: String = "[";
+	var i = 0;
+	while i < p.len { s = s + _lp(&p[i]); i = i + 1; }
+	return s + "]";
+}
+
+fn _loopkind_tag(k: &LoopKind) nothrow -> String {
+	match k {
+		LoopKind::LMap() => { return "m"; },
+		LoopKind::LFilter() => { return "f"; },
+		LoopKind::LFold() => { return "d"; }
+	}
+}
+
+// NCase arms encoded order-independently (sorted by match_const).
+fn _arms_canonical(arms: &Array<IrCaseArm>) nothrow -> String {
+	var order = _arm_order(arms);
+	var s: String = "[";
+	var k = 0;
+	while k < order.len {
+		s = s + _lp(&arms[order[k]].match_const) + _lp(&arms[order[k]].target);
+		k = k + 1;
+	}
+	return s + "]";
+}
+
+fn _arm_order(arms: &Array<IrCaseArm>) nothrow -> Array<Int> {
+	var idx: Array<Int> = [];
+	var i = 0;
+	while i < arms.len { idx.push(i); i = i + 1; }
+	var a = 1;
+	while a < idx.len {
+		var b = a;
+		while b > 0 and _str_lt(&arms[idx[b]].match_const, &arms[idx[b - 1]].match_const) {
+			idx.swap(b, b - 1);
+			b = b - 1;
+		}
+		a = a + 1;
+	}
+	return move idx;
+}
+
+// Node indices sorted by node id (declaration-order-independent canonical).
+fn _node_order_by_id(nodes: &Array<IrNode>) nothrow -> Array<Int> {
+	var idx: Array<Int> = [];
+	var i = 0;
+	while i < nodes.len { idx.push(i); i = i + 1; }
+	var a = 1;
+	while a < idx.len {
+		var b = a;
+		var cont = true;
+		while cont and b > 0 {
+			val ia = _node_id(&nodes[idx[b]]);
+			val ib = _node_id(&nodes[idx[b - 1]]);
+			if _str_lt(&ia, &ib) { idx.swap(b, b - 1); b = b - 1; }
+			else { cont = false; }
+		}
+		a = a + 1;
+	}
+	return move idx;
+}
+
+fn _node_id(n: &IrNode) nothrow -> String {
+	match n {
+		IrNode::NOperation(id, operation, input, next) => { return _dup(id); },
+		IrNode::NLet(id, name, value, next) => { return _dup(id); },
+		IrNode::NIf(id, cond, then_node, else_node) => { return _dup(id); },
+		IrNode::NCase(id, scrutinee, arms, default_node) => { return _dup(id); },
+		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { return _dup(id); },
+		IrNode::NReturn(id, value) => { return _dup(id); }
+	}
+}
+
+// ===== helpers =====
+
+// Number of keys in a declaration object (0 if not an object).
+fn _obj_len(node: &json.JsonNode) nothrow -> Int {
+	match node.as_object() { Optional::Some(o) => { return o.len(); }, Optional::None => { return 0; } }
+}
+
+// A declaration carries exactly its allowed keys; more than `allowed` means an unknown key.
+fn _reject_extra(actual: Int, allowed: Int) -> Void {
+	if actual > allowed { throw IrError(message = "unknown key in type/field declaration"); }
+}
+
+// A JSON number literal is FLOAT-shaped iff its raw text carries a fractional point or an
+// exponent ('.', 'e', or 'E'); otherwise it is integer-shaped. (No numeric coercion: Int and
+// Float partition number literals by shape.)
+fn _is_float_shaped(raw: &String) nothrow -> Bool {
+	var i = 0;
+	while i < raw.byte_length() {
+		val c = raw.byte_at(i);
+		if c == 46 or c == 101 or c == 69 { return true; }   // '.', 'e', 'E'
+		i = i + 1;
+	}
+	return false;
+}
+
+fn _is_optional(ty: &IrType) nothrow -> Bool {
+	match ty { IrType::TOptional(_) => { return true; }, default => { return false; } }
+}
+
+fn _req_str(node: &json.JsonNode, key: &String) -> String {
+	match node.get(key) {
+		Optional::Some(v) => {
+			match v.as_string() {
+				Optional::Some(s) => { return move s; },
+				Optional::None => { throw IrError(message = "field '" + _dup(key) + "' must be a string"); }
+			}
+		},
+		Optional::None => { throw IrError(message = "missing field '" + _dup(key) + "'"); }
+	}
+}
+
+// Length-prefix a field name: "{byte_length}:{name};" — so concatenated names can't collide.
+fn _lp(s: &String) nothrow -> String {
+	return fmt.format_int(s.byte_length()) + ":" + _dup(s) + ";";
+}
+
+fn _sort_fields(fields: &mut Array<IrField>) nothrow -> Void {
+	// Insertion sort by name (field counts are small).
+	var i = 1;
+	while i < fields.len {
+		var j = i;
+		while j > 0 and _str_lt(&fields[j].name, &fields[j - 1].name) {
+			fields.swap(j, j - 1);
+			j = j - 1;
+		}
+		i = i + 1;
+	}
+}
+
+fn _check_no_dup_fields(fields: &Array<IrField>) -> Void {
+	var i = 1;
+	while i < fields.len {
+		if _str_eq(&fields[i].name, &fields[i - 1].name) {
+			throw IrError(message = "duplicate object field '" + _dup(&fields[i].name) + "'");
+		}
+		i = i + 1;
+	}
+}
+
+fn _str_eq(a: &String, b: &String) nothrow -> Bool {
+	if a.byte_length() != b.byte_length() { return false; }
+	var i = 0;
+	while i < a.byte_length() {
+		if a.byte_at(i) != b.byte_at(i) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+// Unsigned-byte lexicographic less-than.
+fn _str_lt(a: &String, b: &String) nothrow -> Bool {
+	val na = a.byte_length();
+	val nb = b.byte_length();
+	var i = 0;
+	while i < na and i < nb {
+		val ca = a.byte_at(i);
+		val cb = b.byte_at(i);
+		if ca < cb { return true; }
+		if ca > cb { return false; }
+		i = i + 1;
+	}
+	return na < nb;
+}
+
+fn _dup(s: &String) nothrow -> String {
+	val n = s.byte_length();
+	var buf = io.buffer(n);
+	var i = 0;
+	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
+	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), n);
+}

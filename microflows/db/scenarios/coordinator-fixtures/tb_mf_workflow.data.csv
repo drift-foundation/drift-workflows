@@ -30,3 +30,6 @@ a0000000000000000000000000000025,protocol_spike,1,1,1,0,1,2000-01-01 00:00:00.00
 # 26: claimable forward planned workflow — run with a MALFORMED registry config (post-claim
 # validation throws) must DEFER revision_unavailable + RELEASE the lease (no leak).
 a0000000000000000000000000000026,protocol_spike,1,1,1,0,1,2000-01-01 00:00:00.000000,1,c0000000000000000000000000000000,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000,0,"{""pos"":""start""}",\N,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000
+# 27: claimable forward LEGACY workflow with NO plan pin (simulates a concurrently-created
+# legacy id). A planned RESUME claims it, reloads, finds no pin, and must RELEASE the lease.
+a0000000000000000000000000000027,protocol_spike,1,1,1,0,1,2000-01-01 00:00:00.000000,1,c0000000000000000000000000000000,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000,0,"{""pos"":""start""}",\N,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000

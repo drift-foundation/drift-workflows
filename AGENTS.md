@@ -53,7 +53,8 @@ such folder MUST carry two files:
 ## Defect policy (strict)
 
 - If behavior indicates a core defect (protocol parsing, state machine, concurrency, memory/lifetime, I/O correctness, or runtime integration), classify it immediately as `CORE_BUG`.
-- Do not patch user-facing API code to avoid triggering a suspected `CORE_BUG` unless explicitly approved as a temporary workaround.
+- Do not implement or retain workarounds for any confirmed or suspected compiler, runtime, toolchain, or other `CORE_BUG`.
+- If the defect is external to this repository, block the dependent work until a certified root-cause fix is available.
 
 ### Regression-first requirement (mandatory)
 
@@ -67,11 +68,12 @@ For every suspected `CORE_BUG`, do this in order:
 
 ### No semantic masking
 
-Forbidden without explicit approval:
+Forbidden:
 
 - Rewriting control flow primarily to bypass correctness defects.
 - Rewriting ownership/lifetime patterns primarily to hide memory/concurrency defects.
 - Any source change whose main purpose is to avoid fixing root cause.
+- Catch-all error handling, alternate APIs, compatibility shims, or representation changes introduced to avoid a confirmed or suspected compiler/runtime/toolchain defect.
 
 ### Stop-and-confirm gate
 
@@ -81,15 +83,9 @@ On first detection of a likely `CORE_BUG`, stop broader implementation changes a
 - failing test path
 - suspected subsystem
 
-Then continue with root-cause fix by default; ask before any temporary workaround.
-
-### Temporary workaround protocol (opt-in only)
-
-If user explicitly requests a temporary workaround:
-
-- Keep it minimal and localized.
-- Add a `progress.md` (or `TODO.md`) note referencing regression test and bug label.
-- Do not mark complete until root-cause fix is landed or explicitly deferred.
+Then continue only with the root-cause fix. If that fix belongs to an external project,
+record the blocker and stop dependent implementation until the fixed certified dependency
+is available.
 
 ### Completion criteria
 
@@ -97,5 +93,3 @@ A `CORE_BUG` is not done unless both are present:
 
 - pinned regression test
 - root-cause fix
-
-Workaround-only changes must be reported as partial, not final resolution.

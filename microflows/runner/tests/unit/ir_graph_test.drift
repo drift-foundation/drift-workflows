@@ -1,0 +1,211 @@
+// Unit tests for the V1 control-flow graph IR (Step 1b(ii): types + canonical hashing +
+// flat-plan compatibility). Covers the FLAT->degenerate-graph builder shape, canonical
+// determinism, declaration-order independence (nodes and NCase arms), structural distinctness
+// (a change in any hashed field changes the canonical), INPUT CANONICALIZATION (reordered keys
+// hash identically; malformed input -> Err), and the empty plan. Execution and structural
+// validation are a separate chunk and are NOT exercised here.
+//
+// Standalone: compiled together with ../src/ir.drift (ir imports only std.*), no DB.
+
+module microflows.runner.tests.ir_graph_test;
+
+import std.core as core;
+import microflows.runner.ir as ir;
+
+fn _seq(a: &String, b: &String) nothrow -> Bool {
+	if a.byte_length() != b.byte_length() { return false; }
+	var i = 0;
+	while i < a.byte_length() {
+		if a.byte_at(i) != b.byte_at(i) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+fn _empty_path() nothrow -> Array<String> { var p: Array<String> = []; return move p; }
+
+// Unwrap a builder Result; on an UNEXPECTED Err, return a sentinel graph whose entry ("ERR")
+// fails the caller's shape assertions with a known code (the malformed path is tested explicitly).
+fn _unwrap_graph(r: core.Result<ir.IrGraph, ir.IrError>) nothrow -> ir.IrGraph {
+	match move r {
+		core.Result::Ok(g) => { return move g; },
+		core.Result::Err(e) => {
+			var nodes: Array<ir.IrNode> = [];
+			nodes.push(ir.IrNode::NReturn(id = "ERR", value = ir.IrExpr::EConst(canonical_json = "null")));
+			return ir.IrGraph(nodes = move nodes, entry = "ERR");
+		}
+	}
+}
+
+fn _flat_two() nothrow -> Array<ir.FlatStep> {
+	var s: Array<ir.FlatStep> = [];
+	s.push(ir.FlatStep(operation = "alpha", input_json = "{\"a\":1}"));
+	s.push(ir.FlatStep(operation = "beta", input_json = "{\"b\":2}"));
+	return move s;
+}
+
+// A 2-operation straight-line graph built by hand, optionally with the node table in REVERSE
+// declaration order (same ids/content) — to prove canonical is order-independent. The literals
+// are already canonical (single-key objects / scalars), so they satisfy EConst's contract.
+fn _two_op_graph(reverse: Bool) nothrow -> ir.IrGraph {
+	var nodes: Array<ir.IrNode> = [];
+	if reverse {
+		nodes.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
+		nodes.push(ir.IrNode::NOperation(id = "n1", operation = "beta", input = ir.IrExpr::EConst(canonical_json = "{\"b\":2}"), next = "n2"));
+		nodes.push(ir.IrNode::NOperation(id = "n0", operation = "alpha", input = ir.IrExpr::EConst(canonical_json = "{\"a\":1}"), next = "n1"));
+	} else {
+		nodes.push(ir.IrNode::NOperation(id = "n0", operation = "alpha", input = ir.IrExpr::EConst(canonical_json = "{\"a\":1}"), next = "n1"));
+		nodes.push(ir.IrNode::NOperation(id = "n1", operation = "beta", input = ir.IrExpr::EConst(canonical_json = "{\"b\":2}"), next = "n2"));
+		nodes.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
+	}
+	return ir.IrGraph(nodes = move nodes, entry = "n0");
+}
+
+// A graph with an NCase whose arms are in normal or swapped order (same content).
+fn _case_graph(swap: Bool) nothrow -> ir.IrGraph {
+	var arms: Array<ir.IrCaseArm> = [];
+	if swap {
+		arms.push(ir.IrCaseArm(match_const = "\"b\"", target = "n1"));
+		arms.push(ir.IrCaseArm(match_const = "\"a\"", target = "n2"));
+	} else {
+		arms.push(ir.IrCaseArm(match_const = "\"a\"", target = "n2"));
+		arms.push(ir.IrCaseArm(match_const = "\"b\"", target = "n1"));
+	}
+	var nodes: Array<ir.IrNode> = [];
+	nodes.push(ir.IrNode::NCase(id = "n0", scrutinee = ir.IrExpr::EArg(path = _empty_path()), arms = move arms, default_node = "n3"));
+	nodes.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "1")));
+	nodes.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "2")));
+	nodes.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "0")));
+	return ir.IrGraph(nodes = move nodes, entry = "n0");
+}
+
+fn scenario() nothrow -> Int {
+	// 1. flat_to_graph SHAPE: 2 steps -> 3 nodes, entry n0, op chain, terminal NReturn.
+	val flat = _flat_two();
+	val g = _unwrap_graph(ir.flat_to_graph(&flat));
+	if g.nodes.len != 3 { return 1; }
+	if !_seq(&g.entry, &"n0") { return 2; }
+	match &g.nodes[0] {
+		ir.IrNode::NOperation(id, operation, input, next) => {
+			if !_seq(id, &"n0") { return 3; }
+			if !_seq(operation, &"alpha") { return 4; }
+			if !_seq(next, &"n1") { return 5; }
+		},
+		default => { return 6; }
+	}
+	match &g.nodes[1] {
+		ir.IrNode::NOperation(id, operation, input, next) => {
+			if !_seq(operation, &"beta") { return 7; }
+			if !_seq(next, &"n2") { return 8; }
+		},
+		default => { return 9; }
+	}
+	match &g.nodes[2] {
+		ir.IrNode::NReturn(id, value) => { if !_seq(id, &"n2") { return 10; } },
+		default => { return 11; }
+	}
+
+	// 2. DETERMINISM: same inputs -> identical canonical.
+	val c_a = ir.graph_canonical(&g);
+	val flat_b = _flat_two();
+	val g_b = _unwrap_graph(ir.flat_to_graph(&flat_b));
+	val c_b = ir.graph_canonical(&g_b);
+	if !_seq(&c_a, &c_b) { return 20; }
+
+	// 3. flat_to_graph result must equal the hand-built straight-line graph (compat anchor).
+	val c_hand = ir.graph_canonical(&_two_op_graph(false));
+	if !_seq(&c_a, &c_hand) { return 21; }
+
+	// 4. NODE ORDER INDEPENDENCE: reversed node table, same content -> same canonical.
+	val c_rev = ir.graph_canonical(&_two_op_graph(true));
+	if !_seq(&c_hand, &c_rev) { return 22; }
+
+	// 5. NCase ARM ORDER INDEPENDENCE.
+	val c_case = ir.graph_canonical(&_case_graph(false));
+	val c_case_sw = ir.graph_canonical(&_case_graph(true));
+	if !_seq(&c_case, &c_case_sw) { return 23; }
+
+	// 6. DISTINCTNESS: a changed operation name must change the canonical.
+	var diff_steps: Array<ir.FlatStep> = [];
+	diff_steps.push(ir.FlatStep(operation = "ALPHA", input_json = "{\"a\":1}"));
+	diff_steps.push(ir.FlatStep(operation = "beta", input_json = "{\"b\":2}"));
+	val g_diff_op = _unwrap_graph(ir.flat_to_graph(&diff_steps));
+	val c_diff_op = ir.graph_canonical(&g_diff_op);
+	if _seq(&c_a, &c_diff_op) { return 24; }
+
+	// 7. DISTINCTNESS: a changed input constant must change the canonical.
+	var diff_in: Array<ir.FlatStep> = [];
+	diff_in.push(ir.FlatStep(operation = "alpha", input_json = "{\"a\":2}"));
+	diff_in.push(ir.FlatStep(operation = "beta", input_json = "{\"b\":2}"));
+	val g_diff_in = _unwrap_graph(ir.flat_to_graph(&diff_in));
+	val c_diff_in = ir.graph_canonical(&g_diff_in);
+	if _seq(&c_a, &c_diff_in) { return 25; }
+
+	// 8. DISTINCTNESS: a changed Case branch TARGET must change the canonical.
+	var arms_t: Array<ir.IrCaseArm> = [];
+	arms_t.push(ir.IrCaseArm(match_const = "\"a\"", target = "n3"));   // n2 -> n3
+	arms_t.push(ir.IrCaseArm(match_const = "\"b\"", target = "n1"));
+	var nodes_t: Array<ir.IrNode> = [];
+	nodes_t.push(ir.IrNode::NCase(id = "n0", scrutinee = ir.IrExpr::EArg(path = _empty_path()), arms = move arms_t, default_node = "n3"));
+	nodes_t.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "1")));
+	nodes_t.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "2")));
+	nodes_t.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "0")));
+	val g_case_t = ir.IrGraph(nodes = move nodes_t, entry = "n0");
+	val c_case_t = ir.graph_canonical(&g_case_t);
+	if _seq(&c_case, &c_case_t) { return 26; }
+
+	// 9. INPUT CANONICALIZATION: two plans whose inputs differ only by KEY ORDER must hash the
+	//    same (no false revision change). flat_to_graph canonicalizes the input constant.
+	var r1: Array<ir.FlatStep> = [];
+	r1.push(ir.FlatStep(operation = "op", input_json = "{\"a\":1,\"b\":2}"));
+	var r2: Array<ir.FlatStep> = [];
+	r2.push(ir.FlatStep(operation = "op", input_json = "{\"b\":2,\"a\":1}"));
+	val gr1 = _unwrap_graph(ir.flat_to_graph(&r1));
+	val gr2 = _unwrap_graph(ir.flat_to_graph(&r2));
+	val cr1 = ir.graph_canonical(&gr1);
+	val cr2 = ir.graph_canonical(&gr2);
+	if !_seq(&cr1, &cr2) { return 27; }
+
+	// 10. MALFORMED input -> Err (the only expected failure).
+	var bad: Array<ir.FlatStep> = [];
+	bad.push(ir.FlatStep(operation = "op", input_json = "{not valid"));
+	match ir.flat_to_graph(&bad) {
+		core.Result::Err(e) => {},
+		core.Result::Ok(g_bad) => { return 28; }
+	}
+
+	// 11. canonical_json directly: reordered keys collapse to one form; bad JSON -> Err.
+	val ca = ir.canonical_json(&"{\"a\":1,\"b\":2}");
+	val cb = ir.canonical_json(&"{\"b\":2,\"a\":1}");
+	match move ca {
+		core.Result::Ok(sa) => {
+			match move cb {
+				core.Result::Ok(sb) => { if !_seq(&sa, &sb) { return 29; } },
+				core.Result::Err(e) => { return 34; }
+			}
+		},
+		core.Result::Err(e) => { return 35; }
+	}
+	match ir.canonical_json(&"nope") {
+		core.Result::Err(e) => {},
+		core.Result::Ok(s) => { return 36; }
+	}
+
+	// 12. EMPTY plan -> a single NReturn, entry n0.
+	var empty: Array<ir.FlatStep> = [];
+	val g_empty = _unwrap_graph(ir.flat_to_graph(&empty));
+	if g_empty.nodes.len != 1 { return 30; }
+	if !_seq(&g_empty.entry, &"n0") { return 31; }
+	match &g_empty.nodes[0] {
+		ir.IrNode::NReturn(id, value) => { if !_seq(id, &"n0") { return 32; } },
+		default => { return 33; }
+	}
+
+	return 0;
+}
+
+fn main() nothrow -> Int {
+	val r = scenario();
+	if r != 0 { return r; }
+	return 0;
+}

@@ -49,6 +49,10 @@ test:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	# Runner-owned unit tests (the V1 control-flow graph IR in runner/src/ir.drift) are
+	# DB-free — run them as part of THIS component gate, before taking the DB lock. (ir.drift
+	# is Microflows code; this is its component home.)
+	( cd runner && just test )
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
 	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _test-locked
 

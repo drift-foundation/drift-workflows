@@ -83,14 +83,18 @@ def _wf_id():
     return uuid.uuid4().hex  # 32 hex chars
 
 
-def run_runner(runner_cfg, wf_hex, operation=None, input_json=None):
-    # Routing comes from the config registry (no --participant-url). --operation is
-    # given only for a FRESH submission; a resume runs on the workflow id alone.
+def run_runner(runner_cfg, wf_hex, operation=None, input_json=None, arguments=None):
+    # Routing comes from the config registry (no --participant-url). For a LEGACY single-op
+    # workflow, --operation is given only for a FRESH submission. For a PLANNED workflow,
+    # --arguments marks a SUBMISSION (create/reassert with those instance args); omitting it
+    # is a RESUME (drive from durable state). A resume runs on the workflow id alone.
     cmd = [str(RUNNER_BIN), "--config", runner_cfg, "--workflow-id", wf_hex]
     if operation is not None:
         cmd += ["--operation", operation]
     if input_json is not None:
         cmd += ["--input", input_json]
+    if arguments is not None:
+        cmd += ["--arguments", arguments]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
     line = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
     try:
@@ -125,6 +129,7 @@ WF_FWD_PLAN_PINNED_B = "a0000000000000000000000000000023"    # ditto (changed sc
 WF_FWD_PLAN_PINNED_C = "a0000000000000000000000000000024"    # ditto (changed participant -> revision_unavailable)
 WF_FWD_PLAN_VERSION_MISMATCH = "a0000000000000000000000000000025"  # pinned 1.0.0; run as gen 2.0.0 -> revision_unavailable (version alone)
 WF_FWD_PLAN_MALFORMED_CFG = "a0000000000000000000000000000026"   # claimable; malformed registry post-claim -> defer + release lease
+WF_LEGACY_NO_PIN = "a0000000000000000000000000000027"            # claimable legacy (no plan pin); planned resume must release the lease
 
 
 def _request_count(base):
@@ -207,13 +212,18 @@ def main():
     # the single --operation path; resume re-reads the same plan + recovers per-seq
     # from durable state. Same registry as rcf, plus the ordered steps.
     plan_cfgs = []
-    def plan_cfg(steps, version=None):
+    def plan_cfg(steps, version=None, argument_type=None):
         c = dict(runner_cfg); c["plan"] = steps
         # The loaded plan generation's immutable semantic version (default 1.0.0). A
         # process loads ONE generation; resolution is EXACT-MATCH on (plan_version AND
         # content_hash).
         if version is not None:
             c["plan_version"] = version
+        # The script's declared closed-object ARGUMENT TYPE. Submitted --arguments are
+        # validated against it; its canonical encoding is part of content_hash. Absent =>
+        # the empty-object type {} (encoded as "O{}").
+        if argument_type is not None:
+            c["argument_type"] = argument_type
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(c, f); f.close()
         plan_cfgs.append(f.name)
         return f.name
@@ -529,7 +539,7 @@ def main():
                           {"operation": "reserve", "input": {"reservation": "c2"}}])
         wfc = _wf_id()
         ex0 = _exec_count(base)
-        code, body = run_runner(cplan, wfc)
+        code, body = run_runner(cplan, wfc, arguments="{}")
         ex_d = _exec_count(base) - ex0
         ck = _mdb(f"SELECT seq, LOWER(HEX(operation_id)), "
                   f"JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reservation')) "
@@ -657,7 +667,7 @@ def main():
         ncplan = plan_cfg([{"operation": "echo-transform", "input": {"values": [1, 2, 3]}}])
         wfnc = _wf_id()
         ex0 = _exec_count(base)
-        code, body = run_runner(ncplan, wfnc)
+        code, body = run_runner(ncplan, wfnc, arguments="{}")
         wf = _mdb(f"SELECT state FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wfnc}')")
         check("forward_plan_single_noncompensable",
               code == 0 and body.get("workflow") == "completed"
@@ -673,10 +683,149 @@ def main():
         _named_f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         json.dump(named, _named_f); _named_f.close(); plan_cfgs.append(_named_f.name)
         wfnm = _wf_id()
-        code, body = run_runner(_named_f.name, wfnm)
+        code, body = run_runner(_named_f.name, wfnm, arguments="{}")
         nm = _mdb(f"SELECT script_name FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wfnm}')")
         check("forward_named_plan_completes",
               code == 0 and body.get("workflow") == "completed" and nm == [["checkout-v1"]], (code, body, nm))
+
+        # C5c. ARGUMENT IDENTITY on (re)submission + canonical equivalence (review items 1+3).
+        # A planned SUBMISSION carries instance arguments (--arguments). Resubmitting the SAME
+        # id with the SAME content in a DIFFERENT key order is canonicalized at the command
+        # boundary and is idempotent (never a false workflow_conflict); resubmitting with
+        # DIFFERENT content is rejected workflow_conflict (instance arguments are immutable).
+        ab_type = {"type": "object", "fields": [
+            {"name": "a", "type": {"type": "int"}}, {"name": "b", "type": {"type": "int"}}]}
+        aplan = plan_cfg([{"operation": "echo-transform", "input": {"values": [7, 8, 9]}}], argument_type=ab_type)
+        wfa = _wf_id()
+        code, body = run_runner(aplan, wfa, arguments='{"b":2,"a":1}')   # reordered keys
+        check("forward_args_submit_completes",
+              code == 0 and body.get("workflow") == "completed", (code, body))
+        # resubmit, SAME content, canonical order -> idempotent terminal replay (no conflict).
+        code, body = run_runner(aplan, wfa, arguments='{"a":1,"b":2}')
+        check("forward_args_reorder_equivalent",
+              code == 0 and body.get("workflow") == "already_terminal", (code, body))
+        # resubmit, DIFFERENT content -> workflow_conflict (no resume under changed args).
+        code, body = run_runner(aplan, wfa, arguments='{"a":1,"b":9}')
+        check("forward_args_resubmit_conflict",
+              code == 9 and body.get("workflow") == "deferred"
+              and body.get("reason") == "workflow_conflict", (code, body))
+
+        # C5d. ARGUMENT-TYPE VALIDATION before creation (Step 1b). A richer declared type
+        # exercises every validation axis; a valid object completes, each malformed object is
+        # rejected as `invalid_arguments` with NO durable instance written.
+        vtype = {"type": "object", "fields": [
+            {"name": "id", "type": {"type": "int"}},
+            {"name": "name", "type": {"type": "string"}},
+            {"name": "tags", "type": {"type": "array", "elem": {"type": "string"}}},
+            {"name": "meta", "type": {"type": "object", "fields": [
+                {"name": "k", "type": {"type": "int"}}]}},
+            {"name": "note", "type": {"type": "optional", "inner": {"type": "string"}}}]}
+        vplan = plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}], argument_type=vtype)
+
+        def _submit_args(args_obj):
+            return run_runner(vplan, _wf_id(), arguments=json.dumps(args_obj))
+
+        def _check_valid(name, args_obj):
+            code, body = _submit_args(args_obj)
+            check(name, code == 0 and body.get("workflow") == "completed", (code, body))
+
+        def _check_invalid(name, args_obj):
+            code, body = _submit_args(args_obj)
+            check(name, code == 2 and body.get("workflow") == "aborted"
+                  and body.get("reason") == "invalid_arguments", (code, body))
+
+        _full = {"id": 1, "name": "x", "tags": ["a", "b"], "meta": {"k": 2}, "note": "hi"}
+        _check_valid("args_valid_full", _full)
+        # valid with the OPTIONAL field absent.
+        _check_valid("args_valid_optional_absent", {"id": 1, "name": "x", "tags": [], "meta": {"k": 2}})
+        # valid with fields in a DIFFERENT order (canonicalized; still conforms).
+        _check_valid("args_valid_reordered", {"note": "hi", "meta": {"k": 2}, "tags": ["a"], "name": "x", "id": 1})
+        _check_invalid("args_missing_field", {"name": "x", "tags": [], "meta": {"k": 2}})           # no 'id'
+        _check_invalid("args_extra_field", {**_full, "extra": 1})                                    # undeclared field
+        _check_invalid("args_wrong_scalar", {"id": "nope", "name": "x", "tags": [], "meta": {"k": 2}})  # id not int
+        _check_invalid("args_nested_object_mismatch", {"id": 1, "name": "x", "tags": [], "meta": {"k": "no"}})  # meta.k not int
+        _check_invalid("args_array_element_mismatch", {"id": 1, "name": "x", "tags": [1, 2], "meta": {"k": 2}})  # tags not strings
+        # A rejected submission writes NO durable state: query the workflow + args tables.
+        wf_inv = _wf_id()
+        code, body = run_runner(vplan, wf_inv, arguments=json.dumps({"name": "x", "tags": [], "meta": {"k": 2}}))  # missing id
+        inv_wf = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wf_inv}')")
+        inv_args = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_args WHERE workflow_id = UNHEX('{wf_inv}')")
+        check("args_invalid_no_durable_state",
+              code == 2 and body.get("reason") == "invalid_arguments"
+              and inv_wf == [["0"]] and inv_args == [["0"]], (code, body, inv_wf, inv_args))
+
+        # C5e. EXACT NUMERIC semantics (no implicit coercion). Int = integer-shaped + in range;
+        # Float = float-shaped + finite.
+        ntype = {"type": "object", "fields": [
+            {"name": "id", "type": {"type": "int"}}, {"name": "ratio", "type": {"type": "float"}}]}
+        nplan = plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}], argument_type=ntype)
+
+        def _nsubmit(raw):  # raw JSON string (so we can send 1e400 etc.)
+            return run_runner(nplan, _wf_id(), arguments=raw)
+
+        code, body = _nsubmit('{"id":1,"ratio":1.5}')
+        check("args_num_valid", code == 0 and body.get("workflow") == "completed", (code, body))
+        for nm, raw in [
+            ("args_int_rejects_float_shaped", '{"id":1.0,"ratio":1.5}'),
+            ("args_int_rejects_overflow", '{"id":99999999999999999999,"ratio":1.5}'),
+            ("args_float_rejects_integer_shaped", '{"id":1,"ratio":2}'),
+            ("args_float_rejects_non_finite", '{"id":1,"ratio":1e400}'),
+        ]:
+            code, body = _nsubmit(raw)
+            check(nm, code == 2 and body.get("reason") == "invalid_arguments", (nm, code, body))
+
+        # C5f. UNKNOWN KEY in a type/field declaration is rejected (a typo must not silently
+        # produce an unintended contract whose dropped data is absent from content_hash). The
+        # malformed argument_type fails registry build, so the submission does not succeed.
+        bad_type = {"type": "object", "fields": [
+            {"name": "a", "type": {"type": "int", "bogus": 1}}]}   # unknown key "bogus"
+        badplan = plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}], argument_type=bad_type)
+        wf_bad = _wf_id()
+        code, body = run_runner(badplan, wf_bad, arguments='{"a":1}')
+        bad_plan_rows = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_plan WHERE workflow_id = UNHEX('{wf_bad}')")
+        check("args_type_unknown_key_rejected",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config"
+              and bad_plan_rows == [["0"]], (code, body, bad_plan_rows))
+
+        # C5g. DECLARATION-ORDER hash-equivalence: the type's canonical encoding sorts fields,
+        # so two configs differing ONLY in field order produce the SAME content_hash.
+        t_ab = {"type": "object", "fields": [
+            {"name": "a", "type": {"type": "int"}}, {"name": "b", "type": {"type": "int"}}]}
+        t_ba = {"type": "object", "fields": [
+            {"name": "b", "type": {"type": "int"}}, {"name": "a", "type": {"type": "int"}}]}
+        wf_ab = _wf_id(); wf_ba = _wf_id()
+        run_runner(plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}], argument_type=t_ab),
+                   wf_ab, arguments='{"a":1,"b":2}')
+        run_runner(plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}], argument_type=t_ba),
+                   wf_ba, arguments='{"a":1,"b":2}')
+        h_ab = _mdb(f"SELECT LOWER(HEX(content_hash)) FROM tb_mf_workflow_plan WHERE workflow_id = UNHEX('{wf_ab}')")
+        h_ba = _mdb(f"SELECT LOWER(HEX(content_hash)) FROM tb_mf_workflow_plan WHERE workflow_id = UNHEX('{wf_ba}')")
+        check("args_type_declaration_order_hash_equivalent",
+              h_ab == h_ba and h_ab and h_ab != [["NULL"]], (h_ab, h_ba))
+
+        # C5h. EXISTING-workflow reassertion must NOT validate arguments against the ACTIVE
+        # type — only a FRESH submission does (a rollout may change the declared type). Create
+        # under {a:int}; resubmit under a DIFFERENT active type {b:int} with the SAME (v1-valid)
+        # args -> idempotent terminal replay, NOT invalid_arguments.
+        ta = {"type": "object", "fields": [{"name": "a", "type": {"type": "int"}}]}
+        tb = {"type": "object", "fields": [{"name": "b", "type": {"type": "int"}}]}
+        wfre = _wf_id()
+        code, body = run_runner(plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}], argument_type=ta),
+                                wfre, arguments='{"a":1}')
+        check("forward_args_existing_setup", code == 0 and body.get("workflow") == "completed", (code, body))
+        code, body = run_runner(plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}], argument_type=tb),
+                                wfre, arguments='{"a":1}')   # {"a":1} is INVALID for {b:int}
+        check("forward_args_existing_not_revalidated",
+              code == 0 and body.get("workflow") == "already_terminal", (code, body))
+
+        # C5i. CONCURRENT-LEGACY-ID race (pinned via a seeded legacy workflow with no plan pin):
+        # a planned RESUME claims it, reloads, finds no durable pin, and RELEASES the lease
+        # (never leaks it) before reporting not_found.
+        code, body = run_runner(cplan, WF_LEGACY_NO_PIN)   # resume (no --arguments)
+        lease = _mdb(f"SELECT lease_owner FROM tb_mf_workflow WHERE workflow_id = UNHEX('{WF_LEGACY_NO_PIN}')")
+        check("forward_legacy_id_no_lease_leak",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "not_found"
+              and lease == [["NULL"]], (code, body, lease))
 
         # C6. FIRST-operation rejection begins reversal: a definite forward failure of op1
         # (no prior checkpoint) reverses straight to `reversed` — never blocks. The second
@@ -685,7 +834,7 @@ def main():
                            {"operation": "reserve", "input": {"reservation": "fr2"}}])
         wffr = _wf_id()
         ex0 = _exec_count(base)
-        code, body = run_runner(frplan, wffr)
+        code, body = run_runner(frplan, wffr, arguments="{}")
         wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wffr}')")
         ncp = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wffr}')")
         check("forward_first_reject_reverses",
@@ -703,7 +852,7 @@ def main():
                           {"operation": "reserve", "input": {"reservation": "d2", "_fault": {"reject": True}}}])
         wfd = _wf_id()
         ex0 = _exec_count(base)
-        code, body = run_runner(dplan, wfd)
+        code, body = run_runner(dplan, wfd, arguments="{}")
         ex_d = _exec_count(base) - ex0
         check("forward_fail_begins_reversal",
               code == 0 and body.get("workflow") == "reversed" and ex_d == 2, (code, body, ex_d))
@@ -747,7 +896,7 @@ def main():
                            {"operation": "reserve", "input": {"reservation": "la2", "_fault": {"reject": True}}}])
         wfla = _wf_id()
         ex0, pu0, rq0 = _exec_count(base), _put_count(base), _request_count(base)
-        code, body = run_runner(laplan, wfla)
+        code, body = run_runner(laplan, wfla, arguments="{}")
         ex_d, pu_d, rq_d = _exec_count(base) - ex0, _put_count(base) - pu0, _request_count(base) - rq0
         check("forward_fail_lost_ack",
               code == 0 and body.get("workflow") == "reversed"
@@ -799,7 +948,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 45
+    EXPECTED_CHECKS = 67
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

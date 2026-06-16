@@ -58,6 +58,7 @@ UNIT_ROOT = "packages/microflows/tests/unit"
 LIVE_TESTS = [
     "packages/microflows/tests/e2e/live_lease_test.drift",
     "packages/microflows/tests/e2e/live_reversal_test.drift",
+    "packages/microflows/tests/e2e/live_args_test.drift",
 ]
 
 # Per-invocation nonce → fresh fixture namespace each `just test`.

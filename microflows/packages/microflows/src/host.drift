@@ -64,7 +64,8 @@ export {
 	ReverseHeadOutcome,
 	CreatePlannedOutcome,
 	PinnedScript,
-	PlanGetOutcome
+	PlanGetOutcome,
+	ArgsGetOutcome
 };
 
 // ===== Identity =====
@@ -313,12 +314,23 @@ pub variant CreatePlannedOutcome {
 	// The workflow_id exists under a CONTRADICTORY identity: a DIFFERENT stored plan name
 	// (id collision — must not adopt the other plan), or a NON-plan (legacy) workflow with
 	// no pin to return. It cannot be (re)interpreted as this plan.
-	PlanConflict(plan_length: Int)
+	PlanConflict(plan_length: Int),
+	// The workflow_id exists under the SAME plan name but DIFFERENT instance arguments
+	// (compared byte-for-byte on the canonical args document). Instance data is immutable —
+	// a different argument object is a different instance, not an adoptable race winner.
+	WorkflowConflict(plan_length: Int)
 }
 
 // plan_get: read a workflow's durable pinned identity (registry-independent).
 pub variant PlanGetOutcome {
 	Found(pin: PinnedScript),
+	NotFound
+}
+
+// args_get: read a workflow's durable instance arguments (the canonical JSON object).
+// Resume reads this, never submission/CLI input.
+pub variant ArgsGetOutcome {
+	Found(args_json: String),
 	NotFound
 }
 
@@ -402,16 +414,22 @@ pub interface MicroflowsHost {
 	fn create_workflow(self: &Self, workflow_id: &Array<Byte>, script_name: &String,
 	                   script_revision: Int, event_ts: &String, next_attempt_at: &String,
 	                   continuation_json: &String, event_payload_json: &String) -> CreateOutcome;
-	// Create a workflow AND pin its plan (plan_version + content_hash + length)
-	// atomically. Idempotent; Created/Exists return the committed pin (Exists returns
-	// the WINNING durable pin); PlanConflict on a contradictory identity — a different
-	// stored plan name (id collision) or a legacy non-plan workflow.
+	// Create a workflow AND pin its plan (plan_version + content_hash + length) + its
+	// instance arguments atomically. The argument object (`args_json`) is CANONICALIZED at
+	// this command boundary (ordered-key compact UTF-8) before storage/compare, so reordered
+	// keys never produce a false conflict. Idempotent; Created/Exists return the committed pin
+	// (Exists returns the WINNING durable pin); PlanConflict on a contradictory identity
+	// (different plan name / legacy non-plan); WorkflowConflict when the same plan name is
+	// reused with different canonical argument bytes.
 	fn create_planned(self: &Self, workflow_id: &Array<Byte>, script_name: &String,
 	                  plan_version: &String, event_ts: &String, next_attempt_at: &String,
 	                  continuation_json: &String, event_payload_json: &String,
-	                  content_hash: &Array<Byte>, plan_length: Int) -> CreatePlannedOutcome;
+	                  content_hash: &Array<Byte>, plan_length: Int,
+	                  args_json: &String) -> CreatePlannedOutcome;
 	// Read a workflow's durable pinned script-revision identity (registry-independent).
 	fn plan_get(self: &Self, workflow_id: &Array<Byte>) -> PlanGetOutcome;
+	// Read a workflow's durable instance arguments (resume reads this, never CLI input).
+	fn args_get(self: &Self, workflow_id: &Array<Byte>) -> ArgsGetOutcome;
 	// Claim the next due instance of one script (§24.2). db_now and
 	// lease_expires_at come from clock_read, fixed for this command.
 	fn claim_next(self: &Self, script_name: &String, db_now: &String,
@@ -542,55 +560,96 @@ pub fn build_host(var b: HostBuilder) nothrow -> core.Result<arc.Arc<MicroflowsH
 		Optional::None => { json.new_object().to_node() }
 	};
 
-	try {
-		val rpc_cfg: rpc.RpcConnectionConfig = _build_rpc_config_from_json_throwing(&cfg_node);
-		val pool_cfg: pool.PoolConfig = _build_pool_config_from_json_throwing(&cfg_node);
-		val p: pool.ConnectionPool = pool.open(move rpc_cfg, move pool_cfg).or_throw();
-
-		val inst = HostImpl(
-			identity = move taken_identity,
-			pool = move p
-		);
-		val inst_arc: arc.Arc<HostImpl> = arc.arc(move inst);
-		val host: arc.Arc<MicroflowsHost> = inst_arc.as_interface<type MicroflowsHost>();
-		return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Ok(move host);
-	} catch managed:ManagedError(e) {
-		return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(
-			HostConfigError(
-				kind = HostConfigErrorKind::PoolOpenFailed(upstream_tag = _dup(&e.tag)),
-				path = ""
-			)
-		);
-	} catch HostConfigError(e) {
-		return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(move e);
-	} catch unexpected {
-		return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(
-			HostConfigError(
-				kind = HostConfigErrorKind::PoolOpenFailed(upstream_tag = "unexpected"),
-				path = ""
-			)
-		);
+	// Errors-as-values: the parsers RETURN Result<_, HostConfigError> so the structured error
+	// stays a movable native value and never round-trips through throw/catch. (A caught
+	// HostConfigError cannot be re-raised in its concrete form — its `kind` is a non-scalar
+	// variant field, outside the v1 typed-catch projection boundary; confirmed an intentional
+	// toolchain limitation, 2026-06-15.) Statement-form matches: the Err arm returns the value,
+	// the Ok arm carries the config forward. pool.open's Result is matched directly — no try
+	// (match-arm bindings are not in scope inside a nested try block).
+	match _build_rpc_config_from_json(&cfg_node) {
+		core.Result::Err(cfg_err) => {
+			return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(move cfg_err);
+		},
+		core.Result::Ok(rpc_cfg) => {
+			match _build_pool_config_from_json(&cfg_node) {
+				core.Result::Err(cfg_err) => {
+					return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(move cfg_err);
+				},
+				core.Result::Ok(pool_cfg) => {
+					match pool.open(move rpc_cfg, move pool_cfg) {
+						core.Result::Err(open_err) => {
+							return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(
+								HostConfigError(
+									kind = HostConfigErrorKind::PoolOpenFailed(upstream_tag = _dup(&open_err.tag)),
+									path = ""
+								)
+							);
+						},
+						core.Result::Ok(p) => {
+							val inst = HostImpl(
+								identity = move taken_identity,
+								pool = move p
+							);
+							val inst_arc: arc.Arc<HostImpl> = arc.arc(move inst);
+							val host: arc.Arc<MicroflowsHost> = inst_arc.as_interface<type MicroflowsHost>();
+							return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Ok(move host);
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
 // ===== JSON config parsing =====
 
-fn _build_rpc_config_from_json_throwing(node: &json.JsonNode) -> rpc.RpcConnectionConfig {
-	val backend: String = _read_string_throws(node, &"backend");
+// Errors-as-values: returns Result<_, HostConfigError>; a parse failure is a movable native
+// HostConfigError, never thrown/recaught. Flat propagation idiom: `var x = <default>; match`
+// (a statement-form match may `return` from an arm; expression-form `val x = match …` may not).
+fn _build_rpc_config_from_json(node: &json.JsonNode)
+	nothrow -> core.Result<rpc.RpcConnectionConfig, HostConfigError>
+{
+	var backend: String = "";
+	match _read_required_string(node, &"backend") {
+		core.Result::Ok(s) => { backend = move s; },
+		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
+	}
 	if backend != "mariadb" {
-		throw HostConfigError(
-			kind = HostConfigErrorKind::JsonUnknownBackend(value = move backend),
-			path = "backend"
+		return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(
+			HostConfigError(kind = HostConfigErrorKind::JsonUnknownBackend(value = move backend), path = "backend")
 		);
 	}
-	val host: String = _read_string_throws(node, &"host");
-	val port: Int = _read_int_throws(node, &"port");
-	if port < 1 or port > 65535 {
-		throw HostConfigError(kind = HostConfigErrorKind::JsonPortOutOfRange(value = port), path = "port");
+	var host: String = "";
+	match _read_required_string(node, &"host") {
+		core.Result::Ok(s) => { host = move s; },
+		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
 	}
-	val user: String = _read_string_throws(node, &"user");
-	val password: String = _read_string_throws(node, &"password");
-	val database: String = _read_string_throws(node, &"database");
+	var port: Int = 0;
+	match _read_required_int(node, &"port") {
+		core.Result::Ok(v) => { port = v; },
+		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
+	}
+	if port < 1 or port > 65535 {
+		return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(
+			HostConfigError(kind = HostConfigErrorKind::JsonPortOutOfRange(value = port), path = "port")
+		);
+	}
+	var user: String = "";
+	match _read_required_string(node, &"user") {
+		core.Result::Ok(s) => { user = move s; },
+		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
+	}
+	var password: String = "";
+	match _read_required_string(node, &"password") {
+		core.Result::Ok(s) => { password = move s; },
+		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
+	}
+	var database: String = "";
+	match _read_required_string(node, &"database") {
+		core.Result::Ok(s) => { database = move s; },
+		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
+	}
 	val connect_timeout_ms: Int = _read_optional_positive_int(node, &"connect_timeout_ms", 5000);
 	val io_timeout_ms: Int = _read_optional_positive_int(node, &"io_timeout_ms", 30000);
 
@@ -604,17 +663,18 @@ fn _build_rpc_config_from_json_throwing(node: &json.JsonNode) -> rpc.RpcConnecti
 	builder.with_read_timeout_ms(io_timeout_ms);
 	builder.with_write_timeout_ms(io_timeout_ms);
 	match rpc.build_connection_config(move builder) {
-		core.Result::Ok(cfg) => { return move cfg; },
+		core.Result::Ok(cfg) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Ok(move cfg); },
 		core.Result::Err(_) => {
-			throw HostConfigError(
-				kind = HostConfigErrorKind::RpcConfigInvalid(upstream_tag = "rpc-config-build-failed"),
-				path = ""
+			return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(
+				HostConfigError(kind = HostConfigErrorKind::RpcConfigInvalid(upstream_tag = "rpc-config-build-failed"), path = "")
 			);
 		}
 	}
 }
 
-fn _build_pool_config_from_json_throwing(node: &json.JsonNode) -> pool.PoolConfig {
+fn _build_pool_config_from_json(node: &json.JsonNode)
+	nothrow -> core.Result<pool.PoolConfig, HostConfigError>
+{
 	var pc: pool.PoolConfig = pool.default_pool_config();
 
 	val pool_opt: Optional<&json.JsonNode> = node.get(&"pool");
@@ -622,28 +682,28 @@ fn _build_pool_config_from_json_throwing(node: &json.JsonNode) -> pool.PoolConfi
 		Optional::Some(psub) => {
 			match psub.get_int_at_path(&"min_idle") {
 				Optional::Some(v) => {
-					if v < 0 { throw HostConfigError(kind = HostConfigErrorKind::JsonPoolSizingInvalid(key = "min_idle", value = v), path = "pool.min_idle"); }
+					if v < 0 { return core.Result<pool.PoolConfig, HostConfigError>::Err(HostConfigError(kind = HostConfigErrorKind::JsonPoolSizingInvalid(key = "min_idle", value = v), path = "pool.min_idle")); }
 					pc.min_idle = v;
 				},
 				Optional::None => {}
 			}
 			match psub.get_int_at_path(&"max_conns") {
 				Optional::Some(v) => {
-					if v < 1 { throw HostConfigError(kind = HostConfigErrorKind::JsonPoolSizingInvalid(key = "max_conns", value = v), path = "pool.max_conns"); }
+					if v < 1 { return core.Result<pool.PoolConfig, HostConfigError>::Err(HostConfigError(kind = HostConfigErrorKind::JsonPoolSizingInvalid(key = "max_conns", value = v), path = "pool.max_conns")); }
 					pc.max_conns = v;
 				},
 				Optional::None => {}
 			}
 			match psub.get_int_at_path(&"idle_timeout_ms") {
 				Optional::Some(v) => {
-					if v <= 0 { throw HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "idle_timeout_ms", value = v), path = "pool.idle_timeout_ms"); }
+					if v <= 0 { return core.Result<pool.PoolConfig, HostConfigError>::Err(HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "idle_timeout_ms", value = v), path = "pool.idle_timeout_ms")); }
 					pc.idle_timeout_ms = v;
 				},
 				Optional::None => {}
 			}
 			match psub.get_int_at_path(&"keepalive_interval_ms") {
 				Optional::Some(v) => {
-					if v < 0 { throw HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "keepalive_interval_ms", value = v), path = "pool.keepalive_interval_ms"); }
+					if v < 0 { return core.Result<pool.PoolConfig, HostConfigError>::Err(HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "keepalive_interval_ms", value = v), path = "pool.keepalive_interval_ms")); }
 					pc.keepalive_interval_ms = v;
 				},
 				Optional::None => {}
@@ -653,39 +713,47 @@ fn _build_pool_config_from_json_throwing(node: &json.JsonNode) -> pool.PoolConfi
 	}
 
 	// Always bound the pool acquire (mirrors Singular: never block forever).
-	pc.acquire_timeout = Optional<conc.Duration>::Some(conc.Duration(millis = _read_acquire_timeout_ms(node)));
+	var acquire_ms: Int = 5000;
+	match _read_acquire_timeout_ms(node) {
+		core.Result::Ok(v) => { acquire_ms = v; },
+		core.Result::Err(e) => { return core.Result<pool.PoolConfig, HostConfigError>::Err(move e); }
+	}
+	pc.acquire_timeout = Optional<conc.Duration>::Some(conc.Duration(millis = acquire_ms));
 
-	return move pc;
+	return core.Result<pool.PoolConfig, HostConfigError>::Ok(move pc);
 }
 
-fn _read_acquire_timeout_ms(node: &json.JsonNode) -> Int {
+fn _read_acquire_timeout_ms(node: &json.JsonNode) nothrow -> core.Result<Int, HostConfigError> {
 	match node.get(&"pool") {
 		Optional::Some(psub) => {
 			match psub.get_int_at_path(&"acquire_timeout_ms") {
 				Optional::Some(v) => {
-					if v <= 0 { throw HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "acquire_timeout_ms", value = v), path = "pool.acquire_timeout_ms"); }
-					return v;
+					if v <= 0 { return core.Result<Int, HostConfigError>::Err(HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "acquire_timeout_ms", value = v), path = "pool.acquire_timeout_ms")); }
+					return core.Result<Int, HostConfigError>::Ok(v);
 				},
-				Optional::None => { return 5000; }
+				Optional::None => { return core.Result<Int, HostConfigError>::Ok(5000); }
 			}
 		},
-		Optional::None => { return 5000; }
+		Optional::None => { return core.Result<Int, HostConfigError>::Ok(5000); }
 	}
 }
 
-fn _read_string_throws(node: &json.JsonNode, key: &String) -> String {
+fn _read_required_string(node: &json.JsonNode, key: &String)
+	nothrow -> core.Result<String, HostConfigError>
+{
 	val opt: Optional<&json.JsonNode> = node.get(key);
 	match opt {
 		Optional::None => {
-			throw HostConfigError(kind = HostConfigErrorKind::JsonMissingKey(key = _dup(key)), path = _dup(key));
+			return core.Result<String, HostConfigError>::Err(
+				HostConfigError(kind = HostConfigErrorKind::JsonMissingKey(key = _dup(key)), path = _dup(key))
+			);
 		},
 		Optional::Some(n) => {
 			match n.as_string() {
-				Optional::Some(s) => { return move s; },
+				Optional::Some(s) => { return core.Result<String, HostConfigError>::Ok(move s); },
 				Optional::None => {
-					throw HostConfigError(
-						kind = HostConfigErrorKind::JsonBadType(key = _dup(key), expected = "String"),
-						path = _dup(key)
+					return core.Result<String, HostConfigError>::Err(
+						HostConfigError(kind = HostConfigErrorKind::JsonBadType(key = _dup(key), expected = "String"), path = _dup(key))
 					);
 				}
 			}
@@ -693,19 +761,22 @@ fn _read_string_throws(node: &json.JsonNode, key: &String) -> String {
 	}
 }
 
-fn _read_int_throws(node: &json.JsonNode, key: &String) -> Int {
+fn _read_required_int(node: &json.JsonNode, key: &String)
+	nothrow -> core.Result<Int, HostConfigError>
+{
 	val opt: Optional<&json.JsonNode> = node.get(key);
 	match opt {
 		Optional::None => {
-			throw HostConfigError(kind = HostConfigErrorKind::JsonMissingKey(key = _dup(key)), path = _dup(key));
+			return core.Result<Int, HostConfigError>::Err(
+				HostConfigError(kind = HostConfigErrorKind::JsonMissingKey(key = _dup(key)), path = _dup(key))
+			);
 		},
 		Optional::Some(n) => {
 			match n.as_int() {
-				Optional::Some(v) => { return v; },
+				Optional::Some(v) => { return core.Result<Int, HostConfigError>::Ok(v); },
 				Optional::None => {
-					throw HostConfigError(
-						kind = HostConfigErrorKind::JsonBadType(key = _dup(key), expected = "Int"),
-						path = _dup(key)
+					return core.Result<Int, HostConfigError>::Err(
+						HostConfigError(kind = HostConfigErrorKind::JsonBadType(key = _dup(key), expected = "Int"), path = _dup(key))
 					);
 				}
 			}
@@ -800,7 +871,8 @@ implement MicroflowsHost for HostImpl {
 	pub fn create_planned(self: &HostImpl, workflow_id: &Array<Byte>, script_name: &String,
 	                      plan_version: &String, event_ts: &String, next_attempt_at: &String,
 	                      continuation_json: &String, event_payload_json: &String,
-	                      content_hash: &Array<Byte>, plan_length: Int) -> CreatePlannedOutcome {
+	                      content_hash: &Array<Byte>, plan_length: Int,
+	                      args_json: &String) -> CreatePlannedOutcome {
 		_validate_id16("workflow_id", workflow_id);
 		if content_hash.len != 33 { throw HostException(kind = HostErrorKind::InvalidArg(field = "content_hash")); }
 		_validate_nonempty("script_name", script_name);
@@ -808,6 +880,10 @@ implement MicroflowsHost for HostImpl {
 		if plan_length < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "plan_length")); }
 		_validate_nonempty("event_ts", event_ts);
 		_validate_nonempty("next_attempt_at", next_attempt_at);
+		// Canonicalize the arguments at the command boundary (ordered-key compact UTF-8) and
+		// pass them as BYTES, so the proc stores + byte-compares a canonical document (never
+		// collated text, never a caller's incidental key order).
+		val args_canon = _canonical_args(args_json);
 		try {
 			var lease = _acquire_conn(self);
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
@@ -821,13 +897,34 @@ implement MicroflowsHost for HostImpl {
 			args.push(_meta_object_arg("event_payload", event_payload_json));
 			args.push(rpc.arg_bytes(_dup_bytes(content_hash)));
 			args.push(rpc.arg_int(plan_length));
+			args.push(rpc.arg_bytes(_utf8_bytes(&args_canon)));
 			val sp: String = "sp_mf_workflow_create_planned";
 			val doc = _call_sp_doc(conn, &sp, move args);
 			val outcome = _doc_outcome(&doc);
 			if outcome == "created" { return CreatePlannedOutcome::Created(_decode_pin(&doc)); }
 			if outcome == "exists" { return CreatePlannedOutcome::Exists(_decode_pin(&doc)); }
 			if outcome == "plan_conflict" { return CreatePlannedOutcome::PlanConflict(_doc_int_req(&doc, &"plan_length", "create-planned-no-plan-length")); }
+			if outcome == "workflow_conflict" { return CreatePlannedOutcome::WorkflowConflict(_doc_int_req(&doc, &"plan_length", "create-planned-no-plan-length")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:create_planned"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn args_get(self: &HostImpl, workflow_id: &Array<Byte>) -> ArgsGetOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			val sp: String = "sp_mf_args_get";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "found" { return ArgsGetOutcome::Found(_doc_object_text_req(&doc, &"args")); }
+			if outcome == "not_found" { return ArgsGetOutcome::NotFound(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:args_get"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
 			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
@@ -1538,6 +1635,33 @@ fn _is_json_object(s: &String) nothrow -> Bool {
 		},
 		core.Result::Err(_) => { return false; }
 	}
+}
+
+// Canonicalize an arguments JSON document to ORDERED-KEY COMPACT UTF-8. Enforced at the
+// command boundary: a caller's incidental key order/whitespace can never produce a false
+// workflow_conflict. A non-object / malformed value is rejected (InvalidJson).
+fn _canonical_args(args_json: &String) -> String {
+	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
+	// STRICT: reject duplicate keys + non-standard numbers, so the canonical argument document
+	// (and the workflow_conflict identity it backs) is well-defined.
+	match json.parse_strict(args_json) {
+		core.Result::Ok(node) => {
+			match node.as_object() {
+				Optional::Some(_) => { return json.encode_compact_with_config(&node, &cfg); },
+				Optional::None => { throw HostException(kind = HostErrorKind::InvalidJson(field = "arguments")); }
+			}
+		},
+		core.Result::Err(_) => { throw HostException(kind = HostErrorKind::InvalidJson(field = "arguments")); }
+	}
+}
+
+// UTF-8 bytes of a String (for a binary RPC argument).
+fn _utf8_bytes(s: &String) nothrow -> Array<Byte> {
+	val n = s.byte_length();
+	var out: Array<Byte> = [];
+	var i = 0;
+	while i < n { out.push(s.byte_at(i)); i = i + 1; }
+	return move out;
 }
 
 // Required JSON object document argument (continuation): empty/malformed/
