@@ -160,6 +160,34 @@ bodies, and remote ops in iteration remain deferred.
   expressions (`map`/`filter`/`fold`). Deferred: source-language parser, `while`, node-graph loop
   bodies, remote operations inside iteration, `case` config surface.
 
+## Landed: manual-IR control flow — `case` (NCase from graph config)
+
+`NCase` is now reachable from the graph config. The interpreter, structural validation, `op_depth`,
+and reversal already supported it (`_succs` includes every arm target + default, so all the
+execution-model invariants apply unchanged); this slice adds ONLY the config surface + hardening.
+Pure control flow: no durable boundary, no continuation/event.
+- **Config.** `{"kind":"case","id":...,"scrutinee":<expr>,"arms":[{"match":<json>,"target":...},...],
+  "default":...}`. Strict keys (case node = 5; each arm = exactly `{match,target}`); `default` is
+  REQUIRED. The arm `match` is canonicalized into the match constant (so `{"a":1,"b":2}` and
+  `{"b":2,"a":1}` collapse to one arm). `validate_graph` (unchanged) enforces canonical/valid match
+  constants and rejects DUPLICATE arm constants; replay takes the first matching arm else `default`.
+- **Execution model preserved.** `op_depth` stays uniform across every arm AND the default (an
+  op-unbalanced case is rejected at build → `invalid_config`); `nonfinal_operations` enforces
+  compensation across all reachable paths, so a forward failure reverses only the taken arm's
+  checkpoints.
+- **Tests.** Unit (`ir_exec_test`): valid case parses+validates; duplicate arm constants (different
+  spelling, same canonical) rejected; missing `default` / unknown arm key / missing `match` /
+  unknown node key rejected. Integration (C8): matching arm selected from durable args; default arm
+  when no match; no durable event at the case boundary (event-count parity with a 1-op plan);
+  claimable RESUME replays the same selection from durable args (else it would FAULT, not stay
+  pending); op-unbalanced case rejected before dispatch; branch reversal compensates ONLY the taken
+  case path (untaken arms have no op row/checkpoint/execution). Integration 90/90 (was 84); full
+  `just test` green.
+- **The manual graph now supports:** straight-line, `if`, `case`, `let`, `return`, and finite array
+  expressions (`map`/`filter`/`fold`). Remaining runtime-side frontend work: cross-branch result
+  merge / typed value refinements. Deferred until the manual IR is fully proven: the source-language
+  parser, `while`, node-graph loop bodies, remote operations inside iteration.
+
 ## Landed: chunk 2 PART 2 — runner adopts the graph
 Delivered in verifiable stages.
 - **Stage 1 (LANDED, full gate green):** the graph is authoritative for IDENTITY + VALIDATION.

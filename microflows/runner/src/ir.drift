@@ -420,12 +420,14 @@ fn _nid(i: Int) nothrow -> String { return "n" + fmt.format_int(i); }
 //          | {"kind":"return","id":...,"value":<expr>}
 //          | {"kind":"map"|"filter","id":...,"source":<expr>,"elem":NAME,"as":NAME,"body":<expr>,"next":...}
 //          | {"kind":"fold","id":...,"source":<expr>,"elem":NAME,"as":NAME,"init":<expr>,"body":<expr>,"next":...}
+//          | {"kind":"case","id":...,"scrutinee":<expr>,"arms":[{"match":<json>,"target":...},...],"default":...}
 //   <expr> = {"const":<json>} | {"arg":[seg,...]} | {"result":{"node":...,"path":[seg,...]}}
 //          | {"local":{"name":...,"path":[seg,...]}}     ("path" optional, default [])
-// `const` values are canonicalized into the EConst literal. map/filter/fold are FINITE ARRAY
-// EXPRESSIONS (NLoop): the result binds to local `as`, the body is a pure IrExpr (no remote ops).
-// NCase is intentionally NOT expressible here yet. Returns a Result (IrError caught HERE) so
-// callers in other modules need no error-type-qualified catch.
+// `const` and case-arm `match` values are canonicalized into a CANONICAL JSON literal. map/filter/
+// fold are FINITE ARRAY EXPRESSIONS (NLoop): the result binds to local `as`, the body is a pure
+// IrExpr (no remote ops). `case` (NCase) selects the arm whose `match` equals the scrutinee, else
+// `default`. Returns a Result (IrError caught HERE) so callers in other modules need no
+// error-type-qualified catch.
 pub fn parse_graph(node: &json.JsonNode) -> core.Result<IrGraph, IrError> {
 	try {
 		val g = _parse_graph_throwing(node);
@@ -515,7 +517,44 @@ fn _parse_node(n: &json.JsonNode) -> IrNode {
 		return IrNode::NLoop(id = move id, kind = LoopKind::LFold(), source = move source, elem = move elem,
 		                     acc = move as_name, init = move init, body = move body, next = move next);
 	}
+	// case: branch on the scrutinee value. `arms` map a CANONICAL match constant to a target node;
+	// `default` (required) is taken when no arm matches. Pure control flow (no durable boundary).
+	// validate_graph enforces canonical/valid match constants and rejects duplicate arm constants;
+	// op_depth keeps every arm + default uniform.
+	if _str_eq(&kind, &"case") {
+		val scrutinee = _parse_expr_at(n, &"scrutinee");
+		val default_n = _req_str(n, &"default");
+		var arms: Array<IrCaseArm> = [];
+		match n.get(&"arms") {
+			Optional::Some(an) => {
+				match an.as_array() {
+					Optional::Some(arr) => {
+						var i = 0;
+						while i < arr.len { arms.push(_parse_case_arm(&arr[i])); i = i + 1; }
+					},
+					Optional::None => { throw IrError(message = "case 'arms' must be an array"); }
+				}
+			},
+			Optional::None => { throw IrError(message = "case missing 'arms'"); }
+		}
+		_reject_extra(nkeys, 5);   // kind, id, scrutinee, arms, default
+		return IrNode::NCase(id = move id, scrutinee = move scrutinee, arms = move arms, default_node = move default_n);
+	}
 	throw IrError(message = "unknown graph node kind: " + _dup(&kind));
+}
+
+// Parse one case arm: exactly {match, target}. `match` is a JSON value canonicalized into the
+// match constant (so {"a":1,"b":2} and {"b":2,"a":1} collapse to one arm, caught as a duplicate);
+// `target` is the destination node id. Unknown/missing keys are rejected.
+fn _parse_case_arm(n: &json.JsonNode) -> IrCaseArm {
+	val target = _req_str(n, &"target");
+	var mc: String = "";
+	match n.get(&"match") {
+		Optional::Some(m) => { mc = _canon_node(m); },
+		Optional::None => { throw IrError(message = "case arm missing 'match'"); }
+	}
+	_reject_extra(_obj_len(n), 2);   // match, target
+	return IrCaseArm(match_const = move mc, target = move target);
 }
 
 // Parse the expression at object key `key` (required).
@@ -1021,7 +1060,7 @@ fn _canon_node(n: &json.JsonNode) nothrow -> String {
 //   - at least one node and a unique id per node;
 //   - `entry` names an existing node;
 //   - every edge (next / branch targets / arm targets / default) targets an existing node;
-//   - control flow is ACYCLIC (V1 loops are finite array transforms, NOT back-edges) so replay
+//   - control flow is ACYCLIC (V1 loops are finite array expressions, NOT back-edges) so replay
 //     terminates; every reachable sink is an `NReturn` (valid terminal shape);
 //   - every `EResult(node)` names an `NOperation` that DOMINATES the referencing node (always
 //     settled before it executes — never a forward/self/cross-branch result reference);
@@ -1073,7 +1112,7 @@ pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
 	i = 0; while i < nn { color.push(0); i = i + 1; }
 	val entry_idx = _find_node(g, &g.entry);
 	if _has_cycle(g, entry_idx, &mut color) {
-		return Optional<String>::Some("control-flow cycle (loops must be finite array transforms, not back-edges)");
+		return Optional<String>::Some("control-flow cycle (loops must be finite array expressions, not back-edges)");
 	}
 
 	// reject UNREACHABLE nodes: `graph_canonical` includes every node, so dead code would

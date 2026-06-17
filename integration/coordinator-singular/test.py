@@ -1181,6 +1181,131 @@ def main():
               and pu_d == 0 and rq_d >= 1,
               (code_s, body_s, op_s, code_r, body_r, op_r, f"put+{pu_d} req+{rq_d}"))
 
+        # ===== C8. MANUAL-IR CONTROL FLOW: `case` (NCase from graph config) =====
+        # A directly-authored multi-way branch: case args.mode -> arm "a"/"b" else default, each
+        # reserving a distinct id. Pure control flow (the NCase is replayed, never persisted); the
+        # interpreter + validation + op_depth already supported NCase — this exercises the config
+        # surface. Each arm/default runs EXACTLY one op (uniform op_depth = plan_length = 1).
+        CASE_AT = {"type": "object", "fields": [{"name": "mode", "type": {"type": "string"}}]}
+
+        def case_graph(fault_on_a=None):
+            a_input = {"reservation": "cmA"}
+            if fault_on_a is not None:
+                a_input["_fault"] = fault_on_a
+            return {"entry": "n0", "nodes": [
+                {"kind": "case", "id": "n0", "scrutinee": {"arg": ["mode"]},
+                 "arms": [{"match": "a", "target": "n1"}, {"match": "b", "target": "n2"}], "default": "n3"},
+                {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": a_input}, "next": "n4"},
+                {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "cmB"}}, "next": "n4"},
+                {"kind": "operation", "id": "n3", "operation": "reserve", "input": {"const": {"reservation": "cmD"}}, "next": "n4"},
+                {"kind": "return", "id": "n4", "value": {"const": None}},
+            ]}
+        ccfg = graph_cfg(case_graph(), argument_type=CASE_AT)
+
+        # C8a. The matching arm is selected from the DURABLE args: mode "a" dispatches ONLY op A
+        # (reserve cmA); mode "b" ONLY op B. The untaken arms/default never dispatch (exec +1 each).
+        wca = _wf_id()
+        ex0 = _exec_count(base)
+        code_a, body_a = run_runner(ccfg, wca, arguments=json.dumps({"mode": "a"}))
+        exa = _exec_count(base) - ex0
+        cka = _mdb(f"SELECT seq, JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reservation')) "
+                   f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wca}') ORDER BY seq")
+        wcb = _wf_id()
+        ex0 = _exec_count(base)
+        code_b, body_b = run_runner(ccfg, wcb, arguments=json.dumps({"mode": "b"}))
+        exb = _exec_count(base) - ex0
+        check("graph_case_selects_matching_arm",
+              code_a == 0 and body_a.get("result") == {"reserved": "cmA"} and exa == 1 and cka == [["1", "cmA"]]
+              and code_b == 0 and body_b.get("result") == {"reserved": "cmB"} and exb == 1,
+              (code_a, body_a, exa, cka, code_b, body_b, exb))
+
+        # C8b. The DEFAULT arm runs when no arm matches: mode "z" dispatches ONLY the default op
+        # (reserve cmD).
+        wcd = _wf_id()
+        ex0 = _exec_count(base)
+        code_d, body_d = run_runner(ccfg, wcd, arguments=json.dumps({"mode": "z"}))
+        exd = _exec_count(base) - ex0
+        ckd = _mdb(f"SELECT seq, JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reservation')) "
+                   f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wcd}') ORDER BY seq")
+        check("graph_case_default_when_no_match",
+              code_d == 0 and body_d.get("result") == {"reserved": "cmD"} and exd == 1 and ckd == [["1", "cmD"]],
+              (code_d, body_d, exd, ckd))
+
+        # C8c. NO durable record at the case boundary: the NCase is PURE (replayed, never persisted).
+        # A 1-op straight-line plan and this 1-op-on-taken-path case produce the SAME event count.
+        slc = plan_cfg([{"operation": "reserve", "input": {"reservation": "csl"}}])
+        wcsl = _wf_id()
+        run_runner(slc, wcsl, arguments="{}")
+        nev_case = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wca}')")
+        nev_sl = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wcsl}')")
+        check("graph_case_no_durable_event_at_boundary",
+              nev_case == nev_sl and nev_case != [["0"]], (nev_case, nev_sl))
+
+        # C8d. A CLAIMABLE RESUME replays the SAME case selection from the durable args. Submit
+        # mode "a" with op A PENDING: arm "a" is chosen, op A requested-not-settled, workflow defers.
+        # Nudge claimable + RESUME (no --arguments): it re-derives arm "a" from the durable args
+        # (scrutinee arg "mode") and reconciles op A. Had it used {}/CLI, the scrutinee would be
+        # MISSING and replay would FAULT -> deferred, not pending.
+        pcfg = graph_cfg(case_graph(fault_on_a={"respond_pending": True}), argument_type=CASE_AT)
+        wcr = _wf_id()
+        opq = (f"SELECT operation_name, JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation')) "
+               f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wcr}') ORDER BY operation_seq")
+        code_s, body_s = run_runner(pcfg, wcr, arguments=json.dumps({"mode": "a"}))
+        op_s = _mdb(opq)
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wcr}')")
+        code_r, body_r = run_runner(pcfg, wcr)
+        op_r = _mdb(opq)
+        check("graph_case_resume_replays_selection_from_durable_args",
+              code_s == 9 and body_s.get("workflow") == "pending" and op_s == [["reserve", "cmA"]]
+              and code_r == 9 and body_r.get("workflow") == "pending" and op_r == [["reserve", "cmA"]],
+              (code_s, body_s, op_s, code_r, body_r, op_r))
+
+        # C8e. An op-UNBALANCED case (arm "a" 2 ops, arm "b"/default 1) is NON-EXECUTABLE: rejected
+        # at BUILD (op_depth), surfaced as invalid_config, with NO operation dispatched.
+        unbal_case = {"entry": "n0", "nodes": [
+            {"kind": "case", "id": "n0", "scrutinee": {"arg": ["mode"]},
+             "arms": [{"match": "a", "target": "n1"}, {"match": "b", "target": "n2"}], "default": "n3"},
+            {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": {"reservation": "u1"}}, "next": "n5"},
+            {"kind": "operation", "id": "n5", "operation": "reserve", "input": {"const": {"reservation": "u2"}}, "next": "n4"},
+            {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "u3"}}, "next": "n4"},
+            {"kind": "operation", "id": "n3", "operation": "reserve", "input": {"const": {"reservation": "u4"}}, "next": "n4"},
+            {"kind": "return", "id": "n4", "value": {"const": None}},
+        ]}
+        wcu = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(graph_cfg(unbal_case, argument_type=CASE_AT), wcu, arguments=json.dumps({"mode": "a"}))
+        check("graph_case_unbalanced_rejected_before_dispatch",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config"
+              and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C8f. BRANCH REVERSAL compensates ONLY the taken case path: a 2-deep case (the arm op is
+        # compensable, a shared final op fails). mode "a" -> reserve cmA settles + checkpoints, the
+        # final op is rejected -> reversal compensates ONLY cmA (release). The untaken arms (cmB,
+        # cmD) have no operation row, checkpoint, or participant execution.
+        def rev_case_graph():
+            return {"entry": "n0", "nodes": [
+                {"kind": "case", "id": "n0", "scrutinee": {"arg": ["mode"]},
+                 "arms": [{"match": "a", "target": "n1"}, {"match": "b", "target": "n2"}], "default": "n3"},
+                {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": {"reservation": "cmA"}}, "next": "n5"},
+                {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "cmB"}}, "next": "n5"},
+                {"kind": "operation", "id": "n3", "operation": "reserve", "input": {"const": {"reservation": "cmD"}}, "next": "n5"},
+                {"kind": "operation", "id": "n5", "operation": "reserve", "input": {"const": {"reservation": "cfin", "_fault": {"reject": True}}}, "next": "n6"},
+                {"kind": "return", "id": "n6", "value": {"const": None}},
+            ]}
+        wcrv = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(graph_cfg(rev_case_graph(), argument_type=CASE_AT), wcrv, arguments=json.dumps({"mode": "a"}))
+        ex_d = _exec_count(base) - ex0
+        wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wcrv}')")
+        cks = _mdb(f"SELECT seq, reversal_state, JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reservation')) "
+                   f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wcrv}') ORDER BY seq")
+        untaken = _mdb(f"SELECT COUNT(*) FROM tb_mf_operation WHERE workflow_id = UNHEX('{wcrv}') "
+                       f"AND (input_json LIKE '%cmB%' OR input_json LIKE '%cmD%')")
+        check("graph_case_reversal_compensates_taken_path_only",
+              code == 0 and body.get("workflow") == "reversed" and ex_d == 2
+              and wf == [["5", "2"]] and cks == [["1", "2", "cmA"]] and untaken == [["0"]],
+              (code, body, ex_d, wf, cks, untaken))
+
         # C5h. EXISTING-workflow reassertion must NOT validate arguments against the ACTIVE
         # type — only a FRESH submission does (a rollout may change the declared type). Create
         # under {a:int}; resubmit under a DIFFERENT active type {b:int} with the SAME (v1-valid)
@@ -1326,7 +1451,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 84
+    EXPECTED_CHECKS = 90
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

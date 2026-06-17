@@ -39,6 +39,35 @@ fn _pg_accepts(text: &String) -> Bool {
 	}
 }
 
+// parse_graph THEN validate_graph: true iff the config is rejected at EITHER stage. (Some hardening
+// — duplicate arm constants — is enforced by validate_graph, not the parser.)
+fn _pgv_rejects(text: &String) -> Bool {
+	match json.parse_strict(text) {
+		core.Result::Ok(n) => {
+			match ir.parse_graph(&n) {
+				core.Result::Ok(g) => {
+					match ir.validate_graph(&g) { Optional::Some(m) => { return true; }, Optional::None => { return false; } }
+				},
+				core.Result::Err(e) => { return true; }
+			}
+		},
+		core.Result::Err(e) => { return false; }
+	}
+}
+fn _pgv_accepts(text: &String) -> Bool {
+	match json.parse_strict(text) {
+		core.Result::Ok(n) => {
+			match ir.parse_graph(&n) {
+				core.Result::Ok(g) => {
+					match ir.validate_graph(&g) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
+				},
+				core.Result::Err(e) => { return false; }
+			}
+		},
+		core.Result::Err(e) => { return false; }
+	}
+}
+
 fn _seq(a: &String, b: &String) nothrow -> Bool {
 	if a.byte_length() != b.byte_length() { return false; }
 	var i = 0;
@@ -469,6 +498,20 @@ fn scenario() -> Int {
 	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"ys\"}}}]}") { return 120; }
 	// fold MISSING 'init' rejected.
 	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"fold\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"a\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"a\"}}}]}") { return 121; }
+
+	// ===== case config parsing + hardening =====
+	// valid case parses AND validates.
+	if !_pgv_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"mode\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"},{\"match\":\"b\",\"target\":\"n2\"}],\"default\":\"n3\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":2}},{\"kind\":\"return\",\"id\":\"n3\",\"value\":{\"const\":0}}]}") { return 124; }
+	// DUPLICATE arm constants (different spelling, SAME canonical) rejected at validate.
+	if !_pgv_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":{\"a\":1,\"b\":2},\"target\":\"n1\"},{\"match\":{\"b\":2,\"a\":1},\"target\":\"n2\"}],\"default\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":2}}]}") { return 125; }
+	// case MISSING 'default' rejected (parse).
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"}]},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 126; }
+	// case arm with an UNKNOWN key rejected (parse).
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\",\"bogus\":1}],\"default\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 127; }
+	// case arm MISSING 'match' rejected (parse).
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"target\":\"n1\"}],\"default\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 128; }
+	// case node with an UNKNOWN extra key rejected (parse).
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"}],\"default\":\"n1\",\"bogus\":1},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 129; }
 
 	return 0;
 }
