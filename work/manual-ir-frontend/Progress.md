@@ -14,7 +14,7 @@ content_hash are the remaining 1b(ii) chunk.
 ## Landed: control-flow graph IR — chunk 1 (Step 1b(ii): types + canonical + flat compat)
 - **Graph node types in `ir.drift`** (additive; runner behavior unchanged): `IrExpr` (closed leaf
   source set — `EConst`/`EArg`/`EResult`/`ELocal`, each path-projectable; determinism is
-  structural), `LoopKind` (`LMap`/`LFilter`/`LFold` — finite array transforms, no `while`),
+  structural), `LoopKind` (`LMap`/`LFilter`/`LFold` — finite array expressions, no `while`),
   `IrCaseArm`, `IrNode` (`NOperation`/`NLet`/`NIf`/`NCase`/`NLoop`/`NReturn`), `IrGraph`. Control
   flow is a FLAT node table keyed by stable id with node-id edges (not nested nodes) → finite
   value, no `Box` needed; a loop body is a pure `IrExpr` (structurally forbids a remote op in a
@@ -63,8 +63,9 @@ with NO parser/DSL and NO new storage. Full gate green; integration 77/77.
   uses `"graph"` when present, else lifts the flat `"plan"` to a degenerate graph;
   `_is_planned_config` recognizes EITHER as planned (so `--arguments` submission works for graphs).
 - **Execution beyond the degenerate guard:** `_assert_degenerate` → **`_assert_executable`** —
-  rejects only `NLoop` (loops still deferred) and derives `plan_length` from **`ir.op_depth`**.
-  The forward loop drives `ir.advance` for `operation`/`if`/`let`/`return`.
+  derives `plan_length` from **`ir.op_depth`**. (At this chunk it also rejected `NLoop`; loops are
+  now executed as finite array expressions — see that section below.) The forward loop drives
+  `ir.advance` for `operation`/`if`/`let`/`return`.
 - **Operation sequencing for branches** (guardrail 1 — validated at BUILD, not handled at runtime):
   durable seq = EXECUTION POSITION (`settled.len+1`); replay maps each settled result back to the
   node id `advance` chose. `ir.op_depth` requires a UNIFORM per-path operation count (rejecting
@@ -89,8 +90,8 @@ with NO parser/DSL and NO new storage. Full gate green; integration 77/77.
   DURABLE args — staying `pending`; had it used `{}`/CLI it would `graph_replay_fault` — with the
   false-branch contrast under one config, an op-unbalanced if rejected before dispatch, and a
   NON-COMPENSABLE non-final op rejected before dispatch. Existing straight-line planned suite green.
-- **Deferred (still):** finite loops (`NLoop` validated, not executed); `case`; cross-branch result
-  merge; the source-language parser.
+- **Deferred (then):** finite loops, `case`, cross-branch result merge, the source-language parser.
+  (Finite array expressions — `map`/`filter`/`fold` — are now EXECUTED; see that section below.)
 - **Strictness follow-up (review finding):** `_parse_expr` validated the `result`/`local` sub-objects
   by COUNT only (`_reject_extra(_, 2)`), so `{"result":{"node":"n1","bogus":1}}` (2 keys, no `path`)
   silently dropped `bogus`. Now `_reject_unknown_opt_path` validates the actual key NAMES (only
@@ -124,6 +125,40 @@ in existing fixture tables).
   graph re-evaluation would have dispatched a forward reserve, so `exec`=1 proves checkpoint-driven.
 - **Coverage:** the manual graph `if` now has forward, resume, terminal-replay, AND reversal
   coverage. Integration 81/81 (was 78); full `just test` green.
+
+## Landed: manual-IR finite array expressions — map / filter / fold (NLoop execution)
+
+`NLoop` is now EXECUTED in `ir.advance` for the restricted V1 model: finite, pure, local-only
+array expressions whose result feeds later operation inputs. NOT workflow-loop semantics — a loop
+is a pure VALUE step (like `let`), never a durable progress step. Parser, `while`, node-graph
+bodies, and remote ops in iteration remain deferred.
+- **Model.** The loop result binds to a downstream local named by config key `as` (the `acc`
+  field). For `fold` it is ALSO the in-body accumulator (threaded from `init`); for `map`/`filter`
+  it is only the post-loop result name (their `init` is the unit null). No `NLoop` signature change
+  — so `graph_canonical` / `content_hash` / `flat_to_graph` are structurally untouched.
+- **Execution (`_eval_loop`).** Source must evaluate to a finite array (else a clean `Fault`, no
+  panic). `map` → array of body results; `filter` → the ORIGINAL elements whose (bool) body is true
+  (non-bool body → `Fault`); `fold` → the accumulator threaded `init`→body→…. The body is a pure
+  `IrExpr` over `elem` (+ `acc` for fold) — a remote dispatch is structurally impossible.
+- **Config + strictness.** New node kinds `map`/`filter`/`fold` in `parse_graph` (exact allowed
+  keys: `{kind,id,source,elem,as,body,next}`, fold adds `init`; unknown/missing keys rejected).
+  `validate_graph`: `as` required + distinct from `elem`; map/filter `init` must be null; a loop
+  result is a dominating local binder (downstream `ELocal(as)` resolves; globally unique with NLet
+  names). `_assert_executable` no longer rejects `NLoop` (loops contribute 0 to `op_depth`).
+- **Durable semantics unchanged.** A loop is not an `NOperation`: no operation seq, no continuation
+  write, no event at the loop boundary. Replay recomputes the loop deterministically from durable
+  args/results/locals.
+- **Tests.** Unit (`ir_exec_test`): map/filter/fold success (incl. empty source), source-not-array
+  + non-bool-filter Faults, fold threads `init` and writes per element, a loop feeding an operation
+  input + resume recompute, and validation/parse strictness (elem≠as, non-null map/filter init,
+  valid map/fold parse, unknown/missing key rejects). Integration (C7): a `fold` computes an
+  operation input and the op dispatches EXACTLY once; event-count parity with a const-input op
+  proves NO durable event at the loop boundary; a claimable RESUME recomputes the loop-derived input
+  identically (settled prior op stays settled + not re-dispatched, later op GET-first, no second
+  PUT). Integration 84/84 (was 81); full `just test` green.
+- **The manual graph now supports:** straight-line, `if`, `let`, `return`, and finite array
+  expressions (`map`/`filter`/`fold`). Deferred: source-language parser, `while`, node-graph loop
+  bodies, remote operations inside iteration, `case` config surface.
 
 ## Landed: chunk 2 PART 2 — runner adopts the graph
 Delivered in verifiable stages.
@@ -170,9 +205,10 @@ Delivered in verifiable stages.
     claim) and the post-claim node-id guard (defers + releases lease).
 
   **Stage 3 completes the graph-authoritative STRAIGHT-LINE runner proof: the graph is now the
-  single source for validation, identity (content_hash), and forward execution. Parser / non-
-  degenerate control-flow EXECUTION (branches, finite loops, Let) remain separate follow-up work
-  (the IR types + validation + interpreter for them already exist in `ir.drift`, exercised by
+  single source for validation, identity (content_hash), and forward execution. (Non-degenerate
+  control-flow EXECUTION — branches, `let`, and finite array expressions — has since LANDED; only
+  the source-language parser remains.) The IR types + validation + interpreter already exist in
+  `ir.drift`, exercised by
   `ir_exec_test`, but are not yet reachable from config and not yet executed by the runner).**
 
 ## Landed: graph validation + interpreter — chunk 2 PART 1 (ir.drift; runner not yet switched)
@@ -180,7 +216,7 @@ Authoritative validation + a pure-control-flow interpreter, both in `ir.drift`, 
 The runner does NOT yet build/validate/execute via the graph and `content_hash` is UNCHANGED —
 that adoption (+ fixture recompute + restart integration tests) is chunk 2 PART 2.
 - **`validate_graph(g) -> Optional<String>`** — rejects: empty graph, duplicate ids, missing
-  `entry`, dangling edge targets, control-flow CYCLES (DFS; loops are finite transforms, not
+  `entry`, dangling edge targets, control-flow CYCLES (DFS; loops are finite array expressions, not
   back-edges), UNREACHABLE nodes (dead code must not affect revision identity — `graph_canonical`
   hashes every node — nor escape validation), non-terminal sinks (valid terminal = `NReturn`),
   `EResult` to a non-`NOperation` / self / non-dominating op, graph-level `ELocal` with no
@@ -194,8 +230,9 @@ that adoption (+ fixture recompute + restart integration tests) is chunk 2 PART 
   for the next UNSETTLED op, or `Completed(result)` at `NReturn` (`Fault` is defensive). Evaluates
   `EConst`/`EArg`/`EResult`/`ELocal` (path projection) and `NLet`/`NIf`/`NCase`; SETTLED ops are
   skipped (their result feeds later `EResult`). Restart-deterministic: same (args, settled) →
-  same step. Persistence unchanged — only `NOperation` is a durable boundary. **Loop EXECUTION is
-  a follow-up** (`NLoop` is validated but `advance` faults on it); no config produces loops yet.
+  same step. Persistence unchanged — only `NOperation` is a durable boundary. (Loop EXECUTION has
+  since LANDED — `advance` evaluates `map`/`filter`/`fold` as pure value steps; see the finite
+  array expressions section.)
 - **Tests:** `microflows/runner/tests/unit/ir_exec_test.drift` (new) — validation accept/reject
   per defect class; replay over a degenerate graph and a branching graph (EArg/EResult/ELocal
   projection, NLet, NIf true/false, NCase, operation-skip, restart determinism). base+asan, gated
@@ -304,7 +341,7 @@ Earlier rounds:
 - **Persist only at remote-op boundaries.** Branches, loops, and `let`s write no
   continuation; restart **replays** deterministic pure control flow from the last durable
   remote-op boundary. Requires pure control flow to depend only on durable inputs.
-- **V1 loops are structurally finite array transforms** (`map`/`filter`/`fold` over a finite
+- **V1 loops are structurally finite array expressions** (`map`/`filter`/`fold` over a finite
   array — no `for-each`, no `while`); termination is structural.
 - **Closed, minimal V1 value model:** `Null`/`Bool`/`Int`/`Float`/`String`/`Array<T>`/
   closed-field `Object`/`Optional<T>`; literals, `let`, durable input/result refs, typed

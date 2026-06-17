@@ -909,23 +909,14 @@ fn _build_graph(plan: &Array<PlanStep>) -> ir.IrGraph {
 	}
 }
 
-// The forward driver executes operation / let / if / case / return nodes — NOT loops (NLoop is
-// validated for shape but not yet EXECUTED; finite transforms are deferred). It also requires a
-// UNIFORM per-path operation count so the durable execution-position seq lands the final op at
-// seq == plan_length (the storage layer's finality derivation). Returns plan_length (the uniform
-// op count); throws RunnerError on a loop node or an op-unbalanced branch. Called at registry
-// build so rejection is BEFORE any claim (invalid_config / revision_unavailable, no lease leak).
+// The forward driver executes operation / let / if / case / return / loop nodes. NLoop is a FINITE
+// ARRAY EXPRESSION (map/filter/fold): a pure, non-suspending value step (no operation seq, no
+// durable write), so it does not affect the uniform per-path operation count. The driver requires
+// that UNIFORM count so the durable execution-position seq lands the final op at seq ==
+// plan_length (the storage layer's finality derivation). Returns plan_length (the uniform op
+// count); throws RunnerError on an op-unbalanced branch. Called at registry build so rejection is
+// BEFORE any claim (invalid_config / revision_unavailable, no lease leak).
 fn _assert_executable(graph: &ir.IrGraph) -> Int {
-	var i = 0;
-	while i < graph.nodes.len {
-		match &graph.nodes[i] {
-			ir.IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
-				throw RunnerError(message = "graph execution does not support loops yet (NLoop)");
-			},
-			default => {}
-		}
-		i = i + 1;
-	}
 	match ir.op_depth(graph) {
 		core.Result::Ok(d) => { return d; },
 		core.Result::Err(e) => { throw RunnerError(message = "graph not executable: " + e.message); }

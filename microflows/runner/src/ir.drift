@@ -351,8 +351,9 @@ pub struct IrCaseArm {
 // A graph NODE. `id` is this node's stable unique key; edges (`next`, `then_node`, `else_node`,
 // arm `target`s, `default_node`) reference other nodes by id. A loop's body is a pure `IrExpr`
 // over its element/accumulator locals — which structurally forbids a remote operation inside a
-// loop (no `IrExpr` arm can be an operation). For NLoop, `acc`/`init` are used by `LFold` only
-// (map/filter leave `acc = ""` and `init = EConst("null")`).
+// loop (no `IrExpr` arm can be an operation). For NLoop, `acc` is the result-binding local name
+// (the downstream local the loop result binds to) — for `LFold` it is ALSO the in-body accumulator
+// threaded from `init`; `LMap`/`LFilter` thread no accumulator, so their `init = EConst("null")`.
 pub variant IrNode {
 	NOperation(id: String, operation: String, input: IrExpr, next: String),   // remote op; result bound to `id`
 	NLet(id: String, name: String, value: IrExpr, next: String),              // bind a pure derived local
@@ -417,11 +418,14 @@ fn _nid(i: Int) nothrow -> String { return "n" + fmt.format_int(i); }
 //          | {"kind":"if","id":...,"cond":<expr>,"then":...,"else":...}
 //          | {"kind":"let","id":...,"name":...,"value":<expr>,"next":...}
 //          | {"kind":"return","id":...,"value":<expr>}
+//          | {"kind":"map"|"filter","id":...,"source":<expr>,"elem":NAME,"as":NAME,"body":<expr>,"next":...}
+//          | {"kind":"fold","id":...,"source":<expr>,"elem":NAME,"as":NAME,"init":<expr>,"body":<expr>,"next":...}
 //   <expr> = {"const":<json>} | {"arg":[seg,...]} | {"result":{"node":...,"path":[seg,...]}}
 //          | {"local":{"name":...,"path":[seg,...]}}     ("path" optional, default [])
-// `const` values are canonicalized into the EConst literal. NLoop / NCase are intentionally NOT
-// expressible here yet (slice scope: operation + if + let + return). Returns a Result (IrError
-// caught HERE) so callers in other modules need no error-type-qualified catch.
+// `const` values are canonicalized into the EConst literal. map/filter/fold are FINITE ARRAY
+// EXPRESSIONS (NLoop): the result binds to local `as`, the body is a pure IrExpr (no remote ops).
+// NCase is intentionally NOT expressible here yet. Returns a Result (IrError caught HERE) so
+// callers in other modules need no error-type-qualified catch.
 pub fn parse_graph(node: &json.JsonNode) -> core.Result<IrGraph, IrError> {
 	try {
 		val g = _parse_graph_throwing(node);
@@ -482,6 +486,34 @@ fn _parse_node(n: &json.JsonNode) -> IrNode {
 		val value = _parse_expr_at(n, &"value");
 		_reject_extra(nkeys, 3);   // kind, id, value
 		return IrNode::NReturn(id = move id, value = move value);
+	}
+	// Finite array expressions (map/filter/fold over a finite array source). The result binds to
+	// a downstream local named `as`; the body is a pure IrExpr over `elem` (+ the `as` accumulator
+	// for fold), so it can never dispatch a remote operation. map/filter carry no accumulator (the
+	// init is implicitly the unit null); fold threads `as` from `init` through the body.
+	if _str_eq(&kind, &"map") or _str_eq(&kind, &"filter") {
+		val source = _parse_expr_at(n, &"source");
+		val elem = _req_str(n, &"elem");
+		val as_name = _req_str(n, &"as");
+		val body = _parse_expr_at(n, &"body");
+		val next = _req_str(n, &"next");
+		_reject_extra(nkeys, 7);   // kind, id, source, elem, as, body, next
+		var lk = LoopKind::LMap();
+		if _str_eq(&kind, &"filter") { lk = LoopKind::LFilter(); }
+		return IrNode::NLoop(id = move id, kind = move lk, source = move source, elem = move elem,
+		                     acc = move as_name, init = IrExpr::EConst(canonical_json = "null"),
+		                     body = move body, next = move next);
+	}
+	if _str_eq(&kind, &"fold") {
+		val source = _parse_expr_at(n, &"source");
+		val elem = _req_str(n, &"elem");
+		val as_name = _req_str(n, &"as");
+		val init = _parse_expr_at(n, &"init");
+		val body = _parse_expr_at(n, &"body");
+		val next = _req_str(n, &"next");
+		_reject_extra(nkeys, 8);   // kind, id, source, elem, as, init, body, next
+		return IrNode::NLoop(id = move id, kind = LoopKind::LFold(), source = move source, elem = move elem,
+		                     acc = move as_name, init = move init, body = move body, next = move next);
 	}
 	throw IrError(message = "unknown graph node kind: " + _dup(&kind));
 }
@@ -733,9 +765,9 @@ fn _node_id(n: &IrNode) nothrow -> String {
 // (see `validate_graph`); `Fault` is a defensive surface for a malformed graph or a value-shape
 // mismatch, never expected on the validated path.
 //
-// NOTE: loop EXECUTION (map/filter/fold) is a follow-up — `NLoop` is fully VALIDATED (finite
-// shape) but `advance` faults on it. No config produces loops yet (the runner builds only
-// degenerate straight-line graphs), so this does not affect execution.
+// `NLoop` is a finite array expression (map/filter/fold): `advance` EVALUATES it as a pure value
+// step (source must be a finite array; body is a pure `IrExpr`) and binds the result to the loop's
+// `acc` local — no durable boundary, recomputed on replay like any other pure control flow.
 
 // A settled remote-operation result fed into replay: node id -> its canonical JSON result.
 pub struct OpResult {
@@ -821,7 +853,28 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 				}
 			},
 			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
-				return StepOutcome::Fault(message = "loop execution is a follow-up (NLoop is validated, not yet executed): " + _dup(id));
+				// Finite array expression: evaluate the source (must be a finite array), run the
+				// pure body per element (map/filter/fold), and bind the result to local `acc` — just
+				// like an NLet. NO operation seq, NO durable write: a loop is recomputed on replay
+				// from the same durable args/results/locals, so it is deterministic.
+				match _eval(g, source, &args_node, settled, &local_names, &local_vals) {
+					core.Result::Ok(sn) => {
+						match sn.as_array() {
+							Optional::Some(arr) => {
+								match _eval_loop(g, kind, arr, elem, acc, init, body, &args_node, settled, &local_names, &local_vals) {
+									core.Result::Ok(rn) => {
+										local_names.push(_dup(acc));
+										local_vals.push(move rn);
+										cur = _dup(next);
+									},
+									core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
+								}
+							},
+							Optional::None => { return StepOutcome::Fault(message = "loop source is not an array: " + _dup(id)); }
+						}
+					},
+					core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
+				}
 			}
 		}
 	}
@@ -880,6 +933,64 @@ fn _ev_err(m: &String) nothrow -> core.Result<json.JsonNode, IrError> {
 	return core.Result<json.JsonNode, IrError>::Err(IrError(message = _dup(m)));
 }
 
+fn _is_filter(k: &LoopKind) nothrow -> Bool {
+	match k { LoopKind::LFilter() => { return true; }, default => { return false; } }
+}
+
+// Evaluate a finite array expression (map/filter/fold) over `arr`, returning the result value:
+//   map    -> array of body results (one per element)
+//   filter -> array of the ORIGINAL elements for which the body evaluated to `true`
+//   fold   -> the accumulator threaded from `init` through the body (the final value)
+// The body is a pure IrExpr evaluated in the OUTER scope augmented with `elem` (the current
+// element) and, for fold, `acc` (the running accumulator). No remote dispatch is possible.
+fn _eval_loop(g: &IrGraph, kind: &LoopKind, arr: &Array<json.JsonNode>, elem: &String, acc: &String,
+              init: &IrExpr, body: &IrExpr, args: &json.JsonNode, settled: &Array<OpResult>,
+              outer_names: &Array<String>, outer_vals: &Array<json.JsonNode>) nothrow -> core.Result<json.JsonNode, IrError> {
+	val is_fold = _is_fold(kind);
+	val is_filter = _is_filter(kind);
+	// fold's initial accumulator is `init` evaluated in the OUTER scope (no elem/acc visible).
+	var fold_acc = json.JsonNode::Null();
+	if is_fold {
+		match _eval(g, init, args, settled, outer_names, outer_vals) {
+			core.Result::Ok(iv) => { fold_acc = move iv; },
+			core.Result::Err(e) => { return core.Result<json.JsonNode, IrError>::Err(IrError(message = e.message)); }
+		}
+	}
+	var out = json.new_array();
+	var e = 0;
+	while e < arr.len {
+		// Body scope = outer locals + element (+ running accumulator for fold). Rebuilt per element
+		// (clone_deep of the outer locals) so no element/accumulator slot is mutated in place.
+		var bnames: Array<String> = [];
+		var bvals: Array<json.JsonNode> = [];
+		var k = 0;
+		while k < outer_names.len { bnames.push(_dup(&outer_names[k])); bvals.push(outer_vals[k].clone_deep()); k = k + 1; }
+		bnames.push(_dup(elem));
+		bvals.push(arr[e].clone_deep());
+		if is_fold { bnames.push(_dup(acc)); bvals.push(fold_acc.clone_deep()); }
+		match _eval(g, body, args, settled, &bnames, &bvals) {
+			core.Result::Ok(rv) => {
+				if is_fold {
+					fold_acc = move rv;
+				} else {
+					if is_filter {
+						match rv.as_bool() {
+							Optional::Some(keep) => { if keep { out.push(arr[e].clone_deep()); } },
+							Optional::None => { return _ev_err(&"filter body did not evaluate to a bool"); }
+						}
+					} else {
+						out.push(move rv);   // map
+					}
+				}
+			},
+			core.Result::Err(e2) => { return core.Result<json.JsonNode, IrError>::Err(IrError(message = e2.message)); }
+		}
+		e = e + 1;
+	}
+	if is_fold { return core.Result<json.JsonNode, IrError>::Ok(move fold_acc); }
+	return core.Result<json.JsonNode, IrError>::Ok(out.to_node());
+}
+
 // Project `path` (object keys; [] = the whole value) into a JSON value, returning an owned copy.
 fn _project(node: &json.JsonNode, path: &Array<String>) nothrow -> Optional<json.JsonNode> {
 	if path.len == 0 { return Optional<json.JsonNode>::Some(node.clone_deep()); }
@@ -914,10 +1025,11 @@ fn _canon_node(n: &json.JsonNode) nothrow -> String {
 //     terminates; every reachable sink is an `NReturn` (valid terminal shape);
 //   - every `EResult(node)` names an `NOperation` that DOMINATES the referencing node (always
 //     settled before it executes — never a forward/self/cross-branch result reference);
-//   - every graph-level `ELocal(name)` is bound by a dominating `NLet` (loop body exprs may also
-//     use the loop's `elem`/`acc`); and
-//   - every `NLoop` has a valid finite shape (kind in {map,filter,fold}; map/filter carry no
-//     accumulator). A loop body is a pure `IrExpr`, so a remote operation inside a loop is
+//   - every graph-level `ELocal(name)` is bound by a dominating `NLet` OR a dominating `NLoop`
+//     result (`acc`) (loop body exprs may also use the loop's `elem`/`acc`); and
+//   - every `NLoop` has a valid finite shape (kind in {map,filter,fold}; result name `acc` is
+//     present and distinct from `elem`; map/filter thread no accumulator, so their `init` is the
+//     unit null). A loop body is a pure `IrExpr`, so a remote operation inside a loop is
 //     structurally impossible — nothing to check.
 // Dominance is computed simply (graphs are tiny): X dominates Y iff Y is reachable from `entry`
 // but becomes unreachable once X is removed.
@@ -985,10 +1097,11 @@ pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
 		i = i + 1;
 	}
 
-	// V1: NLet local names are globally UNIQUE. Replay resolves a local by its (single) binding;
-	// allowing two same-named dominating NLets would make shadowing declaration-order-sensitive.
+	// V1: local binding names (NLet names + NLoop result names) are globally UNIQUE. Replay resolves
+	// a local by its (single) binding; allowing two same-named dominating binders would make
+	// shadowing declaration-order-sensitive.
 	match _dup_let_name(g) {
-		Optional::Some(nm) => { return Optional<String>::Some("duplicate NLet local name: " + move nm); },
+		Optional::Some(nm) => { return Optional<String>::Some("duplicate local binding name: " + move nm); },
 		Optional::None => {}
 	}
 
@@ -1005,7 +1118,7 @@ pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
 	return Optional<String>::None();
 }
 
-// First duplicated NLet local name (Some(name)), or None.
+// First duplicated local binding name — an NLet name or an NLoop result name (Some(name)), or None.
 fn _dup_let_name(g: &IrGraph) nothrow -> Optional<String> {
 	var names: Array<String> = [];
 	var i = 0;
@@ -1014,6 +1127,10 @@ fn _dup_let_name(g: &IrGraph) nothrow -> Optional<String> {
 			IrNode::NLet(id, name, value, next) => {
 				if _contains_str(&names, name) { return Optional<String>::Some(_dup(name)); }
 				names.push(_dup(name));
+			},
+			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
+				if _contains_str(&names, acc) { return Optional<String>::Some(_dup(acc)); }
+				names.push(_dup(acc));
 			},
 			default => {}
 		}
@@ -1139,6 +1256,39 @@ fn _has_dominating_let(g: &IrGraph, name: &String, y: Int) nothrow -> Bool {
 	return false;
 }
 
+// True iff `name` is ANY local binding name in the graph — an NLet name or an NLoop result (`acc`).
+// These are exactly the names that can appear in the interpreter's local table at runtime, so a
+// loop element sharing one of them would shadow it on some path. Path-INSENSITIVE by design (see
+// the loop element-name check): a binder on a non-dominating branch still collides at runtime.
+fn _is_binder_name(g: &IrGraph, name: &String) nothrow -> Bool {
+	var i = 0;
+	while i < g.nodes.len {
+		match &g.nodes[i] {
+			IrNode::NLet(id, lname, value, next) => { if _str_eq(lname, name) { return true; } },
+			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { if _str_eq(acc, name) { return true; } },
+			default => {}
+		}
+		i = i + 1;
+	}
+	return false;
+}
+
+// True iff some reachable NLoop whose RESULT binds `name` (its `acc`) dominates node `y` — a loop
+// result is a downstream local exactly like an NLet binding.
+fn _has_dominating_loop_result(g: &IrGraph, name: &String, y: Int) nothrow -> Bool {
+	var i = 0;
+	while i < g.nodes.len {
+		match &g.nodes[i] {
+			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
+				if _str_eq(acc, name) and _dominates(g, i, y) { return true; }
+			},
+			default => {}
+		}
+		i = i + 1;
+	}
+	return false;
+}
+
 // Validate one node's expressions + (for NLoop) its finite shape.
 fn _check_node(g: &IrGraph, idx: Int) nothrow -> Optional<String> {
 	var no_locals: Array<String> = [];
@@ -1167,10 +1317,26 @@ fn _check_node(g: &IrGraph, idx: Int) nothrow -> Optional<String> {
 		},
 		IrNode::NReturn(id, value) => { return _check_expr(g, value, idx, &no_locals); },
 		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
-			// finite shape: map/filter carry NO accumulator (acc empty + init unit-null).
+			// The result binds to a downstream local named `acc` (for fold it is ALSO the in-body
+			// accumulator). It must be named and distinct from the element binding.
+			if acc.byte_length() == 0 { return Optional<String>::Some("loop must name its result binding ('as'): " + _dup(id)); }
+			if elem.byte_length() == 0 { return Optional<String>::Some("loop must name its element ('elem'): " + _dup(id)); }
+			if _str_eq(elem, acc) { return Optional<String>::Some("loop element and result names must differ: " + _dup(id)); }
+			// The element name must NOT collide with ANY local binding name in the graph (NLet name or
+			// loop result). V1 forbids shadowing: `_eval` resolves a local by first match over [outer
+			// locals, elem, acc], and `local_vals` at runtime holds exactly the NLet/loop-result
+			// bindings — so any same-named binder reachable on some path (even one that doesn't
+			// DOMINATE the loop, e.g. bound on only one branch) would mask the element, making the
+			// body read the OUTER value while validation (extra-locals-first) expects the element.
+			// Rejecting against every binder name (not just dominating ones) keeps validation and
+			// execution in agreement regardless of path.
+			if _is_binder_name(g, elem) {
+				return Optional<String>::Some("loop element name collides with a local binding name (rename it): " + _dup(elem));
+			}
 			val is_fold = _is_fold(kind);
+			// map/filter carry NO accumulator to thread: init is unused (the unit null), and the
+			// body sees only `elem`. fold threads `acc` from `init` through the body.
 			if !is_fold {
-				if acc.byte_length() != 0 { return Optional<String>::Some("map/filter loop must not declare an accumulator: " + _dup(id)); }
 				if !_is_const_null(init) { return Optional<String>::Some("map/filter loop init must be null: " + _dup(id)); }
 			}
 			match _check_expr(g, source, idx, &no_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
@@ -1209,6 +1375,7 @@ fn _check_expr(g: &IrGraph, e: &IrExpr, idx: Int, extra_locals: &Array<String>) 
 		IrExpr::ELocal(name, path) => {
 			if _contains_str(extra_locals, name) { return Optional<String>::None(); }
 			if _has_dominating_let(g, name, idx) { return Optional<String>::None(); }
+			if _has_dominating_loop_result(g, name, idx) { return Optional<String>::None(); }
 			return Optional<String>::Some("ELocal references an unbound/non-prior local: " + _dup(name));
 		}
 	}

@@ -2,8 +2,9 @@
 // pure-control-flow interpreter (`advance`) — Step 1b(ii) chunk 2. Covers: validation accepts
 // well-formed graphs and rejects each defect class; replay skips settled operations, threads
 // NLet locals, branches on NIf/NCase, projects EArg/EResult/ELocal by path, reaches NReturn,
-// and is restart-deterministic (same args+settled -> same outcome). Loop EXECUTION is a
-// follow-up (advance faults on NLoop); loop VALIDATION is covered here. Parser is out of scope.
+// and is restart-deterministic (same args+settled -> same outcome). Finite array expressions
+// (map/filter/fold NLoop EXECUTION + parsing + validation) are covered here. Parser (source
+// language) is out of scope.
 //
 // Standalone: compiled with ../src/ir.drift (ir imports only std.*), no DB.
 
@@ -66,6 +67,12 @@ fn _is_need(o: &ir.StepOutcome, node: &String, op: &String, input: &String) noth
 fn _is_completed(o: &ir.StepOutcome, result: &String) nothrow -> Bool {
 	match o {
 		ir.StepOutcome::Completed(result_json) => { return _seq(result_json, result); },
+		default => { return false; }
+	}
+}
+fn _is_fault(o: &ir.StepOutcome) nothrow -> Bool {
+	match o {
+		ir.StepOutcome::Fault(m) => { return true; },
 		default => { return false; }
 	}
 }
@@ -338,6 +345,130 @@ fn scenario() -> Int {
 	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"result\":{\"node\":\"n1\",\"bogus\":1}}}]}") { return 87; }
 	// local expr with an unknown key (path omitted) rejected.
 	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"local\":{\"name\":\"x\",\"bogus\":1}}}]}") { return 88; }
+
+	// ===== finite array expressions: map / filter / fold (NLoop execution) =====
+	// map: ys = [ x.v for x in args.xs ]; return ys.
+	var mp: Array<ir.IrNode> = [];
+	mp.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EArg(path = _p1("xs")),
+	                         elem = "x", acc = "ys", init = ir.IrExpr::EConst(canonical_json = "null"),
+	                         body = ir.IrExpr::ELocal(name = "x", path = _p1("v")), next = "n1"));
+	mp.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "ys", path = _p0())));
+	val gmap = ir.IrGraph(nodes = move mp, entry = "n0");
+	if !_ok_validate(&gmap) { return 100; }
+	val mo = ir.advance(&gmap, &"{\"xs\":[{\"v\":1},{\"v\":2},{\"v\":3}]}", &none);
+	if !_is_completed(&mo, &"[1,2,3]") { return 101; }
+	// map over an empty source -> [].
+	val moe = ir.advance(&gmap, &"{\"xs\":[]}", &none);
+	if !_is_completed(&moe, &"[]") { return 102; }
+	// source not an array -> clean Fault (no panic).
+	val mof = ir.advance(&gmap, &"{\"xs\":5}", &none);
+	if !_is_fault(&mof) { return 103; }
+
+	// filter: keep ORIGINAL elements whose .keep is true.
+	var fl: Array<ir.IrNode> = [];
+	fl.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LFilter(), source = ir.IrExpr::EArg(path = _p1("xs")),
+	                         elem = "x", acc = "kept", init = ir.IrExpr::EConst(canonical_json = "null"),
+	                         body = ir.IrExpr::ELocal(name = "x", path = _p1("keep")), next = "n1"));
+	fl.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "kept", path = _p0())));
+	val gfilter = ir.IrGraph(nodes = move fl, entry = "n0");
+	if !_ok_validate(&gfilter) { return 104; }
+	val fo = ir.advance(&gfilter, &"{\"xs\":[{\"id\":1,\"keep\":true},{\"id\":2,\"keep\":false},{\"id\":3,\"keep\":true}]}", &none);
+	if !_is_completed(&fo, &"[{\"id\":1,\"keep\":true},{\"id\":3,\"keep\":true}]") { return 105; }
+	// filter body not a bool -> clean Fault.
+	val fof = ir.advance(&gfilter, &"{\"xs\":[{\"id\":1,\"keep\":7}]}", &none);
+	if !_is_fault(&fof) { return 106; }
+
+	// fold-A: body overwrites the accumulator with the element -> final = last element (acc is WRITTEN).
+	var fdA: Array<ir.IrNode> = [];
+	fdA.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LFold(), source = ir.IrExpr::EArg(path = _p1("xs")),
+	                          elem = "x", acc = "a", init = ir.IrExpr::EConst(canonical_json = "null"),
+	                          body = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n1"));
+	fdA.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "a", path = _p0())));
+	val gfoldA = ir.IrGraph(nodes = move fdA, entry = "n0");
+	if !_ok_validate(&gfoldA) { return 107; }
+	val foldA = ir.advance(&gfoldA, &"{\"xs\":[1,2,3]}", &none);
+	if !_is_completed(&foldA, &"3") { return 108; }
+
+	// fold-B: body keeps the accumulator -> final = init, unchanged (acc is THREADED from init).
+	var fdB: Array<ir.IrNode> = [];
+	fdB.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LFold(), source = ir.IrExpr::EArg(path = _p1("xs")),
+	                          elem = "x", acc = "a", init = ir.IrExpr::EConst(canonical_json = "7"),
+	                          body = ir.IrExpr::ELocal(name = "a", path = _p0()), next = "n1"));
+	fdB.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "a", path = _p0())));
+	val gfoldB = ir.IrGraph(nodes = move fdB, entry = "n0");
+	if !_ok_validate(&gfoldB) { return 109; }
+	val foldB = ir.advance(&gfoldB, &"{\"xs\":[1,2,3]}", &none);
+	if !_is_completed(&foldB, &"7") { return 110; }
+	// fold over an empty source -> init.
+	val foldBe = ir.advance(&gfoldB, &"{\"xs\":[]}", &none);
+	if !_is_completed(&foldBe, &"7") { return 111; }
+
+	// a loop result feeds an OPERATION input: map -> op(input = local ys) -> return result(op).
+	var lo: Array<ir.IrNode> = [];
+	lo.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EArg(path = _p1("xs")),
+	                         elem = "x", acc = "ys", init = ir.IrExpr::EConst(canonical_json = "null"),
+	                         body = ir.IrExpr::ELocal(name = "x", path = _p1("v")), next = "n1"));
+	lo.push(ir.IrNode::NOperation(id = "n1", operation = "sink", input = ir.IrExpr::ELocal(name = "ys", path = _p0()), next = "n2"));
+	lo.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EResult(node = "n1", path = _p0())));
+	val gloop_op = ir.IrGraph(nodes = move lo, entry = "n0");
+	if !_ok_validate(&gloop_op) { return 112; }
+	// step 1: the loop recomputes the operation input from durable args (no settled results yet).
+	val lop0 = ir.advance(&gloop_op, &"{\"xs\":[{\"v\":1},{\"v\":2}]}", &none);
+	if !_is_need(&lop0, &"n1", &"sink", &"[1,2]") { return 113; }
+	// resume: op settled -> recompute the loop identically + return the operation's durable result.
+	var ls: Array<ir.OpResult> = [];
+	ls.push(ir.OpResult(node_id = "n1", result_json = "{\"ok\":1}"));
+	val lop1 = ir.advance(&gloop_op, &"{\"xs\":[{\"v\":1},{\"v\":2}]}", &ls);
+	if !_is_completed(&lop1, &"{\"ok\":1}") { return 114; }
+
+	// ===== loop validation + parse strictness =====
+	// element and result names must DIFFER.
+	var same: Array<ir.IrNode> = [];
+	same.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EArg(path = _p1("xs")),
+	                           elem = "x", acc = "x", init = ir.IrExpr::EConst(canonical_json = "null"),
+	                           body = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n1"));
+	same.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "x", path = _p0())));
+	val gsame = ir.IrGraph(nodes = move same, entry = "n0");
+	if !_rejects(&gsame) { return 115; }
+	// map/filter init must be null (non-null init rejected).
+	var bi: Array<ir.IrNode> = [];
+	bi.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EArg(path = _p1("xs")),
+	                         elem = "x", acc = "ys", init = ir.IrExpr::EConst(canonical_json = "1"),
+	                         body = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n1"));
+	bi.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "ys", path = _p0())));
+	val gbi = ir.IrGraph(nodes = move bi, entry = "n0");
+	if !_rejects(&gbi) { return 116; }
+	// element name must NOT shadow a VISIBLE (dominating) local: `let x` then `map ... elem x ...`
+	// is rejected (else body `local x` reads the outer x at runtime while validation expects elem).
+	var sh: Array<ir.IrNode> = [];
+	sh.push(ir.IrNode::NLet(id = "n0", name = "x", value = ir.IrExpr::EConst(canonical_json = "1"), next = "n1"));
+	sh.push(ir.IrNode::NLoop(id = "n1", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EArg(path = _p1("xs")),
+	                         elem = "x", acc = "ys", init = ir.IrExpr::EConst(canonical_json = "null"),
+	                         body = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n2"));
+	sh.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::ELocal(name = "ys", path = _p0())));
+	val gsh = ir.IrGraph(nodes = move sh, entry = "n0");
+	if !_rejects(&gsh) { return 122; }
+	// element-name collision is PATH-INSENSITIVE: `if c then (let x; loop elem x) else (loop elem x)`
+	// — the let x is bound on only the true path (does NOT dominate the loop), yet at runtime the
+	// true path carries outer x before elem x, so the body would read the outer value. Rejected.
+	var psh: Array<ir.IrNode> = [];
+	psh.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n3"));
+	psh.push(ir.IrNode::NLet(id = "n1", name = "x", value = ir.IrExpr::EConst(canonical_json = "1"), next = "n3"));
+	psh.push(ir.IrNode::NLoop(id = "n3", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EArg(path = _p1("xs")),
+	                          elem = "x", acc = "ys", init = ir.IrExpr::EConst(canonical_json = "null"),
+	                          body = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n4"));
+	psh.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "ys", path = _p0())));
+	val gpsh = ir.IrGraph(nodes = move psh, entry = "n0");
+	if !_rejects(&gpsh) { return 123; }
+	// valid map + fold configs PARSE.
+	if !_pg_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"ys\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"ys\"}}}]}") { return 117; }
+	if !_pg_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"fold\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"a\",\"init\":{\"const\":0},\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"a\"}}}]}") { return 118; }
+	// map with an UNKNOWN extra key rejected.
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"ys\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\",\"bogus\":1},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"ys\"}}}]}") { return 119; }
+	// map MISSING the 'as' result-binding key rejected.
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"ys\"}}}]}") { return 120; }
+	// fold MISSING 'init' rejected.
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"fold\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"a\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"a\"}}}]}") { return 121; }
 
 	return 0;
 }

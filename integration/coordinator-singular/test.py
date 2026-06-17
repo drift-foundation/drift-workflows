@@ -1100,6 +1100,87 @@ def main():
               and wf == [["5", "2"]] and ck == [["2", "release", "brA"]],
               (code, body, ex_d, wf, ck))
 
+        # ===== C7. MANUAL-IR FINITE ARRAY EXPRESSIONS: map/filter/fold (NLoop) feeding an op =====
+        # A loop is a PURE value step (no operation seq, no durable write): it is recomputed on
+        # replay from durable args/results, never persisted. Here a fold selects an element of a
+        # finite array (the body is a pure IrExpr — it cannot dispatch), and that loop result feeds
+        # a remote operation's input. (fold-select-last is the one expression that produces a whole
+        # operation-input object; map/filter/fold execution itself is unit-covered in ir_exec_test.)
+        CAND_AT = {"type": "object", "fields": [{"name": "candidates", "type": {"type": "array",
+                   "elem": {"type": "object", "fields": [{"name": "reservation", "type": {"type": "string"}}]}}}]}
+
+        def loop_fold_graph():
+            # fold over args.candidates, threading the element into `chosen` -> chosen = LAST element;
+            # reserve(chosen); return its result. The fold result is the operation input.
+            return {"entry": "n0", "nodes": [
+                {"kind": "fold", "id": "n0", "source": {"arg": ["candidates"]}, "elem": "c", "as": "chosen",
+                 "init": {"const": None}, "body": {"local": {"name": "c"}}, "next": "n1"},
+                {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"local": {"name": "chosen"}}, "next": "n2"},
+                {"kind": "return", "id": "n2", "value": {"result": {"node": "n1"}}},
+            ]}
+
+        # C7a. The loop computes the operation input (selects the last candidate), then the remote op
+        # dispatches EXACTLY once with that derived input.
+        wla = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(graph_cfg(loop_fold_graph(), argument_type=CAND_AT), wla,
+                                arguments=json.dumps({"candidates": [{"reservation": "a"}, {"reservation": "b"}, {"reservation": "c"}]}))
+        ex_d = _exec_count(base) - ex0
+        ops = _mdb(f"SELECT operation_seq, JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation')) "
+                   f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wla}') ORDER BY operation_seq")
+        check("graph_loop_computes_op_input_dispatches_once",
+              code == 0 and body.get("workflow") == "completed" and body.get("result") == {"reserved": "c"}
+              and ex_d == 1 and ops == [["1", "c"]], (code, body, ex_d, ops))
+
+        # C7b. NO durable event at the loop boundary: the fold is PURE (replayed, never persisted).
+        # The loop graph and an equivalent CONST-input reserve produce the SAME event count — the
+        # loop contributes zero events / continuations.
+        const_graph = {"entry": "n0", "nodes": [
+            {"kind": "operation", "id": "n0", "operation": "reserve", "input": {"const": {"reservation": "c"}}, "next": "n1"},
+            {"kind": "return", "id": "n1", "value": {"result": {"node": "n0"}}},
+        ]}
+        wlc = _wf_id()
+        run_runner(graph_cfg(const_graph), wlc, arguments="{}")
+        nev_loop = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wla}')")
+        nev_const = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wlc}')")
+        check("graph_loop_no_durable_event_at_loop_boundary",
+              nev_loop == nev_const and nev_loop != [["0"]], (nev_loop, nev_const))
+
+        # C7c. RESUME: a SETTLED prior op plus a loop-derived input recomputes IDENTICALLY. op1's
+        # input is fold-derived (the last candidate); it settles + checkpoints. op2 (a const-input
+        # reserve) is PENDING, so the workflow defers. A claimable RESUME recomputes the fold from
+        # the DURABLE args — re-deriving op1's input identically (op1 stays settled, never
+        # re-dispatched) — and reconciles op2 GET-first (no second PUT). A non-deterministic loop
+        # would change op1's recorded input or re-dispatch it; this asserts neither happens.
+        def loop_resume_graph():
+            return {"entry": "n0", "nodes": [
+                {"kind": "fold", "id": "n0", "source": {"arg": ["candidates"]}, "elem": "c", "as": "chosen",
+                 "init": {"const": None}, "body": {"local": {"name": "c"}}, "next": "n1"},
+                {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"local": {"name": "chosen"}}, "next": "n2"},
+                {"kind": "operation", "id": "n2", "operation": "reserve",
+                 "input": {"const": {"reservation": "q", "_fault": {"respond_pending": True}}}, "next": "n3"},
+                {"kind": "return", "id": "n3", "value": {"result": {"node": "n2"}}},
+            ]}
+        rcfg = graph_cfg(loop_resume_graph(), argument_type=CAND_AT)
+        wlr = _wf_id()
+        opq = (f"SELECT operation_seq, status, JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation')) "
+               f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wlr}') ORDER BY operation_seq")
+        code_s, body_s = run_runner(rcfg, wlr, arguments=json.dumps({"candidates": [{"reservation": "a"}, {"reservation": "b"}, {"reservation": "z"}]}))
+        op_s = _mdb(opq)
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wlr}')")
+        pu0, rq0 = _put_count(base), _request_count(base)
+        code_r, body_r = run_runner(rcfg, wlr)   # claimable RESUME -> recompute fold + reconcile op2
+        pu_d, rq_d = _put_count(base) - pu0, _request_count(base) - rq0
+        op_r = _mdb(opq)
+        # op1 settled(status 2) with the fold-derived input "z" (the last candidate); op2 requested(1)
+        # with the const "q". After resume: identical rows (loop recomputed deterministically).
+        check("graph_loop_resume_recomputes_loop_derived_input_identically",
+              code_s == 9 and body_s.get("workflow") == "pending"
+              and op_s == [["1", "2", "z"], ["2", "1", "q"]]
+              and code_r == 9 and body_r.get("workflow") == "pending" and op_r == op_s
+              and pu_d == 0 and rq_d >= 1,
+              (code_s, body_s, op_s, code_r, body_r, op_r, f"put+{pu_d} req+{rq_d}"))
+
         # C5h. EXISTING-workflow reassertion must NOT validate arguments against the ACTIVE
         # type — only a FRESH submission does (a rollout may change the declared type). Create
         # under {a:int}; resubmit under a DIFFERENT active type {b:int} with the SAME (v1-valid)
@@ -1245,7 +1326,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 81
+    EXPECTED_CHECKS = 84
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")
