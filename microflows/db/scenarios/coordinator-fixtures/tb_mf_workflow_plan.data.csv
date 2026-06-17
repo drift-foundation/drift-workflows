@@ -1,18 +1,19 @@
 # Durable plan pins for the mid-plan restart seeds (sub-step C/D). The pin is
 # (script_name [on tb_mf_workflow], plan_version, content_hash, plan_length). plan_version
 # is the immutable semantic version (here the default generation 1.0.0). content_hash is
-# the runner-derived 33-byte digest (0x01 scheme + SHA-256 over the canonical revision IR:
-# each step's operation, CANONICAL key-ordered input, resolved schema_version + participant,
-# compensation op + version + participant, FOLLOWED BY the declared argument TYPE's canonical
+# the runner-derived 33-byte digest (0x01 scheme + SHA-256 over the GRAPH IDENTITY:
+# graph_canonical (the control-flow graph shape — node ids, edges, per-operation name +
+# CANONICAL key-ordered input), then per-NOperation resolved schema_version + participant +
+# compensation op/version/participant bindings, then the declared argument TYPE's canonical
 # encoding); plan_length=2. These seeds use the empty-object argument type, so the digest
 # includes the "O{}" type suffix (the argument contract always participates in identity).
 # Resolution is EXACT-MATCH on (plan_version AND content_hash): wf25 is identical to wf22
 # but is driven with a config generation of 2.0.0, so the VERSION alone mismatches.
 workflow_id,plan_version,content_hash,plan_length,created_at
-a0000000000000000000000000000020,1.0.0,019dc1f4d5f9d8a8888b2b72970457c75619c7f4594b03589d8fbaa9b4e1d49cb0,2,2000-01-01 00:00:00.000000
-a0000000000000000000000000000021,1.0.0,01ebb9ce5af03fde9ba8daf4ed0fe6719f12bd9c9d4828f65aa887012aa1f6b492,2,2000-01-01 00:00:00.000000
-a0000000000000000000000000000022,1.0.0,019dc1f4d5f9d8a8888b2b72970457c75619c7f4594b03589d8fbaa9b4e1d49cb0,2,2000-01-01 00:00:00.000000
-a0000000000000000000000000000023,1.0.0,019dc1f4d5f9d8a8888b2b72970457c75619c7f4594b03589d8fbaa9b4e1d49cb0,2,2000-01-01 00:00:00.000000
-a0000000000000000000000000000024,1.0.0,019dc1f4d5f9d8a8888b2b72970457c75619c7f4594b03589d8fbaa9b4e1d49cb0,2,2000-01-01 00:00:00.000000
-a0000000000000000000000000000025,1.0.0,019dc1f4d5f9d8a8888b2b72970457c75619c7f4594b03589d8fbaa9b4e1d49cb0,2,2000-01-01 00:00:00.000000
-a0000000000000000000000000000026,1.0.0,019dc1f4d5f9d8a8888b2b72970457c75619c7f4594b03589d8fbaa9b4e1d49cb0,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000020,1.0.0,01fba1faf3612f01080e0ea7627dae07881573d2d38e36a2c12f870003198c216f,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000021,1.0.0,0161c3ad1af280eb527ce9fe059adfe8e869603604143839740f669cda4679a9a4,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000022,1.0.0,01fba1faf3612f01080e0ea7627dae07881573d2d38e36a2c12f870003198c216f,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000023,1.0.0,01fba1faf3612f01080e0ea7627dae07881573d2d38e36a2c12f870003198c216f,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000024,1.0.0,01fba1faf3612f01080e0ea7627dae07881573d2d38e36a2c12f870003198c216f,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000025,1.0.0,01fba1faf3612f01080e0ea7627dae07881573d2d38e36a2c12f870003198c216f,2,2000-01-01 00:00:00.000000
+a0000000000000000000000000000026,1.0.0,01fba1faf3612f01080e0ea7627dae07881573d2d38e36a2c12f870003198c216f,2,2000-01-01 00:00:00.000000

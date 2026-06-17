@@ -191,6 +191,17 @@ fn scenario() nothrow -> Int {
 		core.Result::Ok(s) => { return 36; }
 	}
 
+	// 11b. operation_names is canonical (sorted-by-node-id) order, INDEPENDENT of node-table
+	//      order — so per-op resolution bindings stay in sync with graph_canonical.
+	val on_f = ir.operation_names(&_two_op_graph(false));
+	val on_r = ir.operation_names(&_two_op_graph(true));   // reversed node table, same content
+	if on_f.len != 2 { return 50; }
+	if on_r.len != 2 { return 51; }
+	if !_seq(&on_f[0], &"alpha") { return 52; }
+	if !_seq(&on_f[1], &"beta") { return 53; }
+	if !_seq(&on_r[0], &"alpha") { return 54; }
+	if !_seq(&on_r[1], &"beta") { return 55; }
+
 	// 12. EMPTY plan -> a single NReturn, entry n0.
 	var empty: Array<ir.FlatStep> = [];
 	val g_empty = _unwrap_graph(ir.flat_to_graph(&empty));

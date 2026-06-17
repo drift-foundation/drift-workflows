@@ -26,6 +26,7 @@ export {
 	graph_canonical,
 	canonical_json,
 	validate_graph,
+	operation_names,
 	OpResult,
 	StepOutcome,
 	advance
@@ -444,6 +445,25 @@ pub fn graph_canonical(g: &IrGraph) nothrow -> String {
 		k = k + 1;
 	}
 	return s + "}";
+}
+
+// Operation NAMES of the graph's NOperation nodes, in the SAME canonical order `graph_canonical`
+// uses (sorted by node id). A caller that composes per-operation RESOLUTION bindings (resolved
+// schema_version + participant + compensation) must iterate in THIS order, so the binding suffix
+// is declaration-order-independent and matches the node ordering inside `graph_canonical` — two
+// equivalent graphs with reordered node tables then hash identically.
+pub fn operation_names(g: &IrGraph) nothrow -> Array<String> {
+	val order = _node_order_by_id(&g.nodes);
+	var out: Array<String> = [];
+	var k = 0;
+	while k < order.len {
+		match &g.nodes[order[k]] {
+			IrNode::NOperation(id, operation, input, next) => { out.push(_dup(operation)); },
+			default => {}
+		}
+		k = k + 1;
+	}
+	return move out;
 }
 
 fn _node_canonical(n: &IrNode) nothrow -> String {

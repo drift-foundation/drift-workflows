@@ -109,9 +109,10 @@ struct PlanStep {
 struct ScriptRevision {
 	name: String,
 	version: String,             // immutable semver: major.minor.patch
-	plan: Array<PlanStep>,
+	plan: Array<PlanStep>,       // flat plan (still drives forward execution in this stage)
+	graph: ir.IrGraph,           // the authoritative control-flow graph (degenerate from `plan`)
 	arg_type: ir.IrType,         // declared closed-object argument type (part of content_hash)
-	content_hash: Array<Byte>,   // 33 bytes: scheme tag + SHA-256
+	content_hash: Array<Byte>,   // 33 bytes: scheme tag + SHA-256 over GRAPH identity
 	plan_length: Int
 }
 
@@ -144,6 +145,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 	val _ = p.option_string("operation", "o", "NAME", "operation to submit (required ONLY for a fresh LEGACY workflow; a resume uses the durable request)", false);
 	val _ = p.option_string("input", "i", "JSON", "operation input (JSON object; default {}); fresh legacy workflow only", false);
 	val _ = p.option_string("arguments", "a", "JSON", "instance arguments (JSON object) for a PLANNED workflow SUBMISSION; supplying it creates/reasserts (and conflicts on changed args), omitting it RESUMES", false);
+	val _ = p.flag("emit-content-hash", "", "build the registry from --config and print the active revision's content_hash (hex), then exit; no DB or --workflow-id needed (used to (re)compute fixtures)");
 
 	var config_path: String = "";
 	var workflow_hex: String = "";
@@ -151,6 +153,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 	var input_json: String = "{}";
 	var arguments_json: String = "";
 	var has_arguments: Bool = false;
+	var emit_hash: Bool = false;
 
 	match p.parse(argv) {
 		core.Result::Ok(parsed) => {
@@ -159,11 +162,17 @@ fn main(argv: Array<String>) nothrow -> Int {
 			match parsed.get_string("operation", p) { Some(v) => { operation_name = _dup(v); }, None => {} }
 			match parsed.get_string("input", p) { Some(v) => { input_json = _dup(v); }, None => {} }
 			match parsed.get_string("arguments", p) { Some(v) => { arguments_json = _dup(v); has_arguments = true; }, None => {} }
+			emit_hash = parsed.has_flag("emit-content-hash", p);
 		},
 		core.Result::Err(_) => {
 			console.eprintln("runner: bad arguments");
 			return 2;
 		}
+	}
+	// Fixture-tooling mode: print the active revision's content_hash for --config, then exit.
+	if emit_hash {
+		if config_path.byte_length() == 0 { console.eprintln("runner: --config required for --emit-content-hash"); return 2; }
+		return try _emit_content_hash(&config_path) catch { console.eprintln("runner: emit-content-hash failed"); 1 };
 	}
 	if config_path.byte_length() == 0 or workflow_hex.byte_length() != 32 {
 		console.eprintln("runner: --config and a 32-hex --workflow-id are required");
@@ -174,6 +183,21 @@ fn main(argv: Array<String>) nothrow -> Int {
 		console.eprintln("runner: fatal");
 		1
 	};
+}
+
+// Build the registry from --config and print the active revision's content_hash (hex). DB-free
+// and config-only: lets fixtures be (re)computed from the ACTUAL hashing algorithm rather than a
+// reimplementation. Validates the registry first so an emit over a bad config fails loudly.
+fn _emit_content_hash(config_path: &String) throws -> Int {
+	val cfg = _load_config_json(config_path);
+	_validate_registry(&cfg);
+	val reg = _registry_build(&cfg);
+	if reg.revisions.len == 0 {
+		console.eprintln("runner: --config has no 'plan' (nothing to hash)");
+		return 2;
+	}
+	console.println(_bytes_to_hex(&reg.revisions[0].content_hash));
+	return 0;
 }
 
 fn _run(config_path: &String, workflow_hex: &String,
@@ -704,10 +728,19 @@ fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
 			// It ALWAYS participates in content_hash (the argument contract is part of the
 			// revision identity — never elided/conditional).
 			val arg_type = _arg_type(cfg);
-			val ch = _content_hash(cfg, &plan, &arg_type);
 			val len = plan.len;
+			// Build the authoritative control-flow graph (degenerate straight-line from the flat
+			// plan) and VALIDATE it. A malformed graph -> RunnerError, surfaced by the existing
+			// build catches as invalid_config (submission, pre-claim) or revision_unavailable
+			// (resume, post-claim) — never executing an ill-formed graph.
+			val graph = _build_graph(&plan);
+			match ir.validate_graph(&graph) {
+				Optional::Some(m) => { throw RunnerError(message = "invalid graph: " + move m); },
+				Optional::None => {}
+			}
+			val ch = _content_hash(cfg, &graph, &arg_type);
 			revs.push(ScriptRevision(name = move name, version = move version,
-			                         plan = move plan, arg_type = move arg_type,
+			                         plan = move plan, graph = move graph, arg_type = move arg_type,
 			                         content_hash = ch, plan_length = len));
 		},
 		Optional::None => {}
@@ -782,12 +815,16 @@ fn _validate_semver(version: &String) -> Void {
 
 // `content_hash` = collision-resistant, versioned digest of a revision's IR: a 1-byte
 // scheme tag (0x01) followed by SHA-256 over the canonical encoding = 33 bytes. This is
-// the immutable identity the runner verifies against the durable pin ("never
-// substitute"). NOT the per-operation `input_hash` (UUID-v3, participant idempotency).
-// The DECLARED ARGUMENT TYPE's canonical encoding is part of the hashed material, so the
-// argument contract always participates in revision identity.
-fn _content_hash(cfg: &json.JsonNode, plan: &Array<PlanStep>, arg_type: &ir.IrType) -> Array<Byte> {
-	val canonical = _plan_canonical(cfg, plan) + ir.canonical(arg_type);
+// the immutable identity the runner verifies against the durable pin ("never substitute").
+// NOT the per-operation `input_hash` (UUID-v3, participant idempotency).
+//
+// The hashed material is the GRAPH IDENTITY: `graph_canonical` (graph shape — node ids, edges,
+// branch targets, loop bodies, per-op name + canonical input) ‖ the per-NOperation RESOLUTION
+// bindings (schema_version + participant + compensation) ‖ the declared argument TYPE. Key order
+// in input/arg JSON never affects it (everything is canonicalized), so identity tracks graph
+// SEMANTICS, not raw spelling.
+fn _content_hash(cfg: &json.JsonNode, graph: &ir.IrGraph, arg_type: &ir.IrType) -> Array<Byte> {
+	val canonical = ir.graph_canonical(graph) + _graph_bindings(cfg, graph) + ir.canonical(arg_type);
 	val msg = _str_bytes(&canonical);
 	val digest = crypto.sha256(&msg);   // 32 bytes
 	var out: Array<Byte> = [];
@@ -802,19 +839,23 @@ fn _content_hash(cfg: &json.JsonNode, plan: &Array<PlanStep>, arg_type: &ir.IrTy
 	return move out;
 }
 
-// Canonical encoding of the plan's FULL executable semantics. Per step: operation name
-// + CANONICAL input + the RESOLVED operation (schema_version + logical participant id) +
-// the compensation binding (operation + version + participant id). Length-prefixed per
-// field so distinct revisions never collide.
-fn _plan_canonical(cfg: &json.JsonNode, plan: &Array<PlanStep>) -> String {
+// Per-NOperation RESOLUTION bindings appended after `graph_canonical`: the RESOLVED operation
+// (schema_version + logical participant id) + compensation binding (operation + version +
+// participant id). `graph_canonical` already carries the op NAME + canonical input + structure;
+// this adds the resolved deployment bindings that the config-only graph encoding cannot know.
+// Iterated in `ir.operation_names` order — the SAME sorted-by-node-id order graph_canonical uses
+// — so the suffix is declaration-order-independent and stays in sync with the graph encoding even
+// when node tables are reordered (non-degenerate graphs).
+fn _graph_bindings(cfg: &json.JsonNode, graph: &ir.IrGraph) -> String {
+	val ops = ir.operation_names(graph);
 	var s: String = "";
 	var i = 0;
-	while i < plan.len {
-		val r = _resolve_operation(cfg, &plan[i].operation, Optional<Int>::None());
+	while i < ops.len {
+		val r = _resolve_operation(cfg, &ops[i], Optional<Int>::None());
 		var comp_op: String = "";
 		var comp_sv: Int = 0;
 		var comp_part: String = "";
-		match _compensation_for(cfg, &plan[i].operation) {
+		match _compensation_for(cfg, &ops[i]) {
 			Optional::Some(c) => {
 				comp_op = _dup(&c.op_name); comp_sv = c.schema_version;
 				comp_part = _dup(&_resolve_operation(cfg, &comp_op, Optional<Int>::None()).participant_id);
@@ -823,16 +864,27 @@ fn _plan_canonical(cfg: &json.JsonNode, plan: &Array<PlanStep>) -> String {
 		}
 		val sv_str = fmt.format_int(r.schema_version);
 		val comp_sv_str = fmt.format_int(comp_sv);
-		// CANONICAL input (static-review item 4): hash the recursively key-ordered compact
-		// form, so JSON objects that differ only in key ORDER produce the SAME content_hash
-		// (no false revision_unavailable). Same ordering `_input_hash` uses.
-		val canon_input = _canonical_json(&plan[i].input_json);
-		s = s + _lp(&plan[i].operation) + _lp(&canon_input)
-		      + _lp(&sv_str) + _lp(&r.participant_id)
+		s = s + _lp(&sv_str) + _lp(&r.participant_id)
 		      + _lp(&comp_op) + _lp(&comp_sv_str) + _lp(&comp_part);
 		i = i + 1;
 	}
 	return move s;
+}
+
+// Build the degenerate straight-line graph from the flat plan (inputs canonicalized into each
+// EConst). A malformed input constant -> RunnerError (defensive: `_build_plan` already validated
+// each input as a JSON object).
+fn _build_graph(plan: &Array<PlanStep>) -> ir.IrGraph {
+	var steps: Array<ir.FlatStep> = [];
+	var i = 0;
+	while i < plan.len {
+		steps.push(ir.FlatStep(operation = _dup(&plan[i].operation), input_json = _dup(&plan[i].input_json)));
+		i = i + 1;
+	}
+	match ir.flat_to_graph(&steps) {
+		core.Result::Ok(g) => { return move g; },
+		core.Result::Err(e) => { throw RunnerError(message = "graph build failed: " + e.message); }
+	}
 }
 
 // Canonical compact JSON: parse + re-encode with lexicographic UTF-8 key ordering, so a

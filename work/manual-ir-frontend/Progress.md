@@ -51,6 +51,25 @@ content_hash are the remaining 1b(ii) chunk.
   (bind first); expression-form `val x = match {…}` can't `return` from an arm — use
   `var x = <default>; match {…}` (statement form).
 
+## In progress: chunk 2 PART 2 — runner adopts the graph
+Delivered in verifiable stages.
+- **Stage 1 (LANDED, full gate green):** the graph is authoritative for IDENTITY + VALIDATION.
+  `_registry_build` now builds the degenerate graph (`_build_graph` via `ir.flat_to_graph`) and
+  runs `ir.validate_graph` — an invalid graph throws `RunnerError`, surfaced by the existing
+  build catches as `invalid_config` (submission, pre-claim) or `revision_unavailable` (resume,
+  post-claim). `content_hash` switched from `_plan_canonical` to GRAPH identity:
+  `ir.graph_canonical(graph)` ‖ `_graph_bindings(cfg, graph)` (per-NOperation resolved
+  schema_version + participant + compensation) ‖ `ir.canonical(arg_type)`. `ScriptRevision`
+  carries the graph. Seed fixtures recomputed via a new DB-free `--emit-content-hash` runner
+  mode (actual algorithm, no Python reimplementation): `[e1,e2]` `019dc1f4…`→`01fba1fa…`,
+  frplan `01ebb9ce…`→`0161c3ad…`. Execution is STILL plan-based here, so behavior is unchanged;
+  full `just test` green on 0.33.38.
+- **Stage 2 (next):** replace the flat forward loop with `ir.advance(...)` — gather durable args
+  (`args_get`) + settled results (`OpResult`), drive dispatch/settle by `NeedOperation`, complete
+  on `Completed` per existing final-op result rules. `seq = settled.len + 1`.
+- **Stage 3 (next):** integration replay/restart tests (straight-line parity, mid-plan resume via
+  advance, terminal replay, key-order-insensitive content_hash).
+
 ## Landed: graph validation + interpreter — chunk 2 PART 1 (ir.drift; runner not yet switched)
 Authoritative validation + a pure-control-flow interpreter, both in `ir.drift`, fully unit-tested.
 The runner does NOT yet build/validate/execute via the graph and `content_hash` is UNCHANGED —
