@@ -37,3 +37,7 @@ a0000000000000000000000000000025,1,2000-01-01 00:00:00.000000,created,\N,\N,{}
 a0000000000000000000000000000026,1,2000-01-01 00:00:00.000000,created,\N,\N,{}
 a0000000000000000000000000000027,1,2000-01-01 00:00:00.000000,created,\N,\N,{}
 a0000000000000000000000000000028,1,2000-01-01 00:00:00.000000,created,\N,\N,{}
+# 30 (C6): the reversing-branch seed's audit head. current_event_seq=1 on the workflow row
+# matches this reversal_begun event (transition-faithful, like the other reversing seeds); the
+# test's resume appends compensation_requested/settled on top of it.
+a0000000000000000000000000000030,1,2000-01-01 00:00:00.000000,reversal_begun,c0000000000000000000000000000000,\N,{}

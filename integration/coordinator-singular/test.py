@@ -140,6 +140,10 @@ WF_FWD_PLAN_VERSION_MISMATCH = "a0000000000000000000000000000025"  # pinned 1.0.
 WF_FWD_PLAN_MALFORMED_CFG = "a0000000000000000000000000000026"   # claimable; malformed registry post-claim -> defer + release lease
 WF_ARGS_MISSING = "a0000000000000000000000000000028"            # claimable planned; pin OK but NO durable args row (inconsistent) -> defer + release lease
 WF_LEGACY_NO_PIN = "a0000000000000000000000000000027"            # claimable legacy (no plan pin); planned resume must release the lease
+# Manual-IR (C6): a reversing workflow whose ACTIVE checkpoint is a TAKEN branch op. The
+# reverse path reads the checkpoint stack (no pin), so a branch-graph resume unwinds it
+# WITHOUT re-evaluating the if. Drives "restart across branch reversal".
+WF_REVERSE_BRANCH = "a0000000000000000000000000000030"           # reversing; 1 active checkpoint (taken branch op A)
 
 
 def _request_count(base):
@@ -892,6 +896,24 @@ def main():
                 {"kind": "return", "id": "n3", "value": {"const": None}},
             ]}
 
+        # A two-deep branch graph for reversal coverage: if args.flag then reserve brA else
+        # reserve brB, then a SHARED final op (reserve "fin"), then return. Both branch paths run
+        # the branch op THEN the final op -> uniform op_depth = plan_length = 2. The branch op is
+        # NON-final (compensable: reserve->release); the final op is the one driven to reject. The
+        # merge node's input is CONST (no cross-branch result merge). With fail_final, the final op
+        # is rejected -> reversal compensates ONLY the taken branch's checkpoint.
+        def rev_branch_graph(fail_final=False):
+            fin = {"reservation": "fin"}
+            if fail_final:
+                fin = {"reservation": "fin", "_fault": {"reject": True}}
+            return {"entry": "n0", "nodes": [
+                {"kind": "if", "id": "n0", "cond": {"arg": ["flag"]}, "then": "n1", "else": "n2"},
+                {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": {"reservation": "brA"}}, "next": "n3"},
+                {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "brB"}}, "next": "n3"},
+                {"kind": "operation", "id": "n3", "operation": "reserve", "input": {"const": fin}, "next": "n4"},
+                {"kind": "return", "id": "n4", "value": {"const": None}},
+            ]}
+
         gcfg = graph_cfg(branch_graph(), argument_type=BRANCH_AT)
 
         # C6a. TRUE branch dispatches ONLY op A (reserve brA); op B is never dispatched (exec +1).
@@ -999,6 +1021,84 @@ def main():
         check("graph_noncompensable_nonfinal_op_rejected",
               code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config"
               and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C6h. FORWARD FAILURE after a taken branch: the taken branch's compensable op (reserve
+        # brA) settles + checkpoints, then the SHARED final op (reserve fin) is definitely rejected
+        # (400) -> begin_reversal -> compensate ONLY the taken path's checkpoint (release brA) ->
+        # reversed. exec = reserve brA + release brA = 2 (the rejected final op runs no body). The
+        # UNTAKEN branch (brB) has NO operation row, NO checkpoint, NO participant execution.
+        rbcfg = graph_cfg(rev_branch_graph(fail_final=True), argument_type=BRANCH_AT)
+        wfrb = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(rbcfg, wfrb, arguments=json.dumps({"flag": True}))
+        ex_d = _exec_count(base) - ex0
+        wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wfrb}')")
+        cks = _mdb(f"SELECT seq, reversal_state, JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reservation')) "
+                   f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wfrb}') ORDER BY seq")
+        ops = _mdb(f"SELECT operation_seq, JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation')) "
+                   f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wfrb}') ORDER BY operation_seq")
+        brB_ops = _mdb(f"SELECT COUNT(*) FROM tb_mf_operation WHERE workflow_id = UNHEX('{wfrb}') AND input_json LIKE '%brB%'")
+        brB_cks = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wfrb}') AND payload LIKE '%brB%'")
+        check("graph_branch_forward_fail_reverses_taken_path_only",
+              code == 0 and body.get("workflow") == "reversed" and ex_d == 2
+              and wf == [["5", "2"]] and cks == [["1", "2", "brA"]]
+              and ops == [["1", "brA"], ["2", "fin"]]
+              and brB_ops == [["0"]] and brB_cks == [["0"]],
+              (code, body, ex_d, wf, cks, ops, brB_ops, brB_cks))
+
+        # C6i. MID-FLIGHT branch resume reconciles the persisted request GET-FIRST (no second PUT).
+        # Submit flag:true with branch op A PENDING: op A is requested-not-settled (a durable
+        # operation_request, no checkpoint; Singular left Working). A claimable RESUME RECOVERS that
+        # request and reconciles it by GET (the participant is still Working -> 202 pending) — it
+        # does NOT re-PUT the same operation id (put delta 0), issues at least the reconcile GET
+        # (request delta >= 1), and never re-evaluates into the other branch (the op row is
+        # unchanged: still the single seq-1 reserve brA).
+        mfcfg = graph_cfg(branch_graph(fault_on_a={"respond_pending": True}), argument_type=BRANCH_AT)
+        wfmf = _wf_id()
+        opq = (f"SELECT operation_seq, operation_name, status, "
+               f"JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation')) "
+               f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wfmf}') ORDER BY operation_seq")
+        code_s, body_s = run_runner(mfcfg, wfmf, arguments=json.dumps({"flag": True}))
+        op_s = _mdb(opq)
+        # Test-control nudge (NOT seeding): make the deferred workflow due so the resume re-claims.
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' "
+             f"WHERE workflow_id = UNHEX('{wfmf}')")
+        pu0, rq0 = _put_count(base), _request_count(base)
+        code_r, body_r = run_runner(mfcfg, wfmf)   # claimable RESUME -> GET-first reconcile
+        pu_d, rq_d = _put_count(base) - pu0, _request_count(base) - rq0
+        op_r = _mdb(opq)
+        check("graph_branch_midflight_resume_get_first_no_second_put",
+              code_s == 9 and body_s.get("workflow") == "pending"
+              and code_r == 9 and body_r.get("workflow") == "pending"
+              and pu_d == 0 and rq_d >= 1
+              and op_s == [["1", "reserve", "1", "brA"]] and op_r == op_s,
+              (code_s, body_s, code_r, body_r, f"put+{pu_d} req+{rq_d}", op_s, op_r))
+
+        # C6j. RESTART across branch reversal: a worker took the branch, settled the branch op
+        # (durable checkpoint, reservation brA), and BEGAN reversal, then crashed (seeded
+        # WF_REVERSE_BRANCH: state=reversing, direction=reverse, one active checkpoint). A fresh
+        # resume driven with the BRANCH graph config unwinds from the CHECKPOINT STACK, not graph
+        # control flow: it never re-evaluates the if (a graph re-eval would dispatch a forward
+        # reserve, so exec would exceed 1), compensates the one checkpoint EXACTLY ONCE via
+        # 'release' on its durable payload (brA), and reaches reversed in the reverse direction. The
+        # graph IS present (its pin must verify), but the reverse path never consults it. The seed
+        # is transition-faithful (reversal_begun audit head matching current_event_seq, an args
+        # child for the planned invariant); only the plan pin is inserted here, because its
+        # content_hash is the runner's own digest of this exact config (asserted live, not frozen).
+        rbrcfg = graph_cfg(rev_branch_graph(), argument_type=BRANCH_AT)
+        _mdb(f"INSERT INTO tb_mf_workflow_plan (workflow_id, plan_version, content_hash, plan_length, created_at) "
+             f"VALUES (UNHEX('{WF_REVERSE_BRANCH}'), '1.0.0', UNHEX('{emit_content_hash(rbrcfg)}'), 2, '2000-01-01 00:00:00.000000')")
+        ex0 = _exec_count(base)
+        code, body = run_runner(rbrcfg, WF_REVERSE_BRANCH)
+        ex_d = _exec_count(base) - ex0
+        wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{WF_REVERSE_BRANCH}')")
+        ck = _mdb(f"SELECT reversal_state, reverse_operation_name, "
+                  f"JSON_UNQUOTE(JSON_EXTRACT(reverse_input_json,'$.reservation')) "
+                  f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{WF_REVERSE_BRANCH}') ORDER BY seq")
+        check("graph_branch_reversal_restart_unwinds_from_checkpoint",
+              code == 0 and body.get("workflow") == "reversed" and ex_d == 1
+              and wf == [["5", "2"]] and ck == [["2", "release", "brA"]],
+              (code, body, ex_d, wf, ck))
 
         # C5h. EXISTING-workflow reassertion must NOT validate arguments against the ACTIVE
         # type — only a FRESH submission does (a rollout may change the declared type). Create
@@ -1145,7 +1245,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 78
+    EXPECTED_CHECKS = 81
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

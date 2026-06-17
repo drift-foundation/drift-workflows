@@ -20,3 +20,7 @@ a000000000000000000000000000000d,2,reserve,0000000000000000000000000000b0d2,"{""
 # Forward mid-plan seeds (sub-step C/D): op1's active checkpoint (payload = op input).
 a0000000000000000000000000000020,1,reserve,b0000000000000000000000000000201,"{""reservation"":""e1""}",1,\N,\N,\N,\N,\N,\N,\N,2000-01-01 00:00:02.000000,2000-01-01 00:00:02.000000
 a0000000000000000000000000000021,1,reserve,b0000000000000000000000000000211,"{""reservation"":""f1""}",1,\N,\N,\N,\N,\N,\N,\N,2000-01-01 00:00:02.000000,2000-01-01 00:00:02.000000
+# 30 (C6): the taken branch op A's active checkpoint (payload = its reserve input, brA). The
+# reverse unwind derives 'release' from the reserve->release binding and uses THIS payload as
+# the compensation input — proving it unwinds from the checkpoint, not the graph.
+a0000000000000000000000000000030,1,reserve,0000000000000000000000000000b351,"{""reservation"":""brA""}",1,\N,\N,\N,\N,\N,\N,\N,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000

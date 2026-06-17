@@ -91,6 +91,39 @@ with NO parser/DSL and NO new storage. Full gate green; integration 77/77.
   NON-COMPENSABLE non-final op rejected before dispatch. Existing straight-line planned suite green.
 - **Deferred (still):** finite loops (`NLoop` validated, not executed); `case`; cross-branch result
   merge; the source-language parser.
+- **Strictness follow-up (review finding):** `_parse_expr` validated the `result`/`local` sub-objects
+  by COUNT only (`_reject_extra(_, 2)`), so `{"result":{"node":"n1","bogus":1}}` (2 keys, no `path`)
+  silently dropped `bogus`. Now `_reject_unknown_opt_path` validates the actual key NAMES (only
+  `<required>` + optional `path`); unit cases (`ir_exec_test`) reject `{node,bogus}` / `{name,bogus}`.
+
+## Landed: manual-IR control flow, slice 2 — branch durability + reversibility
+
+Proves a branch graph (`if`) is durable and reversible across the real failure paths, using the
+existing graph config surface only. No loops, no parser/DSL, no cross-branch result merge (the
+merge node's input is a `const`), no new durable state (no new tables/columns; one reversing seed
+in existing fixture tables).
+- **Mid-flight branch resume reconciles GET-first (no second PUT):** submit `flag:true` with the
+  branch op PENDING (Singular left Working) → op requested-not-settled. A claimable RESUME RECOVERS
+  the durable request and reconciles by GET (participant still Working → 202), never re-PUTting the
+  same operation id, and never re-evaluating into the other branch. Test
+  `graph_branch_midflight_resume_get_first_no_second_put` asserts `put` delta 0, `request` delta ≥1,
+  op row unchanged.
+- **Forward failure after a taken branch:** a 2-deep branch graph (`reserve brA/brB` → shared final
+  `reserve fin` → return; uniform `op_depth`=2). With `flag:true` and the FINAL op rejected (400):
+  the taken branch's compensable op settles+checkpoints, then the rejection BEGINS reversal and
+  compensates ONLY the taken path (`release brA`) → reversed. Test
+  `graph_branch_forward_fail_reverses_taken_path_only`: exec+2, checkpoint reversed, trigger op
+  present, and the UNTAKEN branch (`brB`) has zero operation rows, zero checkpoints, zero execution.
+- **Restart across branch reversal:** seeded `WF_REVERSE_BRANCH` (state=reversing, direction=reverse,
+  one active checkpoint = taken branch op A, payload `brA`; no pin in the seed). A fresh resume
+  driven with the branch graph config (matching plan pin inserted live from the runner's own
+  `--emit-content-hash`) reaches `_run_reversal`, which unwinds from the CHECKPOINT STACK
+  (`reverse_head`) and reads compensation from the operations registry (`_compensation_for`) — it
+  NEVER consults the graph. Test `graph_branch_reversal_restart_unwinds_from_checkpoint`: reversed,
+  reverse direction, compensation EXACTLY once (`exec`+1, `release` on durable payload `brA`); a
+  graph re-evaluation would have dispatched a forward reserve, so `exec`=1 proves checkpoint-driven.
+- **Coverage:** the manual graph `if` now has forward, resume, terminal-replay, AND reversal
+  coverage. Integration 81/81 (was 78); full `just test` green.
 
 ## Landed: chunk 2 PART 2 — runner adopts the graph
 Delivered in verifiable stages.

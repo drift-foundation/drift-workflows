@@ -36,3 +36,9 @@ a0000000000000000000000000000027,protocol_spike,1,1,1,0,1,2000-01-01 00:00:00.00
 # 28: claimable forward PLANNED workflow with a MATCHING plan pin but NO durable args row
 # (inconsistent state). A planned RESUME must DEFER + RELEASE the lease BEFORE any dispatch.
 a0000000000000000000000000000028,protocol_spike,1,1,1,0,1,2000-01-01 00:00:00.000000,1,c0000000000000000000000000000000,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000,0,"{""pos"":""start""}",\N,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000
+# 30 (C6): reversing workflow with ONE active checkpoint that is a TAKEN BRANCH op (op A,
+# reservation brA). State=reversing(2), direction=reverse(2), claimable (lease/next_attempt in
+# the past). script_name=protocol_spike matches the branch graph revision's default name, so a
+# branch-graph RESUME (with a matching plan pin, inserted by the test) reaches _run_reversal and
+# unwinds this from the CHECKPOINT STACK WITHOUT re-evaluating the if.
+a0000000000000000000000000000030,protocol_spike,1,2,2,2,1,2000-01-01 00:00:00.000000,1,c0000000000000000000000000000000,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000,0,"{""pos"":""reverse"",""seq"":1}",0000000000000000000000000000b305,2000-01-01 00:00:00.000000,2000-01-01 00:00:00.000000

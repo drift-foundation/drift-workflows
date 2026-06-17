@@ -11,3 +11,8 @@ a0000000000000000000000000000023,7b7d,2000-01-01 00:00:00.000000
 a0000000000000000000000000000024,7b7d,2000-01-01 00:00:00.000000
 a0000000000000000000000000000025,7b7d,2000-01-01 00:00:00.000000
 a0000000000000000000000000000026,7b7d,2000-01-01 00:00:00.000000
+# 30 (C6): the reversing-branch seed is planned (the test inserts a live plan pin), so it carries
+# its args child too. The branch graph's argument type declares {flag:bool}, and the instance was
+# created flag:true — canonical {"flag":true} = 0x7b22666c6167223a747275657d. (Reversal never reads
+# args; this keeps the "planned implies args child" invariant faithful.)
+a0000000000000000000000000000030,7b22666c6167223a747275657d,2000-01-01 00:00:00.000000
