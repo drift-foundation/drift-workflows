@@ -250,26 +250,19 @@ fn _run(config_path: &String, workflow_hex: &String,
 		return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, is_submission, arguments_json);
 	}
 	if is_submission {
-		// Fresh planned SUBMISSION: requires a config plan (the legacy single-op path takes
-		// --operation, not --arguments).
-		match _build_plan(&cfg) {
-			Optional::Some(_) => {
-				return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, true, arguments_json);
-			},
-			Optional::None => {
-				console.println("{\"workflow\":\"aborted\",\"reason\":\"arguments_require_planned_config\"}");
-				return 2;
-			}
+		// Fresh planned SUBMISSION: requires a planned config — a flat "plan" OR a manual-IR
+		// "graph" (the legacy single-op path takes --operation, not --arguments).
+		if _is_planned_config(&cfg) {
+			return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, true, arguments_json);
 		}
+		console.println("{\"workflow\":\"aborted\",\"reason\":\"arguments_require_planned_config\"}");
+		return 2;
 	}
-	// No durable pin and no --arguments: a RESUME (or legacy). A config "plan" => a resume of
-	// a planned workflow (which, absent a pin, claim resolves to not_found); otherwise the
-	// legacy single-op path below.
-	match _build_plan(&cfg) {
-		Optional::Some(_) => {
-			return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, false, arguments_json);
-		},
-		Optional::None => {}
+	// No durable pin and no --arguments: a RESUME (or legacy). A planned config ("plan" or
+	// "graph") => a resume of a planned workflow (which, absent a pin, claim resolves to
+	// not_found); otherwise the legacy single-op path below.
+	if _is_planned_config(&cfg) {
+		return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, false, arguments_json);
 	}
 
 	// Legacy single-op path: validate the registry now (it routes the single dispatch).
@@ -716,10 +709,37 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 // PLAN_VERSION_DEFAULT) so different deployments genuinely carry different generations.
 // The version is validated as an immutable semver (major.minor.patch). v1 does NOT
 // retain multiple revisions — that, plus activation/reload, is a future evolution.
+// A PLANNED config carries the IR as either a flat "plan" or a manual-IR "graph" (presence-only
+// check; the actual parse/validate happens in _registry_build). Distinguishes planned workflows
+// (which take --arguments + a content-hash-pinned revision) from the legacy single-op path.
+fn _is_planned_config(cfg: &json.JsonNode) nothrow -> Bool {
+	match cfg.get(&"graph") { Optional::Some(_) => { return true; }, Optional::None => {} }
+	match cfg.get(&"plan") { Optional::Some(_) => { return true; }, Optional::None => {} }
+	return false;
+}
+
 fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
 	var revs: Array<ScriptRevision> = [];
-	match _build_plan(cfg) {
-		Optional::Some(plan) => {
+	// The revision IR comes from EITHER an explicit manual-IR "graph" config (non-degenerate
+	// shapes) OR the flat "plan" lifted to a degenerate straight-line graph. Neither present ->
+	// no revision (legacy single-op path).
+	var graph_opt: Optional<ir.IrGraph> = Optional<ir.IrGraph>::None();
+	match cfg.get(&"graph") {
+		Optional::Some(gnode) => {
+			match ir.parse_graph(gnode) {
+				core.Result::Ok(g) => { graph_opt = Optional<ir.IrGraph>::Some(move g); },
+				core.Result::Err(e) => { throw RunnerError(message = "invalid graph config: " + e.message); }
+			}
+		},
+		Optional::None => {
+			match _build_plan(cfg) {
+				Optional::Some(plan) => { graph_opt = Optional<ir.IrGraph>::Some(_build_graph(&plan)); },
+				Optional::None => {}
+			}
+		}
+	}
+	match move graph_opt {
+		Optional::Some(graph) => {
 			val name = _config_str(cfg, &"script_name", _dup(&SCRIPT_NAME));
 			val version = _config_str(cfg, &"plan_version", _dup(&PLAN_VERSION_DEFAULT));
 			_validate_semver(&version);
@@ -727,25 +747,23 @@ fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
 			// It ALWAYS participates in content_hash (the argument contract is part of the
 			// revision identity — never elided/conditional).
 			val arg_type = _arg_type(cfg);
-			val len = plan.len;
-			// Build the authoritative control-flow graph (degenerate straight-line from the flat
-			// plan) and VALIDATE it. A malformed graph -> RunnerError, surfaced by the existing
-			// build catches as invalid_config (submission, pre-claim) or revision_unavailable
-			// (resume, post-claim) — never executing an ill-formed graph.
-			val graph = _build_graph(&plan);
+			// VALIDATE the graph. A malformed graph -> RunnerError, surfaced by the existing build
+			// catches as invalid_config (submission, pre-claim) or revision_unavailable (resume,
+			// post-claim) — never executing an ill-formed graph.
 			match ir.validate_graph(&graph) {
 				Optional::Some(m) => { throw RunnerError(message = "invalid graph: " + move m); },
 				Optional::None => {}
 			}
-			// The forward driver executes only DEGENERATE straight-line graphs (no branches/loops/
-			// lets yet — parser is out of scope). Reject anything else HERE, at build (before any
-			// claim) — surfaced as invalid_config (submission) / revision_unavailable (resume) — so
-			// a non-executable graph can never strand a lease via a post-claim fault.
-			_assert_degenerate(&graph);
+			// Reject non-executable shapes (loops; op-unbalanced branches) at build, BEFORE any
+			// claim, and derive plan_length = the uniform per-path operation count.
+			val plan_length = _assert_executable(&graph);
+			// Reject non-reversible graphs: every non-final operation must be compensable (mirrors
+			// the flat-plan rule, generalized over branches), so reversal can never strand.
+			_assert_reversible(cfg, &graph);
 			val ch = _content_hash(cfg, &graph, &arg_type);
 			revs.push(ScriptRevision(name = move name, version = move version,
 			                         graph = move graph, arg_type = move arg_type,
-			                         content_hash = ch, plan_length = len));
+			                         content_hash = ch, plan_length = plan_length));
 		},
 		Optional::None => {}
 	}
@@ -891,19 +909,49 @@ fn _build_graph(plan: &Array<PlanStep>) -> ir.IrGraph {
 	}
 }
 
-// The forward driver supports only DEGENERATE straight-line graphs (only NOperation + NReturn
-// nodes — no NLet/NIf/NCase/NLoop). Given validate_graph (acyclic, all-reachable, single terminal)
-// has passed, that node-kind restriction alone guarantees a single op chain. Throws RunnerError on
-// anything else; called at registry build so rejection happens BEFORE any claim.
-fn _assert_degenerate(graph: &ir.IrGraph) -> Void {
+// The forward driver executes operation / let / if / case / return nodes — NOT loops (NLoop is
+// validated for shape but not yet EXECUTED; finite transforms are deferred). It also requires a
+// UNIFORM per-path operation count so the durable execution-position seq lands the final op at
+// seq == plan_length (the storage layer's finality derivation). Returns plan_length (the uniform
+// op count); throws RunnerError on a loop node or an op-unbalanced branch. Called at registry
+// build so rejection is BEFORE any claim (invalid_config / revision_unavailable, no lease leak).
+fn _assert_executable(graph: &ir.IrGraph) -> Int {
 	var i = 0;
 	while i < graph.nodes.len {
 		match &graph.nodes[i] {
-			ir.IrNode::NOperation(id, operation, input, next) => {},
-			ir.IrNode::NReturn(id, value) => {},
-			default => { throw RunnerError(message = "graph execution supports straight-line operations only (no branches/loops/lets yet)"); }
+			ir.IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
+				throw RunnerError(message = "graph execution does not support loops yet (NLoop)");
+			},
+			default => {}
 		}
 		i = i + 1;
+	}
+	match ir.op_depth(graph) {
+		core.Result::Ok(d) => { return d; },
+		core.Result::Err(e) => { throw RunnerError(message = "graph not executable: " + e.message); }
+	}
+}
+
+// Every NON-FINAL operation (one that executes before the final position on its path, so a later
+// op can still fail and begin reversal) MUST declare a compensation binding — else a reversal
+// would strand at no_compensation_binding. Mirrors _validate_plan's flat-plan rule, generalized
+// over the graph (covers branches). Throws RunnerError at registry build (before any claim).
+fn _assert_reversible(cfg: &json.JsonNode, graph: &ir.IrGraph) -> Void {
+	match ir.nonfinal_operations(graph) {
+		core.Result::Ok(ops) => {
+			var i = 0;
+			while i < ops.len {
+				match _compensation_for(cfg, &ops[i]) {
+					Optional::Some(_) => {},
+					Optional::None => {
+						throw RunnerError(message = "non-final operation '" + _dup(&ops[i])
+							+ "' has no compensation binding — it must be reversible");
+					}
+				}
+				i = i + 1;
+			}
+		},
+		core.Result::Err(e) => { throw RunnerError(message = "graph reversibility check: " + e.message); }
 	}
 }
 
@@ -957,22 +1005,11 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		return _defer_dispatch(host, workflow_id, fencing_token, "planned_args_missing");
 	}
 
-	// Already-settled operation results (resume), fed to `advance` so it skips past them. The op
-	// at seq K is graph node "n{K-1}". Track final_result / last_op_id from the highest settled.
+	// Settled operation results, fed to `advance` so it replays past them. Built INCREMENTALLY as
+	// replay reaches each operation: the durable seq is the EXECUTION POSITION (settled.len+1), and
+	// the result is mapped back to whatever IR node id advance chose for THIS path — so branching
+	// works without any positional node-id assumption.
 	var settled: Array<ir.OpResult> = [];
-	var sq = 1;
-	while sq <= n {
-		match host.operation_result(workflow_id, sq) {
-			mf.OperationResultOutcome::Succeeded(r) => {
-				last_op_id_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, sq));
-				settled.push(ir.OpResult(node_id = _node_id_for_seq(sq), result_json = _dup(&r)));
-				final_result = move r;
-			},
-			mf.OperationResultOutcome::Requested => {},
-			mf.OperationResultOutcome::NotFound => {}
-		}
-		sq = sq + 1;
-	}
 
 	// REPLAY pure control flow to the next durable boundary, EXECUTE that operation, repeat until
 	// replay reaches the terminal NReturn (`Completed`). The bound is purely defensive (a
@@ -995,17 +1032,26 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				return _defer_dispatch(host, workflow_id, fencing_token, "graph_replay_fault");
 			},
 			ir.StepOutcome::NeedOperation(node_id, op, input) => {
-				// Degenerate straight-line graph: the next unsettled operation is execution
-				// position settled.len+1 (ops settle contiguously — the DB enforces
-				// predecessor-settled), and its node id is "n{seq-1}". A mismatch means a
-				// non-degenerate graph, whose execution is out of scope (parser is out of scope).
+				// Durable seq = EXECUTION POSITION on the taken path (settled.len+1); ops settle
+				// contiguously (the DB enforces predecessor-settled). Build validation guarantees a
+				// UNIFORM op count per path (op_depth == plan_length), so the path's final op lands
+				// at seq == plan_length, matching the storage layer's finality derivation.
 				val seq = settled.len + 1;
-				if !_str_eq(node_id, &_node_id_for_seq(seq)) {
-					// Defensive: registry build (`_assert_degenerate`) already rejects non-degenerate
-					// graphs BEFORE claim, so this is unreachable. If ever reached, DEFER (release the
-					// lease) rather than throw — a post-claim throw would strand the lease until expiry.
-					return _defer_dispatch(host, workflow_id, fencing_token, "non_degenerate_graph");
+				// Already durably settled (resume)? Feed its result back into replay — keyed by the
+				// node id advance chose for THIS execution position — and re-advance; never
+				// re-dispatch. (Pure control flow before it is replayed, never persisted.)
+				var prior_done = false;
+				match host.operation_result(workflow_id, seq) {
+					mf.OperationResultOutcome::Succeeded(r) => {
+						last_op_id_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, seq));
+						settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&r)));
+						final_result = move r;
+						prior_done = true;
+					},
+					mf.OperationResultOutcome::Requested => {},
+					mf.OperationResultOutcome::NotFound => {}
 				}
+				if prior_done { continue; }
 				var is_final = false;
 				if seq == n { is_final = true; }
 
@@ -1140,9 +1186,6 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 	console.eprintln("forward drive exceeded step budget");
 	return _defer_dispatch(host, workflow_id, fencing_token, "forward_budget_exceeded");
 }
-
-// Graph node id for an operation seq (degenerate straight-line graph: op at seq K is node n{K-1}).
-fn _node_id_for_seq(seq: Int) nothrow -> String { return "n" + fmt.format_int(seq - 1); }
 
 // A definite forward failure with a compensable checkpoint stack: transition
 // forward -> reversing (or straight to reversed when nothing is compensable) via the

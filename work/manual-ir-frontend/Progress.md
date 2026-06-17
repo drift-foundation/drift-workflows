@@ -51,7 +51,48 @@ content_hash are the remaining 1b(ii) chunk.
   (bind first); expression-form `val x = match {…}` can't `return` from an arm — use
   `var x = <default>; match {…}` (statement form).
 
-## In progress: chunk 2 PART 2 — runner adopts the graph
+## Landed: manual-IR control flow, slice 1 — `if` (graph interpreter reachable for one branch shape)
+The graph interpreter is now REACHABLE from config for a non-degenerate shape (a single `if`),
+with NO parser/DSL and NO new storage. Full gate green; integration 77/77.
+- **Manual-IR `graph` config** (`ir.parse_graph`): a directly-authored control-flow graph (config
+  `"graph"` key) — `operation` / `if` / `let` / `return` nodes + `const`/`arg`/`result`/`local`
+  expressions. Intentionally small (no loops, no `case`, no parser). `const` values are
+  canonicalized into the `EConst` literal. **STRICT parsing** (graph is content-hashed identity):
+  each node kind has EXACTLY its allowed keys and an expression is EXACTLY ONE variant — unknown/
+  extra keys or multiple variant keys are rejected (no silent drop / priority). `_registry_build`
+  uses `"graph"` when present, else lifts the flat `"plan"` to a degenerate graph;
+  `_is_planned_config` recognizes EITHER as planned (so `--arguments` submission works for graphs).
+- **Execution beyond the degenerate guard:** `_assert_degenerate` → **`_assert_executable`** —
+  rejects only `NLoop` (loops still deferred) and derives `plan_length` from **`ir.op_depth`**.
+  The forward loop drives `ir.advance` for `operation`/`if`/`let`/`return`.
+- **Operation sequencing for branches** (guardrail 1 — validated at BUILD, not handled at runtime):
+  durable seq = EXECUTION POSITION (`settled.len+1`); replay maps each settled result back to the
+  node id `advance` chose. `ir.op_depth` requires a UNIFORM per-path operation count (rejecting
+  op-unbalanced branches at registry build → invalid_config / revision_unavailable, before any
+  dispatch), so the path's final op lands at `seq == plan_length` and the storage layer's finality
+  derivation (`is_final ⟺ seq==plan_length`) holds UNCHANGED — no new durable state.
+- **Reversibility (graph-level compensation):** `_assert_reversible` (via `ir.nonfinal_operations`)
+  rejects at BUILD any graph where a NON-FINAL operation (one that can execute before the final
+  position, so a later op could fail and begin reversal) lacks a compensation binding — generalizes
+  `_validate_plan`'s flat-plan rule across branches, so reversal can never strand at
+  `no_compensation_binding`.
+- **Result references** (guardrail 2): `EResult(node)` is valid only if that NOperation DOMINATES
+  the reference (enforced by `validate_graph`). Branch tests keep each branch op's result
+  branch-local / rely on terminal replay of the final durable op result; no cross-branch merge
+  (an explicit merge model is deliberately deferred).
+- **Tests:** unit — `ir_exec_test` (op_depth straight-line=2 / balanced-if=1 / **unbalanced→Err**;
+  `nonfinal_operations`; `parse_graph` strictness — unknown node key / multi-variant expr / unknown
+  variant / extra top-level key all rejected). Integration C6 (graph-driven): if-true dispatches
+  only branch A (B zero calls), if-false only B, no durable record at the branch boundary (pure
+  NIf — same event count as a 1-op plan), terminal replay returns the final durable op result, a
+  **claimable RESUME** (nudge `next_attempt_at`) re-derives the branch through `ir.advance` from the
+  DURABLE args — staying `pending`; had it used `{}`/CLI it would `graph_replay_fault` — with the
+  false-branch contrast under one config, an op-unbalanced if rejected before dispatch, and a
+  NON-COMPENSABLE non-final op rejected before dispatch. Existing straight-line planned suite green.
+- **Deferred (still):** finite loops (`NLoop` validated, not executed); `case`; cross-branch result
+  merge; the source-language parser.
+
+## Landed: chunk 2 PART 2 — runner adopts the graph
 Delivered in verifiable stages.
 - **Stage 1 (LANDED, full gate green):** the graph is authoritative for IDENTITY + VALIDATION.
   `_registry_build` now builds the degenerate graph (`_build_graph` via `ir.flat_to_graph`) and

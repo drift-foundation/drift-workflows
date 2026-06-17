@@ -10,7 +10,33 @@
 module microflows.runner.tests.ir_exec_test;
 
 import std.core as core;
+import std.json as json;
 import microflows.runner.ir as ir;
+
+// parse_graph on a JSON config string: true iff it is REJECTED (Err). (The JSON itself must be
+// valid — we test graph-level rejection, not JSON parse errors.)
+fn _pg_rejects(text: &String) -> Bool {
+	match json.parse_strict(text) {
+		core.Result::Ok(n) => {
+			match ir.parse_graph(&n) {
+				core.Result::Err(e) => { return true; },
+				core.Result::Ok(g) => { return false; }
+			}
+		},
+		core.Result::Err(e) => { return false; }
+	}
+}
+fn _pg_accepts(text: &String) -> Bool {
+	match json.parse_strict(text) {
+		core.Result::Ok(n) => {
+			match ir.parse_graph(&n) {
+				core.Result::Ok(g) => { return true; },
+				core.Result::Err(e) => { return false; }
+			}
+		},
+		core.Result::Err(e) => { return false; }
+	}
+}
 
 fn _seq(a: &String, b: &String) nothrow -> Bool {
 	if a.byte_length() != b.byte_length() { return false; }
@@ -57,7 +83,7 @@ fn _graph_b() nothrow -> ir.IrGraph {
 	return ir.IrGraph(nodes = move nodes, entry = "n0");
 }
 
-fn scenario() nothrow -> Int {
+fn scenario() -> Int {
 	// ===== validation: well-formed graphs accepted =====
 	var flat: Array<ir.FlatStep> = [];
 	flat.push(ir.FlatStep(operation = "alpha", input_json = "{\"a\":1}"));
@@ -250,11 +276,75 @@ fn scenario() nothrow -> Int {
 	val c_def = ir.advance(&gc, &"{\"mode\":\"z\"}", &none);
 	if !_is_completed(&c_def, &"0") { return 52; }
 
+	// ===== op_depth: uniform per-path operation count (durable seq model) =====
+	// straight-line 2-op graph -> depth 2.
+	match ir.op_depth(&gd) {
+		core.Result::Ok(d) => { if d != 2 { return 70; } },
+		core.Result::Err(e) => { return 71; }
+	}
+	// BALANCED if (one op on each branch) -> depth 1, and validates.
+	var bnodes: Array<ir.IrNode> = [];
+	bnodes.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	bnodes.push(ir.IrNode::NOperation(id = "n1", operation = "A", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	bnodes.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	bnodes.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val bal = ir.IrGraph(nodes = move bnodes, entry = "n0");
+	if !_ok_validate(&bal) { return 72; }
+	match ir.op_depth(&bal) {
+		core.Result::Ok(d) => { if d != 1 { return 73; } },
+		core.Result::Err(e) => { return 74; }
+	}
+	// UNBALANCED if (true path 2 ops, false path 1 op) -> op_depth Err (validate still passes).
+	var unodes: Array<ir.IrNode> = [];
+	unodes.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	unodes.push(ir.IrNode::NOperation(id = "n1", operation = "A", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n4"));
+	unodes.push(ir.IrNode::NOperation(id = "n4", operation = "C", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	unodes.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	unodes.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val unbal = ir.IrGraph(nodes = move unodes, entry = "n0");
+	if !_ok_validate(&unbal) { return 75; }
+	match ir.op_depth(&unbal) {
+		core.Result::Err(e) => {},
+		core.Result::Ok(d) => { return 76; }
+	}
+
+	// ===== nonfinal_operations: NOperations before the final execution position (must be compensable) =====
+	// straight-line [alpha, beta]: alpha is non-final (seq1 < plan_length 2), beta is final.
+	match ir.nonfinal_operations(&gd) {
+		core.Result::Ok(nf) => {
+			if nf.len != 1 { return 77; }
+			if !_seq(&nf[0], &"alpha") { return 78; }
+		},
+		core.Result::Err(e) => { return 79; }
+	}
+	// balanced if (1 op per branch, plan_length 1): both branch ops are FINAL -> none non-final.
+	match ir.nonfinal_operations(&bal) {
+		core.Result::Ok(nf) => { if nf.len != 0 { return 80; } },
+		core.Result::Err(e) => { return 81; }
+	}
+
+	// ===== parse_graph strictness (graph config is content-hashed identity) =====
+	// valid if-graph accepted.
+	if !_pg_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"f\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":2}}]}") { return 82; }
+	// unknown/extra key on a node rejected.
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":1},\"bogus\":1}]}") { return 83; }
+	// expression with TWO variant keys rejected (no silent priority).
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":1,\"arg\":[\"f\"]}}]}") { return 84; }
+	// expression with an unknown variant key rejected.
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"konst\":1}}]}") { return 85; }
+	// unknown top-level graph key rejected.
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"extra\":1,\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":1}}]}") { return 86; }
+	// result expr with an unknown key (path omitted) rejected — count-only would have admitted {node, bogus}.
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"result\":{\"node\":\"n1\",\"bogus\":1}}}]}") { return 87; }
+	// local expr with an unknown key (path omitted) rejected.
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"local\":{\"name\":\"x\",\"bogus\":1}}}]}") { return 88; }
+
 	return 0;
 }
 
 fn main() nothrow -> Int {
-	val r = scenario();
+	var r = 0;
+	try { r = scenario(); } catch unexpected { return 91; }
 	if r != 0 { return r; }
 	return 0;
 }

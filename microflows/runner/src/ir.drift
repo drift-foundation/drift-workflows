@@ -23,9 +23,12 @@ export {
 	IrGraph,
 	FlatStep,
 	flat_to_graph,
+	parse_graph,
 	graph_canonical,
 	canonical_json,
 	validate_graph,
+	op_depth,
+	nonfinal_operations,
 	operation_names,
 	OpResult,
 	StepOutcome,
@@ -404,6 +407,148 @@ pub fn flat_to_graph(steps: &Array<FlatStep>) -> core.Result<IrGraph, IrError> {
 }
 
 fn _nid(i: Int) nothrow -> String { return "n" + fmt.format_int(i); }
+
+// ----- manual-IR GRAPH config -> IrGraph (intentionally small; no parser/DSL) -----
+//
+// A directly-authored control-flow graph (the "graph" config key), for non-degenerate shapes the
+// flat plan can't express. Encoding (JSON):
+//   {"entry":"n0","nodes":[ <node>, ... ]}
+//   <node> = {"kind":"operation","id":...,"operation":...,"input":<expr>,"next":...}
+//          | {"kind":"if","id":...,"cond":<expr>,"then":...,"else":...}
+//          | {"kind":"let","id":...,"name":...,"value":<expr>,"next":...}
+//          | {"kind":"return","id":...,"value":<expr>}
+//   <expr> = {"const":<json>} | {"arg":[seg,...]} | {"result":{"node":...,"path":[seg,...]}}
+//          | {"local":{"name":...,"path":[seg,...]}}     ("path" optional, default [])
+// `const` values are canonicalized into the EConst literal. NLoop / NCase are intentionally NOT
+// expressible here yet (slice scope: operation + if + let + return). Returns a Result (IrError
+// caught HERE) so callers in other modules need no error-type-qualified catch.
+pub fn parse_graph(node: &json.JsonNode) -> core.Result<IrGraph, IrError> {
+	try {
+		val g = _parse_graph_throwing(node);
+		return core.Result<IrGraph, IrError>::Ok(move g);
+	} catch IrError(e) {
+		return core.Result<IrGraph, IrError>::Err(IrError(message = e.message));
+	}
+}
+
+fn _parse_graph_throwing(node: &json.JsonNode) -> IrGraph {
+	_reject_extra(_obj_len(node), 2);   // exactly {entry, nodes} — unknown keys rejected
+	val entry = _req_str(node, &"entry");
+	var nodes: Array<IrNode> = [];
+	match node.get(&"nodes") {
+		Optional::Some(nn) => {
+			match nn.as_array() {
+				Optional::Some(arr) => {
+					var i = 0;
+					while i < arr.len { nodes.push(_parse_node(&arr[i])); i = i + 1; }
+				},
+				Optional::None => { throw IrError(message = "graph 'nodes' must be an array"); }
+			}
+		},
+		Optional::None => { throw IrError(message = "graph missing 'nodes'"); }
+	}
+	if nodes.len == 0 { throw IrError(message = "graph 'nodes' must not be empty"); }
+	return IrGraph(nodes = move nodes, entry = entry);
+}
+
+// Each node kind has EXACTLY its allowed keys — unknown/extra keys are rejected (the graph is
+// content-hashed executable identity; a typo'd key must fail validation, not be silently dropped).
+fn _parse_node(n: &json.JsonNode) -> IrNode {
+	val nkeys = _obj_len(n);
+	val kind = _req_str(n, &"kind");
+	val id = _req_str(n, &"id");
+	if _str_eq(&kind, &"operation") {
+		val op = _req_str(n, &"operation");
+		val next = _req_str(n, &"next");
+		val input = _parse_expr_at(n, &"input");
+		_reject_extra(nkeys, 5);   // kind, id, operation, input, next
+		return IrNode::NOperation(id = move id, operation = move op, input = move input, next = move next);
+	}
+	if _str_eq(&kind, &"if") {
+		val then_n = _req_str(n, &"then");
+		val else_n = _req_str(n, &"else");
+		val cond = _parse_expr_at(n, &"cond");
+		_reject_extra(nkeys, 5);   // kind, id, cond, then, else
+		return IrNode::NIf(id = move id, cond = move cond, then_node = move then_n, else_node = move else_n);
+	}
+	if _str_eq(&kind, &"let") {
+		val name = _req_str(n, &"name");
+		val next = _req_str(n, &"next");
+		val value = _parse_expr_at(n, &"value");
+		_reject_extra(nkeys, 5);   // kind, id, name, value, next
+		return IrNode::NLet(id = move id, name = move name, value = move value, next = move next);
+	}
+	if _str_eq(&kind, &"return") {
+		val value = _parse_expr_at(n, &"value");
+		_reject_extra(nkeys, 3);   // kind, id, value
+		return IrNode::NReturn(id = move id, value = move value);
+	}
+	throw IrError(message = "unknown graph node kind: " + _dup(&kind));
+}
+
+// Parse the expression at object key `key` (required).
+fn _parse_expr_at(n: &json.JsonNode, key: &String) -> IrExpr {
+	match n.get(key) {
+		Optional::Some(e) => { return _parse_expr(e); },
+		Optional::None => { throw IrError(message = "node missing expression field '" + _dup(key) + "'"); }
+	}
+}
+
+// An expression is EXACTLY ONE variant: const | arg | result | local. Multiple keys (which would
+// silently resolve by priority) or unknown keys are rejected.
+fn _parse_expr(e: &json.JsonNode) -> IrExpr {
+	_reject_extra(_obj_len(e), 1);   // at most one variant key; 0 falls through to the throw below
+	match e.get(&"const") {
+		Optional::Some(c) => { return IrExpr::EConst(canonical_json = _canon_node(c)); },
+		Optional::None => {}
+	}
+	match e.get(&"arg") {
+		Optional::Some(p) => { return IrExpr::EArg(path = _parse_path(p)); },
+		Optional::None => {}
+	}
+	match e.get(&"result") {
+		Optional::Some(r) => {
+			_reject_unknown_opt_path(r, &"node");   // exactly {node, path?}
+			val rnode = _req_str(r, &"node");
+			return IrExpr::EResult(node = move rnode, path = _parse_path_opt(r, &"path"));
+		},
+		Optional::None => {}
+	}
+	match e.get(&"local") {
+		Optional::Some(l) => {
+			_reject_unknown_opt_path(l, &"name");   // exactly {name, path?}
+			val lname = _req_str(l, &"name");
+			return IrExpr::ELocal(name = move lname, path = _parse_path_opt(l, &"path"));
+		},
+		Optional::None => {}
+	}
+	throw IrError(message = "expression must be exactly one of: const, arg, result, local");
+}
+
+fn _parse_path(p: &json.JsonNode) -> Array<String> {
+	var out: Array<String> = [];
+	match p.as_array() {
+		Optional::Some(arr) => {
+			var i = 0;
+			while i < arr.len {
+				match arr[i].as_string() {
+					Optional::Some(s) => { out.push(move s); },
+					Optional::None => { throw IrError(message = "path segment must be a string"); }
+				}
+				i = i + 1;
+			}
+		},
+		Optional::None => { throw IrError(message = "path must be an array of strings"); }
+	}
+	return move out;
+}
+
+fn _parse_path_opt(n: &json.JsonNode, key: &String) -> Array<String> {
+	match n.get(key) {
+		Optional::Some(p) => { return _parse_path(p); },
+		Optional::None => { var empty: Array<String> = []; return move empty; }
+	}
+}
 
 // Canonical compact JSON: parse strictly + re-encode with lexicographic UTF-8 key ordering, so a
 // value's identity is independent of key spelling/order/whitespace. The IR home's definition of
@@ -1075,6 +1220,126 @@ fn _contains_str(xs: &Array<String>, x: &String) nothrow -> Bool {
 	return false;
 }
 
+// ===== op-depth (uniform per-path NOperation count) =====
+//
+// The durable layer assigns each executed operation a sequence number = its EXECUTION POSITION
+// (1st op = seq 1, …) and derives finality as `seq == plan_length`. For that to hold under
+// branching, EVERY root->NReturn path must traverse the SAME number of NOperation nodes — then
+// the final op of any path lands at seq == plan_length. `op_depth` returns that uniform count
+// (the runner's plan_length), or Err if paths disagree (an op-unbalanced branch). Assumes a
+// graph already accepted by `validate_graph` (acyclic, all nodes reachable, sinks are NReturn).
+// depth(node) = number of NOperations strictly before `node`; computed in topological order
+// (Kahn) so every predecessor contributes before a node is finalized.
+// Per-node op-depth (number of NOperations strictly before each node), in topological order from
+// `entry` (Kahn). Unreachable nodes keep depth -1. Err on an op-unbalanced branch (a node reached
+// via paths with differing operation counts). The shared core of op_depth / nonfinal_operations.
+fn _node_depths(g: &IrGraph) nothrow -> core.Result<Array<Int>, IrError> {
+	val nn = g.nodes.len;
+	var depth: Array<Int> = [];
+	var indeg: Array<Int> = [];
+	var i = 0;
+	while i < nn { depth.push(-1); indeg.push(0); i = i + 1; }
+
+	i = 0;
+	while i < nn {
+		var succs: Array<String> = [];
+		_succs(&g.nodes[i], &mut succs);
+		var s = 0;
+		while s < succs.len {
+			val t = _find_node(g, &succs[s]);
+			if t >= 0 { indeg[t] = indeg[t] + 1; }
+			s = s + 1;
+		}
+		i = i + 1;
+	}
+
+	val entry_idx = _find_node(g, &g.entry);
+	if entry_idx < 0 { return core.Result<Array<Int>, IrError>::Err(IrError(message = "entry not found")); }
+
+	var queue: Array<Int> = [];
+	var qh = 0;
+	depth[entry_idx] = 0;
+	queue.push(entry_idx);
+	while qh < queue.len {
+		val u = queue[qh];
+		qh = qh + 1;
+		var inc = 0;
+		if _is_operation(&g.nodes[u]) { inc = 1; }
+		val ud = depth[u] + inc;
+		var succs: Array<String> = [];
+		_succs(&g.nodes[u], &mut succs);
+		var s = 0;
+		while s < succs.len {
+			val v = _find_node(g, &succs[s]);
+			if v >= 0 {
+				if depth[v] < 0 { depth[v] = ud; }
+				else { if depth[v] != ud { return core.Result<Array<Int>, IrError>::Err(IrError(message = "op-unbalanced branch (paths reach a node with differing operation counts)")); } }
+				indeg[v] = indeg[v] - 1;
+				if indeg[v] == 0 { queue.push(v); }
+			}
+			s = s + 1;
+		}
+	}
+	return core.Result<Array<Int>, IrError>::Ok(move depth);
+}
+
+// plan_length: the uniform NReturn op-depth (all reachable terminals agree), or Err.
+pub fn op_depth(g: &IrGraph) nothrow -> core.Result<Int, IrError> {
+	var depth: Array<Int> = [];
+	match _node_depths(g) {
+		core.Result::Ok(d) => { depth = move d; },
+		core.Result::Err(e) => { return core.Result<Int, IrError>::Err(IrError(message = e.message)); }
+	}
+	var pl = -1;
+	var i = 0;
+	while i < g.nodes.len {
+		if depth[i] >= 0 and _is_return(&g.nodes[i]) {
+			if pl < 0 { pl = depth[i]; }
+			else { if pl != depth[i] { return core.Result<Int, IrError>::Err(IrError(message = "op-unbalanced branch (terminal paths have differing operation counts)")); } }
+		}
+		i = i + 1;
+	}
+	if pl < 0 { return core.Result<Int, IrError>::Err(IrError(message = "no reachable terminal")); }
+	return core.Result<Int, IrError>::Ok(pl);
+}
+
+// Operation NAMES of NOperation nodes that are NON-FINAL — they execute at a position strictly
+// before the final one (seq < plan_length) on their (uniform-length) path, so a later operation
+// can still fail and trigger reversal. Such operations MUST be compensable; the caller checks each
+// against the registry. Err if op-unbalanced (same shape op_depth rejects).
+pub fn nonfinal_operations(g: &IrGraph) nothrow -> core.Result<Array<String>, IrError> {
+	var depth: Array<Int> = [];
+	match _node_depths(g) {
+		core.Result::Ok(d) => { depth = move d; },
+		core.Result::Err(e) => { return core.Result<Array<String>, IrError>::Err(IrError(message = e.message)); }
+	}
+	var pl = -1;
+	var i = 0;
+	while i < g.nodes.len {
+		if depth[i] >= 0 and _is_return(&g.nodes[i]) {
+			if pl < 0 { pl = depth[i]; }
+			else { if pl != depth[i] { return core.Result<Array<String>, IrError>::Err(IrError(message = "op-unbalanced branch (terminal paths have differing operation counts)")); } }
+		}
+		i = i + 1;
+	}
+	if pl < 0 { return core.Result<Array<String>, IrError>::Err(IrError(message = "no reachable terminal")); }
+	var out: Array<String> = [];
+	i = 0;
+	while i < g.nodes.len {
+		if depth[i] >= 0 {
+			match &g.nodes[i] {
+				IrNode::NOperation(id, operation, input, next) => {
+					// seq = depth + 1; non-final iff seq < plan_length.
+					if depth[i] + 1 < pl { out.push(_dup(operation)); }
+				},
+				default => {}
+			}
+		}
+		i = i + 1;
+	}
+	return core.Result<Array<String>, IrError>::Ok(move out);
+}
+
 // ===== helpers =====
 
 // Number of keys in a declaration object (0 if not an object).
@@ -1085,6 +1350,20 @@ fn _obj_len(node: &json.JsonNode) nothrow -> Int {
 // A declaration carries exactly its allowed keys; more than `allowed` means an unknown key.
 fn _reject_extra(actual: Int, allowed: Int) -> Void {
 	if actual > allowed { throw IrError(message = "unknown key in type/field declaration"); }
+}
+
+// A `result`/`local` expression object carries exactly `required` plus an OPTIONAL "path" —
+// nothing else. A count-only bound (<= 2) would admit {required, <unknown>} when "path" is
+// omitted, silently dropping the unknown key. So when two keys are present the second MUST be
+// "path"; `required`'s presence is enforced by the caller's _req_str.
+fn _reject_unknown_opt_path(n: &json.JsonNode, required: &String) -> Void {
+	_reject_extra(_obj_len(n), 2);
+	if _obj_len(n) == 2 {
+		match n.get(&"path") {
+			Optional::Some(_) => {},
+			Optional::None => { throw IrError(message = "unknown key in expression (only '" + _dup(required) + "' and 'path' allowed)"); }
+		}
+	}
 }
 
 // A JSON number literal is FLOAT-shaped iff its raw text carries a fractional point or an

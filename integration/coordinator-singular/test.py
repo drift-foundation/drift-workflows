@@ -238,6 +238,16 @@ def main():
         plan_cfgs.append(f.name)
         return f.name
 
+    def graph_cfg(graph, argument_type=None):
+        # Manual-IR control flow (slice 1): a directly-authored control-flow GRAPH (the "graph"
+        # config key) instead of the flat "plan". Same registry; supports operation/if/let/return.
+        c = dict(runner_cfg); c["graph"] = graph
+        if argument_type is not None:
+            c["argument_type"] = argument_type
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(c, f); f.close()
+        plan_cfgs.append(f.name)
+        return f.name
+
     stub = subprocess.Popen([str(STUB_BIN), "--config", scf.name],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     deadline = time.time() + 15
@@ -863,11 +873,132 @@ def main():
         check("content_hash_changes_on_semantic_graph_change",
               len(h_sem) == 66 and h_sem != h_ko1, (h_sem, h_ko1))
 
-        # (No NON-DEGENERATE-graph integration case: config only builds degenerate straight-line
-        # graphs — there is no parser/control-flow surface yet to author branches/loops/lets, and
-        # we are not inventing one just to test the guard. The unsupported path is covered by
-        # ir_exec_test's validation cases plus the runner's build-time _assert_degenerate (rejects
-        # before claim) and the post-claim node-id guard that defers + releases the lease.)
+        # ===== C6. MANUAL-IR CONTROL FLOW, slice 1: `if` =====
+        # A directly-authored branch graph (the "graph" config key — no parser/DSL): if args.flag
+        # then reserve "brA" else reserve "brB", both returning. This drives the graph interpreter
+        # (ir.advance) beyond the degenerate straight line. Each branch runs EXACTLY one remote op;
+        # the untaken branch is never dispatched. (Both branches have 1 op, so op_depth is uniform
+        # = plan_length = 1; the build rejects op-unbalanced branches — C6f.)
+        BRANCH_AT = {"type": "object", "fields": [{"name": "flag", "type": {"type": "bool"}}]}
+
+        def branch_graph(fault_on_a=None):
+            a_input = {"reservation": "brA"}
+            if fault_on_a is not None:
+                a_input["_fault"] = fault_on_a
+            return {"entry": "n0", "nodes": [
+                {"kind": "if", "id": "n0", "cond": {"arg": ["flag"]}, "then": "n1", "else": "n2"},
+                {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": a_input}, "next": "n3"},
+                {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "brB"}}, "next": "n3"},
+                {"kind": "return", "id": "n3", "value": {"const": None}},
+            ]}
+
+        gcfg = graph_cfg(branch_graph(), argument_type=BRANCH_AT)
+
+        # C6a. TRUE branch dispatches ONLY op A (reserve brA); op B is never dispatched (exec +1).
+        wft = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(gcfg, wft, arguments=json.dumps({"flag": True}))
+        ex_d = _exec_count(base) - ex0
+        ckt = _mdb(f"SELECT seq, JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reservation')) "
+                   f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wft}') ORDER BY seq")
+        check("graph_if_true_dispatches_only_branch_a",
+              code == 0 and body.get("workflow") == "completed" and body.get("result") == {"reserved": "brA"}
+              and ex_d == 1 and ckt == [["1", "brA"]], (code, body, ex_d, ckt))
+
+        # C6b. NO durable record at the branch boundary: the NIf is PURE (replayed, never
+        # persisted). A 1-op straight-line plan and this 1-op-on-taken-path branch produce the
+        # SAME event count — the branch contributes zero events / continuations.
+        slcfg = plan_cfg([{"operation": "reserve", "input": {"reservation": "sl1"}}])
+        wfsl1 = _wf_id()
+        run_runner(slcfg, wfsl1, arguments="{}")
+        nev_t = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wft}')")
+        nev_sl = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wfsl1}')")
+        check("graph_if_no_durable_record_at_branch_boundary",
+              nev_t == nev_sl and nev_t != [["0"]], (nev_t, nev_sl))
+
+        # C6c. FALSE branch dispatches ONLY op B (reserve brB); op A is never dispatched (exec +1).
+        wff = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(gcfg, wff, arguments=json.dumps({"flag": False}))
+        ex_d = _exec_count(base) - ex0
+        ckf = _mdb(f"SELECT seq, JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reservation')) "
+                   f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wff}') ORDER BY seq")
+        check("graph_if_false_dispatches_only_branch_b",
+              code == 0 and body.get("workflow") == "completed" and body.get("result") == {"reserved": "brB"}
+              and ex_d == 1 and ckf == [["1", "brB"]], (code, body, ex_d, ckf))
+
+        # C6d. TERMINAL replay of a completed branch workflow returns the durable FINAL op result
+        # (the taken branch's), independent of the participant.
+        code, body = run_runner(gcfg, wft)
+        check("graph_if_terminal_replay_durable_result",
+              code == 0 and body.get("workflow") == "already_terminal"
+              and body.get("result") == {"reserved": "brA"}, (code, body))
+
+        # C6e. A CLAIMABLE RESUME re-derives the branch through ir.advance from the DURABLE args
+        # (args_get), not {} or CLI. Submit flag:true with op A PENDING (respond_pending): branch
+        # true is chosen, op A (reserve brA) is requested-not-settled, and the workflow defers.
+        # NUDGE next_attempt_at into the past (making it claimable) and RESUME (no --arguments): it
+        # actually re-claims, replays the branch from the durable args, and reconciles op A —
+        # staying "pending". Had the resume used {}/CLI args, the cond (arg "flag") would be MISSING
+        # and replay would FAULT -> deferred:graph_replay_fault, not pending. So a durable-args
+        # regression flips this from "pending" to "deferred". (False-branch contrast: flag:false
+        # selects op B under the SAME config — the branch is decided by args, not the config.)
+        pgcfg = graph_cfg(branch_graph(fault_on_a={"respond_pending": True}), argument_type=BRANCH_AT)
+        wf_pt = _wf_id()
+        code_s, body_s = run_runner(pgcfg, wf_pt, arguments=json.dumps({"flag": True}))
+        op_s = _mdb(f"SELECT operation_name, JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation')) "
+                    f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wf_pt}') ORDER BY operation_seq")
+        # Test-control nudge (NOT seeding): make the deferred workflow due so the resume re-claims.
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' "
+             f"WHERE workflow_id = UNHEX('{wf_pt}')")
+        code_r, body_r = run_runner(pgcfg, wf_pt)   # claimable RESUME -> _run_forward/ir.advance
+        op_r = _mdb(f"SELECT operation_name, JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation')) "
+                    f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wf_pt}') ORDER BY operation_seq")
+        wf_pf = _wf_id()
+        code_f, body_f = run_runner(graph_cfg(branch_graph(), argument_type=BRANCH_AT), wf_pf, arguments=json.dumps({"flag": False}))
+        op_f = _mdb(f"SELECT operation_name, JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation')) "
+                    f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wf_pf}') ORDER BY operation_seq")
+        check("graph_if_resume_replays_branch_from_durable_args",
+              code_s == 9 and body_s.get("workflow") == "pending" and op_s == [["reserve", "brA"]]
+              and code_r == 9 and body_r.get("workflow") == "pending" and op_r == [["reserve", "brA"]]
+              and code_f == 0 and body_f.get("workflow") == "completed"
+              and body_f.get("result") == {"reserved": "brB"} and op_f == [["reserve", "brB"]],
+              (code_s, body_s, op_s, code_r, body_r, op_r, code_f, body_f, op_f))
+
+        # C6f. An op-UNBALANCED if (true path 2 ops, false path 1) is NON-EXECUTABLE: rejected at
+        # BUILD (op_depth), surfaced as invalid_config, with NO operation dispatched.
+        unbal_graph = {"entry": "n0", "nodes": [
+            {"kind": "if", "id": "n0", "cond": {"arg": ["flag"]}, "then": "n1", "else": "n2"},
+            {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": {"reservation": "u1"}}, "next": "n4"},
+            {"kind": "operation", "id": "n4", "operation": "reserve", "input": {"const": {"reservation": "u2"}}, "next": "n3"},
+            {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "u3"}}, "next": "n3"},
+            {"kind": "return", "id": "n3", "value": {"const": None}},
+        ]}
+        ubcfg = graph_cfg(unbal_graph, argument_type=BRANCH_AT)
+        wfu = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(ubcfg, wfu, arguments=json.dumps({"flag": True}))
+        check("graph_unbalanced_branch_rejected_before_dispatch",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config"
+              and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C6g. A graph with a NON-COMPENSABLE NON-FINAL operation is rejected at BUILD: op0
+        # (echo-transform, no compensation binding) precedes the branch, so a later op could fail
+        # and strand reversal. Rejected as invalid_config, with no operation dispatched.
+        noncomp_graph = {"entry": "n0", "nodes": [
+            {"kind": "operation", "id": "n0", "operation": "echo-transform", "input": {"const": {"values": [1]}}, "next": "n1"},
+            {"kind": "if", "id": "n1", "cond": {"arg": ["flag"]}, "then": "n2", "else": "n3"},
+            {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "x"}}, "next": "n4"},
+            {"kind": "operation", "id": "n3", "operation": "reserve", "input": {"const": {"reservation": "y"}}, "next": "n4"},
+            {"kind": "return", "id": "n4", "value": {"const": None}},
+        ]}
+        ncg = graph_cfg(noncomp_graph, argument_type=BRANCH_AT)
+        wfnc2 = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(ncg, wfnc2, arguments=json.dumps({"flag": True}))
+        check("graph_noncompensable_nonfinal_op_rejected",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config"
+              and _exec_count(base) - ex0 == 0, (code, body))
 
         # C5h. EXISTING-workflow reassertion must NOT validate arguments against the ACTIVE
         # type — only a FRESH submission does (a rollout may change the declared type). Create
@@ -1014,7 +1145,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 71
+    EXPECTED_CHECKS = 78
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")
