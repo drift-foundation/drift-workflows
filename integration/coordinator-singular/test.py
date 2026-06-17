@@ -103,6 +103,15 @@ def run_runner(runner_cfg, wf_hex, operation=None, input_json=None, arguments=No
         return out.returncode, {"raw_stdout": out.stdout, "stderr": out.stderr}
 
 
+def emit_content_hash(runner_cfg):
+    """Print the active revision's content_hash for a config via the runner's own algorithm
+    (--emit-content-hash; DB-free). Used to assert hash identity properties without
+    reimplementing the hash."""
+    cmd = [str(RUNNER_BIN), "--config", runner_cfg, "--workflow-id", "0" * 32, "--emit-content-hash"]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+    return out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
+
+
 # Fixed-id fixtures seeded by the `coordinator-fixtures` Mariachi scenario
 # (microflows/db/scenarios/coordinator-fixtures/). Each represents a durable DB
 # state the normal slice cannot reach by running the coordinator forward, so we
@@ -554,9 +563,32 @@ def main():
               and ck[0][2] == "c1" and ck[1][2] == "c2" and ids_distinct,
               (code, body, ex_d, wf, ck))
 
-        # C2. RESUME mid-plan: op1 was already settled (+ checkpoint) by a worker that
-        # crashed; the restart re-reads the plan, SKIPS op1 from durable state, runs ONLY
-        # op2 (exec +1), and completes with the full 2-checkpoint stack.
+        # C1b. STRAIGHT-LINE PARITY through the graph (ir.advance): a fresh 2-op planned workflow
+        # is driven entirely by advance (the runner no longer has a flat loop). Externally it is
+        # identical to the former flat-plan path — both ops dispatch exactly once (exec +2), each
+        # gets a DISTINCT per-seq operation id, each checkpoint carries its own input, and the
+        # completion result is the FINAL op's result {reserved:p2} (not op1's, not a unit value).
+        slplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "p1"}},
+                           {"operation": "reserve", "input": {"reservation": "p2"}}])
+        wfsl = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(slplan, wfsl, arguments="{}")
+        ex_d = _exec_count(base) - ex0
+        ck = _mdb(f"SELECT seq, LOWER(HEX(operation_id)), "
+                  f"JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reservation')) "
+                  f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wfsl}') ORDER BY seq")
+        check("graph_straight_line_parity",
+              code == 0 and body.get("workflow") == "completed" and ex_d == 2
+              and body.get("result") == {"reserved": "p2"}
+              and len(ck) == 2 and ck[0][2] == "p1" and ck[1][2] == "p2"
+              and ck[0][1] != ck[1][1],
+              (code, body, ex_d, ck))
+
+        # C2. RESUME mid-plan THROUGH THE GRAPH (ir.advance): op1 was already settled (+
+        # checkpoint) by a worker that crashed. The restart drives the graph — advance(args,
+        # settled) replays past the settled op1 and yields ONLY op2 as the next NeedOperation;
+        # op1 is NOT re-dispatched (exec +1), op2's checkpoint carries its canonical input (e2),
+        # and the completion result is op2's result {reserved:e2} (the final op, not op1).
         rplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "e1"}},
                           {"operation": "reserve", "input": {"reservation": "e2"}}])
         ex0 = _exec_count(base)
@@ -567,7 +599,8 @@ def main():
         wf = _mdb(f"SELECT state FROM tb_mf_workflow WHERE workflow_id = UNHEX('{WF_FWD_RESUME}')")
         check("forward_plan_resume",
               code == 0 and body.get("workflow") == "completed" and ex_d == 1
-              and wf == [["4"]] and ck == [["1", "e1"], ["2", "e2"]],
+              and wf == [["4"]] and ck == [["1", "e1"], ["2", "e2"]]
+              and body.get("result") == {"reserved": "e2"},
               (code, body, ex_d, wf, ck))
 
         # C3. REVISION PINNING (durable IR): wf22 is pinned to revision-1's content_hash
@@ -816,6 +849,26 @@ def main():
         check("args_type_declaration_order_hash_equivalent",
               h_ab == h_ba and h_ab and h_ab != [["NULL"]], (h_ab, h_ba))
 
+        # C5i. CONTENT_HASH tracks graph SEMANTICS, not raw JSON spelling. Two plans whose only
+        # difference is the KEY ORDER of a step's input object must emit the SAME content_hash
+        # (inputs are canonicalized into each EConst); a real semantic change (a different input
+        # value) must emit a DIFFERENT one. Computed via the runner's own --emit-content-hash, so
+        # the assertion exercises the actual hashing algorithm rather than a reimplementation.
+        cfg_ko1 = plan_cfg([{"operation": "reserve", "input": {"alpha": 1, "beta": 2}}])
+        cfg_ko2 = plan_cfg([{"operation": "reserve", "input": {"beta": 2, "alpha": 1}}])
+        cfg_sem = plan_cfg([{"operation": "reserve", "input": {"alpha": 1, "beta": 3}}])
+        h_ko1, h_ko2, h_sem = emit_content_hash(cfg_ko1), emit_content_hash(cfg_ko2), emit_content_hash(cfg_sem)
+        check("content_hash_input_key_order_insensitive",
+              len(h_ko1) == 66 and h_ko1 == h_ko2, (h_ko1, h_ko2))
+        check("content_hash_changes_on_semantic_graph_change",
+              len(h_sem) == 66 and h_sem != h_ko1, (h_sem, h_ko1))
+
+        # (No NON-DEGENERATE-graph integration case: config only builds degenerate straight-line
+        # graphs — there is no parser/control-flow surface yet to author branches/loops/lets, and
+        # we are not inventing one just to test the guard. The unsupported path is covered by
+        # ir_exec_test's validation cases plus the runner's build-time _assert_degenerate (rejects
+        # before claim) and the post-claim node-id guard that defers + releases the lease.)
+
         # C5h. EXISTING-workflow reassertion must NOT validate arguments against the ACTIVE
         # type — only a FRESH submission does (a rollout may change the declared type). Create
         # under {a:int}; resubmit under a DIFFERENT active type {b:int} with the SAME (v1-valid)
@@ -961,7 +1014,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 68
+    EXPECTED_CHECKS = 71
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

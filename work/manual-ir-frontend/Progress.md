@@ -76,9 +76,30 @@ Delivered in verifiable stages.
   mid-plan-resume (wf20), and reversal-restart (wf21) tests all pass through the advance path.
   The dispatched input is now the canonical (key-ordered) form; `input_hash` already canonicalized
   so operation identity/idempotency is unchanged (key order is semantically irrelevant).
-- **Stage 3 (next):** explicit integration tests — straight-line parity assertion, mid-plan
-  resume via advance, terminal replay from durable state, and content_hash key-order-insensitivity
-  (input key order → same hash; a semantic graph change → different hash).
+- **Stage 3 (LANDED, full gate green):** explicit behavioral regressions for the graph-driven
+  runner path (no parser/control-flow expansion). Integration 71/71:
+  - `graph_straight_line_parity` — fresh 2-op planned workflow driven entirely by `advance`:
+    completed, result = final op's, exec == 2, distinct per-seq op ids, checkpoint payloads = each
+    op's input (parity with the former flat path).
+  - `forward_plan_resume` (strengthened) — mid-plan resume via `advance`: op1 settled → only op2
+    dispatched (exec +1, op1 not re-dispatched), op2 checkpoint carries its canonical input,
+    completion result = op2's `{reserved:e2}`.
+  - terminal replay already covered by `terminal_rerun_multiop_final_result` +
+    `terminal_replay_registry_config_independent` (returns the FINAL op result `{reserved:c2}` —
+    not op1's, not a unit value — from durable state, even with a malformed registry).
+  - `content_hash_input_key_order_insensitive` + `content_hash_changes_on_semantic_graph_change`
+    — via the runner's own `--emit-content-hash` (not a reimplementation): reordered input keys →
+    identical hash; a changed input value → different hash.
+  - No non-degenerate-graph integration case (config builds only degenerate graphs; no
+    parser/control-flow surface to author one, and we didn't invent one). That path is covered by
+    `ir_exec_test` validation + the runner's build-time `_assert_degenerate` (rejects before
+    claim) and the post-claim node-id guard (defers + releases lease).
+
+  **Stage 3 completes the graph-authoritative STRAIGHT-LINE runner proof: the graph is now the
+  single source for validation, identity (content_hash), and forward execution. Parser / non-
+  degenerate control-flow EXECUTION (branches, finite loops, Let) remain separate follow-up work
+  (the IR types + validation + interpreter for them already exist in `ir.drift`, exercised by
+  `ir_exec_test`, but are not yet reachable from config and not yet executed by the runner).**
 
 ## Landed: graph validation + interpreter — chunk 2 PART 1 (ir.drift; runner not yet switched)
 Authoritative validation + a pure-control-flow interpreter, both in `ir.drift`, fully unit-tested.
