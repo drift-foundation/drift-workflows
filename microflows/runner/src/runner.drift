@@ -109,11 +109,10 @@ struct PlanStep {
 struct ScriptRevision {
 	name: String,
 	version: String,             // immutable semver: major.minor.patch
-	plan: Array<PlanStep>,       // flat plan (still drives forward execution in this stage)
-	graph: ir.IrGraph,           // the authoritative control-flow graph (degenerate from `plan`)
+	graph: ir.IrGraph,           // the authoritative control-flow graph; drives forward execution
 	arg_type: ir.IrType,         // declared closed-object argument type (part of content_hash)
 	content_hash: Array<Byte>,   // 33 bytes: scheme tag + SHA-256 over GRAPH identity
-	plan_length: Int
+	plan_length: Int             // number of NOperation nodes (== flat plan length)
 }
 
 struct ScriptRegistry {
@@ -706,7 +705,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 	if claimed_state == STATE_REVERSING {
 		return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token);
 	}
-	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].plan);
+	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].graph, reg.revisions[ridx].plan_length);
 }
 
 // ===== ScriptRegistry build + lookup (v1: one configured generation per process) =====
@@ -738,9 +737,14 @@ fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
 				Optional::Some(m) => { throw RunnerError(message = "invalid graph: " + move m); },
 				Optional::None => {}
 			}
+			// The forward driver executes only DEGENERATE straight-line graphs (no branches/loops/
+			// lets yet — parser is out of scope). Reject anything else HERE, at build (before any
+			// claim) — surfaced as invalid_config (submission) / revision_unavailable (resume) — so
+			// a non-executable graph can never strand a lease via a post-claim fault.
+			_assert_degenerate(&graph);
 			val ch = _content_hash(cfg, &graph, &arg_type);
 			revs.push(ScriptRevision(name = move name, version = move version,
-			                         plan = move plan, graph = move graph, arg_type = move arg_type,
+			                         graph = move graph, arg_type = move arg_type,
 			                         content_hash = ch, plan_length = len));
 		},
 		Optional::None => {}
@@ -887,6 +891,22 @@ fn _build_graph(plan: &Array<PlanStep>) -> ir.IrGraph {
 	}
 }
 
+// The forward driver supports only DEGENERATE straight-line graphs (only NOperation + NReturn
+// nodes — no NLet/NIf/NCase/NLoop). Given validate_graph (acyclic, all-reachable, single terminal)
+// has passed, that node-kind restriction alone guarantees a single op chain. Throws RunnerError on
+// anything else; called at registry build so rejection happens BEFORE any claim.
+fn _assert_degenerate(graph: &ir.IrGraph) -> Void {
+	var i = 0;
+	while i < graph.nodes.len {
+		match &graph.nodes[i] {
+			ir.IrNode::NOperation(id, operation, input, next) => {},
+			ir.IrNode::NReturn(id, value) => {},
+			default => { throw RunnerError(message = "graph execution supports straight-line operations only (no branches/loops/lets yet)"); }
+		}
+		i = i + 1;
+	}
+}
+
 // Canonical compact JSON: parse + re-encode with lexicographic UTF-8 key ordering, so a
 // value's identity is independent of key spelling/order in config.
 fn _canonical_json(input_json: &String) -> String {
@@ -918,148 +938,211 @@ fn _lp(s: &String) nothrow -> String {
 // compensated, and with none (e.g. the FIRST operation rejected) it reaches `reversed`
 // immediately — never `blocked_resolution` for a definite forward rejection.
 fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
-                workflow_canon_hex: &String, fencing_token: Int, plan: &Array<PlanStep>) -> Int {
-	val n = plan.len;
+                workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int) -> Int {
+	val n = plan_length;
 	var final_result: String = "{}";
 	var last_op_id_hex: String = "";
-	var i = 0;
-	while i < n {
-		val seq = i + 1;
-		var is_final = false;
-		if seq == n { is_final = true; }
 
-		// Already settled (resume): skip to the next operation. A claimed forward
-		// workflow always has at least its LAST operation unsettled, so the loop never
-		// completes purely by skipping.
-		var settled = false;
-		match host.operation_result(workflow_id, seq) {
-			mf.OperationResultOutcome::Succeeded(r) => { final_result = move r; last_op_id_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, seq)); settled = true; },
+	// Durable arguments. A planned workflow ALWAYS has its arguments child — create_planned writes
+	// tb_mf_workflow_args atomically with the workflow. A MISSING args row is therefore
+	// inconsistent durable state, NOT a valid empty-args object: never replay/dispatch on it.
+	// Defer (release the lease — no dispatch, no lease leak) rather than silently use "{}".
+	var args: String = "{}";
+	var have_args = false;
+	match host.args_get(workflow_id) {
+		mf.ArgsGetOutcome::Found(a) => { args = move a; have_args = true; },
+		mf.ArgsGetOutcome::NotFound => {}
+	}
+	if !have_args {
+		return _defer_dispatch(host, workflow_id, fencing_token, "planned_args_missing");
+	}
+
+	// Already-settled operation results (resume), fed to `advance` so it skips past them. The op
+	// at seq K is graph node "n{K-1}". Track final_result / last_op_id from the highest settled.
+	var settled: Array<ir.OpResult> = [];
+	var sq = 1;
+	while sq <= n {
+		match host.operation_result(workflow_id, sq) {
+			mf.OperationResultOutcome::Succeeded(r) => {
+				last_op_id_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, sq));
+				settled.push(ir.OpResult(node_id = _node_id_for_seq(sq), result_json = _dup(&r)));
+				final_result = move r;
+			},
 			mf.OperationResultOutcome::Requested => {},
 			mf.OperationResultOutcome::NotFound => {}
 		}
-		if settled { i = i + 1; continue; }
-
-		// Recover the durable request for this seq, or derive it fresh from the plan
-		// step. The durable request (if any) is authoritative — a restarted worker
-		// must not depend on re-deriving identical fields.
-		var op_name: String = "";
-		var input_json: String = "";
-		var schema_version: Int = 0;
-		var operation_id: Array<Byte> = _operation_id(workflow_canon_hex, seq);
-		var input_hash: String = "";
-		var recovered = false;
-		match host.operation_request_get(workflow_id, seq) {
-			mf.OperationRequestGetOutcome::Found(rec) => {
-				recovered = true;
-				op_name = _dup(&rec.operation_name);
-				input_json = _dup(&rec.input_json);
-				schema_version = rec.schema_version;
-				operation_id = _copy_bytes(&rec.operation_id);
-				input_hash = _dup(&rec.input_hash);
-			},
-			mf.OperationRequestGetOutcome::NotFound => {
-				op_name = _dup(&plan[i].operation);
-				input_json = _dup(&plan[i].input_json);
-				input_hash = _input_hash(&input_json);
-			}
-		}
-		val operation_id_hex = _bytes_to_hex(&operation_id);
-
-		// Resolve the operation; pin the durable schema_version on a resume.
-		var base_url: String = "";
-		var ok = false;
-		var pinned: Optional<Int> = Optional<Int>::None();
-		if recovered { pinned = Optional<Int>::Some(schema_version); }
-		try {
-			val r = _resolve_operation(cfg, &op_name, pinned);
-			schema_version = r.schema_version;
-			base_url = _dup(&r.base_url);
-			ok = true;
-		} catch RunnerError(e) { console.eprintln(e.message); }
-		if !ok {
-			return _defer_dispatch(host, workflow_id, fencing_token, "pinned_contract_unavailable");
-		}
-
-		// Persist the request (idempotent: a resume re-requests the same identity and
-		// gets Exists) + the suspended continuation BEFORE dispatch.
-		val cont_dispatch = "{\"pos\":\"op:" + fmt.format_int(seq) + ":dispatched\",\"operation_seq\":" + fmt.format_int(seq) + "}";
-		val t_req = _now(host);
-		match host.operation_request(workflow_id, fencing_token, seq, &operation_id,
-		                             &op_name, schema_version, &input_json, &input_hash,
-		                             &cont_dispatch, &t_req, &"{}") {
-			mf.OperationRequestOutcome::Requested(_) => {},
-			mf.OperationRequestOutcome::Exists(_) => {},
-			mf.OperationRequestOutcome::FenceLost => {
-				console.println("{\"workflow\":\"aborted\",\"reason\":\"request_fence_lost\"}");
-				return 3;
-			},
-			mf.OperationRequestOutcome::OperationConflict => {
-				console.println("{\"workflow\":\"aborted\",\"reason\":\"operation_conflict\"}");
-				return 3;
-			},
-			mf.OperationRequestOutcome::PlanViolation(reason) => {
-				// The request is out of the pinned plan (seq range / predecessor not
-				// settled). Stop BEFORE dispatch — never a remote side effect out of order.
-				console.println("{\"workflow\":\"aborted\",\"reason\":\"request_plan_violation:" + move reason + "\"}");
-				return 8;
-			},
-			mf.OperationRequestOutcome::EventTimeSkew(defer_until) => {
-				return _defer(host, workflow_id, fencing_token, &defer_until, "request_event_time_skew");
-			},
-			default => {
-				throw RunnerError(message = "operation_request unexpected outcome");
-			}
-		}
-
-		// Dispatch through the generic dispatcher. A RECOVERED request (durable from a
-		// prior drive) reconciles GET-first; a FRESH request is PUT-first.
-		match _dispatch_or_reconcile(recovered, &base_url, &op_name, &operation_id_hex, &input_json) {
-			DispatchResult::Done(r) => {
-				// Checkpoint payload = the operation INPUT (what compensation needs to
-				// reverse it); the result is recorded separately.
-				val t_settle = _now(host);
-				var cont_settle = "{\"pos\":\"complete\"}";
-				if !is_final { cont_settle = "{\"pos\":\"op:" + fmt.format_int(seq) + ":settled\",\"next_operation_seq\":" + fmt.format_int(seq + 1) + "}"; }
-				match host.operation_settle(workflow_id, fencing_token, seq, &operation_id, seq,
-				                            &r, &input_json, &cont_settle, &t_settle, &"{}", is_final) {
-					mf.OperationSettleOutcome::Settled(res) => { final_result = move res; last_op_id_hex = _dup(&operation_id_hex); },
-					mf.OperationSettleOutcome::AlreadySettled(res) => { final_result = move res; last_op_id_hex = _dup(&operation_id_hex); },
-					mf.OperationSettleOutcome::FenceLost => {
-						console.println("{\"workflow\":\"aborted\",\"reason\":\"settle_fence_lost\"}");
-						return 3;
-					},
-					mf.OperationSettleOutcome::PlanViolation(reason) => {
-						// The settle is outside the pinned plan (seq/checkpoint/finality): a
-						// runner/plan inconsistency, never silently settle. Stop and report.
-						console.println("{\"workflow\":\"aborted\",\"reason\":\"settle_plan_violation:" + move reason + "\"}");
-						return 8;
-					},
-					mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
-						return _defer(host, workflow_id, fencing_token, &defer_until, "settle_event_time_skew");
-					},
-					default => {
-						throw RunnerError(message = "operation_settle unexpected outcome");
-					}
-				}
-			},
-			DispatchResult::Pending => {
-				return _defer_pending(host, workflow_id, fencing_token);
-			},
-			DispatchResult::Rejected(reason) => {
-				// A DEFINITE forward rejection ALWAYS begins reversal (the model: every
-				// definite forward failure reverses). begin_reversal unwinds any prior
-				// compensable checkpoints; with NONE (e.g. the first operation rejected) it
-				// reaches `reversed` immediately. Never `blocked_resolution` for a definite
-				// forward rejection — that is reserved for an UNCERTAIN forward outcome.
-				return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, move reason);
-			}
-		}
-		i = i + 1;
+		sq = sq + 1;
 	}
 
-	console.println("{\"workflow\":\"completed\",\"operation_id\":\"" + last_op_id_hex + "\",\"result\":" + final_result + "}");
-	return 0;
+	// REPLAY pure control flow to the next durable boundary, EXECUTE that operation, repeat until
+	// replay reaches the terminal NReturn (`Completed`). The bound is purely defensive (a
+	// validated graph is acyclic, so this terminates within plan_length steps).
+	var guard = 0;
+	while guard < n + 4 {
+		guard = guard + 1;
+		match ir.advance(graph, &args, &settled) {
+			ir.StepOutcome::Completed(result) => {
+				// All operations settled. Report completion per the existing final-op result
+				// rules (the LAST settled op's result + its operation_id), NOT the graph's unit
+				// return value.
+				console.println("{\"workflow\":\"completed\",\"operation_id\":\"" + last_op_id_hex + "\",\"result\":" + final_result + "}");
+				return 0;
+			},
+			ir.StepOutcome::Fault(m) => {
+				// A validated graph should not Fault here. Treat defensively — never execute on a
+				// broken replay; defer (release the lease) rather than corrupt durable state.
+				console.eprintln("graph replay fault: " + m);
+				return _defer_dispatch(host, workflow_id, fencing_token, "graph_replay_fault");
+			},
+			ir.StepOutcome::NeedOperation(node_id, op, input) => {
+				// Degenerate straight-line graph: the next unsettled operation is execution
+				// position settled.len+1 (ops settle contiguously — the DB enforces
+				// predecessor-settled), and its node id is "n{seq-1}". A mismatch means a
+				// non-degenerate graph, whose execution is out of scope (parser is out of scope).
+				val seq = settled.len + 1;
+				if !_str_eq(node_id, &_node_id_for_seq(seq)) {
+					// Defensive: registry build (`_assert_degenerate`) already rejects non-degenerate
+					// graphs BEFORE claim, so this is unreachable. If ever reached, DEFER (release the
+					// lease) rather than throw — a post-claim throw would strand the lease until expiry.
+					return _defer_dispatch(host, workflow_id, fencing_token, "non_degenerate_graph");
+				}
+				var is_final = false;
+				if seq == n { is_final = true; }
+
+				// Recover the durable request for this seq, or derive it from the graph step's
+				// operation + canonical input. The durable request (if any) is authoritative — a
+				// restarted worker must not depend on re-deriving identical fields.
+				var op_name: String = "";
+				var input_json: String = "";
+				var schema_version: Int = 0;
+				var operation_id: Array<Byte> = _operation_id(workflow_canon_hex, seq);
+				var input_hash: String = "";
+				var recovered = false;
+				match host.operation_request_get(workflow_id, seq) {
+					mf.OperationRequestGetOutcome::Found(rec) => {
+						recovered = true;
+						op_name = _dup(&rec.operation_name);
+						input_json = _dup(&rec.input_json);
+						schema_version = rec.schema_version;
+						operation_id = _copy_bytes(&rec.operation_id);
+						input_hash = _dup(&rec.input_hash);
+					},
+					mf.OperationRequestGetOutcome::NotFound => {
+						op_name = _dup(op);
+						input_json = _dup(input);
+						input_hash = _input_hash(&input_json);
+					}
+				}
+				val operation_id_hex = _bytes_to_hex(&operation_id);
+
+				// Resolve the operation; pin the durable schema_version on a resume.
+				var base_url: String = "";
+				var ok = false;
+				var pinned: Optional<Int> = Optional<Int>::None();
+				if recovered { pinned = Optional<Int>::Some(schema_version); }
+				try {
+					val r = _resolve_operation(cfg, &op_name, pinned);
+					schema_version = r.schema_version;
+					base_url = _dup(&r.base_url);
+					ok = true;
+				} catch RunnerError(e) { console.eprintln(e.message); }
+				if !ok {
+					return _defer_dispatch(host, workflow_id, fencing_token, "pinned_contract_unavailable");
+				}
+
+				// Persist the request (idempotent: a resume re-requests the same identity and gets
+				// Exists) + the suspended continuation BEFORE dispatch.
+				val cont_dispatch = "{\"pos\":\"op:" + fmt.format_int(seq) + ":dispatched\",\"operation_seq\":" + fmt.format_int(seq) + "}";
+				val t_req = _now(host);
+				match host.operation_request(workflow_id, fencing_token, seq, &operation_id,
+				                             &op_name, schema_version, &input_json, &input_hash,
+				                             &cont_dispatch, &t_req, &"{}") {
+					mf.OperationRequestOutcome::Requested(_) => {},
+					mf.OperationRequestOutcome::Exists(_) => {},
+					mf.OperationRequestOutcome::FenceLost => {
+						console.println("{\"workflow\":\"aborted\",\"reason\":\"request_fence_lost\"}");
+						return 3;
+					},
+					mf.OperationRequestOutcome::OperationConflict => {
+						console.println("{\"workflow\":\"aborted\",\"reason\":\"operation_conflict\"}");
+						return 3;
+					},
+					mf.OperationRequestOutcome::PlanViolation(reason) => {
+						// The request is out of the pinned plan (seq range / predecessor not
+						// settled). Stop BEFORE dispatch — never a remote side effect out of order.
+						console.println("{\"workflow\":\"aborted\",\"reason\":\"request_plan_violation:" + move reason + "\"}");
+						return 8;
+					},
+					mf.OperationRequestOutcome::EventTimeSkew(defer_until) => {
+						return _defer(host, workflow_id, fencing_token, &defer_until, "request_event_time_skew");
+					},
+					default => {
+						throw RunnerError(message = "operation_request unexpected outcome");
+					}
+				}
+
+				// Dispatch through the generic dispatcher. A RECOVERED request (durable from a
+				// prior drive) reconciles GET-first; a FRESH request is PUT-first.
+				match _dispatch_or_reconcile(recovered, &base_url, &op_name, &operation_id_hex, &input_json) {
+					DispatchResult::Done(r) => {
+						// Checkpoint payload = the operation INPUT (what compensation needs to
+						// reverse it); the result is recorded separately + fed back into replay.
+						val t_settle = _now(host);
+						var cont_settle = "{\"pos\":\"complete\"}";
+						if !is_final { cont_settle = "{\"pos\":\"op:" + fmt.format_int(seq) + ":settled\",\"next_operation_seq\":" + fmt.format_int(seq + 1) + "}"; }
+						match host.operation_settle(workflow_id, fencing_token, seq, &operation_id, seq,
+						                            &r, &input_json, &cont_settle, &t_settle, &"{}", is_final) {
+							mf.OperationSettleOutcome::Settled(res) => {
+								last_op_id_hex = _dup(&operation_id_hex);
+								settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+								final_result = move res;
+							},
+							mf.OperationSettleOutcome::AlreadySettled(res) => {
+								last_op_id_hex = _dup(&operation_id_hex);
+								settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+								final_result = move res;
+							},
+							mf.OperationSettleOutcome::FenceLost => {
+								console.println("{\"workflow\":\"aborted\",\"reason\":\"settle_fence_lost\"}");
+								return 3;
+							},
+							mf.OperationSettleOutcome::PlanViolation(reason) => {
+								// The settle is outside the pinned plan (seq/checkpoint/finality): a
+								// runner/plan inconsistency, never silently settle. Stop and report.
+								console.println("{\"workflow\":\"aborted\",\"reason\":\"settle_plan_violation:" + move reason + "\"}");
+								return 8;
+							},
+							mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
+								return _defer(host, workflow_id, fencing_token, &defer_until, "settle_event_time_skew");
+							},
+							default => {
+								throw RunnerError(message = "operation_settle unexpected outcome");
+							}
+						}
+					},
+					DispatchResult::Pending => {
+						return _defer_pending(host, workflow_id, fencing_token);
+					},
+					DispatchResult::Rejected(reason) => {
+						// A DEFINITE forward rejection ALWAYS begins reversal (the model: every
+						// definite forward failure reverses). begin_reversal unwinds any prior
+						// compensable checkpoints; with NONE (e.g. the first operation rejected) it
+						// reaches `reversed` immediately. Never `blocked_resolution` for a definite
+						// forward rejection — that is reserved for an UNCERTAIN forward outcome.
+						return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, move reason);
+					}
+				}
+			}
+		}
+	}
+
+	// Defensive: a validated acyclic graph reaches Completed within plan_length steps.
+	console.eprintln("forward drive exceeded step budget");
+	return _defer_dispatch(host, workflow_id, fencing_token, "forward_budget_exceeded");
 }
+
+// Graph node id for an operation seq (degenerate straight-line graph: op at seq K is node n{K-1}).
+fn _node_id_for_seq(seq: Int) nothrow -> String { return "n" + fmt.format_int(seq - 1); }
 
 // A definite forward failure with a compensable checkpoint stack: transition
 // forward -> reversing (or straight to reversed when nothing is compensable) via the

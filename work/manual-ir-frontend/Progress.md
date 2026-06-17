@@ -64,11 +64,21 @@ Delivered in verifiable stages.
   mode (actual algorithm, no Python reimplementation): `[e1,e2]` `019dc1f4…`→`01fba1fa…`,
   frplan `01ebb9ce…`→`0161c3ad…`. Execution is STILL plan-based here, so behavior is unchanged;
   full `just test` green on 0.33.38.
-- **Stage 2 (next):** replace the flat forward loop with `ir.advance(...)` — gather durable args
-  (`args_get`) + settled results (`OpResult`), drive dispatch/settle by `NeedOperation`, complete
-  on `Completed` per existing final-op result rules. `seq = settled.len + 1`.
-- **Stage 3 (next):** integration replay/restart tests (straight-line parity, mid-plan resume via
-  advance, terminal replay, key-order-insensitive content_hash).
+- **Stage 2 (LANDED, full gate green):** the graph is authoritative for EXECUTION. `_run_forward`
+  is now advance-driven: gather durable args (`args_get`) + settled results (`OpResult`, op at
+  seq K = node `n{K-1}`), then loop `ir.advance` → `NeedOperation` (recover-or-derive request,
+  resolve, request, dispatch, settle; append the settled result and continue) / `Completed`
+  (report completion per existing final-op result rules — last settled op's result, not the
+  graph's unit return) / `Fault` (defensive defer). `seq = settled.len + 1` with a guard that the
+  node id equals the degenerate `n{seq-1}` (non-degenerate execution is out of scope). The flat
+  forward loop + `ScriptRevision.plan` are gone. Behavior preserved: full `just test` green
+  (singular 16/16, microflows 20/20 + SP 110/110, integration 67/67) — existing straight-line,
+  mid-plan-resume (wf20), and reversal-restart (wf21) tests all pass through the advance path.
+  The dispatched input is now the canonical (key-ordered) form; `input_hash` already canonicalized
+  so operation identity/idempotency is unchanged (key order is semantically irrelevant).
+- **Stage 3 (next):** explicit integration tests — straight-line parity assertion, mid-plan
+  resume via advance, terminal replay from durable state, and content_hash key-order-insensitivity
+  (input key order → same hash; a semantic graph change → different hash).
 
 ## Landed: graph validation + interpreter — chunk 2 PART 1 (ir.drift; runner not yet switched)
 Authoritative validation + a pure-control-flow interpreter, both in `ir.drift`, fully unit-tested.

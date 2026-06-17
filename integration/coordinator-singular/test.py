@@ -129,6 +129,7 @@ WF_FWD_PLAN_PINNED_B = "a0000000000000000000000000000023"    # ditto (changed sc
 WF_FWD_PLAN_PINNED_C = "a0000000000000000000000000000024"    # ditto (changed participant -> revision_unavailable)
 WF_FWD_PLAN_VERSION_MISMATCH = "a0000000000000000000000000000025"  # pinned 1.0.0; run as gen 2.0.0 -> revision_unavailable (version alone)
 WF_FWD_PLAN_MALFORMED_CFG = "a0000000000000000000000000000026"   # claimable; malformed registry post-claim -> defer + release lease
+WF_ARGS_MISSING = "a0000000000000000000000000000028"            # claimable planned; pin OK but NO durable args row (inconsistent) -> defer + release lease
 WF_LEGACY_NO_PIN = "a0000000000000000000000000000027"            # claimable legacy (no plan pin); planned resume must release the lease
 
 
@@ -662,6 +663,18 @@ def main():
               and body.get("reason") == "revision_unavailable"
               and lease == [["NULL"]] and _exec_count(base) - ex0 == 0, (code, body, lease))
 
+        # C4e. MISSING durable arguments is INCONSISTENT durable state, not empty args. A planned
+        # workflow always has its args child (create_planned writes it atomically), so a claimable
+        # pinned workflow with a matching pin but NO args row must DEFER + RELEASE the lease BEFORE
+        # any replay/dispatch — never silently treat missing args as {} and dispatch.
+        ex0 = _exec_count(base)
+        code, body = run_runner(rplan, WF_ARGS_MISSING)
+        lease = _mdb(f"SELECT lease_owner FROM tb_mf_workflow WHERE workflow_id = UNHEX('{WF_ARGS_MISSING}')")
+        check("forward_missing_args_defers_no_dispatch_no_lease_leak",
+              code == 9 and body.get("workflow") == "deferred"
+              and body.get("reason") == "planned_args_missing"
+              and lease == [["NULL"]] and _exec_count(base) - ex0 == 0, (code, body, lease))
+
         # C5. A SINGLE-operation plan whose only step is NON-compensable is valid (the
         # final step never needs compensation) and completes.
         ncplan = plan_cfg([{"operation": "echo-transform", "input": {"values": [1, 2, 3]}}])
@@ -948,7 +961,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 67
+    EXPECTED_CHECKS = 68
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")
