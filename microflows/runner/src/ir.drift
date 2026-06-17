@@ -24,7 +24,11 @@ export {
 	FlatStep,
 	flat_to_graph,
 	graph_canonical,
-	canonical_json
+	canonical_json,
+	validate_graph,
+	OpResult,
+	StepOutcome,
+	advance
 };
 
 // ===== V1 closed value-type model (manual-IR frontend, Step 1b: argument types) =====
@@ -404,11 +408,23 @@ fn _nid(i: Int) nothrow -> String { return "n" + fmt.format_int(i); }
 // value's identity is independent of key spelling/order/whitespace. The IR home's definition of
 // "canonical JSON literal" (EConst / IrCaseArm.match_const); the runner's `_canonical_json` uses
 // the same scheme and may later delegate here. Err(IrError) on malformed input.
-pub fn canonical_json(text: &String) -> core.Result<String, IrError> {
+pub fn canonical_json(text: &String) nothrow -> core.Result<String, IrError> {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
 	match json.parse_strict(text) {
 		core.Result::Ok(n) => { return core.Result<String, IrError>::Ok(json.encode_compact_with_config(&n, &cfg)); },
 		core.Result::Err(_) => { return core.Result<String, IrError>::Err(IrError(message = "constant is not valid JSON")); }
+	}
+}
+
+// A constant string must be VALID and already CANONICAL JSON (key-ordered compact) — so replay
+// never Faults on EConst, and NCase matching compares canonical-vs-canonical (not raw spelling).
+fn _check_const(text: &String) nothrow -> Optional<String> {
+	match canonical_json(text) {
+		core.Result::Ok(c) => {
+			if !_str_eq(&c, text) { return Optional<String>::Some("constant is not canonical JSON: " + _dup(text)); }
+			return Optional<String>::None();
+		},
+		core.Result::Err(e) => { return Optional<String>::Some("constant is not valid JSON: " + _dup(text)); }
 	}
 }
 
@@ -535,6 +551,508 @@ fn _node_id(n: &IrNode) nothrow -> String {
 		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { return _dup(id); },
 		IrNode::NReturn(id, value) => { return _dup(id); }
 	}
+}
+
+// ===== pure-control-flow interpreter (Step 1b(ii) chunk 2) =====
+//
+// `advance` REPLAYS the graph's pure control flow from the durable arguments + the settled
+// remote-operation results, and STOPS at the next durable boundary: either the next UNSETTLED
+// `NOperation` (returns `NeedOperation` with that operation's input as canonical JSON) or the
+// terminal `NReturn` (returns `Completed` with the workflow result). Pure nodes (`NLet`/`NIf`/
+// `NCase`) are evaluated to thread locals + choose branches; a SETTLED operation contributes its
+// result (available to later `EResult`) and replay continues past it. Persistence is unchanged:
+// only `NOperation` is a durable boundary — pure control flow is always re-derived by replay, so
+// a restarted worker calling `advance` with the same (args, settled) reaches the same next step.
+//
+// Replay is deterministic and structural (no clock/random/etc.). Call it on a VALIDATED graph
+// (see `validate_graph`); `Fault` is a defensive surface for a malformed graph or a value-shape
+// mismatch, never expected on the validated path.
+//
+// NOTE: loop EXECUTION (map/filter/fold) is a follow-up — `NLoop` is fully VALIDATED (finite
+// shape) but `advance` faults on it. No config produces loops yet (the runner builds only
+// degenerate straight-line graphs), so this does not affect execution.
+
+// A settled remote-operation result fed into replay: node id -> its canonical JSON result.
+pub struct OpResult {
+	pub node_id: String,
+	pub result_json: String
+}
+
+// The outcome of advancing to the next durable boundary.
+pub variant StepOutcome {
+	NeedOperation(node_id: String, operation: String, input_json: String),   // next unsettled remote op
+	Completed(result_json: String),                                          // reached NReturn
+	Fault(message: String)                                                   // defensive (validate first)
+}
+
+pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothrow -> StepOutcome {
+	var args_ok = false;
+	var args_node = json.new_object().to_node();
+	match json.parse_strict(arguments) {
+		core.Result::Ok(n) => { args_node = move n; args_ok = true; },
+		core.Result::Err(_) => {}
+	}
+	if !args_ok { return StepOutcome::Fault(message = "arguments are not valid JSON"); }
+
+	var local_names: Array<String> = [];
+	var local_vals: Array<json.JsonNode> = [];
+
+	var cur = _dup(&g.entry);
+	var steps = 0;
+	val budget = g.nodes.len + 4;
+	while steps < budget {
+		steps = steps + 1;
+		val idx = _find_node(g, &cur);
+		if idx < 0 { return StepOutcome::Fault(message = "node not found during replay: " + _dup(&cur)); }
+		match &g.nodes[idx] {
+			IrNode::NReturn(id, value) => {
+				match _eval(g, value, &args_node, settled, &local_names, &local_vals) {
+					core.Result::Ok(n) => { return StepOutcome::Completed(result_json = _canon_node(&n)); },
+					core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
+				}
+			},
+			IrNode::NOperation(id, operation, input, next) => {
+				match _find_settled(settled, id) {
+					Optional::Some(_) => { cur = _dup(next); },   // settled: continue past it
+					Optional::None => {
+						match _eval(g, input, &args_node, settled, &local_names, &local_vals) {
+							core.Result::Ok(n) => { return StepOutcome::NeedOperation(node_id = _dup(id), operation = _dup(operation), input_json = _canon_node(&n)); },
+							core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
+						}
+					}
+				}
+			},
+			IrNode::NLet(id, name, value, next) => {
+				match _eval(g, value, &args_node, settled, &local_names, &local_vals) {
+					core.Result::Ok(n) => { local_names.push(_dup(name)); local_vals.push(move n); cur = _dup(next); },
+					core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
+				}
+			},
+			IrNode::NIf(id, cond, then_node, else_node) => {
+				match _eval(g, cond, &args_node, settled, &local_names, &local_vals) {
+					core.Result::Ok(n) => {
+						match n.as_bool() {
+							Optional::Some(b) => { if b { cur = _dup(then_node); } else { cur = _dup(else_node); } },
+							Optional::None => { return StepOutcome::Fault(message = "NIf condition is not a bool"); }
+						}
+					},
+					core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
+				}
+			},
+			IrNode::NCase(id, scrutinee, arms, default_node) => {
+				match _eval(g, scrutinee, &args_node, settled, &local_names, &local_vals) {
+					core.Result::Ok(n) => {
+						val v = _canon_node(&n);
+						var tgt = _dup(default_node);
+						var matched = false;
+						var a = 0;
+						while a < arms.len {
+							if !matched and _str_eq(&arms[a].match_const, &v) { tgt = _dup(&arms[a].target); matched = true; }
+							a = a + 1;
+						}
+						cur = move tgt;
+					},
+					core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
+				}
+			},
+			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
+				return StepOutcome::Fault(message = "loop execution is a follow-up (NLoop is validated, not yet executed): " + _dup(id));
+			}
+		}
+	}
+	return StepOutcome::Fault(message = "replay step budget exceeded (graph may be cyclic — validate first)");
+}
+
+// Evaluate an expression against (durable args, settled results, locals) to a JSON value.
+fn _eval(g: &IrGraph, e: &IrExpr, args: &json.JsonNode, settled: &Array<OpResult>,
+         lnames: &Array<String>, lvals: &Array<json.JsonNode>) nothrow -> core.Result<json.JsonNode, IrError> {
+	match e {
+		IrExpr::EConst(canonical_json) => {
+			match json.parse_strict(canonical_json) {
+				core.Result::Ok(n) => { return core.Result<json.JsonNode, IrError>::Ok(move n); },
+				core.Result::Err(_) => { return _ev_err(&"EConst is not valid JSON"); }
+			}
+		},
+		IrExpr::EArg(path) => {
+			match _project(args, path) {
+				Optional::Some(n) => { return core.Result<json.JsonNode, IrError>::Ok(move n); },
+				Optional::None => { return _ev_err(&"EArg path not found"); }
+			}
+		},
+		IrExpr::EResult(node, path) => {
+			match _find_settled(settled, node) {
+				Optional::Some(rj) => {
+					match json.parse_strict(rj) {
+						core.Result::Ok(rn) => {
+							match _project(&rn, path) {
+								Optional::Some(n) => { return core.Result<json.JsonNode, IrError>::Ok(move n); },
+								Optional::None => { return _ev_err(&"EResult path not found"); }
+							}
+						},
+						core.Result::Err(_) => { return _ev_err(&"settled result is not valid JSON"); }
+					}
+				},
+				Optional::None => { return _ev_err(&"EResult references an unsettled operation"); }
+			}
+		},
+		IrExpr::ELocal(name, path) => {
+			var k = 0;
+			while k < lnames.len {
+				if _str_eq(&lnames[k], name) {
+					match _project(&lvals[k], path) {
+						Optional::Some(n) => { return core.Result<json.JsonNode, IrError>::Ok(move n); },
+						Optional::None => { return _ev_err(&"ELocal path not found"); }
+					}
+				}
+				k = k + 1;
+			}
+			return _ev_err(&"ELocal references an unbound local");
+		}
+	}
+}
+
+fn _ev_err(m: &String) nothrow -> core.Result<json.JsonNode, IrError> {
+	return core.Result<json.JsonNode, IrError>::Err(IrError(message = _dup(m)));
+}
+
+// Project `path` (object keys; [] = the whole value) into a JSON value, returning an owned copy.
+fn _project(node: &json.JsonNode, path: &Array<String>) nothrow -> Optional<json.JsonNode> {
+	if path.len == 0 { return Optional<json.JsonNode>::Some(node.clone_deep()); }
+	match node.get_path(path) {
+		Optional::Some(n) => { return Optional<json.JsonNode>::Some(n.clone_deep()); },
+		Optional::None => { return Optional<json.JsonNode>::None(); }
+	}
+}
+
+fn _find_settled(settled: &Array<OpResult>, id: &String) nothrow -> Optional<&String> {
+	var i = 0;
+	while i < settled.len {
+		if _str_eq(&settled[i].node_id, id) { return Optional<&String>::Some(&settled[i].result_json); }
+		i = i + 1;
+	}
+	return Optional<&String>::None();
+}
+
+fn _canon_node(n: &json.JsonNode) nothrow -> String {
+	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
+	return json.encode_compact_with_config(n, &cfg);
+}
+
+// ===== structural validation (Step 1b(ii) chunk 2: the graph is authoritative) =====
+//
+// `validate_graph` returns None when the graph is well-formed, or Some(message) on the first
+// structural defect. Enforced (a workflow must never execute an ill-formed graph):
+//   - at least one node and a unique id per node;
+//   - `entry` names an existing node;
+//   - every edge (next / branch targets / arm targets / default) targets an existing node;
+//   - control flow is ACYCLIC (V1 loops are finite array transforms, NOT back-edges) so replay
+//     terminates; every reachable sink is an `NReturn` (valid terminal shape);
+//   - every `EResult(node)` names an `NOperation` that DOMINATES the referencing node (always
+//     settled before it executes — never a forward/self/cross-branch result reference);
+//   - every graph-level `ELocal(name)` is bound by a dominating `NLet` (loop body exprs may also
+//     use the loop's `elem`/`acc`); and
+//   - every `NLoop` has a valid finite shape (kind in {map,filter,fold}; map/filter carry no
+//     accumulator). A loop body is a pure `IrExpr`, so a remote operation inside a loop is
+//     structurally impossible — nothing to check.
+// Dominance is computed simply (graphs are tiny): X dominates Y iff Y is reachable from `entry`
+// but becomes unreachable once X is removed.
+pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
+	val nn = g.nodes.len;
+	if nn == 0 { return Optional<String>::Some("graph has no nodes"); }
+
+	// unique ids
+	var i = 0;
+	while i < nn {
+		var j = i + 1;
+		val idi = _node_id(&g.nodes[i]);
+		while j < nn {
+			val idj = _node_id(&g.nodes[j]);
+			if _str_eq(&idi, &idj) { return Optional<String>::Some("duplicate node id: " + _dup(&idi)); }
+			j = j + 1;
+		}
+		i = i + 1;
+	}
+
+	// entry exists
+	if _find_node(g, &g.entry) < 0 { return Optional<String>::Some("entry node not found: " + _dup(&g.entry)); }
+
+	// every edge targets an existing node
+	i = 0;
+	while i < nn {
+		var succs: Array<String> = [];
+		_succs(&g.nodes[i], &mut succs);
+		var s = 0;
+		while s < succs.len {
+			if _find_node(g, &succs[s]) < 0 {
+				return Optional<String>::Some("edge target not found: " + _dup(&succs[s]));
+			}
+			s = s + 1;
+		}
+		i = i + 1;
+	}
+
+	// acyclic control flow (DFS back-edge detection over reachable nodes)
+	var color: Array<Int> = [];   // 0=white 1=gray 2=black
+	i = 0; while i < nn { color.push(0); i = i + 1; }
+	val entry_idx = _find_node(g, &g.entry);
+	if _has_cycle(g, entry_idx, &mut color) {
+		return Optional<String>::Some("control-flow cycle (loops must be finite array transforms, not back-edges)");
+	}
+
+	// reject UNREACHABLE nodes: `graph_canonical` includes every node, so dead code would
+	// otherwise affect revision identity while escaping the per-node checks below. Requiring
+	// full reachability also means every node is validated.
+	val reach = _reachable_without(g, -1);
+	i = 0;
+	while i < nn {
+		if !reach[i] { return Optional<String>::Some("unreachable node: " + _dup(&_node_id(&g.nodes[i]))); }
+		i = i + 1;
+	}
+
+	// terminal shape: every sink (no successors) must be an NReturn.
+	i = 0;
+	while i < nn {
+		var succs: Array<String> = [];
+		_succs(&g.nodes[i], &mut succs);
+		if succs.len == 0 and !_is_return(&g.nodes[i]) {
+			return Optional<String>::Some("non-terminal node has no successor: " + _dup(&_node_id(&g.nodes[i])));
+		}
+		i = i + 1;
+	}
+
+	// V1: NLet local names are globally UNIQUE. Replay resolves a local by its (single) binding;
+	// allowing two same-named dominating NLets would make shadowing declaration-order-sensitive.
+	match _dup_let_name(g) {
+		Optional::Some(nm) => { return Optional<String>::Some("duplicate NLet local name: " + move nm); },
+		Optional::None => {}
+	}
+
+	// per-node: expression ref checks + loop shape + NCase arm checks (all nodes reachable here).
+	i = 0;
+	while i < nn {
+		match _check_node(g, i) {
+			Optional::Some(m) => { return Optional<String>::Some(move m); },
+			Optional::None => {}
+		}
+		i = i + 1;
+	}
+
+	return Optional<String>::None();
+}
+
+// First duplicated NLet local name (Some(name)), or None.
+fn _dup_let_name(g: &IrGraph) nothrow -> Optional<String> {
+	var names: Array<String> = [];
+	var i = 0;
+	while i < g.nodes.len {
+		match &g.nodes[i] {
+			IrNode::NLet(id, name, value, next) => {
+				if _contains_str(&names, name) { return Optional<String>::Some(_dup(name)); }
+				names.push(_dup(name));
+			},
+			default => {}
+		}
+		i = i + 1;
+	}
+	return Optional<String>::None();
+}
+
+// First duplicated NCase match_const (Some(const)), or None.
+fn _dup_case_const(arms: &Array<IrCaseArm>) nothrow -> Optional<String> {
+	var i = 0;
+	while i < arms.len {
+		var j = i + 1;
+		while j < arms.len {
+			if _str_eq(&arms[i].match_const, &arms[j].match_const) { return Optional<String>::Some(_dup(&arms[i].match_const)); }
+			j = j + 1;
+		}
+		i = i + 1;
+	}
+	return Optional<String>::None();
+}
+
+// Index of the node with id `id`, or -1.
+fn _find_node(g: &IrGraph, id: &String) nothrow -> Int {
+	var i = 0;
+	while i < g.nodes.len {
+		val nid = _node_id(&g.nodes[i]);
+		if _str_eq(&nid, id) { return i; }
+		i = i + 1;
+	}
+	return -1;
+}
+
+// Append a node's successor ids (control-flow out-edges) to `out`.
+fn _succs(n: &IrNode, out: &mut Array<String>) nothrow -> Void {
+	match n {
+		IrNode::NOperation(id, operation, input, next) => { out.push(_dup(next)); },
+		IrNode::NLet(id, name, value, next) => { out.push(_dup(next)); },
+		IrNode::NIf(id, cond, then_node, else_node) => { out.push(_dup(then_node)); out.push(_dup(else_node)); },
+		IrNode::NCase(id, scrutinee, arms, default_node) => {
+			var a = 0;
+			while a < arms.len { out.push(_dup(&arms[a].target)); a = a + 1; }
+			out.push(_dup(default_node));
+		},
+		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { out.push(_dup(next)); },
+		IrNode::NReturn(id, value) => {}
+	}
+}
+
+fn _is_return(n: &IrNode) nothrow -> Bool {
+	match n { IrNode::NReturn(id, value) => { return true; }, default => { return false; } }
+}
+
+fn _is_operation(n: &IrNode) nothrow -> Bool {
+	match n { IrNode::NOperation(id, operation, input, next) => { return true; }, default => { return false; } }
+}
+
+// DFS back-edge detection from `idx` over the (already target-checked) graph.
+fn _has_cycle(g: &IrGraph, idx: Int, color: &mut Array<Int>) nothrow -> Bool {
+	color[idx] = 1;   // gray
+	var succs: Array<String> = [];
+	_succs(&g.nodes[idx], &mut succs);
+	var s = 0;
+	while s < succs.len {
+		val t = _find_node(g, &succs[s]);
+		if t >= 0 {
+			if color[t] == 1 { return true; }              // back-edge into a gray node
+			if color[t] == 0 and _has_cycle(g, t, color) { return true; }
+		}
+		s = s + 1;
+	}
+	color[idx] = 2;   // black
+	return false;
+}
+
+// Reachability flags from `entry`, optionally treating node `removed` (index, or -1) as absent
+// (used for dominance: X dominates Y iff Y is reachable normally but not with X removed).
+fn _reachable_without(g: &IrGraph, removed: Int) nothrow -> Array<Bool> {
+	var reach: Array<Bool> = [];
+	var i = 0; while i < g.nodes.len { reach.push(false); i = i + 1; }
+	val entry_idx = _find_node(g, &g.entry);
+	if entry_idx < 0 or entry_idx == removed { return move reach; }
+	var work: Array<Int> = [];
+	work.push(entry_idx);
+	reach[entry_idx] = true;
+	var h = 0;
+	while h < work.len {
+		val cur = work[h];
+		h = h + 1;
+		var succs: Array<String> = [];
+		_succs(&g.nodes[cur], &mut succs);
+		var s = 0;
+		while s < succs.len {
+			val t = _find_node(g, &succs[s]);
+			if t >= 0 and t != removed and !reach[t] { reach[t] = true; work.push(t); }
+			s = s + 1;
+		}
+	}
+	return move reach;
+}
+
+// X (index x) dominates Y (index y): x != y, y reachable, y unreachable once x removed.
+fn _dominates(g: &IrGraph, x: Int, y: Int) nothrow -> Bool {
+	if x == y { return false; }
+	val with = _reachable_without(g, -1);
+	if !with[y] { return false; }
+	val without = _reachable_without(g, x);
+	return !without[y];
+}
+
+// True iff some reachable NLet binding `name` dominates node `y`.
+fn _has_dominating_let(g: &IrGraph, name: &String, y: Int) nothrow -> Bool {
+	var i = 0;
+	while i < g.nodes.len {
+		match &g.nodes[i] {
+			IrNode::NLet(id, lname, value, next) => {
+				if _str_eq(lname, name) and _dominates(g, i, y) { return true; }
+			},
+			default => {}
+		}
+		i = i + 1;
+	}
+	return false;
+}
+
+// Validate one node's expressions + (for NLoop) its finite shape.
+fn _check_node(g: &IrGraph, idx: Int) nothrow -> Optional<String> {
+	var no_locals: Array<String> = [];
+	match &g.nodes[idx] {
+		IrNode::NOperation(id, operation, input, next) => { return _check_expr(g, input, idx, &no_locals); },
+		IrNode::NLet(id, name, value, next) => { return _check_expr(g, value, idx, &no_locals); },
+		IrNode::NIf(id, cond, then_node, else_node) => { return _check_expr(g, cond, idx, &no_locals); },
+		IrNode::NCase(id, scrutinee, arms, default_node) => {
+			// Each arm constant must be valid + canonical (checked FIRST, so the duplicate check
+			// below compares canonical forms rather than raw spelling).
+			var a = 0;
+			while a < arms.len {
+				match _check_const(&arms[a].match_const) {
+					Optional::Some(m) => { return Optional<String>::Some(move m); },
+					Optional::None => {}
+				}
+				a = a + 1;
+			}
+			// Reject duplicate arm constants: replay takes the first match while canonical sorts
+			// arms by match_const, so duplicates make branch selection ambiguous/order-sensitive.
+			match _dup_case_const(arms) {
+				Optional::Some(c) => { return Optional<String>::Some("duplicate NCase match_const: " + move c); },
+				Optional::None => {}
+			}
+			return _check_expr(g, scrutinee, idx, &no_locals);
+		},
+		IrNode::NReturn(id, value) => { return _check_expr(g, value, idx, &no_locals); },
+		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
+			// finite shape: map/filter carry NO accumulator (acc empty + init unit-null).
+			val is_fold = _is_fold(kind);
+			if !is_fold {
+				if acc.byte_length() != 0 { return Optional<String>::Some("map/filter loop must not declare an accumulator: " + _dup(id)); }
+				if !_is_const_null(init) { return Optional<String>::Some("map/filter loop init must be null: " + _dup(id)); }
+			}
+			match _check_expr(g, source, idx, &no_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+			match _check_expr(g, init, idx, &no_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+			// body locals: the element, plus the accumulator for fold.
+			var locals: Array<String> = [];
+			locals.push(_dup(elem));
+			if is_fold { locals.push(_dup(acc)); }
+			return _check_expr(g, body, idx, &locals);
+		}
+	}
+}
+
+fn _is_fold(k: &LoopKind) nothrow -> Bool {
+	match k { LoopKind::LFold() => { return true; }, default => { return false; } }
+}
+
+fn _is_const_null(e: &IrExpr) nothrow -> Bool {
+	match e { IrExpr::EConst(canonical_json) => { return _str_eq(canonical_json, &"null"); }, default => { return false; } }
+}
+
+// Validate every EResult/ELocal reference inside `e` against node `idx`'s scope. `extra_locals`
+// are names additionally in scope (a loop body's element/accumulator).
+fn _check_expr(g: &IrGraph, e: &IrExpr, idx: Int, extra_locals: &Array<String>) nothrow -> Optional<String> {
+	match e {
+		IrExpr::EConst(canonical_json) => { return _check_const(canonical_json); },
+		IrExpr::EArg(path) => { return Optional<String>::None(); },
+		IrExpr::EResult(node, path) => {
+			val t = _find_node(g, node);
+			if t < 0 { return Optional<String>::Some("EResult references missing node: " + _dup(node)); }
+			if !_is_operation(&g.nodes[t]) { return Optional<String>::Some("EResult must reference an NOperation: " + _dup(node)); }
+			if t == idx { return Optional<String>::Some("EResult references its own node: " + _dup(node)); }
+			if !_dominates(g, t, idx) { return Optional<String>::Some("EResult references a non-prior operation: " + _dup(node)); }
+			return Optional<String>::None();
+		},
+		IrExpr::ELocal(name, path) => {
+			if _contains_str(extra_locals, name) { return Optional<String>::None(); }
+			if _has_dominating_let(g, name, idx) { return Optional<String>::None(); }
+			return Optional<String>::Some("ELocal references an unbound/non-prior local: " + _dup(name));
+		}
+	}
+}
+
+fn _contains_str(xs: &Array<String>, x: &String) nothrow -> Bool {
+	var i = 0;
+	while i < xs.len { if _str_eq(&xs[i], x) { return true; } i = i + 1; }
+	return false;
 }
 
 // ===== helpers =====

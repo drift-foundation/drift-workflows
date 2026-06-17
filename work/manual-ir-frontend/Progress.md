@@ -51,6 +51,34 @@ content_hash are the remaining 1b(ii) chunk.
   (bind first); expression-form `val x = match {…}` can't `return` from an arm — use
   `var x = <default>; match {…}` (statement form).
 
+## Landed: graph validation + interpreter — chunk 2 PART 1 (ir.drift; runner not yet switched)
+Authoritative validation + a pure-control-flow interpreter, both in `ir.drift`, fully unit-tested.
+The runner does NOT yet build/validate/execute via the graph and `content_hash` is UNCHANGED —
+that adoption (+ fixture recompute + restart integration tests) is chunk 2 PART 2.
+- **`validate_graph(g) -> Optional<String>`** — rejects: empty graph, duplicate ids, missing
+  `entry`, dangling edge targets, control-flow CYCLES (DFS; loops are finite transforms, not
+  back-edges), UNREACHABLE nodes (dead code must not affect revision identity — `graph_canonical`
+  hashes every node — nor escape validation), non-terminal sinks (valid terminal = `NReturn`),
+  `EResult` to a non-`NOperation` / self / non-dominating op, graph-level `ELocal` with no
+  dominating `NLet`, duplicate `NLet` local names (V1: globally unique — replay resolves a local
+  by its single binding, so same-named shadowing would be order-sensitive), duplicate `NCase`
+  `match_const` (replay takes the first match while canonical sorts arms → ambiguous), and bad
+  finite-loop shape (map/filter carry no accumulator). Dominance computed simply (X dominates Y
+  iff Y reachable but unreachable once X removed) — fine for tiny graphs.
+- **`advance(g, arguments, settled) -> StepOutcome`** — replays pure control flow from durable
+  args + settled op results to the next durable boundary: `NeedOperation(node,op,canonical input)`
+  for the next UNSETTLED op, or `Completed(result)` at `NReturn` (`Fault` is defensive). Evaluates
+  `EConst`/`EArg`/`EResult`/`ELocal` (path projection) and `NLet`/`NIf`/`NCase`; SETTLED ops are
+  skipped (their result feeds later `EResult`). Restart-deterministic: same (args, settled) →
+  same step. Persistence unchanged — only `NOperation` is a durable boundary. **Loop EXECUTION is
+  a follow-up** (`NLoop` is validated but `advance` faults on it); no config produces loops yet.
+- **Tests:** `microflows/runner/tests/unit/ir_exec_test.drift` (new) — validation accept/reject
+  per defect class; replay over a degenerate graph and a branching graph (EArg/EResult/ELocal
+  projection, NLet, NIf true/false, NCase, operation-skip, restart determinism). base+asan, gated
+  under `test-microflows` (runner `test` recipe now runs both `ir_graph_test` + `ir_exec_test`).
+- Drift note (0.33.36): `Array.pop()` did NOT shrink `.len` as expected in a stack worklist
+  (infinite loop / hang) — use a head-index worklist (`while h < work.len { … h+=1 }`) instead.
+
 ## Landed: typed argument contract (Step 1b — value-model slice)
 - **`microflows/runner/src/ir.drift`** (new, runner-owned): the closed V1 value-type model
   `IrType` (Null/Bool/Int/Float/String/Array/closed Object/Optional — recursive arms via

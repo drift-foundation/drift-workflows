@@ -1,0 +1,260 @@
+// Unit tests for the V1 graph IR's structural validation (`validate_graph`) and the
+// pure-control-flow interpreter (`advance`) — Step 1b(ii) chunk 2. Covers: validation accepts
+// well-formed graphs and rejects each defect class; replay skips settled operations, threads
+// NLet locals, branches on NIf/NCase, projects EArg/EResult/ELocal by path, reaches NReturn,
+// and is restart-deterministic (same args+settled -> same outcome). Loop EXECUTION is a
+// follow-up (advance faults on NLoop); loop VALIDATION is covered here. Parser is out of scope.
+//
+// Standalone: compiled with ../src/ir.drift (ir imports only std.*), no DB.
+
+module microflows.runner.tests.ir_exec_test;
+
+import std.core as core;
+import microflows.runner.ir as ir;
+
+fn _seq(a: &String, b: &String) nothrow -> Bool {
+	if a.byte_length() != b.byte_length() { return false; }
+	var i = 0;
+	while i < a.byte_length() { if a.byte_at(i) != b.byte_at(i) { return false; } i = i + 1; }
+	return true;
+}
+
+fn _p0() nothrow -> Array<String> { var p: Array<String> = []; return move p; }
+fn _p1(a: String) nothrow -> Array<String> { var p: Array<String> = []; p.push(move a); return move p; }
+
+fn _ok_validate(g: &ir.IrGraph) nothrow -> Bool {
+	match ir.validate_graph(g) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
+}
+fn _rejects(g: &ir.IrGraph) nothrow -> Bool {
+	match ir.validate_graph(g) { Optional::Some(m) => { return true; }, Optional::None => { return false; } }
+}
+
+fn _is_need(o: &ir.StepOutcome, node: &String, op: &String, input: &String) nothrow -> Bool {
+	match o {
+		ir.StepOutcome::NeedOperation(node_id, operation, input_json) => {
+			return _seq(node_id, node) and _seq(operation, op) and _seq(input_json, input);
+		},
+		default => { return false; }
+	}
+}
+fn _is_completed(o: &ir.StepOutcome, result: &String) nothrow -> Bool {
+	match o {
+		ir.StepOutcome::Completed(result_json) => { return _seq(result_json, result); },
+		default => { return false; }
+	}
+}
+
+// Graph B: fetch -> let flag=fetch.ok -> if flag then commit(fetch.data)->return fetch.data
+//          else return "aborted".
+fn _graph_b() nothrow -> ir.IrGraph {
+	var nodes: Array<ir.IrNode> = [];
+	nodes.push(ir.IrNode::NOperation(id = "n0", operation = "fetch", input = ir.IrExpr::EArg(path = _p1("payload")), next = "n1"));
+	nodes.push(ir.IrNode::NLet(id = "n1", name = "flag", value = ir.IrExpr::EResult(node = "n0", path = _p1("ok")), next = "n2"));
+	nodes.push(ir.IrNode::NIf(id = "n2", cond = ir.IrExpr::ELocal(name = "flag", path = _p0()), then_node = "n3", else_node = "n4"));
+	nodes.push(ir.IrNode::NOperation(id = "n3", operation = "commit", input = ir.IrExpr::EResult(node = "n0", path = _p1("data")), next = "n5"));
+	nodes.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::EConst(canonical_json = "\"aborted\"")));
+	nodes.push(ir.IrNode::NReturn(id = "n5", value = ir.IrExpr::EResult(node = "n0", path = _p1("data"))));
+	return ir.IrGraph(nodes = move nodes, entry = "n0");
+}
+
+fn scenario() nothrow -> Int {
+	// ===== validation: well-formed graphs accepted =====
+	var flat: Array<ir.FlatStep> = [];
+	flat.push(ir.FlatStep(operation = "alpha", input_json = "{\"a\":1}"));
+	flat.push(ir.FlatStep(operation = "beta", input_json = "{\"b\":2}"));
+	var gd_ok = false;
+	var gd = _graph_b();   // placeholder; overwritten below
+	match ir.flat_to_graph(&flat) {
+		core.Result::Ok(g) => { gd = move g; gd_ok = true; },
+		core.Result::Err(e) => {}
+	}
+	if !gd_ok { return 1; }
+	if !_ok_validate(&gd) { return 2; }
+
+	val gb = _graph_b();
+	if !_ok_validate(&gb) { return 3; }
+
+	// ===== validation: defect classes rejected =====
+	// duplicate id
+	var dup: Array<ir.IrNode> = [];
+	dup.push(ir.IrNode::NOperation(id = "x", operation = "a", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "x"));
+	dup.push(ir.IrNode::NReturn(id = "x", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val g_dup = ir.IrGraph(nodes = move dup, entry = "x");
+	if !_rejects(&g_dup) { return 10; }
+
+	// missing entry
+	var me: Array<ir.IrNode> = [];
+	me.push(ir.IrNode::NReturn(id = "n0", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val g_me = ir.IrGraph(nodes = move me, entry = "zzz");
+	if !_rejects(&g_me) { return 11; }
+
+	// dangling edge target
+	var de: Array<ir.IrNode> = [];
+	de.push(ir.IrNode::NOperation(id = "n0", operation = "a", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "ghost"));
+	de.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val g_de = ir.IrGraph(nodes = move de, entry = "n0");
+	if !_rejects(&g_de) { return 12; }
+
+	// cycle
+	var cy: Array<ir.IrNode> = [];
+	cy.push(ir.IrNode::NOperation(id = "n0", operation = "a", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n1"));
+	cy.push(ir.IrNode::NOperation(id = "n1", operation = "b", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n0"));
+	val g_cy = ir.IrGraph(nodes = move cy, entry = "n0");
+	if !_rejects(&g_cy) { return 13; }
+
+	// EResult -> non-operation (references a NReturn)
+	var er: Array<ir.IrNode> = [];
+	er.push(ir.IrNode::NLet(id = "n0", name = "v", value = ir.IrExpr::EResult(node = "n1", path = _p0()), next = "n1"));
+	er.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val g_er = ir.IrGraph(nodes = move er, entry = "n0");
+	if !_rejects(&g_er) { return 14; }
+
+	// EResult -> non-prior (forward reference to a later op)
+	var fwd: Array<ir.IrNode> = [];
+	fwd.push(ir.IrNode::NOperation(id = "n0", operation = "a", input = ir.IrExpr::EResult(node = "n1", path = _p0()), next = "n1"));
+	fwd.push(ir.IrNode::NOperation(id = "n1", operation = "b", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n2"));
+	fwd.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val g_fwd = ir.IrGraph(nodes = move fwd, entry = "n0");
+	if !_rejects(&g_fwd) { return 15; }
+
+	// ELocal unbound
+	var ul: Array<ir.IrNode> = [];
+	ul.push(ir.IrNode::NOperation(id = "n0", operation = "a", input = ir.IrExpr::ELocal(name = "ghost", path = _p0()), next = "n1"));
+	ul.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val g_ul = ir.IrGraph(nodes = move ul, entry = "n0");
+	if !_rejects(&g_ul) { return 16; }
+
+	// finite-loop shape: map loop carrying an accumulator is rejected
+	var ml: Array<ir.IrNode> = [];
+	ml.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EArg(path = _p1("xs")), elem = "e", acc = "acc", init = ir.IrExpr::EConst(canonical_json = "0"), body = ir.IrExpr::ELocal(name = "e", path = _p0()), next = "n1"));
+	ml.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val g_ml = ir.IrGraph(nodes = move ml, entry = "n0");
+	if !_rejects(&g_ml) { return 17; }
+
+	// a well-formed fold loop validates
+	var fl: Array<ir.IrNode> = [];
+	fl.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LFold(), source = ir.IrExpr::EArg(path = _p1("xs")), elem = "e", acc = "acc", init = ir.IrExpr::EConst(canonical_json = "0"), body = ir.IrExpr::ELocal(name = "acc", path = _p0()), next = "n1"));
+	fl.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val g_fl = ir.IrGraph(nodes = move fl, entry = "n0");
+	if !_ok_validate(&g_fl) { return 18; }
+
+	// duplicate NCase match_const rejected
+	var dc: Array<ir.IrNode> = [];
+	var dca: Array<ir.IrCaseArm> = [];
+	dca.push(ir.IrCaseArm(match_const = "\"a\"", target = "n1"));
+	dca.push(ir.IrCaseArm(match_const = "\"a\"", target = "n2"));   // duplicate const
+	dc.push(ir.IrNode::NCase(id = "n0", scrutinee = ir.IrExpr::EArg(path = _p1("m")), arms = move dca, default_node = "n3"));
+	dc.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "1")));
+	dc.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "2")));
+	dc.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "0")));
+	val g_dc = ir.IrGraph(nodes = move dc, entry = "n0");
+	if !_rejects(&g_dc) { return 19; }
+
+	// duplicate NLet local name rejected
+	var dl: Array<ir.IrNode> = [];
+	dl.push(ir.IrNode::NLet(id = "n0", name = "v", value = ir.IrExpr::EArg(path = _p1("a")), next = "n1"));
+	dl.push(ir.IrNode::NLet(id = "n1", name = "v", value = ir.IrExpr::EArg(path = _p1("b")), next = "n2"));   // dup name
+	dl.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::ELocal(name = "v", path = _p0())));
+	val g_dl = ir.IrGraph(nodes = move dl, entry = "n0");
+	if !_rejects(&g_dl) { return 60; }
+
+	// unreachable node rejected (nothing targets n2)
+	var ur: Array<ir.IrNode> = [];
+	ur.push(ir.IrNode::NOperation(id = "n0", operation = "a", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n1"));
+	ur.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	ur.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val g_ur = ir.IrGraph(nodes = move ur, entry = "n0");
+	if !_rejects(&g_ur) { return 61; }
+
+	// EConst with NON-CANONICAL JSON (reordered keys) rejected
+	var nc: Array<ir.IrNode> = [];
+	nc.push(ir.IrNode::NOperation(id = "n0", operation = "a", input = ir.IrExpr::EConst(canonical_json = "{\"b\":2,\"a\":1}"), next = "n1"));
+	nc.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val g_nc = ir.IrGraph(nodes = move nc, entry = "n0");
+	if !_rejects(&g_nc) { return 62; }
+
+	// EConst with INVALID JSON rejected
+	var iv: Array<ir.IrNode> = [];
+	iv.push(ir.IrNode::NReturn(id = "n0", value = ir.IrExpr::EConst(canonical_json = "{bad")));
+	val g_iv = ir.IrGraph(nodes = move iv, entry = "n0");
+	if !_rejects(&g_iv) { return 63; }
+
+	// NCase match_const with NON-CANONICAL JSON rejected
+	var mc: Array<ir.IrNode> = [];
+	var mca: Array<ir.IrCaseArm> = [];
+	mca.push(ir.IrCaseArm(match_const = "{\"b\":2,\"a\":1}", target = "n1"));
+	mc.push(ir.IrNode::NCase(id = "n0", scrutinee = ir.IrExpr::EArg(path = _p1("m")), arms = move mca, default_node = "n1"));
+	mc.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "0")));
+	val g_mc = ir.IrGraph(nodes = move mc, entry = "n0");
+	if !_rejects(&g_mc) { return 64; }
+
+	// ===== interpreter: degenerate graph replay =====
+	var none: Array<ir.OpResult> = [];
+	val o0 = ir.advance(&gd, &"{}", &none);
+	if !_is_need(&o0, &"n0", &"alpha", &"{\"a\":1}") { return 20; }
+
+	var s1: Array<ir.OpResult> = [];
+	s1.push(ir.OpResult(node_id = "n0", result_json = "{\"r\":1}"));
+	val o1 = ir.advance(&gd, &"{}", &s1);
+	if !_is_need(&o1, &"n1", &"beta", &"{\"b\":2}") { return 21; }
+
+	var s2: Array<ir.OpResult> = [];
+	s2.push(ir.OpResult(node_id = "n0", result_json = "{\"r\":1}"));
+	s2.push(ir.OpResult(node_id = "n1", result_json = "{\"r\":2}"));
+	val o2 = ir.advance(&gd, &"{}", &s2);
+	if !_is_completed(&o2, &"null") { return 22; }
+
+	// ===== interpreter: branching + EArg/EResult/ELocal projection (graph B) =====
+	// step 1: needs fetch with input projected from args.payload
+	val b0 = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &none);
+	if !_is_need(&b0, &"n0", &"fetch", &"{\"k\":1}") { return 30; }
+
+	// step 2 (true branch): n0 settled ok=true -> let flag=true -> if true -> commit(fetch.data)
+	var bs1: Array<ir.OpResult> = [];
+	bs1.push(ir.OpResult(node_id = "n0", result_json = "{\"data\":{\"d\":9},\"ok\":true}"));
+	val b1 = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &bs1);
+	if !_is_need(&b1, &"n3", &"commit", &"{\"d\":9}") { return 31; }
+
+	// step 3: n0 + n3 settled -> return fetch.data
+	var bs2: Array<ir.OpResult> = [];
+	bs2.push(ir.OpResult(node_id = "n0", result_json = "{\"data\":{\"d\":9},\"ok\":true}"));
+	bs2.push(ir.OpResult(node_id = "n3", result_json = "{\"done\":1}"));
+	val b2 = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &bs2);
+	if !_is_completed(&b2, &"{\"d\":9}") { return 32; }
+
+	// false branch: n0 settled ok=false -> if false -> return "aborted"
+	var bf: Array<ir.OpResult> = [];
+	bf.push(ir.OpResult(node_id = "n0", result_json = "{\"data\":{\"d\":9},\"ok\":false}"));
+	val bfo = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &bf);
+	if !_is_completed(&bfo, &"\"aborted\"") { return 33; }
+
+	// ===== restart determinism: same (args, settled) -> identical outcome =====
+	val r_a = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &bs1);
+	val r_b = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &bs1);
+	if !_is_need(&r_a, &"n3", &"commit", &"{\"d\":9}") { return 40; }
+	if !_is_need(&r_b, &"n3", &"commit", &"{\"d\":9}") { return 41; }
+
+	// ===== NCase =====
+	var cn: Array<ir.IrNode> = [];
+	var arms: Array<ir.IrCaseArm> = [];
+	arms.push(ir.IrCaseArm(match_const = "\"a\"", target = "n1"));
+	arms.push(ir.IrCaseArm(match_const = "\"b\"", target = "n2"));
+	cn.push(ir.IrNode::NCase(id = "n0", scrutinee = ir.IrExpr::EArg(path = _p1("mode")), arms = move arms, default_node = "n3"));
+	cn.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "1")));
+	cn.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "2")));
+	cn.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "0")));
+	val gc = ir.IrGraph(nodes = move cn, entry = "n0");
+	if !_ok_validate(&gc) { return 50; }
+	val c_b = ir.advance(&gc, &"{\"mode\":\"b\"}", &none);
+	if !_is_completed(&c_b, &"2") { return 51; }
+	val c_def = ir.advance(&gc, &"{\"mode\":\"z\"}", &none);
+	if !_is_completed(&c_def, &"0") { return 52; }
+
+	return 0;
+}
+
+fn main() nothrow -> Int {
+	val r = scenario();
+	if r != 0 { return r; }
+	return 0;
+}

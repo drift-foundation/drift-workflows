@@ -26,13 +26,16 @@ test:
 	set -euo pipefail
 	DC="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/driftc"
 	OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
-	for variant in base asan; do
-		san=""; [[ "$variant" == asan ]] && san="--sanitize=address"
-		"$DC" --target-word-bits 64 $san \
-			--entry microflows.runner.tests.ir_graph_test::main \
-			src/ir.drift tests/unit/ir_graph_test.drift -o "$OUT/ir_graph_test.$variant"
-		"$OUT/ir_graph_test.$variant"
-		echo "[runner] ir_graph_test#$variant ok"
+	# Each unit test is a module under tests/unit/ compiled standalone with src/ir.drift.
+	for t in ir_graph_test ir_exec_test; do
+		for variant in base asan; do
+			san=""; [[ "$variant" == asan ]] && san="--sanitize=address"
+			"$DC" --target-word-bits 64 $san \
+				--entry "microflows.runner.tests.${t}::main" \
+				src/ir.drift "tests/unit/${t}.drift" -o "$OUT/${t}.$variant"
+			"$OUT/${t}.$variant"
+			echo "[runner] ${t}#$variant ok"
+		done
 	done
 
 clean:
