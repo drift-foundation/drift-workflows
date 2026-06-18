@@ -9,19 +9,23 @@ the already-proven IR. Prove control-flow machinery and durable restart before m
 syntax work.
 
 ## Current behavior / problem
-The runner executes a **flat, ordered manual plan**: `struct PlanStep { operation,
-input_json }` (config `"plan"`), resolved step-by-step via
-`_build_plan` / `_resolve_operation` / `_compensation_for`, pinned by `content_hash` and
-loaded through the in-process `ScriptRegistry`. `_validate_plan` only checks that each
-step's operation resolves. There are **no conditionals, no loops, and no typed values** —
-the "IR" is a list of operations with literal JSON inputs.
+**(Largely resolved — the manual-IR runtime surface is now complete; see "Current status".)**
 
-The design's value model (microflows_design.md §4: JSON-compatible values, schemas
-authoritative at remote + durable boundaries, typed path traversal, variables / arrays /
-objects / optionals / `if` / `case` / early return, deterministic local iteration +
-collection transforms) is not yet representable or executable. Per §7 the parser/type
-checker is explicitly scheduled **after** a proven runtime, and §8.3a keeps the manual IR
-as the loader until then.
+Originally the runner executed only a **flat, ordered manual plan**: `struct PlanStep
+{ operation, input_json }` (config `"plan"`), resolved step-by-step, with **no conditionals,
+no loops, and no typed values**. That has been built out: `microflows/runner/src/ir.drift`
+now holds a **typed control-flow graph IR** the runner executes — straight-line, `if`, `case`,
+finite array expressions (`map`/`filter`/`fold`), cross-branch result merge, `let`, `return` —
+with structural validation, typed expression validation (operation input/result contracts), and
+graph-authoritative `content_hash`. The flat plan is lifted to a degenerate straight-line graph,
+so legacy plans still run.
+
+The design's value model (microflows_design.md §4: JSON-compatible values, schemas authoritative
+at remote + durable boundaries, typed path traversal, variables / arrays / objects / optionals /
+`if` / `case` / early return, deterministic local iteration + collection transforms) is now
+representable and executable over **manually authored** IR/config. The ONE remaining gap is the
+textual front end: per §7 the parser/type checker is scheduled **after** the proven runtime, and
+§8.3a keeps the manual IR/config as the loader until the parser lowers source into it.
 
 ## Accepted design decisions
 - **IR-first, parser-last (the agreed sequence).** Steps 1–4 build and prove the IR,
@@ -256,11 +260,27 @@ parser/type-checker/IR/diagnostics when we get here.)
   model.
 
 ## Current status and next action
-**Charter only — not started.** Next action: **Step 1** — land the typed IR
-(`microflows/runner/src/ir.drift`) + durable workflow arguments: flat plan as a degenerate
-straight-line graph (current suites stay green), `content_hash` over the graph, and the
-immutable args child written atomically with the workflow + plan pin (`create_planned` +
-`args_get` + host variants, with `workflow_conflict` on differing canonical content).
+**Manual-IR runtime surface COMPLETE (steps 1–4) AND parser slice 1 (step 5) LANDED.** The typed
+IR, durable arguments, structural + typed validation, control-flow EXECUTION (straight-line, `if`,
+`case`, finite array expressions, cross-branch merge, `let`, `return`), graph-authoritative
+`content_hash`, and pinned replay/reversal regressions are all landed; and the textual front end has
+begun — a straight-line `.mf` source lowers into the EXACT config the manual IR executes, with NO new
+runtime semantics. Full `just test` green (certified driftc 0.33.41 / ABI 17; integration **106/106**,
+was 101). See Progress.md for the per-chunk record.
+
+Parser slice 1 (`microflows/runner/src/parser.drift` + `--lower-source` CLI): `args` →
+`argument_type`, `op … { input/result }` → operation contracts, `steps { <op> <json> … }` → a flat
+`plan`; reuses `_build_plan`/`parse_graph`/`validate_graph`/`type_check_graph`/`content_hash`
+unchanged (no new IR nodes, execution paths, or durable state). Source is the SOLE authority on
+contracts (any base `input_type`/`result_type` is stripped, never inherited into identity), and
+`--lower-source` runs the real build/validation path (DB-free) before printing, so an invalid
+source/config fails AT lowering. Parity proven: a parser-lowered config and the hand-authored manual
+config produce the IDENTICAL `--emit-content-hash` and execute to the same outcome; a malformed
+source fails at lowering, before any dispatch.
+
+Next action: **Step 5, parser slice 2** — add `if`/`case`/finite-array-expr/`merge`/`let` surface
+syntax, lowering to the `"graph"` config the manual IR executes (same content_hash/execution parity
+discipline). Later: diagnostics/spans (slice 1's are shallow), `../drift-lang` reuse TBD.
 
 ## Open questions / blockers
 - **✅ RESOLVED on Drift 0.33.35 — recursive-IR clean form landed.** `core.Box<T>` + the
@@ -295,7 +315,23 @@ boundaries persist nothing; loops are finite array transforms — see Accepted d
 decisions.)*
 
 ## Relevant review findings
-- None yet (new lane). Carries forward the storage-portability constraints: single-
-  `workflow_id` aggregate; continuation as the restart authority; `content_hash`
-  exact-match identity now over the control-flow graph; durable suspension only at remote
-  operations (never inside a loop).
+Per-finding detail lives in Progress.md (the review ledger for this lane). Landed themes from the
+multiple review rounds, all fixed + regression-tested:
+- **Strict config parsing** — `parse_graph`/expr/case/merge sub-objects reject unknown/extra/missing
+  keys and duplicate arms by exact key NAMES, not just counts (no silent drops).
+- **Branch durability + reversibility** — transition-faithful reversing fixtures (matching audit
+  head + args child); reversal compensates only the taken branch/case path + shared downstream
+  checkpoints; restart unwinds from the checkpoint stack, not graph control flow.
+- **Finite array expressions** — loop element name must not collide with ANY graph binder
+  (path-insensitive shadowing rejection); a non-array loop source is rejected at type-check
+  (direct literal AND one laundered through a merge), not deferred to a replay fault.
+- **Typed expression validation** — closed object literals infer field-by-field; a const reaching a
+  typed op input through a `let`/`merge`/`loop` binder is value-validated (`validate`) or rejected
+  (the three-way `Known`/`Unknown`/`Imprecise` inference — `Imprecise` is never permissive);
+  assignability (`null`/`T` ⊑ `Optional<T>`); compensation input must match the forward checkpoint
+  payload, and compensation type tags are folded into `content_hash`.
+
+Carries forward the storage-portability constraints: single-`workflow_id` aggregate; continuation as
+the restart authority; `content_hash` exact-match identity over the control-flow graph (incl. arg +
+operation/compensation type contracts); durable suspension only at remote operations (never inside a
+pure node — `if`/`case`/loop/merge/`let` write no continuation/event).

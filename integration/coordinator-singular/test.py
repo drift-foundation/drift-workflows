@@ -277,6 +277,27 @@ def main():
         plan_cfgs.append(f.name)
         return f.name
 
+    def lower_source(mf_text):
+        # Lower `.mf` SOURCE into a runnable config via the runner's OWN --lower-source frontend
+        # (base routing = runner_cfg; the parser emits "plan" + "argument_type" + operation
+        # contract overlays). Returns (returncode, config_path); config_path is None when lowering
+        # FAILS — so a malformed source surfaces as a nonzero exit AND no emitted config (no
+        # config to run => no possible dispatch).
+        mff = tempfile.NamedTemporaryFile("w", suffix=".mf", delete=False); mff.write(mf_text); mff.close()
+        plan_cfgs.append(mff.name)
+        cmd = [str(RUNNER_BIN), "--config", rcf.name, "--workflow-id", "0" * 32, "--lower-source", mff.name]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+        if out.returncode != 0:
+            return out.returncode, None
+        line = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
+        try:
+            cfg = json.loads(line)
+        except json.JSONDecodeError:
+            return out.returncode, None
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(cfg, f); f.close()
+        plan_cfgs.append(f.name)
+        return out.returncode, f.name
+
     stub = subprocess.Popen([str(STUB_BIN), "--config", scf.name],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     deadline = time.time() + 15
@@ -1657,6 +1678,86 @@ def main():
               and ex_d == 2 and pu_d >= 3 and (rq_d - pu_d) >= 2,
               (code, body, f"exec+{ex_d} put+{pu_d} req+{rq_d}"))
 
+        # ===== C11. TEXTUAL FRONTEND (parser slice 1): lowering PARITY =====
+        # A `.mf` source lowered through the runner's --lower-source frontend must produce the SAME
+        # config the manual IR consumes — proven by IDENTICAL content_hash with a hand-authored
+        # equivalent and IDENTICAL execution. The frontend adds NO runtime semantics: it reuses the
+        # existing plan/argument_type/contract machinery. A malformed source fails at lowering,
+        # before any config exists to run (so no dispatch is even possible). (Placed BEFORE the
+        # participant-down teardown below, since the execute parity check dispatches to the stub.)
+        P_RESV_IN = {"type": "object", "fields": [{"name": "reservation", "type": {"type": "string"}}]}
+        P_RESV_OUT = {"type": "object", "fields": [{"name": "reserved", "type": {"type": "string"}}]}
+        P_AT = {"type": "object", "fields": [{"name": "amount", "type": {"type": "int"}},
+                                             {"name": "currency", "type": {"type": "string"}}]}
+        mf_src = (
+            "# straight-line refund (slice 1)\n"
+            "args { amount: int, currency: string }\n"
+            "op reserve { input: { reservation: string } result: { reserved: string } }\n"
+            "op release { input: { reservation: string } }\n"
+            "steps {\n"
+            "  reserve { \"reservation\": \"ps1\" }\n"
+            "  reserve { \"reservation\": \"ps2\" }\n"
+            "}\n"
+        )
+        lr_code, lowered = lower_source(mf_src)
+        # Hand-authored manual equivalent: the SAME flat plan + argument_type + the SAME input/result
+        # contracts overlaid on reserve/release (routing untouched).
+        hand = dict(runner_cfg)
+        hops = []
+        for o in runner_cfg["operations"]:
+            o2 = dict(o)
+            if o2["name"] == "reserve":
+                o2["input_type"] = P_RESV_IN; o2["result_type"] = P_RESV_OUT
+            if o2["name"] == "release":
+                o2["input_type"] = P_RESV_IN
+            hops.append(o2)
+        hand["operations"] = hops
+        hand["plan"] = [{"operation": "reserve", "input": {"reservation": "ps1"}},
+                        {"operation": "reserve", "input": {"reservation": "ps2"}}]
+        hand["argument_type"] = P_AT
+        hf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(hand, hf); hf.close()
+        plan_cfgs.append(hf.name)
+        h_lowered = emit_content_hash(lowered) if lowered else "<none>"
+        h_hand = emit_content_hash(hf.name)
+        check("parser_lowering_content_hash_parity",
+              lr_code == 0 and lowered is not None and h_lowered != "" and h_lowered == h_hand,
+              (lr_code, lowered, h_lowered, h_hand))
+
+        # Both the lowered and the hand-authored config EXECUTE to the same outcome (the final op's
+        # result {reserved: ps2}, two dispatches each) — lowering parity at runtime, not just identity.
+        args_p = json.dumps({"amount": 1, "currency": "USD"})
+        wlp = _wf_id(); ex0 = _exec_count(base)
+        code_l, body_l = run_runner(lowered, wlp, arguments=args_p)
+        exl = _exec_count(base) - ex0
+        wlh = _wf_id(); ex0 = _exec_count(base)
+        code_h, body_h = run_runner(hf.name, wlh, arguments=args_p)
+        exh = _exec_count(base) - ex0
+        check("parser_lowered_executes_to_parity_result",
+              code_l == 0 and body_l.get("workflow") == "completed" and body_l.get("result") == {"reserved": "ps2"} and exl == 2
+              and code_h == 0 and body_h.get("workflow") == "completed" and body_h.get("result") == body_l.get("result") and exh == 2,
+              (code_l, body_l, exl, code_h, body_h, exh))
+
+        # A malformed source fails at LOWERING (nonzero, no config emitted) -> before any dispatch.
+        ex0 = _exec_count(base)
+        bad_code, bad_cfg = lower_source("args { amount: int }\n")   # no 'steps' block
+        check("parser_malformed_source_fails_before_dispatch",
+              bad_code != 0 and bad_cfg is None and _exec_count(base) - ex0 == 0,
+              (bad_code, bad_cfg))
+
+        # A contract for an operation absent from the routing registry is rejected at lowering
+        # (a dropped contract would be absent from content_hash) — also before any dispatch.
+        ghost_code, ghost_cfg = lower_source(
+            "op ghost { input: { x: int } }\nsteps { reserve { \"reservation\": \"g\" } }\n")
+        check("parser_unknown_op_contract_rejected",
+              ghost_code != 0 and ghost_cfg is None, (ghost_code, ghost_cfg))
+
+        # --lower-source VALIDATES the emitted config through the real build path (DB-free, no
+        # dispatch) before printing — so a semantically-invalid source (here: a step op absent from
+        # the routing registry, which the parser alone would not catch) fails at lowering, not later.
+        step_code, step_cfg = lower_source("steps { ghoststep { \"x\": 1 } }\n")
+        check("parser_lower_validates_emitted_config",
+              step_code != 0 and step_cfg is None, (step_code, step_cfg))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the
         # LOCAL authoritative result; no dependency on the participant.
         stub.terminate()
@@ -1689,6 +1790,7 @@ def main():
         check("terminal_replay_registry_config_independent", code == 0
               and body.get("workflow") == "already_terminal"
               and body.get("result") == {"reserved": "c2"}, (code, body))
+
     finally:
         stub.terminate()
         try:
@@ -1702,7 +1804,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 101
+    EXPECTED_CHECKS = 106
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

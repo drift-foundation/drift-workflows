@@ -37,6 +37,7 @@ import std.uuid as uuid;
 import std.crypto as crypto;
 import microflows.host as mf;
 import microflows.runner.ir as ir;
+import microflows.runner.parser as parser;
 import web.client as client;
 
 const SCRIPT_NAME: String = "protocol_spike";
@@ -145,6 +146,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 	val _ = p.option_string("input", "i", "JSON", "operation input (JSON object; default {}); fresh legacy workflow only", false);
 	val _ = p.option_string("arguments", "a", "JSON", "instance arguments (JSON object) for a PLANNED workflow SUBMISSION; supplying it creates/reasserts (and conflicts on changed args), omitting it RESUMES", false);
 	val _ = p.flag("emit-content-hash", "", "build the registry from --config and print the active revision's content_hash (hex), then exit; no DB or --workflow-id needed (used to (re)compute fixtures)");
+	val _ = p.option_string("lower-source", "", "FILE", "lower a .mf source file into a runnable config: use --config as the base routing registry, print the merged config JSON to stdout, then exit (no DB/dispatch; the textual frontend)", false);
 
 	var config_path: String = "";
 	var workflow_hex: String = "";
@@ -153,6 +155,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 	var arguments_json: String = "";
 	var has_arguments: Bool = false;
 	var emit_hash: Bool = false;
+	var lower_source_path: String = "";
 
 	match p.parse(argv) {
 		core.Result::Ok(parsed) => {
@@ -161,12 +164,19 @@ fn main(argv: Array<String>) nothrow -> Int {
 			match parsed.get_string("operation", p) { Some(v) => { operation_name = _dup(v); }, None => {} }
 			match parsed.get_string("input", p) { Some(v) => { input_json = _dup(v); }, None => {} }
 			match parsed.get_string("arguments", p) { Some(v) => { arguments_json = _dup(v); has_arguments = true; }, None => {} }
+			match parsed.get_string("lower-source", p) { Some(v) => { lower_source_path = _dup(v); }, None => {} }
 			emit_hash = parsed.has_flag("emit-content-hash", p);
 		},
 		core.Result::Err(_) => {
 			console.eprintln("runner: bad arguments");
 			return 2;
 		}
+	}
+	// Frontend mode: lower a .mf source file into a runnable config (base routing from --config),
+	// print the merged config JSON, then exit. Pure front end — no DB, no claim, no dispatch.
+	if lower_source_path.byte_length() != 0 {
+		if config_path.byte_length() == 0 { console.eprintln("runner: --config (base routing) required for --lower-source"); return 2; }
+		return try _lower_source(&lower_source_path, &config_path) catch { console.eprintln("runner: lower-source failed"); 1 };
 	}
 	// Fixture-tooling mode: print the active revision's content_hash for --config, then exit.
 	if emit_hash {
@@ -197,6 +207,56 @@ fn _emit_content_hash(config_path: &String) throws -> Int {
 	}
 	console.println(_bytes_to_hex(&reg.revisions[0].content_hash));
 	return 0;
+}
+
+// Frontend mode: lower a `.mf` source file into a COMPLETE runnable config. The `--config` file is
+// the base deployment routing (db + participants + operations registry); the parser emits the
+// `"plan"` + `"argument_type"` + operation contract overlays from source, producing the identical
+// config shape the manual IR consumes. Pure front end: it reads two files and prints JSON — no DB,
+// no claim, no dispatch. A malformed source (or a contract for an unknown operation) fails HERE,
+// before anything durable happens. The printed config is itself runnable / hashable unchanged.
+fn _lower_source(source_path: &String, config_path: &String) throws -> Int {
+	val source = _read_text(source_path);
+	val base = _load_config_json(config_path);
+	match parser.lower(&source, &base) {
+		core.Result::Ok(merged) => {
+			// VALIDATE the lowered config through the SAME build path a real run/--emit-content-hash
+			// uses (registry + graph structure + types + contracts + compensation), so a semantically
+			// invalid source/config combination (e.g. a step op absent from the registry, a duplicate
+			// args field, a type-contract error) fails HERE — still DB-free, no claim, no dispatch —
+			// rather than emitting a config that only blows up later. Only then is the printed config
+			// genuinely "runnable / hashable unchanged".
+			val ok = try _validate_lowered(&merged) catch RunnerError(e) {
+				console.eprintln("runner: lower-source: invalid lowered config: " + e.message);
+				false
+			};
+			if !ok { return 3; }
+			console.println(json.encode_compact(&merged));
+			return 0;
+		},
+		core.Result::Err(e) => {
+			console.eprintln("runner: lower-source: " + e.message);
+			return 3;
+		}
+	}
+}
+
+// Run the build-time validation path over a lowered config (no DB, no dispatch). Throws RunnerError
+// on any build-time rejection; returns true when the config builds to exactly one revision.
+fn _validate_lowered(merged: &json.JsonNode) throws -> Bool {
+	_validate_registry(merged);
+	val reg = _registry_build(merged);
+	if reg.revisions.len == 0 { throw RunnerError(message = "lowered config has no 'plan'"); }
+	return true;
+}
+
+// Read a file's full contents as UTF-8 text (no JSON parse) — for `.mf` source.
+fn _read_text(path: &String) throws -> String {
+	val timeout = conc.Duration(millis = 5000);
+	match io.file_builder(_dup(path)).read(true).timeout(timeout).build() {
+		core.Result::Ok(file) => { return _drain(move file); },
+		core.Result::Err(_) => { throw RunnerError(message = "cannot open source " + _dup(path)); }
+	}
 }
 
 fn _run(config_path: &String, workflow_hex: &String,

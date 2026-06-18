@@ -1,0 +1,495 @@
+// Microflows textual frontend — parser slice 1 (straight-line workflows).
+//
+// This module is a PURE FRONT END: it lowers `.mf` source text into the SAME config shape the
+// manual IR already executes and hashes (a flat `"plan"` + `"argument_type"` + per-operation
+// `input_type`/`result_type` contracts), reusing the runner's existing `_build_plan` /
+// `parse_graph` / `validate_graph` / `type_check_graph` / `content_hash` machinery UNCHANGED.
+// It adds NO IR nodes, NO execution paths, NO durable state, and NO new runtime semantics — the
+// acceptance criterion is LOWERING PARITY (a parser-emitted config and the hand-authored manual
+// config for the same workflow produce the identical content_hash and the identical run outcome).
+//
+// Slice 1 surface (deliberately narrow — diagnostics/spans are shallow):
+//   args { name: <type>, ... }                  -> the closed-object argument_type
+//   op <name> { input: <type>  result: <type> } -> operation input/result CONTRACTS (both optional)
+//   steps { <op> <json-object>  ... }            -> a straight-line flat plan (constant inputs)
+//   # ... line comments to end of line
+//
+//   <type> := int | float | bool | string | null
+//           | { <ident>: <type>, ... }   (object; trailing/optional commas tolerated)
+//           | [ <type> ]                  (array)
+//           | <type> ?                    (optional; postfix, repeatable)
+//
+// Deferred to later slices (each lowering to already-proven IR): if/case/array-expr/merge/let
+// surface syntax, result/argument references in step inputs, richer diagnostics, and `../drift-lang`
+// reuse. Slice 1 step inputs are constant JSON objects (matching the proven flat-plan surface).
+//
+// Standalone & dependency-light: imports only std.* plus the runner-owned `ir` (for nothing at
+// runtime — kept import-free of DB/host), so the unit test compiles it with src/ir.drift, no DB.
+
+module microflows.runner.parser;
+
+import std.core as core;
+import std.json as json;
+import std.text as text;
+import std.format as fmt;
+import std.io as io;
+import std.iter as iter;
+use trait iter.SinglePassIterator;
+
+export {
+	ParseError,
+	ContractDecl,
+	ParsedWorkflow,
+	parse_source,
+	lower
+};
+
+// A parse/lowering failure. All-scalar (a single String), so a typed `catch ParseError(e)` can
+// project `e.message` — the error is reconstructed as a fresh native value at the Result boundary.
+pub error ParseError { message: String }
+
+// One operation's declared CONTRACT, lowered to the config type encoding. Both optional: an `op`
+// that declares neither input nor result adds no contract (the operation stays unchecked).
+pub struct ContractDecl {
+	pub name: String,
+	pub input_type: Optional<json.JsonNode>,
+	pub result_type: Optional<json.JsonNode>
+}
+
+// The workflow-level config pieces a `.mf` source lowers to. `plan` is a JSON array of
+// `{operation, input}` steps (the flat manual-IR plan); `arg_type` is the closed-object
+// argument_type encoding (None => the script declares none, i.e. the empty object); `contracts`
+// overlay input/result types onto the deployment operations registry.
+pub struct ParsedWorkflow {
+	pub plan: json.JsonNode,
+	pub arg_type: Optional<json.JsonNode>,
+	pub contracts: Array<ContractDecl>
+}
+
+// ===== public entry points =====
+
+// Parse `.mf` source into its workflow-level config pieces. The structured error is caught HERE
+// (where ParseError is a local type) and reconstructed as a movable native value, so callers in
+// other modules need no error-type-qualified catch (errors-as-values; mirrors ir.parse_object_type).
+pub fn parse_source(source: &String) -> core.Result<ParsedWorkflow, ParseError> {
+	try {
+		var c = Cursor(src = _dup(source), pos = 0);
+		val pw = _parse(&mut c);
+		return core.Result<ParsedWorkflow, ParseError>::Ok(move pw);
+	} catch ParseError(e) {
+		return core.Result<ParsedWorkflow, ParseError>::Err(ParseError(message = e.message));
+	}
+}
+
+// Lower `.mf` source into a COMPLETE runnable config: the `base` deployment config (db +
+// participants + operations routing) with `"plan"` + `"argument_type"` set from source and the
+// source-declared input/result contracts OVERLAID onto the matching operations. The result is the
+// identical config shape the manual IR consumes, so the existing runner path runs it unchanged.
+// A `base` without an "operations" registry, or a contract for an operation absent from it, is a
+// lowering error (surfaced before any DB/dispatch).
+pub fn lower(source: &String, base: &json.JsonNode) -> core.Result<json.JsonNode, ParseError> {
+	try {
+		var c = Cursor(src = _dup(source), pos = 0);
+		val pw = _parse(&mut c);
+		val merged = _merge(base, &pw);
+		return core.Result<json.JsonNode, ParseError>::Ok(move merged);
+	} catch ParseError(e) {
+		return core.Result<json.JsonNode, ParseError>::Err(ParseError(message = e.message));
+	}
+}
+
+// ===== cursor over the source bytes =====
+
+struct Cursor {
+	src: String,
+	pos: Int
+}
+
+fn _eof(c: &Cursor) nothrow -> Bool { return c.pos >= c.src.byte_length(); }
+
+// Skip whitespace AND `#`-to-end-of-line comments.
+fn _skip_ws(c: &mut Cursor) nothrow -> Void {
+	while !_eof(c) {
+		val b = c.src.byte_at(c.pos);
+		if text.is_space(b) {
+			c.pos = c.pos + 1;
+		} else if cast<Int>(b) == 35 {   // '#': line comment
+			while !_eof(c) and cast<Int>(c.src.byte_at(c.pos)) != 10 { c.pos = c.pos + 1; }
+		} else {
+			return;
+		}
+	}
+}
+
+fn _is_ident_start(b: Byte) nothrow -> Bool {
+	return text.is_alpha(b) or cast<Int>(b) == 95;   // letter or '_'
+}
+fn _is_ident_char(b: Byte) nothrow -> Bool {
+	return text.is_alnum(b) or cast<Int>(b) == 95 or cast<Int>(b) == 45;   // letter/digit/'_'/'-'
+}
+
+// Read an identifier ([A-Za-z_][A-Za-z0-9_-]*) after skipping leading whitespace.
+fn _read_ident(c: &mut Cursor) -> String {
+	_skip_ws(c);
+	if _eof(c) or !_is_ident_start(c.src.byte_at(c.pos)) {
+		throw ParseError(message = "expected an identifier at byte " + fmt.format_int(c.pos));
+	}
+	val start = c.pos;
+	while !_eof(c) and _is_ident_char(c.src.byte_at(c.pos)) { c.pos = c.pos + 1; }
+	return _slice(c, start, c.pos - start);
+}
+
+// Require the next non-whitespace byte to equal `code` (a single-char token); consume it.
+fn _expect(c: &mut Cursor, code: Int, what: &String) -> Void {
+	_skip_ws(c);
+	if _eof(c) or cast<Int>(c.src.byte_at(c.pos)) != code {
+		throw ParseError(message = "expected " + _dup(what) + " at byte " + fmt.format_int(c.pos));
+	}
+	c.pos = c.pos + 1;
+}
+
+// Consume the next non-whitespace byte iff it equals `code`; report whether it did.
+fn _accept(c: &mut Cursor, code: Int) nothrow -> Bool {
+	_skip_ws(c);
+	if !_eof(c) and cast<Int>(c.src.byte_at(c.pos)) == code { c.pos = c.pos + 1; return true; }
+	return false;
+}
+
+fn _slice(c: &Cursor, start: Int, len: Int) -> String {
+	match text.substring(&c.src, start, len) {
+		core.Result::Ok(s) => { return move s; },
+		core.Result::Err(_) => { throw ParseError(message = "internal: bad source slice"); }
+	}
+}
+
+// ===== grammar =====
+
+// file := item* ; item := args_decl | op_decl | steps_decl. Exactly one optional `args`, zero or
+// more `op`, exactly one `steps` (required).
+fn _parse(c: &mut Cursor) -> ParsedWorkflow {
+	var arg_type: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
+	var contracts: Array<ContractDecl> = [];
+	var plan: json.JsonNode = json.new_array().to_node();
+	var seen_args = false;
+	var seen_steps = false;
+
+	_skip_ws(c);
+	while !_eof(c) {
+		val kw = _read_ident(c);
+		if _str_eq(&kw, &"args") {
+			if seen_args { throw ParseError(message = "duplicate 'args' block"); }
+			seen_args = true;
+			arg_type = Optional<json.JsonNode>::Some(_parse_object_type(c));
+		} else if _str_eq(&kw, &"op") {
+			val cd = _parse_op_decl(c, &contracts);
+			contracts.push(move cd);
+		} else if _str_eq(&kw, &"steps") {
+			if seen_steps { throw ParseError(message = "duplicate 'steps' block"); }
+			seen_steps = true;
+			plan = _parse_steps(c);
+		} else {
+			throw ParseError(message = "unknown top-level keyword '" + _dup(&kw) + "' (expected args/op/steps)");
+		}
+		_skip_ws(c);
+	}
+	if !seen_steps { throw ParseError(message = "missing 'steps' block"); }
+	return ParsedWorkflow(plan = move plan, arg_type = move arg_type, contracts = move contracts);
+}
+
+// type := base ('?')* ; the postfix '?' wraps in an optional encoding (repeatable).
+fn _parse_type(c: &mut Cursor) -> json.JsonNode {
+	var base = _parse_base_type(c);
+	while _accept(c, 63) {   // '?'
+		var o = json.new_object();
+		o.set("type", _jstr("optional"));
+		o.set("inner", move base);
+		base = o.to_node();
+	}
+	return move base;
+}
+
+// base := scalar-keyword | object-type | array-type
+fn _parse_base_type(c: &mut Cursor) -> json.JsonNode {
+	_skip_ws(c);
+	if _eof(c) { throw ParseError(message = "expected a type"); }
+	val b = c.src.byte_at(c.pos);
+	if cast<Int>(b) == 123 { return _parse_object_type(c); }   // '{'
+	if cast<Int>(b) == 91 {                                     // '[' array
+		c.pos = c.pos + 1;
+		val elem = _parse_type(c);
+		_expect(c, 93, &"']'");
+		var o = json.new_object();
+		o.set("type", _jstr("array"));
+		o.set("elem", move elem);
+		return o.to_node();
+	}
+	var kw = _read_ident(c);
+	if _str_eq(&kw, &"int") or _str_eq(&kw, &"float") or _str_eq(&kw, &"bool")
+	   or _str_eq(&kw, &"string") or _str_eq(&kw, &"null") {
+		var o = json.new_object();
+		o.set("type", _jstr(move kw));
+		return o.to_node();
+	}
+	throw ParseError(message = "unknown type '" + _dup(&kw) + "'");
+}
+
+// object-type := '{' (ident ':' type (','? ident ':' type)* ','?)? '}' — lowered to the config
+// `{"type":"object","fields":[{"name","type"}...]}` encoding (parse_type later sorts fields, so
+// declaration order is irrelevant to identity).
+fn _parse_object_type(c: &mut Cursor) -> json.JsonNode {
+	_expect(c, 123, &"'{'");
+	var fields = json.new_array();
+	while !_accept(c, 125) {   // until '}'
+		if _eof(c) { throw ParseError(message = "unterminated object type"); }
+		var name = _read_ident(c);
+		_expect(c, 58, &"':'");
+		val fty = _parse_type(c);
+		var fo = json.new_object();
+		fo.set("name", _jstr(move name));
+		fo.set("type", move fty);
+		fields.push(fo.to_node());
+		val _ = _accept(c, 44);   // optional ','
+	}
+	var o = json.new_object();
+	o.set("type", _jstr("object"));
+	o.set("fields", fields.to_node());
+	return o.to_node();
+}
+
+// op_decl := 'op' ident '{' (('input'|'result') ':' type)* '}'. The leading 'op' is already
+// consumed by the caller. Each clause is unique; the op name must be unique across the file.
+fn _parse_op_decl(c: &mut Cursor, existing: &Array<ContractDecl>) -> ContractDecl {
+	var name = _read_ident(c);
+	var i = 0;
+	while i < existing.len {
+		if _str_eq(&existing[i].name, &name) { throw ParseError(message = "duplicate 'op' declaration for '" + _dup(&name) + "'"); }
+		i = i + 1;
+	}
+	_expect(c, 123, &"'{'");
+	var input_t: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
+	var result_t: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
+	var has_input = false;
+	var has_result = false;
+	while !_accept(c, 125) {   // until '}'
+		if _eof(c) { throw ParseError(message = "unterminated 'op' block for '" + _dup(&name) + "'"); }
+		val clause = _read_ident(c);
+		_expect(c, 58, &"':'");
+		if _str_eq(&clause, &"input") {
+			if has_input { throw ParseError(message = "duplicate 'input' in op '" + _dup(&name) + "'"); }
+			has_input = true;
+			input_t = Optional<json.JsonNode>::Some(_parse_type(c));
+		} else if _str_eq(&clause, &"result") {
+			if has_result { throw ParseError(message = "duplicate 'result' in op '" + _dup(&name) + "'"); }
+			has_result = true;
+			result_t = Optional<json.JsonNode>::Some(_parse_type(c));
+		} else {
+			throw ParseError(message = "unknown op clause '" + _dup(&clause) + "' (expected input/result)");
+		}
+		val _ = _accept(c, 44);   // optional ','
+	}
+	return ContractDecl(name = move name, input_type = move input_t, result_type = move result_t);
+}
+
+// steps := 'steps' '{' (ident json-object)* '}'. The leading 'steps' is already consumed. Each
+// step is an operation name followed by a CONSTANT JSON object literal (its request input). The
+// JSON object is grabbed as a balanced-brace span and parsed by the strict JSON parser, so the
+// emitted plan input is byte-identical in meaning to a hand-authored flat-plan step.
+fn _parse_steps(c: &mut Cursor) -> json.JsonNode {
+	_expect(c, 123, &"'{'");
+	var plan = json.new_array();
+	while !_accept(c, 125) {   // until '}'
+		if _eof(c) { throw ParseError(message = "unterminated 'steps' block"); }
+		var op = _read_ident(c);
+		_skip_ws(c);
+		if _eof(c) or cast<Int>(c.src.byte_at(c.pos)) != 123 {
+			throw ParseError(message = "expected a JSON object input for step '" + _dup(&op) + "'");
+		}
+		val start = c.pos;
+		val end = _scan_json_object(c);
+		val raw = _slice(c, start, end - start);
+		val input = _parse_json_object(&raw);
+		var step = json.new_object();
+		step.set("operation", _jstr(move op));
+		step.set("input", move input);
+		plan.push(step.to_node());
+	}
+	if plan.len() == 0 { throw ParseError(message = "'steps' block must declare at least one step"); }
+	return plan.to_node();
+}
+
+// Scan a balanced `{...}` starting at c.pos (which must be '{'); return the index just past the
+// matching '}' and advance the cursor there. String literals (and their escapes) are skipped so
+// braces inside strings don't affect nesting.
+fn _scan_json_object(c: &mut Cursor) -> Int {
+	val n = c.src.byte_length();
+	var i = c.pos;
+	var depth = 0;
+	var in_str = false;
+	var esc = false;
+	while i < n {
+		val ch = cast<Int>(c.src.byte_at(i));
+		if in_str {
+			if esc { esc = false; }
+			else if ch == 92 { esc = true; }     // backslash
+			else if ch == 34 { in_str = false; } // closing quote
+		} else {
+			if ch == 34 { in_str = true; }       // opening quote
+			else if ch == 123 { depth = depth + 1; }   // '{'
+			else if ch == 125 {                  // '}'
+				depth = depth - 1;
+				if depth == 0 { c.pos = i + 1; return i + 1; }
+			}
+		}
+		i = i + 1;
+	}
+	throw ParseError(message = "unterminated JSON object in 'steps'");
+}
+
+fn _parse_json_object(raw: &String) -> json.JsonNode {
+	match json.parse_strict(raw) {
+		core.Result::Ok(n) => {
+			var is_obj = false;
+			match n.as_object() { Optional::Some(_) => { is_obj = true; }, Optional::None => {} }
+			if !is_obj { throw ParseError(message = "step input must be a JSON object"); }
+			return move n;
+		},
+		core.Result::Err(_) => { throw ParseError(message = "invalid JSON object in step input"); }
+	}
+}
+
+// ===== lowering: merge the parsed pieces into the base deployment config =====
+
+fn _merge(base: &json.JsonNode, pw: &ParsedWorkflow) -> json.JsonNode {
+	var out = json.new_object();
+	var has_ops = false;
+	var it = base.entries();
+	var done = false;
+	while !done {
+		match it.next() {
+			Optional::Some(entry) => {
+				val k = entry.key;
+				// We author plan + argument_type ourselves; drop any base "plan"/"graph"/
+				// "argument_type" so the lowered config is unambiguously the parsed workflow.
+				if _str_eq(k, &"plan") or _str_eq(k, &"graph") or _str_eq(k, &"argument_type") {
+				} else if _str_eq(k, &"operations") {
+					has_ops = true;
+					out.set(_dup(k), _overlay_operations(entry.value, pw));
+				} else {
+					out.set(_dup(k), entry.value.clone_deep());
+				}
+			},
+			Optional::None => { done = true; }
+		}
+	}
+	if !has_ops and pw.contracts.len > 0 {
+		throw ParseError(message = "config has no 'operations' registry to attach contracts to");
+	}
+	out.set("plan", pw.plan.clone_deep());
+	match &pw.arg_type {
+		Optional::Some(at) => { out.set("argument_type", at.clone_deep()); },
+		Optional::None => {}
+	}
+	return out.to_node();
+}
+
+// Rebuild the operations array, overlaying each source contract's input/result type onto the
+// matching operation entry. A contract whose operation is absent from the registry is a lowering
+// error (it would silently vanish, and a dropped contract is absent from content_hash).
+fn _overlay_operations(opsnode: &json.JsonNode, pw: &ParsedWorkflow) -> json.JsonNode {
+	match opsnode.as_array() {
+		Optional::Some(items) => {
+			var matched: Array<Bool> = [];
+			var ci = 0;
+			while ci < pw.contracts.len { matched.push(false); ci = ci + 1; }
+			var arr = json.new_array();
+			var i = 0;
+			while i < items.len {
+				val nm = _op_name(&items[i]);
+				// SOURCE is the sole authority on contracts: strip any input_type/result_type the
+				// base routing config might carry, then re-add ONLY the source-declared ones. Without
+				// this, a base contract would leak into the emitted config + content_hash, making
+				// source identity depend on non-source data (a `op x {}` could inherit a stale type).
+				var o = _op_strip_contracts(&items[i]);
+				val ix = _find_contract(pw, &nm);
+				if ix >= 0 {
+					matched[ix] = true;
+					match &pw.contracts[ix].input_type { Optional::Some(t) => { o.set("input_type", t.clone_deep()); }, Optional::None => {} }
+					match &pw.contracts[ix].result_type { Optional::Some(t) => { o.set("result_type", t.clone_deep()); }, Optional::None => {} }
+				}
+				arr.push(o.to_node());
+				i = i + 1;
+			}
+			var k = 0;
+			while k < pw.contracts.len {
+				if !matched[k] { throw ParseError(message = "op '" + _dup(&pw.contracts[k].name) + "' declared in source but absent from the operations registry"); }
+				k = k + 1;
+			}
+			return arr.to_node();
+		},
+		Optional::None => { throw ParseError(message = "config 'operations' must be a JSON array"); }
+	}
+}
+
+fn _op_name(item: &json.JsonNode) -> String {
+	match item.get(&"name") {
+		Optional::Some(n) => {
+			match n.as_string() { Optional::Some(s) => { return move s; }, Optional::None => { throw ParseError(message = "operation 'name' must be a string"); } }
+		},
+		Optional::None => { throw ParseError(message = "operation entry missing 'name'"); }
+	}
+}
+
+fn _find_contract(pw: &ParsedWorkflow, name: &String) nothrow -> Int {
+	var i = 0;
+	while i < pw.contracts.len {
+		if _str_eq(&pw.contracts[i].name, name) { return i; }
+		i = i + 1;
+	}
+	return -1;
+}
+
+// Copy an operation entry into a fresh object, DROPPING any input_type/result_type — so the only
+// contracts in the emitted config are the source-declared ones re-added by the caller.
+fn _op_strip_contracts(item: &json.JsonNode) -> json.JsonObject {
+	var o = json.new_object();
+	var it = item.entries();
+	var done = false;
+	while !done {
+		match it.next() {
+			Optional::Some(entry) => {
+				val k = entry.key;
+				if _str_eq(k, &"input_type") or _str_eq(k, &"result_type") {
+					// drop: a base contract is not source identity
+				} else {
+					o.set(_dup(k), entry.value.clone_deep());
+				}
+			},
+			Optional::None => { done = true; }
+		}
+	}
+	return move o;
+}
+
+// ===== small helpers =====
+
+fn _jstr(s: String) nothrow -> json.JsonNode { return json.JsonNode::String(value = move s); }
+
+fn _str_eq(a: &String, b: &String) nothrow -> Bool {
+	if a.byte_length() != b.byte_length() { return false; }
+	var i = 0;
+	while i < a.byte_length() {
+		if a.byte_at(i) != b.byte_at(i) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+fn _dup(s: &String) nothrow -> String {
+	val n = s.byte_length();
+	if n == 0 { return ""; }
+	var buf = io.buffer(n);
+	var i = 0;
+	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
+	val ptr = io.buffer_ptr(&buf);
+	return core.string_from_utf8_bytes(ptr, n);
+}

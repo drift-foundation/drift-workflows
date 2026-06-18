@@ -2,14 +2,89 @@
 
 Charter (objective, decisions, plan, verification): [README.md](./README.md).
 
-## Status: **Step 1 in progress — arg substrate + typed argument contract LANDED**
+## Status: **Parser slice 1 LANDED — straight-line `.mf` lowers to the proven IR with content_hash + execution parity**
 
-The lane is scoped (IR-first, parser-last). Step 1's durable argument substrate (1a) AND the
-typed argument contract (the value-model slice of 1b: `ir.drift` + validation +
-type-in-content_hash) are landed and green (full `just test`, ABI 17). Step 1b(ii) chunk 1 —
-control-flow graph IR **types + canonical hashing + flat-plan compatibility** — is landed
-(below). Execution (interpreter) + structural validation + making the graph authoritative for
-content_hash are the remaining 1b(ii) chunk.
+The lane is scoped (IR-first, parser-last). The **manual-IR runtime surface is complete and fully
+proven**, and **the textual front end has now begun**: a straight-line `.mf` source lowers into the
+EXACT config the manual IR already executes and hashes, with NO new runtime semantics. Full
+`just test` green on certified driftc 0.33.41 / ABI 17 — integration **106/106** (was 101),
+microflows 20/20, SP 110/110, singular 16/16.
+
+Proven runtime surface (unchanged this slice): durable arguments, the typed value/argument model,
+and the control-flow graph IR with EXECUTION + structural validation + graph-authoritative
+`content_hash` for —
+- **straight-line** operation plans (the flat plan lifted to a degenerate graph),
+- **`if`** branches (uniform op-depth; branch reversal),
+- **`case`** multi-way branches,
+- **finite array expressions** (`map`/`filter`/`fold`, pure `IrExpr` bodies),
+- **cross-branch result merge** (`NMerge` phi),
+- **typed expression validation** (operation input/result contracts; three-way inference;
+  assignability; compensation-payload + content_hash type identity).
+
+Branches/loops/merges/lets write no continuation/event (only `NOperation` is a durable boundary);
+replay re-derives the pure path deterministically.
+
+**Next: parser slice 2** — add `if`/`case`/array-expr/merge/`let` surface syntax (each lowering to
+already-proven IR), then diagnostics/spans. Scoped below.
+
+## Landed: parser slice 1 — straight-line textual front end (lowering parity, no new semantics)
+
+A NEW runner-owned module `microflows/runner/src/parser.drift` lowers `.mf` SOURCE TEXT into the
+SAME config the manual IR consumes — a flat `"plan"` + `"argument_type"` + per-operation
+`input_type`/`result_type` contract overlays — reusing the existing `_build_plan` / `parse_graph` /
+`validate_graph` / `type_check_graph` / `content_hash` machinery UNCHANGED. NO new IR nodes, NO new
+execution paths, NO new durable state, NO dispatch/continuation changes. The acceptance criterion is
+**lowering parity**, not a polished language.
+- **Surface (slice 1, deliberately narrow).** `args { name: <type>, … }` → the closed-object
+  `argument_type`; `op <name> { input: <type>  result: <type> }` → operation input/result CONTRACTS
+  (both optional); `steps { <op> <json-object> … }` → a straight-line flat plan (constant JSON
+  inputs, matching the proven flat-plan surface); `#`-to-EOL comments. Types: `int`/`float`/`bool`/
+  `string`/`null`, `{ field: T, … }` (object), `[T]` (array), `T?` (postfix optional). No
+  `if`/`case`/loop/merge/`let`/result-reference syntax yet (deferred to later slices).
+- **Public API.** `parse_source(src) -> Result<ParsedWorkflow, ParseError>` (the workflow-level
+  pieces: plan node, optional arg-type node, contract overlays) and `lower(src, base) -> Result<
+  JsonNode, ParseError>` (merge into the base deployment routing → a complete runnable config).
+  Errors-as-values: ParseError is all-scalar, caught typed at the Result boundary (mirrors
+  `ir.parse_object_type`). A contract for an operation absent from the registry is a lowering error
+  (a dropped contract would be absent from `content_hash`).
+- **CLI.** `microflows-runner --config <base.json> --lower-source <wf.mf>` prints the merged config
+  JSON to stdout, then exits — a PURE front end (reads two files, prints JSON; no DB, no claim, no
+  dispatch). A malformed source (or unknown-op contract) fails HERE with a nonzero exit, before
+  anything durable. The printed config is itself runnable / `--emit-content-hash`-able unchanged.
+- **Tests.** Unit (`tests/unit/parser_test.drift`, DB-free, compiled with `ir.drift`+`parser.drift`,
+  base+asan, gated in the runner `test` recipe): parse correctness, IR-identity parity (the parsed
+  plan and a hand-authored plan lift to the same `graph_canonical`; arg/contract types match by
+  `ir.canonical`), lowering overlay, and a battery of malformed-source rejections (missing/empty
+  `steps`, unknown keyword/type/op-clause, unterminated braces, non-object step input, duplicate
+  `args`/`op`). Integration (C11, 4 checks): a parser-lowered config and the hand-authored manual
+  config produce the IDENTICAL `--emit-content-hash`; BOTH execute to the same outcome (final op
+  result `{reserved:ps2}`, two dispatches each); a malformed source fails at lowering with no
+  dispatch; an unknown-op contract is rejected at lowering; an emitted config referencing an op
+  absent from the registry is rejected at lowering (the build-validation gate). Integration 101→106.
+- **Review findings addressed (two).**
+  - *Base contracts are not source identity (High).* `_merge`/`_op_strip_contracts` STRIP any
+    `input_type`/`result_type` the base routing config carries from EVERY operation, then re-add ONLY
+    the source-declared contracts. Without this, a `op x {}` (or a partial contract) could inherit a
+    stale base type into the emitted config + `content_hash`, making source identity depend on
+    non-source data. Unit `parser_test` 5b: a base with a STALE reserve contract + a contract-free
+    source emits a reserve with no `input_type`/`result_type`.
+  - *`--lower-source` validates the emitted config (Medium).* After lowering, the CLI runs the SAME
+    build path a real run / `--emit-content-hash` uses (`_validate_registry` + `_registry_build` —
+    registry/graph/type/contract/compensation checks), DB-free and dispatch-free, BEFORE printing.
+    So a semantically-invalid source/config (a step op absent from the registry, a duplicate `args`
+    field, a type-contract error) fails AT lowering, not later — the printed config is genuinely
+    "runnable / hashable unchanged". Integration `parser_lower_validates_emitted_config`.
+- **Drift notes (0.33.41).** A module-level constant is `const` (not `val`); `+`-concatenation is
+  not const-evaluable (use a fn). An `export {…}` block needs a trailing `;`. Iterating
+  `JsonNode.entries()` needs `use trait iter.SinglePassIterator;` in scope. `&` of a call-result
+  temporary is rejected (bind to a `val` first). An empty array literal needs a type annotation. A
+  bare tail `match` is not a return — bind or `return` it.
+
+## Deferred: later parser slices (each lowers to already-proven IR; no new runtime semantics)
+- **Slice 2:** `if`/`case`/finite-array-expr/`merge`/`let` surface syntax (lowering to the `"graph"`
+  config the manual IR already executes), with the same content_hash/execution parity discipline.
+- **Slice 3+:** diagnostics/spans (slice 1's are shallow — byte offsets), and possible
+  `../drift-lang` reuse for the lexer/parser/type-checker.
 
 ## Landed: control-flow graph IR — chunk 1 (Step 1b(ii): types + canonical + flat compat)
 - **Graph node types in `ir.drift`** (additive; runner behavior unchanged): `IrExpr` (closed leaf
@@ -476,34 +551,44 @@ Earlier rounds:
   inherited from the host platform.
 
 ## Step ledger
-- [~] **1 — Typed workflow IR + durable arguments** in `ir.drift` (+ `db`/`host`).
+- [x] **1 — Typed workflow IR + durable arguments** in `ir.drift` (+ `db`/`host`).
   - [x] **1a — durable argument substrate** (schema + atomic create_planned + args_get + host
     + byte-compare `workflow_conflict` + SP tests). LANDED, green.
   - [x] **1b(i) — value-model slice** (`ir.drift` type model + recursive validator + canonical
     encoding; declared argument type; validation before create; type-in-content_hash). LANDED.
-  - [ ] **1b(ii) — control-flow graph** in `ir.drift` (`Operation`/`If`/`Case`/finite `Loop`/
-    `Let`/`Return`); flat `PlanStep` as a degenerate straight-line graph; `content_hash` over
-    the whole graph. **NEXT.**
-- [ ] **2 — Semantic validation / type checking** (graph-aware): operation + compensation
-  resolution · input/result contract compatibility · stable node-id result refs · arg-type
-  well-formedness + references · branch target validity · typed+validated control-flow drivers
-  (no raw-JSON branch/loop source) · side-effect-free + structurally-finite loop constraint ·
-  reachable terminals. (Determinism needs no check — it is structural.)
-- [ ] **3 — Execution: conditionals + replayable pure loops.** Pure boundaries write **no**
-  continuation; restart re-derives the pure path from the last remote-op boundary.
-- [ ] **4 — Pinned replay regressions across every control-flow construct** (branch, loop→op,
-  mid-spine across a branch, early return, reversal across a taken branch) — asserting
-  deterministic pure-control-flow replay and no continuation write at pure boundaries.
-- [ ] **5 — Textual DSL parser LAST** — lowers `.mf` into the proven IR, reuses the step-2
-  validator; diagnostics; possible `../drift-lang` reuse.
+  - [x] **1b(ii) — control-flow graph** in `ir.drift` (`Operation`/`If`/`Case`/finite `Loop`/
+    `Let`/`Merge`/`Return`); flat `PlanStep` as a degenerate straight-line graph; `content_hash`
+    over the whole graph. LANDED (see the chunk sections above).
+- [x] **2 — Semantic validation / type checking** (graph-aware): structural `validate_graph`
+  (unique ids, edges, acyclic, reachable, terminal shape, dominance for `EResult`/`ELocal`,
+  loop/merge shape) + `type_check_graph` (operation input/result contracts, `EArg`/`EResult`/
+  `ELocal` path resolution, `NIf` Bool, `NCase` arms, `NLoop` source/body, `NMerge` agreement,
+  assignability, compensation-payload compatibility). LANDED.
+- [x] **3 — Execution: conditionals + replayable pure loops + merge.** `ir.advance` drives
+  `operation`/`if`/`case`/`let`/`map`/`filter`/`fold`/`merge`/`return`. Pure boundaries write
+  **no** continuation/event; restart re-derives the pure path from the last remote-op boundary.
+  LANDED.
+- [x] **4 — Pinned replay regressions across every control-flow construct** (branch true/false,
+  case selection + default, loop-derived op input, merge into a shared op, mid-flight resume,
+  reversal across a taken branch/case + shared downstream, changed-contract → revision_unavailable)
+  — deterministic pure-control-flow replay, no continuation write at pure boundaries. LANDED
+  (integration C6–C10).
+- [~] **5 — Textual parser** (NEW sub-step) — lowers source text into the proven IR, reusing
+  `_build_plan`/`parse_graph`/`validate_graph`/`type_check_graph`/`content_hash` with NO new runtime
+  semantics.
+  - [x] **slice 1 — straight-line** workflow + declared arguments + operation input/result contracts
+    → `microflows/runner/src/parser.drift` + `--lower-source` CLI → emits the same `plan`/
+    `argument_type`/contract config → `content_hash` + execution parity with the hand-authored manual
+    IR (unit `parser_test`; integration C11). LANDED, full `just test` green.
+  - [ ] **slice 2 —** `if`/`case`/finite-array-expr/`merge`/`let` surface syntax (lowering to the
+    `"graph"` config), same parity discipline.
+  - [ ] **slice 3+ —** diagnostics/spans; possible `../drift-lang` reuse.
 
 ## Next action
-**Step 1b(ii):** add the control-flow graph node types to `ir.drift`
-(`Operation`/`If`/`Case`/finite `Loop`/`Let`/`Return`), re-express the existing flat
-`PlanStep` plan as a degenerate straight-line graph (current suites stay green), and extend
-`content_hash` over the whole graph (the value-model + arg-type + canonical machinery is
-already in place). Resume-reads-`args_get` gets wired when the IR actually consumes arguments
-(Step 3).
+**Step 5, parser slice 2:** extend the textual front end with control-flow surface syntax
+(`if`/`case`/finite array expressions/`merge`/`let`), lowering to the `"graph"` config the manual IR
+already executes — same acceptance: parser-emitted config vs hand-authored graph config → identical
+`--emit-content-hash` and identical run outcome. No runtime/IR/storage changes (front end only).
 
 ## Open questions (see README)
 How far back replay restarts (last settled op vs start) · `../drift-lang` reuse for step 5.

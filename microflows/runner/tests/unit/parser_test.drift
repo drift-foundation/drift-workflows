@@ -1,0 +1,271 @@
+// Unit tests for the textual frontend (parser slice 1) — `microflows.runner.parser`. Proves the
+// parser LOWERS straight-line `.mf` source into the SAME workflow-level config pieces the manual
+// IR consumes, and rejects malformed source. The DEEP content_hash + execution parity is proven by
+// the integration suite (through the real runner binary); here we prove lowering correctness at the
+// IR-identity level (graph_canonical / type canonical) plus parse acceptance/rejection.
+//
+// Standalone: compiled with ../src/ir.drift + ../src/parser.drift (both import only std.*), no DB.
+
+module microflows.runner.tests.parser_test;
+
+import std.core as core;
+import std.json as json;
+import microflows.runner.ir as ir;
+import microflows.runner.parser as parser;
+
+error TestError { message: String }
+
+// A straight-line workflow: declared arguments, two operation contracts, two constant-input steps.
+fn _src() nothrow -> String {
+	return "# straight-line refund (slice 1)\n"
+		+ "args { amount: int, currency: string }\n"
+		+ "op reserve { input: { reservation: string } result: { reserved: string } }\n"
+		+ "op release { input: { reservation: string } }\n"
+		+ "steps {\n"
+		+ "  reserve { \"reservation\": \"p1\" }\n"
+		+ "  reserve { \"reservation\": \"p2\" }\n"
+		+ "}\n";
+}
+
+fn _str_eq(a: &String, b: &String) nothrow -> Bool {
+	if a.byte_length() != b.byte_length() { return false; }
+	var i = 0;
+	while i < a.byte_length() { if a.byte_at(i) != b.byte_at(i) { return false; } i = i + 1; }
+	return true;
+}
+
+fn _parse_ok(src: &String) -> Bool {
+	var ok = false;
+	match parser.parse_source(src) { core.Result::Ok(_) => { ok = true; }, core.Result::Err(_) => { ok = false; } }
+	return ok;
+}
+fn _parse_err(src: &String) -> Bool {
+	var err = false;
+	match parser.parse_source(src) { core.Result::Ok(_) => { err = false; }, core.Result::Err(_) => { err = true; } }
+	return err;
+}
+
+// A flat-plan JSON array -> Array<ir.FlatStep> (operation + compact input), so a parsed plan and a
+// hand-authored plan can be lifted to a degenerate graph and compared by graph_canonical (the exact
+// IR identity the runner pins).
+fn _plan_to_steps(plan: &json.JsonNode) nothrow -> Array<ir.FlatStep> {
+	var out: Array<ir.FlatStep> = [];
+	match plan.as_array() {
+		Optional::Some(items) => {
+			var i = 0;
+			while i < items.len {
+				var op: String = "";
+				match items[i].get(&"operation") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { op = move s; }, Optional::None => {} } }, Optional::None => {} }
+				var inp: String = "{}";
+				match items[i].get(&"input") { Optional::Some(n) => { inp = json.encode_compact(n); }, Optional::None => {} }
+				out.push(ir.FlatStep(operation = move op, input_json = move inp));
+				i = i + 1;
+			}
+		},
+		Optional::None => {}
+	}
+	return move out;
+}
+
+fn _graph_canon_of(steps: &Array<ir.FlatStep>) -> String {
+	match ir.flat_to_graph(steps) {
+		core.Result::Ok(g) => { return ir.graph_canonical(&g); },
+		core.Result::Err(_) => { return "<err>"; }
+	}
+}
+
+// Canonical form of an object-type encoding node (None/invalid -> a distinct sentinel).
+fn _objtype_canon(node: &json.JsonNode) -> String {
+	match ir.parse_object_type(node) {
+		core.Result::Ok(ty) => { return ir.canonical(&ty); },
+		core.Result::Err(_) => { return "<bad>"; }
+	}
+}
+
+fn scenario() -> Int {
+	val src = _src();
+	// ---- 1. parse the valid source ----
+	var pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
+	match parser.parse_source(&src) {
+		core.Result::Ok(p) => { pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); },
+		core.Result::Err(_) => { return 1; }
+	}
+	var empty_contracts: Array<parser.ContractDecl> = [];
+	var empty_plan = json.new_array().to_node();
+	var pw = parser.ParsedWorkflow(plan = move empty_plan, arg_type = Optional<json.JsonNode>::None(), contracts = move empty_contracts);
+	match move pw_opt { Optional::Some(p) => { pw = move p; }, Optional::None => { return 2; } }
+
+	// ---- 2. plan parity via graph_canonical (degenerate-graph identity) ----
+	val parsed_steps = _plan_to_steps(&pw.plan);
+	if parsed_steps.len != 2 { return 3; }
+	var hand: Array<ir.FlatStep> = [];
+	hand.push(ir.FlatStep(operation = "reserve", input_json = "{\"reservation\":\"p1\"}"));
+	hand.push(ir.FlatStep(operation = "reserve", input_json = "{\"reservation\":\"p2\"}"));
+	val pc = _graph_canon_of(&parsed_steps);
+	val hc = _graph_canon_of(&hand);
+	if !_str_eq(&pc, &hc) { return 4; }
+
+	// ---- 3. argument_type parity (canonical, order-independent) ----
+	var at = json.new_object().to_node();
+	match &pw.arg_type { Optional::Some(n) => { at = n.clone_deep(); }, Optional::None => { return 5; } }
+	val hand_at_node = _pj(&"{\"type\":\"object\",\"fields\":[{\"name\":\"currency\",\"type\":{\"type\":\"string\"}},{\"name\":\"amount\",\"type\":{\"type\":\"int\"}}]}");
+	val hand_at = _objtype_canon(&hand_at_node);
+	if _str_eq(&hand_at, &"<bad>") { return 6; }
+	val at_canon = _objtype_canon(&at);
+	if !_str_eq(&at_canon, &hand_at) { return 7; }
+
+	// ---- 4. contracts: reserve has input + result, release input only ----
+	if pw.contracts.len != 2 { return 8; }
+	val ri = _find(&pw.contracts, &"reserve");
+	val li = _find(&pw.contracts, &"release");
+	if ri < 0 or li < 0 { return 9; }
+	// reserve.input_type canonical == {reservation:string}
+	var r_in = json.new_object().to_node();
+	match &pw.contracts[ri].input_type { Optional::Some(n) => { r_in = n.clone_deep(); }, Optional::None => { return 10; } }
+	val r_in_canon = _objtype_canon(&r_in);
+	val r_in_exp_node = _pj(&"{\"type\":\"object\",\"fields\":[{\"name\":\"reservation\",\"type\":{\"type\":\"string\"}}]}");
+	val r_in_exp = _objtype_canon(&r_in_exp_node);
+	if !_str_eq(&r_in_canon, &r_in_exp) { return 11; }
+	// reserve has a result; release has none.
+	match &pw.contracts[ri].result_type { Optional::Some(_) => {}, Optional::None => { return 12; } }
+	match &pw.contracts[li].result_type { Optional::Some(_) => { return 13; }, Optional::None => {} }
+
+	// ---- 5. lower() overlays contracts onto a base operations registry ----
+	val base = _pj(&"{\"worker_id\":\"w\",\"operations\":[{\"name\":\"reserve\",\"participant\":\"ref\",\"schema_version\":1},{\"name\":\"release\",\"participant\":\"ref\",\"schema_version\":1}]}");
+	var merged = json.new_object().to_node();
+	match parser.lower(&src, &base) {
+		core.Result::Ok(m) => { merged = move m; },
+		core.Result::Err(_) => { return 14; }
+	}
+	// merged has a plan (2 steps) and an argument_type, and reserve carries input_type/result_type.
+	match merged.get(&"plan") { Optional::Some(_) => {}, Optional::None => { return 15; } }
+	match merged.get(&"argument_type") { Optional::Some(_) => {}, Optional::None => { return 16; } }
+	val mops = _op_by_name(&merged, &"reserve");
+	val none_sentinel: String = "<none>";
+	if _str_eq(&mops, &none_sentinel) { return 17; }
+	// the overlaid reserve op declares both input_type and result_type.
+	match merged.get(&"operations") {
+		Optional::Some(on) => {
+			match on.as_array() {
+				Optional::Some(items) => {
+					var found_typed = false;
+					var i = 0;
+					while i < items.len {
+						var nm: String = "";
+						match items[i].get(&"name") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { nm = move s; }, Optional::None => {} } }, Optional::None => {} }
+						if _str_eq(&nm, &"reserve") {
+							match items[i].get(&"input_type") { Optional::Some(_) => {}, Optional::None => { return 18; } }
+							match items[i].get(&"result_type") { Optional::Some(_) => {}, Optional::None => { return 19; } }
+							found_typed = true;
+						}
+						i = i + 1;
+					}
+					if !found_typed { return 20; }
+				},
+				Optional::None => { return 21; }
+			}
+		},
+		Optional::None => { return 22; }
+	}
+
+	// ---- 5b. base contracts are STRIPPED — source is the sole contract authority ----
+	// A base routing config carrying a STALE input_type/result_type on reserve, with a source that
+	// declares `op reserve {}` (NO contract), must emit a reserve with NO input_type/result_type
+	// (else source identity / content_hash would depend on non-source data).
+	val base_stale = _pj(&"{\"worker_id\":\"w\",\"operations\":[{\"name\":\"reserve\",\"participant\":\"ref\",\"schema_version\":1,\"input_type\":{\"type\":\"object\",\"fields\":[{\"name\":\"STALE\",\"type\":{\"type\":\"int\"}}]},\"result_type\":{\"type\":\"string\"}},{\"name\":\"release\",\"participant\":\"ref\",\"schema_version\":1}]}");
+	val src_nc = "op reserve {}\nsteps { reserve { \"reservation\": \"p1\" } }\n";
+	var merged_nc = json.new_object().to_node();
+	match parser.lower(&src_nc, &base_stale) {
+		core.Result::Ok(m) => { merged_nc = move m; },
+		core.Result::Err(_) => { return 23; }
+	}
+	match merged_nc.get(&"operations") {
+		Optional::Some(on) => {
+			match on.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						var nm: String = "";
+						match items[i].get(&"name") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { nm = move s; }, Optional::None => {} } }, Optional::None => {} }
+						if _str_eq(&nm, &"reserve") {
+							match items[i].get(&"input_type") { Optional::Some(_) => { return 24; }, Optional::None => {} }
+							match items[i].get(&"result_type") { Optional::Some(_) => { return 25; }, Optional::None => {} }
+						}
+						i = i + 1;
+					}
+				},
+				Optional::None => { return 26; }
+			}
+		},
+		Optional::None => { return 27; }
+	}
+
+	// ---- 6. malformed sources are rejected (Err), each before any dispatch ----
+	if !_parse_err(&"args { amount: int }\n") { return 30; }                       // missing steps
+	if !_parse_err(&"frobnicate { }\nsteps { reserve {} }\n") { return 31; }       // unknown keyword
+	if !_parse_err(&"op x { input: blob }\nsteps { x {} }\n") { return 32; }       // unknown type
+	if !_parse_err(&"args { a: int \nsteps { x {} }\n") { return 33; }             // unterminated object type
+	if !_parse_err(&"steps { reserve { \"a\": 1 \n") { return 34; }                // unterminated JSON object
+	if !_parse_err(&"steps {\n") { return 35; }                                    // unterminated steps block
+	if !_parse_err(&"steps { reserve [1,2] }\n") { return 36; }                    // step input not an object
+	if !_parse_err(&"steps { reserve 5 }\n") { return 37; }                        // step input not '{'
+	if !_parse_err(&"args { a: int }\nargs { b: int }\nsteps { x {} }\n") { return 38; }  // duplicate args
+	if !_parse_err(&"op x {}\nop x {}\nsteps { x {} }\n") { return 39; }           // duplicate op
+	if !_parse_err(&"steps { }\n") { return 40; }                                  // empty steps
+	if !_parse_err(&"op x { bogus: int }\nsteps { x {} }\n") { return 41; }        // unknown op clause
+
+	// the empty-input single step parses (constant {}), and an object-less args is fine when absent.
+	if !_parse_ok(&"steps { ping {} }\n") { return 42; }
+	if !_parse_ok(&"args {}\nsteps { ping {} }\n") { return 43; }  // empty arg object
+
+	// ---- 7. lower() rejects a contract for an operation absent from the registry ----
+	match parser.lower(&"op ghost { input: { x: int } }\nsteps { reserve { \"reservation\": \"p1\" } }\n", &base) {
+		core.Result::Ok(_) => { return 44; },
+		core.Result::Err(_) => {}
+	}
+
+	return 0;
+}
+
+fn _find(cs: &Array<parser.ContractDecl>, name: &String) nothrow -> Int {
+	var i = 0;
+	while i < cs.len { if _str_eq(&cs[i].name, name) { return i; } i = i + 1; }
+	return -1;
+}
+
+// Returns the operation's name if present in merged.operations, else a sentinel.
+fn _op_by_name(merged: &json.JsonNode, name: &String) nothrow -> String {
+	match merged.get(&"operations") {
+		Optional::Some(on) => {
+			match on.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						match items[i].get(&"name") {
+							Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { if _str_eq(&s, name) { return move s; } }, Optional::None => {} } },
+							Optional::None => {}
+						}
+						i = i + 1;
+					}
+				},
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
+	return "<none>";
+}
+
+// Parse a JSON literal (test input); abort the test scenario on a malformed literal.
+fn _pj(text: &String) -> json.JsonNode {
+	match json.parse_strict(text) {
+		core.Result::Ok(n) => { return move n; },
+		core.Result::Err(_) => { throw TestError(message = "bad test JSON literal"); }
+	}
+}
+
+fn main() nothrow -> Int {
+	var r = 0;
+	try { r = scenario(); } catch unexpected { return 91; }
+	return r;
+}
