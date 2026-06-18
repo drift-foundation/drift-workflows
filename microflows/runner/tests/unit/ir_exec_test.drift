@@ -513,6 +513,90 @@ fn scenario() -> Int {
 	// case node with an UNKNOWN extra key rejected (parse).
 	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"}],\"default\":\"n1\",\"bogus\":1},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 129; }
 
+	// ===== cross-branch result merge (NMerge phi) =====
+	// if flag then opA else opB -> merge picked = result(taken branch) -> return picked.
+	var mrg: Array<ir.IrNode> = [];
+	mrg.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	mrg.push(ir.IrNode::NOperation(id = "n1", operation = "A", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	mrg.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	var mrgs: Array<ir.MergeArm> = [];
+	mrgs.push(ir.MergeArm(from = "n1", value = ir.IrExpr::EResult(node = "n1", path = _p0())));
+	mrgs.push(ir.MergeArm(from = "n2", value = ir.IrExpr::EResult(node = "n2", path = _p0())));
+	mrg.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move mrgs, next = "n4"));
+	mrg.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
+	val gmrg = ir.IrGraph(nodes = move mrg, entry = "n0");
+	if !_ok_validate(&gmrg) { return 130; }
+	// true branch: opA settled -> merge picks result(n1).
+	var mt: Array<ir.OpResult> = [];
+	mt.push(ir.OpResult(node_id = "n1", result_json = "{\"x\":1}"));
+	val mto = ir.advance(&gmrg, &"{\"flag\":true}", &mt);
+	if !_is_completed(&mto, &"{\"x\":1}") { return 131; }
+	// false branch: opB settled -> merge picks result(n2). (Same config, selection by taken path.)
+	var mf2: Array<ir.OpResult> = [];
+	mf2.push(ir.OpResult(node_id = "n2", result_json = "{\"y\":2}"));
+	val mfo = ir.advance(&gmrg, &"{\"flag\":false}", &mf2);
+	if !_is_completed(&mfo, &"{\"y\":2}") { return 132; }
+
+	// validation: a merge MISSING a source for one predecessor (only n1 sourced) is rejected.
+	var ms1: Array<ir.IrNode> = [];
+	ms1.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	ms1.push(ir.IrNode::NOperation(id = "n1", operation = "A", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	ms1.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	var ms1s: Array<ir.MergeArm> = [];
+	ms1s.push(ir.MergeArm(from = "n1", value = ir.IrExpr::EResult(node = "n1", path = _p0())));
+	ms1.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move ms1s, next = "n4"));
+	ms1.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
+	val gms1 = ir.IrGraph(nodes = move ms1, entry = "n0");
+	if !_rejects(&gms1) { return 133; }
+
+	// validation: a merge source whose value references the OTHER branch's result (not available on
+	// this predecessor's path) is rejected — result(n2) sourced from n1.
+	var ms2: Array<ir.IrNode> = [];
+	ms2.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	ms2.push(ir.IrNode::NOperation(id = "n1", operation = "A", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	ms2.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	var ms2s: Array<ir.MergeArm> = [];
+	ms2s.push(ir.MergeArm(from = "n1", value = ir.IrExpr::EResult(node = "n2", path = _p0())));
+	ms2s.push(ir.MergeArm(from = "n2", value = ir.IrExpr::EResult(node = "n2", path = _p0())));
+	ms2.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move ms2s, next = "n4"));
+	ms2.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
+	val gms2 = ir.IrGraph(nodes = move ms2, entry = "n0");
+	if !_rejects(&gms2) { return 134; }
+
+	// validation: DUPLICATE source 'from' (two sources from n1) is rejected — ambiguous selection.
+	var ms3: Array<ir.IrNode> = [];
+	ms3.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	ms3.push(ir.IrNode::NOperation(id = "n1", operation = "A", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	ms3.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	var ms3s: Array<ir.MergeArm> = [];
+	ms3s.push(ir.MergeArm(from = "n1", value = ir.IrExpr::EResult(node = "n1", path = _p0())));
+	ms3s.push(ir.MergeArm(from = "n1", value = ir.IrExpr::EResult(node = "n1", path = _p0())));
+	ms3s.push(ir.MergeArm(from = "n2", value = ir.IrExpr::EResult(node = "n2", path = _p0())));
+	ms3.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move ms3s, next = "n4"));
+	ms3.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
+	val gms3 = ir.IrGraph(nodes = move ms3, entry = "n0");
+	if !_rejects(&gms3) { return 138; }
+
+	// validation: a source whose 'from' is NOT an immediate predecessor (here n0, the if itself,
+	// which edges to n1/n2 — not to the merge) is rejected.
+	var ms4: Array<ir.IrNode> = [];
+	ms4.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	ms4.push(ir.IrNode::NOperation(id = "n1", operation = "A", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	ms4.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	var ms4s: Array<ir.MergeArm> = [];
+	ms4s.push(ir.MergeArm(from = "n1", value = ir.IrExpr::EResult(node = "n1", path = _p0())));
+	ms4s.push(ir.MergeArm(from = "n2", value = ir.IrExpr::EResult(node = "n2", path = _p0())));
+	ms4s.push(ir.MergeArm(from = "n0", value = ir.IrExpr::EConst(canonical_json = "0")));
+	ms4.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move ms4s, next = "n4"));
+	ms4.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
+	val gms4 = ir.IrGraph(nodes = move ms4, entry = "n0");
+	if !_rejects(&gms4) { return 139; }
+
+	// merge config: valid merge parses + validates; unknown source key / missing 'from' rejected.
+	if !_pgv_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"f\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"A\",\"input\":{\"const\":{}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"B\",\"input\":{\"const\":{}},\"next\":\"n3\"},{\"kind\":\"merge\",\"id\":\"n3\",\"name\":\"picked\",\"sources\":[{\"from\":\"n1\",\"value\":{\"result\":{\"node\":\"n1\"}}},{\"from\":\"n2\",\"value\":{\"result\":{\"node\":\"n2\"}}}],\"next\":\"n4\"},{\"kind\":\"return\",\"id\":\"n4\",\"value\":{\"local\":{\"name\":\"picked\"}}}]}") { return 135; }
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"merge\",\"id\":\"n0\",\"name\":\"p\",\"sources\":[{\"from\":\"n1\",\"value\":{\"const\":1},\"bogus\":1}],\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"p\"}}}]}") { return 136; }
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"merge\",\"id\":\"n0\",\"name\":\"p\",\"sources\":[{\"value\":{\"const\":1}}],\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"p\"}}}]}") { return 137; }
+
 	return 0;
 }
 

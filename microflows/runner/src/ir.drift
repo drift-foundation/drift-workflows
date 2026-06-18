@@ -19,6 +19,7 @@ export {
 	IrExpr,
 	LoopKind,
 	IrCaseArm,
+	MergeArm,
 	IrNode,
 	IrGraph,
 	FlatStep,
@@ -348,6 +349,16 @@ pub struct IrCaseArm {
 	pub target: String
 }
 
+// One source of an NMerge (a phi): when control reaches the merge FROM the immediate predecessor
+// node `from`, bind the merge local to `value`. `value` is a pure IrExpr evaluated in the taken
+// path's scope (durable args, settled results, locals available after `from`) — so a branch-local
+// op result / let can be carried across the join without inventing storage. Sources are encoded
+// order-independently (sorted by `from`).
+pub struct MergeArm {
+	pub from: String,
+	pub value: IrExpr
+}
+
 // A graph NODE. `id` is this node's stable unique key; edges (`next`, `then_node`, `else_node`,
 // arm `target`s, `default_node`) reference other nodes by id. A loop's body is a pure `IrExpr`
 // over its element/accumulator locals — which structurally forbids a remote operation inside a
@@ -360,6 +371,7 @@ pub variant IrNode {
 	NIf(id: String, cond: IrExpr, then_node: String, else_node: String),      // `cond` is Bool-valued
 	NCase(id: String, scrutinee: IrExpr, arms: Array<IrCaseArm>, default_node: String),
 	NLoop(id: String, kind: LoopKind, source: IrExpr, elem: String, acc: String, init: IrExpr, body: IrExpr, next: String),
+	NMerge(id: String, name: String, sources: Array<MergeArm>, next: String),  // phi: rejoin paths, bind `name`
 	NReturn(id: String, value: IrExpr)                                        // terminal: the workflow result
 }
 
@@ -421,6 +433,7 @@ fn _nid(i: Int) nothrow -> String { return "n" + fmt.format_int(i); }
 //          | {"kind":"map"|"filter","id":...,"source":<expr>,"elem":NAME,"as":NAME,"body":<expr>,"next":...}
 //          | {"kind":"fold","id":...,"source":<expr>,"elem":NAME,"as":NAME,"init":<expr>,"body":<expr>,"next":...}
 //          | {"kind":"case","id":...,"scrutinee":<expr>,"arms":[{"match":<json>,"target":...},...],"default":...}
+//          | {"kind":"merge","id":...,"name":NAME,"sources":[{"from":NODE_ID,"value":<expr>},...],"next":...}
 //   <expr> = {"const":<json>} | {"arg":[seg,...]} | {"result":{"node":...,"path":[seg,...]}}
 //          | {"local":{"name":...,"path":[seg,...]}}     ("path" optional, default [])
 // `const` and case-arm `match` values are canonicalized into a CANONICAL JSON literal. map/filter/
@@ -540,6 +553,28 @@ fn _parse_node(n: &json.JsonNode) -> IrNode {
 		_reject_extra(nkeys, 5);   // kind, id, scrutinee, arms, default
 		return IrNode::NCase(id = move id, scrutinee = move scrutinee, arms = move arms, default_node = move default_n);
 	}
+	// merge: a phi that rejoins branch paths, binding `name` to a value selected by which immediate
+	// predecessor (`from`) control arrived from. Pure control flow; validate_graph enforces that the
+	// sources are total + unambiguous over the incoming edges and references are in-scope.
+	if _str_eq(&kind, &"merge") {
+		val name = _req_str(n, &"name");
+		val next = _req_str(n, &"next");
+		var sources: Array<MergeArm> = [];
+		match n.get(&"sources") {
+			Optional::Some(sn) => {
+				match sn.as_array() {
+					Optional::Some(arr) => {
+						var i = 0;
+						while i < arr.len { sources.push(_parse_merge_source(&arr[i])); i = i + 1; }
+					},
+					Optional::None => { throw IrError(message = "merge 'sources' must be an array"); }
+				}
+			},
+			Optional::None => { throw IrError(message = "merge missing 'sources'"); }
+		}
+		_reject_extra(nkeys, 5);   // kind, id, name, sources, next
+		return IrNode::NMerge(id = move id, name = move name, sources = move sources, next = move next);
+	}
 	throw IrError(message = "unknown graph node kind: " + _dup(&kind));
 }
 
@@ -555,6 +590,15 @@ fn _parse_case_arm(n: &json.JsonNode) -> IrCaseArm {
 	}
 	_reject_extra(_obj_len(n), 2);   // match, target
 	return IrCaseArm(match_const = move mc, target = move target);
+}
+
+// Parse one merge source: exactly {from, value}. `from` is the immediate predecessor node id;
+// `value` is the expression bound when control arrives from it. Unknown/missing keys are rejected.
+fn _parse_merge_source(n: &json.JsonNode) -> MergeArm {
+	val from = _req_str(n, &"from");
+	val value = _parse_expr_at(n, &"value");
+	_reject_extra(_obj_len(n), 2);   // from, value
+	return MergeArm(from = move from, value = move value);
 }
 
 // Parse the expression at object key `key` (required).
@@ -700,10 +744,41 @@ fn _node_canonical(n: &IrNode) nothrow -> String {
 			return "O" + _lp(id) + _loopkind_tag(kind) + _expr_canonical(source)
 			     + _lp(elem) + _lp(acc) + _expr_canonical(init) + _expr_canonical(body) + _lp(next);
 		},
+		IrNode::NMerge(id, name, sources, next) => {
+			return "M" + _lp(id) + _lp(name) + _merge_sources_canonical(sources) + _lp(next);
+		},
 		IrNode::NReturn(id, value) => {
 			return "R" + _lp(id) + _expr_canonical(value);
 		}
 	}
+}
+
+// NMerge sources encoded order-independently (sorted by `from`).
+fn _merge_sources_canonical(sources: &Array<MergeArm>) nothrow -> String {
+	var order = _merge_order(sources);
+	var s: String = "[";
+	var k = 0;
+	while k < order.len {
+		s = s + _lp(&sources[order[k]].from) + _expr_canonical(&sources[order[k]].value);
+		k = k + 1;
+	}
+	return s + "]";
+}
+
+fn _merge_order(sources: &Array<MergeArm>) nothrow -> Array<Int> {
+	var idx: Array<Int> = [];
+	var i = 0;
+	while i < sources.len { idx.push(i); i = i + 1; }
+	var a = 1;
+	while a < idx.len {
+		var b = a;
+		while b > 0 and _str_lt(&sources[idx[b]].from, &sources[idx[b - 1]].from) {
+			idx.swap(b, b - 1);
+			b = b - 1;
+		}
+		a = a + 1;
+	}
+	return move idx;
 }
 
 fn _expr_canonical(e: &IrExpr) nothrow -> String {
@@ -785,6 +860,7 @@ fn _node_id(n: &IrNode) nothrow -> String {
 		IrNode::NIf(id, cond, then_node, else_node) => { return _dup(id); },
 		IrNode::NCase(id, scrutinee, arms, default_node) => { return _dup(id); },
 		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { return _dup(id); },
+		IrNode::NMerge(id, name, sources, next) => { return _dup(id); },
 		IrNode::NReturn(id, value) => { return _dup(id); }
 	}
 }
@@ -834,12 +910,14 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 	var local_vals: Array<json.JsonNode> = [];
 
 	var cur = _dup(&g.entry);
+	var prev: String = "";   // id of the node we arrived FROM (for NMerge source selection); "" at entry
 	var steps = 0;
 	val budget = g.nodes.len + 4;
 	while steps < budget {
 		steps = steps + 1;
 		val idx = _find_node(g, &cur);
 		if idx < 0 { return StepOutcome::Fault(message = "node not found during replay: " + _dup(&cur)); }
+		val here = _dup(&cur);   // the node being processed now; becomes `prev` for the next step
 		match &g.nodes[idx] {
 			IrNode::NReturn(id, value) => {
 				match _eval(g, value, &args_node, settled, &local_names, &local_vals) {
@@ -914,8 +992,28 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 					},
 					core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
 				}
+			},
+			IrNode::NMerge(id, name, sources, next) => {
+				// Phi: control reached this join FROM `prev`. Select the source for that predecessor,
+				// evaluate it in the taken-path scope, bind the result to local `name` — pure, like an
+				// NLet. (`prev` is "" only at the entry; validation forbids a merge with no incoming
+				// edge, so a validated graph always has a matching source.)
+				var picked = false;
+				var ms = 0;
+				while ms < sources.len {
+					if !picked and _str_eq(&sources[ms].from, &prev) {
+						match _eval(g, &sources[ms].value, &args_node, settled, &local_names, &local_vals) {
+							core.Result::Ok(n) => { local_names.push(_dup(name)); local_vals.push(move n); picked = true; },
+							core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
+						}
+					}
+					ms = ms + 1;
+				}
+				if !picked { return StepOutcome::Fault(message = "merge has no source for predecessor '" + _dup(&prev) + "': " + _dup(id)); }
+				cur = _dup(next);
 			}
 		}
+		prev = move here;
 	}
 	return StepOutcome::Fault(message = "replay step budget exceeded (graph may be cyclic — validate first)");
 }
@@ -1136,9 +1234,9 @@ pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
 		i = i + 1;
 	}
 
-	// V1: local binding names (NLet names + NLoop result names) are globally UNIQUE. Replay resolves
-	// a local by its (single) binding; allowing two same-named dominating binders would make
-	// shadowing declaration-order-sensitive.
+	// V1: local binding names (NLet / NLoop result / NMerge result) are globally UNIQUE. Replay
+	// resolves a local by its (single) binding; allowing two same-named dominating binders would
+	// make shadowing declaration-order-sensitive.
 	match _dup_let_name(g) {
 		Optional::Some(nm) => { return Optional<String>::Some("duplicate local binding name: " + move nm); },
 		Optional::None => {}
@@ -1157,21 +1255,18 @@ pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
 	return Optional<String>::None();
 }
 
-// First duplicated local binding name — an NLet name or an NLoop result name (Some(name)), or None.
+// First duplicated local binding name — an NLet name, NLoop result, or NMerge result (Some(name)),
+// or None.
 fn _dup_let_name(g: &IrGraph) nothrow -> Optional<String> {
 	var names: Array<String> = [];
 	var i = 0;
 	while i < g.nodes.len {
-		match &g.nodes[i] {
-			IrNode::NLet(id, name, value, next) => {
-				if _contains_str(&names, name) { return Optional<String>::Some(_dup(name)); }
-				names.push(_dup(name));
+		match _binder_name_of(&g.nodes[i]) {
+			Optional::Some(bn) => {
+				if _contains_str(&names, &bn) { return Optional<String>::Some(move bn); }
+				names.push(move bn);
 			},
-			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
-				if _contains_str(&names, acc) { return Optional<String>::Some(_dup(acc)); }
-				names.push(_dup(acc));
-			},
-			default => {}
+			Optional::None => {}
 		}
 		i = i + 1;
 	}
@@ -1215,6 +1310,7 @@ fn _succs(n: &IrNode, out: &mut Array<String>) nothrow -> Void {
 			out.push(_dup(default_node));
 		},
 		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { out.push(_dup(next)); },
+		IrNode::NMerge(id, name, sources, next) => { out.push(_dup(next)); },
 		IrNode::NReturn(id, value) => {}
 	}
 }
@@ -1280,48 +1376,62 @@ fn _dominates(g: &IrGraph, x: Int, y: Int) nothrow -> Bool {
 	return !without[y];
 }
 
-// True iff some reachable NLet binding `name` dominates node `y`.
-fn _has_dominating_let(g: &IrGraph, name: &String, y: Int) nothrow -> Bool {
+// The downstream LOCAL binding name a node introduces (NLet name, NLoop result `acc`, or NMerge
+// result `name`), or None for nodes that bind nothing. These are exactly the names the interpreter
+// can place in its local table at runtime.
+fn _binder_name_of(n: &IrNode) nothrow -> Optional<String> {
+	match n {
+		IrNode::NLet(id, name, value, next) => { return Optional<String>::Some(_dup(name)); },
+		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { return Optional<String>::Some(_dup(acc)); },
+		IrNode::NMerge(id, name, sources, next) => { return Optional<String>::Some(_dup(name)); },
+		default => { return Optional<String>::None(); }
+	}
+}
+
+// True iff some binder node introducing `name` DOMINATES node `y` (so the local is in scope, on
+// every path, at `y`). Covers NLet / NLoop result / NMerge result uniformly.
+fn _has_dominating_binder(g: &IrGraph, name: &String, y: Int) nothrow -> Bool {
 	var i = 0;
 	while i < g.nodes.len {
-		match &g.nodes[i] {
-			IrNode::NLet(id, lname, value, next) => {
-				if _str_eq(lname, name) and _dominates(g, i, y) { return true; }
-			},
-			default => {}
+		match _binder_name_of(&g.nodes[i]) {
+			Optional::Some(bn) => { if _str_eq(&bn, name) and _dominates(g, i, y) { return true; } },
+			Optional::None => {}
 		}
 		i = i + 1;
 	}
 	return false;
 }
 
-// True iff `name` is ANY local binding name in the graph — an NLet name or an NLoop result (`acc`).
-// These are exactly the names that can appear in the interpreter's local table at runtime, so a
-// loop element sharing one of them would shadow it on some path. Path-INSENSITIVE by design (see
-// the loop element-name check): a binder on a non-dominating branch still collides at runtime.
+// True iff `name` is ANY local binding name in the graph (NLet / NLoop result / NMerge result).
+// A loop element sharing one of these would shadow it on some path. Path-INSENSITIVE by design
+// (see the loop element-name check): a binder on a non-dominating branch still collides at runtime.
 fn _is_binder_name(g: &IrGraph, name: &String) nothrow -> Bool {
 	var i = 0;
 	while i < g.nodes.len {
-		match &g.nodes[i] {
-			IrNode::NLet(id, lname, value, next) => { if _str_eq(lname, name) { return true; } },
-			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { if _str_eq(acc, name) { return true; } },
-			default => {}
+		match _binder_name_of(&g.nodes[i]) {
+			Optional::Some(bn) => { if _str_eq(&bn, name) { return true; } },
+			Optional::None => {}
 		}
 		i = i + 1;
 	}
 	return false;
 }
 
-// True iff some reachable NLoop whose RESULT binds `name` (its `acc`) dominates node `y` — a loop
-// result is a downstream local exactly like an NLet binding.
-fn _has_dominating_loop_result(g: &IrGraph, name: &String, y: Int) nothrow -> Bool {
+// True iff binding/op at index `y` is AVAILABLE right after node `x` executes on every path reaching
+// `x` — i.e. `y` IS `x`, or `y` dominates `x`. Used to scope an NMerge source's value to its
+// predecessor (the source is only taken when arriving from that predecessor, after it executed).
+fn _available_after(g: &IrGraph, y: Int, x: Int) nothrow -> Bool {
+	return y == x or _dominates(g, y, x);
+}
+
+// True iff some binder introducing `name` is available after node `x` (its own binding, or a
+// dominator's).
+fn _binder_available_after(g: &IrGraph, name: &String, x: Int) nothrow -> Bool {
 	var i = 0;
 	while i < g.nodes.len {
-		match &g.nodes[i] {
-			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
-				if _str_eq(acc, name) and _dominates(g, i, y) { return true; }
-			},
-			default => {}
+		match _binder_name_of(&g.nodes[i]) {
+			Optional::Some(bn) => { if _str_eq(&bn, name) and _available_after(g, i, x) { return true; } },
+			Optional::None => {}
 		}
 		i = i + 1;
 	}
@@ -1385,8 +1495,87 @@ fn _check_node(g: &IrGraph, idx: Int) nothrow -> Optional<String> {
 			locals.push(_dup(elem));
 			if is_fold { locals.push(_dup(acc)); }
 			return _check_expr(g, body, idx, &locals);
+		},
+		IrNode::NMerge(id, name, sources, next) => { return _check_merge(g, idx, id, name, sources); }
+	}
+}
+
+// Validate an NMerge (phi): it must be TOTAL and UNAMBIGUOUS over its incoming edges — every
+// immediate predecessor has exactly one source, and every source's `from` is a predecessor — and
+// each source's value must reference only values available after that predecessor executes (the
+// taken path's args/results/locals). This is the EXPLICIT mechanism for crossing a branch: without
+// it, a branch-only op result / local stays non-dominating and an `EResult`/`ELocal` to it is
+// rejected by `_check_expr`.
+fn _check_merge(g: &IrGraph, idx: Int, id: &String, name: &String, sources: &Array<MergeArm>) nothrow -> Optional<String> {
+	if name.byte_length() == 0 { return Optional<String>::Some("merge must name its result binding ('as'): " + _dup(id)); }
+	val merge_id = _dup(id);
+	// Immediate predecessors: nodes whose successor set includes this merge.
+	var preds: Array<Int> = [];
+	var i = 0;
+	while i < g.nodes.len {
+		if i != idx {
+			var succs: Array<String> = [];
+			_succs(&g.nodes[i], &mut succs);
+			var s = 0;
+			while s < succs.len { if _str_eq(&succs[s], &merge_id) { preds.push(i); } s = s + 1; }
+		}
+		i = i + 1;
+	}
+	if preds.len == 0 { return Optional<String>::Some("merge has no incoming edges: " + _dup(id)); }
+	// Each source: a DISTINCT predecessor `from`, with a value valid in that predecessor's scope.
+	var a = 0;
+	while a < sources.len {
+		val fidx = _find_node(g, &sources[a].from);
+		if fidx < 0 { return Optional<String>::Some("merge source 'from' not found: " + _dup(&sources[a].from)); }
+		if !_contains_int(&preds, fidx) { return Optional<String>::Some("merge source 'from' is not a predecessor: " + _dup(&sources[a].from)); }
+		var b = 0;
+		while b < a {
+			if _str_eq(&sources[a].from, &sources[b].from) { return Optional<String>::Some("merge has duplicate source 'from': " + _dup(&sources[a].from)); }
+			b = b + 1;
+		}
+		match _check_merge_source(g, &sources[a].value, fidx) {
+			Optional::Some(m) => { return Optional<String>::Some(move m); },
+			Optional::None => {}
+		}
+		a = a + 1;
+	}
+	// Totality: every predecessor must have a source (else the merge is ambiguous on that path).
+	var p = 0;
+	while p < preds.len {
+		val pid = _node_id(&g.nodes[preds[p]]);
+		var found = false;
+		var c = 0;
+		while c < sources.len { if _str_eq(&sources[c].from, &pid) { found = true; } c = c + 1; }
+		if !found { return Optional<String>::Some("merge missing source for predecessor: " + _dup(&pid)); }
+		p = p + 1;
+	}
+	return Optional<String>::None();
+}
+
+// Validate one merge source's value against predecessor `fidx`'s scope: references must be available
+// AFTER `fidx` executes (its own result/binding, or a dominator's).
+fn _check_merge_source(g: &IrGraph, e: &IrExpr, fidx: Int) nothrow -> Optional<String> {
+	match e {
+		IrExpr::EConst(canonical_json) => { return _check_const(canonical_json); },
+		IrExpr::EArg(path) => { return Optional<String>::None(); },
+		IrExpr::EResult(node, path) => {
+			val t = _find_node(g, node);
+			if t < 0 { return Optional<String>::Some("merge source EResult references missing node: " + _dup(node)); }
+			if !_is_operation(&g.nodes[t]) { return Optional<String>::Some("merge source EResult must reference an NOperation: " + _dup(node)); }
+			if !_available_after(g, t, fidx) { return Optional<String>::Some("merge source EResult is not available at its predecessor: " + _dup(node)); }
+			return Optional<String>::None();
+		},
+		IrExpr::ELocal(name, path) => {
+			if _binder_available_after(g, name, fidx) { return Optional<String>::None(); }
+			return Optional<String>::Some("merge source ELocal is not available at its predecessor: " + _dup(name));
 		}
 	}
+}
+
+fn _contains_int(xs: &Array<Int>, x: Int) nothrow -> Bool {
+	var i = 0;
+	while i < xs.len { if xs[i] == x { return true; } i = i + 1; }
+	return false;
 }
 
 fn _is_fold(k: &LoopKind) nothrow -> Bool {
@@ -1413,8 +1602,7 @@ fn _check_expr(g: &IrGraph, e: &IrExpr, idx: Int, extra_locals: &Array<String>) 
 		},
 		IrExpr::ELocal(name, path) => {
 			if _contains_str(extra_locals, name) { return Optional<String>::None(); }
-			if _has_dominating_let(g, name, idx) { return Optional<String>::None(); }
-			if _has_dominating_loop_result(g, name, idx) { return Optional<String>::None(); }
+			if _has_dominating_binder(g, name, idx) { return Optional<String>::None(); }
 			return Optional<String>::Some("ELocal references an unbound/non-prior local: " + _dup(name));
 		}
 	}

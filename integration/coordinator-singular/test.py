@@ -216,6 +216,11 @@ def main():
             {"name": "reserve", "participant": "ref", "schema_version": 1,
              "compensation": {"operation": "release", "schema_version": 1}},
             {"name": "release", "participant": "ref", "schema_version": 1},
+            # 'confirm' takes a reserve RESULT ({"reserved": id}) — lets a cross-branch merge feed a
+            # branch reserve's result into a later shared op (C9). Compensable -> 'unconfirm'.
+            {"name": "confirm", "participant": "ref", "schema_version": 1,
+             "compensation": {"operation": "unconfirm", "schema_version": 1}},
+            {"name": "unconfirm", "participant": "ref", "schema_version": 1},
         ],
     }
 
@@ -1306,6 +1311,108 @@ def main():
               and wf == [["5", "2"]] and cks == [["1", "2", "cmA"]] and untaken == [["0"]],
               (code, body, ex_d, wf, cks, untaken))
 
+        # ===== C9. MANUAL-IR CROSS-BRANCH RESULT MERGE (NMerge phi) =====
+        # An if rejoins via a `merge` node that binds a local to the TAKEN branch's op result; the
+        # merged value then feeds a SHARED downstream op (`confirm`, whose input is a reserve RESULT
+        # {"reserved": id}). The merge is pure (replayed, never persisted) and recomputed on resume
+        # from the durable branch result — so a branch-local value crosses the join without storage.
+        MERGE_AT = {"type": "object", "fields": [{"name": "flag", "type": {"type": "bool"}}]}
+        MERGE_SRCS = [{"from": "n1", "value": {"result": {"node": "n1"}}},
+                      {"from": "n2", "value": {"result": {"node": "n2"}}}]
+
+        def merge_graph(tail):
+            # if flag then reserve mgA else reserve mgB -> merge picked = result(taken branch) ->
+            # confirm(picked) -> <tail nodes>. `tail` supplies n5.. and the return.
+            nodes = [
+                {"kind": "if", "id": "n0", "cond": {"arg": ["flag"]}, "then": "n1", "else": "n2"},
+                {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": {"reservation": "mgA"}}, "next": "n3"},
+                {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "mgB"}}, "next": "n3"},
+                {"kind": "merge", "id": "n3", "name": "picked", "sources": MERGE_SRCS, "next": "n4"},
+                {"kind": "operation", "id": "n4", "operation": "confirm", "input": {"local": {"name": "picked"}}, "next": "n5"},
+            ] + tail
+            return {"entry": "n0", "nodes": nodes}
+
+        # C9a. The branch op RESULT is merged into the shared confirm op's input: mgA (true) / mgB
+        # (false). confirm dispatches once with the merged reserve result and completes.
+        mcfg = graph_cfg(merge_graph([{"kind": "return", "id": "n5", "value": {"result": {"node": "n4"}}}]), argument_type=MERGE_AT)
+        wma = _wf_id()
+        ex0 = _exec_count(base)
+        code_a, body_a = run_runner(mcfg, wma, arguments=json.dumps({"flag": True}))
+        exa = _exec_count(base) - ex0
+        opa = _mdb(f"SELECT operation_seq, operation_name, "
+                   f"COALESCE(JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reserved')), JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation'))) "
+                   f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wma}') ORDER BY operation_seq")
+        wmb = _wf_id()
+        code_b, body_b = run_runner(mcfg, wmb, arguments=json.dumps({"flag": False}))
+        # seq1 reserve mgA (its reservation), seq2 confirm whose input is the MERGED reserve result
+        # {"reserved":"mgA"} -> the branch op result crossed the join into the shared op.
+        check("graph_merge_branch_result_into_shared_op",
+              code_a == 0 and body_a.get("result") == {"confirmed": "mgA"} and exa == 2
+              and opa == [["1", "reserve", "mgA"], ["2", "confirm", "mgA"]]
+              and code_b == 0 and body_b.get("result") == {"confirmed": "mgB"},
+              (code_a, body_a, exa, opa, code_b, body_b))
+
+        # C9b. NO durable event at the merge boundary: the if + merge are PURE. The merge graph and
+        # an equivalent 2-op straight-line plan (reserve then confirm) produce the SAME event count.
+        mpl = plan_cfg([{"operation": "reserve", "input": {"reservation": "mgA"}},
+                        {"operation": "confirm", "input": {"reserved": "mgA"}}])
+        wmpl = _wf_id()
+        run_runner(mpl, wmpl, arguments="{}")
+        nev_merge = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wma}')")
+        nev_pl = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wmpl}')")
+        check("graph_merge_no_durable_event_at_boundary",
+              nev_merge == nev_pl and nev_merge != [["0"]], (nev_merge, nev_pl))
+
+        # C9c. RESUME recomputes the merged value from durable RESULTS. The branch op + confirm
+        # settle; a trailing op is PENDING, so the workflow defers. A claimable RESUME recomputes the
+        # merge from the durable branch result — re-deriving confirm's input (the merged reserve
+        # result) identically (confirm stays settled, not re-dispatched) — and reconciles the pending
+        # op GET-first (no second PUT). A non-deterministic merge would change confirm's recorded
+        # input; this asserts it does not.
+        rmcfg = graph_cfg(merge_graph([
+            {"kind": "operation", "id": "n5", "operation": "reserve", "input": {"const": {"reservation": "mgq", "_fault": {"respond_pending": True}}}, "next": "n6"},
+            {"kind": "return", "id": "n6", "value": {"result": {"node": "n5"}}},
+        ]), argument_type=MERGE_AT)
+        wmr = _wf_id()
+        opq = (f"SELECT operation_seq, operation_name, status, "
+               f"COALESCE(JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reserved')), JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation'))) "
+               f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wmr}') ORDER BY operation_seq")
+        code_s, body_s = run_runner(rmcfg, wmr, arguments=json.dumps({"flag": True}))
+        op_s = _mdb(opq)
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wmr}')")
+        pu0, rq0 = _put_count(base), _request_count(base)
+        code_r, body_r = run_runner(rmcfg, wmr)
+        pu_d, rq_d = _put_count(base) - pu0, _request_count(base) - rq0
+        op_r = _mdb(opq)
+        check("graph_merge_resume_recomputes_merged_value_identically",
+              code_s == 9 and body_s.get("workflow") == "pending"
+              and op_s == [["1", "reserve", "2", "mgA"], ["2", "confirm", "2", "mgA"], ["3", "reserve", "1", "mgq"]]
+              and code_r == 9 and body_r.get("workflow") == "pending" and op_r == op_s
+              and pu_d == 0 and rq_d >= 1,
+              (code_s, body_s, op_s, code_r, body_r, op_r, f"put+{pu_d} req+{rq_d}"))
+
+        # C9d. REVERSAL compensates ONLY the taken branch PLUS the shared downstream checkpoint. The
+        # branch reserve + the shared confirm settle (2 checkpoints), then a final op is rejected ->
+        # reversal unwinds highest-seq first: unconfirm (confirm) then release (reserve mgA) ->
+        # reversed. The untaken branch (mgB) has no op row/checkpoint/execution.
+        dmcfg = graph_cfg(merge_graph([
+            {"kind": "operation", "id": "n5", "operation": "reserve", "input": {"const": {"reservation": "mgfin", "_fault": {"reject": True}}}, "next": "n6"},
+            {"kind": "return", "id": "n6", "value": {"const": None}},
+        ]), argument_type=MERGE_AT)
+        wmd = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(dmcfg, wmd, arguments=json.dumps({"flag": True}))
+        ex_d = _exec_count(base) - ex0
+        wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wmd}')")
+        cks = _mdb(f"SELECT seq, reversal_state, reverse_operation_name FROM tb_mf_workflow_checkpoint "
+                   f"WHERE workflow_id = UNHEX('{wmd}') ORDER BY seq")
+        untaken = _mdb(f"SELECT COUNT(*) FROM tb_mf_operation WHERE workflow_id = UNHEX('{wmd}') AND input_json LIKE '%mgB%'")
+        check("graph_merge_reversal_compensates_taken_branch_and_shared",
+              code == 0 and body.get("workflow") == "reversed" and ex_d == 4
+              and wf == [["5", "2"]]
+              and cks == [["1", "2", "release"], ["2", "2", "unconfirm"]] and untaken == [["0"]],
+              (code, body, ex_d, wf, cks, untaken))
+
         # C5h. EXISTING-workflow reassertion must NOT validate arguments against the ACTIVE
         # type — only a FRESH submission does (a rollout may change the declared type). Create
         # under {a:int}; resubmit under a DIFFERENT active type {b:int} with the SAME (v1-valid)
@@ -1451,7 +1558,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 90
+    EXPECTED_CHECKS = 94
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

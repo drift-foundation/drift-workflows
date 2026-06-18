@@ -184,9 +184,42 @@ Pure control flow: no durable boundary, no continuation/event.
   case path (untaken arms have no op row/checkpoint/execution). Integration 90/90 (was 84); full
   `just test` green.
 - **The manual graph now supports:** straight-line, `if`, `case`, `let`, `return`, and finite array
-  expressions (`map`/`filter`/`fold`). Remaining runtime-side frontend work: cross-branch result
-  merge / typed value refinements. Deferred until the manual IR is fully proven: the source-language
-  parser, `while`, node-graph loop bodies, remote operations inside iteration.
+  expressions (`map`/`filter`/`fold`).
+
+## Landed: manual-IR cross-branch result merge (NMerge phi)
+
+Branch-local values (an op result / let bound on one branch only) can now feed shared downstream
+work, WITHOUT inventing storage. A new `merge` node (an SSA phi) rejoins paths and binds a local to
+a value selected from the TAKEN branch. Pure control flow: no operation seq, no continuation write,
+no event at the merge boundary; the value is recomputed on replay from durable args/results/locals.
+- **Model (`NMerge(id, name, sources, next)`).** Each `MergeArm{from, value}` keys a value to the
+  immediate predecessor it arrives from. `advance` tracks the predecessor (`prev`) and, at the
+  merge, picks the source for `prev`, evaluates it in the taken-path scope, and binds local `name`
+  (like an NLet). The EXISTING `EResult`/`ELocal` dominance rule is unchanged — the merge is the
+  EXPLICIT, validated mechanism for crossing a branch; a bare cross-branch reference is still
+  rejected.
+- **Validation.** A merge must be TOTAL and UNAMBIGUOUS over its incoming edges: every immediate
+  predecessor has exactly one source, and every source's `from` is a predecessor (missing /
+  non-predecessor / duplicate `from` → rejected). Each source's value is scoped to its predecessor
+  (`_available_after`: the predecessor's own result/binding, or a dominator's), so a source can
+  reference the branch op result it joins but NOT the other branch's. `name` is a normal binder
+  (globally unique with NLet/loop results; downstream `ELocal(name)` resolves via dominance). Binder
+  helpers were unified behind `_binder_name_of` (NLet / NLoop result / NMerge result). op-depth
+  imbalance across arms remains rejected (no durable model for variable op counts yet).
+- **Tests.** Unit (`ir_exec_test`): merge selects the taken branch's result (true + false), and
+  rejects a missing-source merge, a cross-branch source value (`result(other)`), an unknown source
+  key, and a missing `from`; valid merge parses+validates. Integration (C9, via a new `confirm` op
+  whose input is a reserve RESULT, compensable → `unconfirm`): a branch reserve RESULT is merged
+  into the shared `confirm` input (true→mgA / false→mgB); event-count parity proves NO durable event
+  at the merge boundary; a claimable RESUME recomputes the merged value identically from durable
+  results (settled ops untouched, trailing op GET-first, no second PUT); branch reversal compensates
+  the taken branch (`release`) AND the shared downstream checkpoint (`unconfirm`), highest-seq first,
+  with the untaken branch untouched. Integration 94/94 (was 90); full `just test` green.
+- **The manual graph now supports:** straight-line, `if`, `case`, `let`, `return`, finite array
+  expressions (`map`/`filter`/`fold`), and cross-branch result merge. Remaining runtime-side
+  frontend work: typed value refinements (wire the type checker through merge/exprs). Deferred until
+  the manual IR is fully proven: the source-language parser, `while`, node-graph loop bodies, remote
+  operations inside iteration, and a durable model for variable per-branch op counts.
 
 ## Landed: chunk 2 PART 2 — runner adopts the graph
 Delivered in verifiable stages.

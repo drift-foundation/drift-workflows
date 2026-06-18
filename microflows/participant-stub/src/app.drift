@@ -71,6 +71,11 @@ const OP_RESERVE: String = "reserve";
 // Compensation operation: reverses a `reserve` checkpoint. Input is the forward
 // checkpoint payload ({"reservation": id}); result {"compensated": 1, ...}.
 const OP_RELEASE: String = "release";
+// Downstream operation whose INPUT is a `reserve` RESULT ({"reserved": id}) — lets a manual-IR
+// cross-branch merge feed a branch reserve's result into a later shared op. Result {"confirmed": id}.
+// Compensable: its REVERSE is `unconfirm` (input = the confirm checkpoint payload {"reserved": id}).
+const OP_CONFIRM: String = "confirm";
+const OP_UNCONFIRM: String = "unconfirm";
 
 // ===== Entry point =====
 
@@ -466,7 +471,8 @@ fn _validate_echo(input: &json.JsonNode) nothrow -> Bool {
 // ===== Generic operation dispatch (by operation name) =====
 
 fn _supported_op(op: &String) nothrow -> Bool {
-	return op == OP_ECHO_TRANSFORM or op == OP_STRING_JOIN or op == OP_RELEASE or op == OP_RESERVE;
+	return op == OP_ECHO_TRANSFORM or op == OP_STRING_JOIN or op == OP_RELEASE or op == OP_RESERVE
+	    or op == OP_CONFIRM or op == OP_UNCONFIRM;
 }
 
 fn _validate_input(op: &String, input: &json.JsonNode) nothrow -> Bool {
@@ -474,6 +480,8 @@ fn _validate_input(op: &String, input: &json.JsonNode) nothrow -> Bool {
 	if op == OP_STRING_JOIN { return _validate_string_join(input); }
 	if op == OP_RELEASE { return _validate_release(input); }
 	if op == OP_RESERVE { return _validate_reserve(input); }
+	if op == OP_CONFIRM { return _validate_confirm(input); }
+	if op == OP_UNCONFIRM { return _validate_confirm(input); }
 	return false;
 }
 
@@ -481,8 +489,45 @@ fn _execute_op(op: &String, input: &json.JsonNode) -> String {
 	if op == OP_STRING_JOIN { return _string_join(input); }
 	if op == OP_RELEASE { return _release(input); }
 	if op == OP_RESERVE { return _reserve(input); }
+	if op == OP_CONFIRM { return _confirm(input); }
+	if op == OP_UNCONFIRM { return _unconfirm(input); }
 	// default: echo-transform (op already validated/supported before dispatch).
 	return _echo_transform(input);
+}
+
+// Validate the confirm/unconfirm input: { "reserved": "<id>" } — the SHAPE of a reserve RESULT, so a
+// merged branch reserve result can feed this shared op. Extra keys ignored.
+fn _validate_confirm(input: &json.JsonNode) nothrow -> Bool {
+	match input.get(&"reserved") {
+		Optional::Some(n) => {
+			match n.as_string() { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
+		},
+		Optional::None => { return false; }
+	}
+}
+
+fn _confirm(input: &json.JsonNode) -> String {
+	// Precondition: _validate_confirm(input) is true. Echo the reserved id so the result is observable.
+	var reserved: String = "";
+	match input.get(&"reserved") {
+		Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { reserved = move v; }, Optional::None => {} } },
+		Optional::None => {}
+	}
+	var o = json.new_object();
+	o.set("confirmed", json.JsonNode::String(move reserved));
+	return json.encode(o.to_node());
+}
+
+fn _unconfirm(input: &json.JsonNode) -> String {
+	// Compensation for `confirm`: input is the confirm checkpoint payload ({"reserved": id}).
+	var reserved: String = "";
+	match input.get(&"reserved") {
+		Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { reserved = move v; }, Optional::None => {} } },
+		Optional::None => {}
+	}
+	var o = json.new_object();
+	o.set("unconfirmed", json.JsonNode::String(move reserved));
+	return json.encode(o.to_node());
 }
 
 // Validate the forward reserve input: { "reservation": "<id>" }. Extra keys (e.g.
