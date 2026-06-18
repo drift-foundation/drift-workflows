@@ -257,6 +257,26 @@ def main():
         plan_cfgs.append(f.name)
         return f.name
 
+    def typed_graph_cfg(graph, op_types, argument_type=None):
+        # Like graph_cfg, but OVERLAYS declared input_type/result_type onto named operations (a
+        # per-test typed contract; the global registry stays untyped). op_types: {op: {input_type,
+        # result_type}}. The declared types are type-checked at registry build and folded into the
+        # content_hash.
+        c = dict(runner_cfg)
+        ops = []
+        for o in runner_cfg["operations"]:
+            o2 = dict(o)
+            if o2["name"] in op_types:
+                o2.update(op_types[o2["name"]])
+            ops.append(o2)
+        c["operations"] = ops
+        c["graph"] = graph
+        if argument_type is not None:
+            c["argument_type"] = argument_type
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(c, f); f.close()
+        plan_cfgs.append(f.name)
+        return f.name
+
     stub = subprocess.Popen([str(STUB_BIN), "--config", scf.name],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     deadline = time.time() + 15
@@ -1413,6 +1433,130 @@ def main():
               and cks == [["1", "2", "release"], ["2", "2", "unconfirm"]] and untaken == [["0"]],
               (code, body, ex_d, wf, cks, untaken))
 
+        # ===== C10. TYPED EXPRESSION VALIDATION (operation contracts + graph type checking) =====
+        # Operations declare input/result TYPES (per-test, via typed_graph_cfg); the runner
+        # type-checks the graph at registry build (EArg/EResult/ELocal path resolution, NIf Bool,
+        # NMerge agreement, op input type) and folds the types into content_hash. A type error is
+        # invalid_config (submission) / revision_unavailable (resume) — never a dispatch.
+        T_STR = {"type": "string"}
+        T_INT = {"type": "int"}
+        RESV_IN = {"type": "object", "fields": [{"name": "reservation", "type": T_STR}]}
+        RESV_OUT = {"type": "object", "fields": [{"name": "reserved", "type": T_STR}]}
+        SUM_OUT = {"type": "object", "fields": [{"name": "sum", "type": T_INT}]}
+        TY_AT = {"type": "object", "fields": [{"name": "flag", "type": {"type": "bool"}}]}
+        TY_AT_INT = {"type": "object", "fields": [{"name": "flag", "type": {"type": "int"}}]}
+
+        # C10a. A VALID typed graph still executes: reserve declares input {reservation:string};
+        # the branch inputs match, and arg.flag is Bool, so it type-checks and runs.
+        tg_ok = {"entry": "n0", "nodes": [
+            {"kind": "if", "id": "n0", "cond": {"arg": ["flag"]}, "then": "n1", "else": "n2"},
+            {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": {"reservation": "tyA"}}, "next": "n3"},
+            {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "tyB"}}, "next": "n3"},
+            {"kind": "return", "id": "n3", "value": {"const": None}},
+        ]}
+        tycfg = typed_graph_cfg(tg_ok, {"reserve": {"input_type": RESV_IN, "result_type": RESV_OUT}}, argument_type=TY_AT)
+        wty = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(tycfg, wty, arguments=json.dumps({"flag": True}))
+        check("typed_valid_graph_executes",
+              code == 0 and body.get("workflow") == "completed" and _exec_count(base) - ex0 == 1, (code, body))
+
+        # C10b. INVALID branch condition: arg.flag declared Int -> NIf condition is not Bool ->
+        # rejected at build (invalid_config), with NO operation dispatched.
+        wbc = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(typed_graph_cfg(tg_ok, {"reserve": {"input_type": RESV_IN}}, argument_type=TY_AT_INT),
+                                wbc, arguments=json.dumps({"flag": 1}))
+        check("typed_invalid_branch_condition_rejected",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config"
+              and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C10c. INVALID op input: reserve declares input {reservation:string}; a const {reservation:5}
+        # (int) fails the contract -> rejected at build, no dispatch.
+        tg_badin = {"entry": "n0", "nodes": [
+            {"kind": "operation", "id": "n0", "operation": "reserve", "input": {"const": {"reservation": 5}}, "next": "n1"},
+            {"kind": "return", "id": "n1", "value": {"const": None}},
+        ]}
+        wbi = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(typed_graph_cfg(tg_badin, {"reserve": {"input_type": RESV_IN}}, argument_type=TY_AT),
+                                wbi, arguments=json.dumps({"flag": True}))
+        check("typed_invalid_op_input_rejected",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config"
+              and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C10d. INVALID merge: branch A's result is {reserved:string}, branch B's is {sum:int}; the
+        # merge sources disagree on type -> rejected at build, no dispatch.
+        tg_mm = {"entry": "n0", "nodes": [
+            {"kind": "if", "id": "n0", "cond": {"arg": ["flag"]}, "then": "n1", "else": "n2"},
+            {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": {"reservation": "mA"}}, "next": "n3"},
+            {"kind": "operation", "id": "n2", "operation": "echo-transform", "input": {"const": {"values": [1]}}, "next": "n3"},
+            {"kind": "merge", "id": "n3", "name": "picked",
+             "sources": [{"from": "n1", "value": {"result": {"node": "n1"}}}, {"from": "n2", "value": {"result": {"node": "n2"}}}], "next": "n4"},
+            {"kind": "return", "id": "n4", "value": {"local": {"name": "picked"}}},
+        ]}
+        wmm = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(typed_graph_cfg(tg_mm, {"reserve": {"result_type": RESV_OUT}, "echo-transform": {"result_type": SUM_OUT}}, argument_type=TY_AT),
+                                wmm, arguments=json.dumps({"flag": True}))
+        check("typed_invalid_merge_type_mismatch_rejected",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config"
+              and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C10e. RESUME with a CHANGED type contract yields revision_unavailable (never substitution).
+        # Submit a pending workflow whose reserve declares result_type {reserved:string} (in the
+        # content_hash). Resume under a config where reserve's result_type changed to {reserved:int}:
+        # the hash differs from the pin -> revision_unavailable defer, no dispatch/substitution.
+        tg_pend = {"entry": "n0", "nodes": [
+            {"kind": "operation", "id": "n0", "operation": "reserve", "input": {"const": {"reservation": "tyR", "_fault": {"respond_pending": True}}}, "next": "n1"},
+            {"kind": "return", "id": "n1", "value": {"const": None}},
+        ]}
+        cfg_A = typed_graph_cfg(tg_pend, {"reserve": {"result_type": RESV_OUT}}, argument_type=TY_AT)
+        wtr = _wf_id()
+        code_s, body_s = run_runner(cfg_A, wtr, arguments=json.dumps({"flag": True}))
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wtr}')")
+        cfg_B = typed_graph_cfg(tg_pend, {"reserve": {"result_type": {"type": "object", "fields": [{"name": "reserved", "type": T_INT}]}}}, argument_type=TY_AT)
+        ex0 = _exec_count(base)
+        code_r, body_r = run_runner(cfg_B, wtr)
+        check("typed_resume_changed_contract_revision_unavailable",
+              code_s == 9 and body_s.get("workflow") == "pending"
+              and code_r == 9 and body_r.get("workflow") == "deferred" and body_r.get("reason") == "revision_unavailable"
+              and _exec_count(base) - ex0 == 0,
+              (code_s, body_s, code_r, body_r))
+
+        # C10f. COMPENSATION contract: a compensation receives the forward op's checkpoint payload
+        # (its input), so the reverse op's declared input type must match the forward op's. reserve
+        # declares input {reservation:string} but its compensation `release` declares {reservation:int}
+        # -> rejected at build (invalid_config), no dispatch.
+        RESV_IN_INT = {"type": "object", "fields": [{"name": "reservation", "type": T_INT}]}
+        tg_comp = {"entry": "n0", "nodes": [
+            {"kind": "operation", "id": "n0", "operation": "reserve", "input": {"const": {"reservation": "cmp"}}, "next": "n1"},
+            {"kind": "return", "id": "n1", "value": {"const": None}},
+        ]}
+        wcc = _wf_id()
+        ex0 = _exec_count(base)
+        code, body = run_runner(typed_graph_cfg(tg_comp, {"reserve": {"input_type": RESV_IN}, "release": {"input_type": RESV_IN_INT}}, argument_type=TY_AT),
+                                wcc, arguments=json.dumps({"flag": True}))
+        check("typed_compensation_input_mismatch_rejected",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config"
+              and _exec_count(base) - ex0 == 0, (code, body))
+
+        # C10g. A COMPENSATION op's type contract is part of the content_hash: submit a pending
+        # workflow whose `release` declares input {reservation:string}; resume where release's input
+        # changed to {reservation:int} -> hash differs from the pin -> revision_unavailable.
+        ccfg_A = typed_graph_cfg(tg_pend, {"release": {"input_type": RESV_IN}}, argument_type=TY_AT)
+        wcr2 = _wf_id()
+        code_s, body_s = run_runner(ccfg_A, wcr2, arguments=json.dumps({"flag": True}))
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wcr2}')")
+        ccfg_B = typed_graph_cfg(tg_pend, {"release": {"input_type": RESV_IN_INT}}, argument_type=TY_AT)
+        ex0 = _exec_count(base)
+        code_r, body_r = run_runner(ccfg_B, wcr2)
+        check("typed_compensation_type_in_content_hash",
+              code_s == 9 and body_s.get("workflow") == "pending"
+              and code_r == 9 and body_r.get("workflow") == "deferred" and body_r.get("reason") == "revision_unavailable"
+              and _exec_count(base) - ex0 == 0,
+              (code_s, body_s, code_r, body_r))
+
         # C5h. EXISTING-workflow reassertion must NOT validate arguments against the ACTIVE
         # type — only a FRESH submission does (a rollout may change the declared type). Create
         # under {a:int}; resubmit under a DIFFERENT active type {b:int} with the SAME (v1-valid)
@@ -1558,7 +1702,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 94
+    EXPECTED_CHECKS = 101
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

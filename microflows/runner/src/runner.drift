@@ -760,6 +760,16 @@ fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
 			// Reject non-reversible graphs: every non-final operation must be compensable (mirrors
 			// the flat-plan rule, generalized over branches), so reversal can never strand.
 			_assert_reversible(cfg, &graph);
+			// TYPE-check the graph against the declared argument type + operation contracts. A type
+			// error is a config error (invalid_config / revision_unavailable), never a dispatch.
+			val contracts = _op_contracts(cfg);
+			match ir.type_check_graph(&graph, &arg_type, &contracts) {
+				Optional::Some(m) => { throw RunnerError(message = "graph type error: " + move m); },
+				Optional::None => {}
+			}
+			// A compensation receives the forward op's CHECKPOINT PAYLOAD (its input) as its input,
+			// so the reverse op's declared input type must match the forward op's declared input type.
+			_assert_compensation_types(cfg, &graph);
 			val ch = _content_hash(cfg, &graph, &arg_type);
 			revs.push(ScriptRevision(name = move name, version = move version,
 			                         graph = move graph, arg_type = move arg_type,
@@ -782,6 +792,47 @@ fn _arg_type(cfg: &json.JsonNode) -> ir.IrType {
 			}
 		},
 		Optional::None => { return ir.empty_object_type(); }
+	}
+}
+
+// Build the operation CONTRACTS (input/result types) from the config's operations registry. Each
+// type is OPTIONAL — an operation that declares neither is unchecked (so untyped configs behave
+// exactly as before). A malformed type declaration -> RunnerError (invalid_config / deferred).
+fn _op_contracts(cfg: &json.JsonNode) -> Array<ir.OpContract> {
+	var out: Array<ir.OpContract> = [];
+	match cfg.get(&"operations") {
+		Optional::Some(on) => {
+			match on.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						val nm = _req_str(&items[i], &"name", "operation.name");
+						out.push(ir.OpContract(name = move nm,
+						                       input_type = _op_type_opt(&items[i], &"input_type"),
+						                       result_type = _op_type_opt(&items[i], &"result_type")));
+						i = i + 1;
+					}
+				},
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
+	return move out;
+}
+
+// Parse an OPTIONAL declared type at `key` on an operation entry. Absent -> None. Malformed ->
+// RunnerError (surfaced as invalid_config / revision_unavailable by the build catch).
+fn _op_type_opt(item: &json.JsonNode, key: &String) -> Optional<ir.IrType> {
+	match item.get(key) {
+		Optional::Some(tn) => {
+			var ty: ir.IrType = ir.empty_object_type();
+			// parse_type throws ir.IrError; a typed catch can't project its `message` here, so use a
+			// catch-all and re-raise as a RunnerError (surfaced as invalid_config / deferred).
+			try { ty = ir.parse_type(tn); } catch { throw RunnerError(message = "invalid '" + _dup(key) + "' type declaration"); }
+			return Optional<ir.IrType>::Some(move ty);
+		},
+		Optional::None => { return Optional<ir.IrType>::None(); }
 	}
 }
 
@@ -888,9 +939,78 @@ fn _graph_bindings(cfg: &json.JsonNode, graph: &ir.IrGraph) -> String {
 		val comp_sv_str = fmt.format_int(comp_sv);
 		s = s + _lp(&sv_str) + _lp(&r.participant_id)
 		      + _lp(&comp_op) + _lp(&comp_sv_str) + _lp(&comp_part);
+		// Declared TYPE contract participates in identity (so a changed type -> different hash ->
+		// revision_unavailable on resume, never a silent substitution). Tagged + appended ONLY when
+		// present, so an UNTYPED operation yields the identical binding string as before (existing
+		// hashes — flat plans, untyped graphs — are unchanged). The COMPENSATION op's contract is
+		// executable workflow semantics too, so its type tags are included (lowercase) when present.
+		match _op_type_canon(cfg, &ops[i], &"input_type") { Optional::Some(c) => { s = s + "I" + _lp(&c); }, Optional::None => {} }
+		match _op_type_canon(cfg, &ops[i], &"result_type") { Optional::Some(c) => { s = s + "R" + _lp(&c); }, Optional::None => {} }
+		if comp_op.byte_length() > 0 {
+			match _op_type_canon(cfg, &comp_op, &"input_type") { Optional::Some(c) => { s = s + "i" + _lp(&c); }, Optional::None => {} }
+			match _op_type_canon(cfg, &comp_op, &"result_type") { Optional::Some(c) => { s = s + "r" + _lp(&c); }, Optional::None => {} }
+		}
 		i = i + 1;
 	}
 	return move s;
+}
+
+// Canonical encoding of an operation's OPTIONAL declared type at `key`, or None if undeclared.
+// Malformed -> RunnerError (same surfacing as _op_type_opt).
+fn _op_type_canon(cfg: &json.JsonNode, opname: &String, key: &String) -> Optional<String> {
+	match cfg.get(&"operations") {
+		Optional::Some(on) => {
+			match on.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						val nm = _req_str(&items[i], &"name", "operation.name");
+						if _str_eq(&nm, opname) {
+							match _op_type_opt(&items[i], key) {
+								Optional::Some(ty) => { return Optional<String>::Some(ir.canonical(&ty)); },
+								Optional::None => { return Optional<String>::None(); }
+							}
+						}
+						i = i + 1;
+					}
+				},
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
+	return Optional<String>::None();
+}
+
+// A compensation operation receives the forward op's CHECKPOINT PAYLOAD — its input — as its own
+// input. So when both the forward op and its compensation declare an input type, they must MATCH
+// (else the reverse dispatch would receive a payload its contract rejects). Throws RunnerError at
+// registry build (invalid_config / revision_unavailable). Only checks ops that declare types, so
+// untyped configs are unaffected.
+fn _assert_compensation_types(cfg: &json.JsonNode, graph: &ir.IrGraph) -> Void {
+	val ops = ir.operation_names(graph);
+	var i = 0;
+	while i < ops.len {
+		match _compensation_for(cfg, &ops[i]) {
+			Optional::Some(c) => {
+				match _op_type_canon(cfg, &ops[i], &"input_type") {
+					Optional::Some(fwd_in) => {
+						match _op_type_canon(cfg, &c.op_name, &"input_type") {
+							Optional::Some(rev_in) => {
+								if !_str_eq(&fwd_in, &rev_in) {
+									throw RunnerError(message = "compensation '" + _dup(&c.op_name) + "' input type is incompatible with the checkpoint payload of '" + _dup(&ops[i]) + "'");
+								}
+							},
+							Optional::None => {}
+						}
+					},
+					Optional::None => {}
+				}
+			},
+			Optional::None => {}
+		}
+		i = i + 1;
+	}
 }
 
 // Build the degenerate straight-line graph from the flat plan (inputs canonicalized into each

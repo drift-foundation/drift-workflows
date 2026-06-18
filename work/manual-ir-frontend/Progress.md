@@ -216,10 +216,61 @@ no event at the merge boundary; the value is recomputed on replay from durable a
   the taken branch (`release`) AND the shared downstream checkpoint (`unconfirm`), highest-seq first,
   with the untaken branch untouched. Integration 94/94 (was 90); full `just test` green.
 - **The manual graph now supports:** straight-line, `if`, `case`, `let`, `return`, finite array
-  expressions (`map`/`filter`/`fold`), and cross-branch result merge. Remaining runtime-side
-  frontend work: typed value refinements (wire the type checker through merge/exprs). Deferred until
-  the manual IR is fully proven: the source-language parser, `while`, node-graph loop bodies, remote
-  operations inside iteration, and a durable model for variable per-branch op counts.
+  expressions (`map`/`filter`/`fold`), and cross-branch result merge.
+
+## Landed: typed expression validation (operation contracts + graph type checking)
+
+Operations now carry OPTIONAL contracts in the existing IR value-type model — an input type and a
+result type — and the runner TYPE-CHECKS the graph at registry build, before any claim/dispatch.
+This is the last substantial runtime-side frontend hardening before the parser.
+- **Contracts (`ir.OpContract`).** `{name, input_type?, result_type?}`, built from each config
+  operation's `input_type`/`result_type` (a value-type encoding). Both OPTIONAL: an op that declares
+  neither is UNCHECKED, so every existing untyped config behaves exactly as before. The declared
+  types fold into `content_hash` (tagged, appended only when present — untyped configs keep their
+  current hash, so the seeded flat-plan pins are unchanged).
+- **`ir.type_check_graph(g, arg_type, contracts)`** — a topological pass (binders typed before use).
+  Inference is THREE-WAY (`InferType`): `Known` (checked by assignability), `Unknown` (only from an
+  UNTYPED op result/binder — the backward-compatible permissive escape hatch), and `Imprecise` (a
+  const literal whose precise type is undetermined — empty/heterogeneous array, or an object/array
+  containing one). `Imprecise` is NEVER permissive: at a typed op input a STATIC const (a literal, or
+  one reached through a `let`, projected) is checked by VALUE (`validate`, exact ground truth); an
+  imprecise const reaching the boundary through a non-static path (`merge`/`loop`) is conservatively
+  REJECTED. So the bypass — a bad const laundered through any binder — is closed. Checks: `EArg`
+  resolves against the argument type; `EResult` against the op's result type; `ELocal` against its
+  let/loop/merge bound type (all by path projection through object fields, unwrapping `Optional`);
+  `NIf.cond` is Bool; `NCase` arm constants `validate` against the scrutinee type; `NLoop` source is
+  `Array<T>` with the body checked (filter body Bool; `map` result `Array<body>`; `fold` body == the
+  accumulator type — a `null` init is a BOTTOM accumulator, e.g. fold-select-last, so the result is
+  the body type); `NMerge` sources must agree on one type. Type equality is `canonical()` equality;
+  consts are checked by VALUE via the existing `validate()`. CLOSED object const literals are
+  inferred field-by-field (`_infer_const_type` walks `node.entries()`), so a bad-typed const reaching
+  an op input THROUGH a `let`/`merge`/`loop` binder is still caught — not just direct const inputs.
+- **Compensation contracts.** A compensation receives the forward op's CHECKPOINT PAYLOAD (its
+  input) as its own input. So the reverse op's declared input type must MATCH the forward op's
+  (`_assert_compensation_types`), and the compensation op's type tags are folded into the
+  `content_hash` (lowercase tags, appended only when present) — a changed reverse contract changes
+  the revision identity, never a silent substitution.
+- **Runtime unchanged / surfacing.** A bad type contract throws `RunnerError` at registry build →
+  `invalid_config` (submission) / `revision_unavailable` (resume), exactly like the other build-time
+  rejections — never a dispatch, no new durable state. (A typed `catch` can't project `ir.IrError`'s
+  `message`, so `_op_type_opt` uses a catch-all re-raise.)
+- **Tests.** Unit (`ir_exec_test` 140–151): valid typed graph; Int branch condition rejected; bad op
+  input (const int vs declared string) rejected; merge type mismatch rejected; a bad const reaching a
+  typed input through a `let` / `merge` / `loop` binder rejected (incl. an imprecise-field object and
+  an optional/null field); non-const assignability (`{m:string}` ⊑ `{m:Optional<string>}`); and a
+  non-array loop source rejected — a direct literal AND one laundered through a merge. Integration
+  (C10, via per-test `typed_graph_cfg`
+  overlaying contracts so the global registry stays untyped): valid typed graph still executes;
+  invalid branch condition / invalid op input / invalid merge mismatch each rejected before dispatch
+  (`invalid_config`, exec 0); resume under a CHANGED result-type contract yields
+  `revision_unavailable`; compensation input incompatible with the checkpoint payload rejected; a
+  changed COMPENSATION type yields `revision_unavailable` (the type is in the hash — no substitution).
+  Integration 101/101 (was 94); full `just test` green.
+- **The manual graph now supports:** straight-line, `if`, `case`, `let`, `return`, finite array
+  expressions, cross-branch result merge, AND typed expression validation. The manual-IR surface is
+  now "boring and fully proven." Deferred until parser/DSL: the source-language parser, `while`,
+  node-graph loop bodies, remote operations inside iteration, and a durable model for variable
+  per-branch op counts.
 
 ## Landed: chunk 2 PART 2 — runner adopts the graph
 Delivered in verifiable stages.

@@ -5,6 +5,8 @@ import std.json as json;
 import std.format as fmt;
 import std.io as io;
 import std.float as float;
+import std.iter as iter;
+use trait iter.SinglePassIterator;
 
 export {
 	IrType,
@@ -33,7 +35,9 @@ export {
 	operation_names,
 	OpResult,
 	StepOutcome,
-	advance
+	advance,
+	OpContract,
+	type_check_graph
 };
 
 // ===== V1 closed value-type model (manual-IR frontend, Step 1b: argument types) =====
@@ -1576,6 +1580,599 @@ fn _contains_int(xs: &Array<Int>, x: Int) nothrow -> Bool {
 	var i = 0;
 	while i < xs.len { if xs[i] == x { return true; } i = i + 1; }
 	return false;
+}
+
+// ===== graph TYPE checking (Step: typed expression validation) =====
+//
+// An operation's CONTRACT in terms of IR value types: its declared input + result types (each
+// OPTIONAL — an undeclared type means that op is UNCHECKED, so existing untyped configs keep their
+// current behavior). A compensation receives the forward op's checkpoint payload (its input), so the
+// reverse op's declared input type is validated against the forward op's by the runner
+// (`_assert_compensation_types`) and folded into the content_hash — not modeled in OpContract.
+pub struct OpContract {
+	pub name: String,
+	pub input_type: Optional<IrType>,
+	pub result_type: Optional<IrType>
+}
+
+// The outcome of inferring an expression's type. The THREE-WAY distinction is essential at a typed
+// boundary: a `Known` type is checked by assignability; `Unknown` (from an UNTYPED op result/binder)
+// is the permissive backward-compat escape hatch; `Imprecise` (a const LITERAL whose precise type is
+// undetermined — an empty/heterogeneous array, or an object/array containing one) is NOT permissive
+// — at a typed boundary it is value-validated if static, else conservatively REJECTED. Conflating
+// `Imprecise` with `Unknown` is exactly the bypass this avoids.
+variant InferType {
+	Known(ty: IrType),
+	Unknown,
+	Imprecise
+}
+
+fn _clone_infer(i: &InferType) nothrow -> InferType {
+	match i {
+		InferType::Known(ty) => { return InferType::Known(ty = _clone_type(ty)); },
+		InferType::Unknown() => { return InferType::Unknown(); },
+		InferType::Imprecise() => { return InferType::Imprecise(); }
+	}
+}
+
+// Type-check a (structurally VALIDATED) graph against the declared argument type + operation
+// contracts. Returns Some(message) on the first type error, None if well-typed. Inference is
+// PERMISSIVE: an expression whose type cannot be determined (an `EResult`/`ELocal` of an op/binder
+// with NO declared type) is treated as `unknown` and skips the compatibility check — the
+// backward-compatible escape hatch for untyped configs. A CONST literal is NOT such an escape:
+// closed object literals infer field-by-field, and at an op input a static const (even a literal
+// reached through a `let`) is checked by VALUE (`validate`), so an imprecise literal (e.g. an empty
+// array field) is still rejected against a declared type, not waved through. Call AFTER
+// `validate_graph` (assumes acyclic, refs resolve).
+pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpContract>) nothrow -> Optional<String> {
+	var order: Array<Int> = [];
+	match _topo_order(g) {
+		core.Result::Ok(o) => { order = move o; },
+		core.Result::Err(e) => { return Optional<String>::Some(e.message); }
+	}
+	// local name -> its inferred type, accumulated in topological order so a binder is typed before
+	// any dominated use.
+	var lt_names: Array<String> = [];
+	var lt_types: Array<InferType> = [];
+	var k = 0;
+	while k < order.len {
+		val idx = order[k];
+		match &g.nodes[idx] {
+			IrNode::NOperation(id, operation, input, next) => {
+				match _op_input_type(contracts, operation) {
+					Optional::Some(it) => {
+						match _check_value_is(g, input, it, arg_type, contracts, &lt_names, &lt_types) {
+							Optional::Some(m) => { return Optional<String>::Some("operation '" + _dup(operation) + "' input: " + move m); },
+							Optional::None => {}
+						}
+					},
+					Optional::None => {}
+				}
+			},
+			IrNode::NIf(id, cond, then_node, else_node) => {
+				match _infer_expr_type(g, cond, arg_type, contracts, &lt_names, &lt_types) {
+					core.Result::Ok(it) => {
+						match &it {
+							InferType::Known(t) => { if !_str_eq(&canonical(t), &"b") { return Optional<String>::Some("NIf condition must be Bool (got " + canonical(t) + "): " + _dup(id)); } },
+							InferType::Imprecise() => { return Optional<String>::Some("NIf condition must be Bool (got an imprecise literal): " + _dup(id)); },
+							InferType::Unknown() => {}
+						}
+					},
+					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
+				}
+			},
+			IrNode::NCase(id, scrutinee, arms, default_node) => {
+				match _infer_expr_type(g, scrutinee, arg_type, contracts, &lt_names, &lt_types) {
+					core.Result::Ok(it) => {
+						match &it {
+							InferType::Known(st) => {
+								var a = 0;
+								while a < arms.len {
+									match json.parse_strict(&arms[a].match_const) {
+										core.Result::Ok(mn) => {
+											match validate(&mn, st) {
+												Optional::Some(m) => { return Optional<String>::Some("NCase arm constant incompatible with scrutinee type: " + move m); },
+												Optional::None => {}
+											}
+										},
+										core.Result::Err(_) => {}
+									}
+									a = a + 1;
+								}
+							},
+							default => {}
+						}
+					},
+					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
+				}
+			},
+			IrNode::NLet(id, name, value, next) => {
+				match _infer_expr_type(g, value, arg_type, contracts, &lt_names, &lt_types) {
+					core.Result::Ok(opt) => { lt_names.push(_dup(name)); lt_types.push(move opt); },
+					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
+				}
+			},
+			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
+				match _tc_loop(g, id, kind, source, elem, acc, init, body, arg_type, contracts, &lt_names, &lt_types) {
+					core.Result::Ok(rt) => { lt_names.push(_dup(acc)); lt_types.push(move rt); },
+					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
+				}
+			},
+			IrNode::NMerge(id, name, sources, next) => {
+				match _tc_merge(g, id, sources, arg_type, contracts, &lt_names, &lt_types) {
+					core.Result::Ok(mt) => { lt_names.push(_dup(name)); lt_types.push(move mt); },
+					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
+				}
+			},
+			IrNode::NReturn(id, value) => {
+				// No declared return type; still infer to catch a structurally-bad projection.
+				match _infer_expr_type(g, value, arg_type, contracts, &lt_names, &lt_types) {
+					core.Result::Ok(_) => {},
+					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
+				}
+			}
+		}
+		k = k + 1;
+	}
+	return Optional<String>::None();
+}
+
+// Check that expression `e` has type `expected`. A STATIC const value — a literal, or a literal
+// reached through a `let` binder, projected by path — is checked by VALUE (`validate`, the exact
+// ground truth: handles optional/null/nested fields AND literals whose inferred type is imprecise).
+// Any other expression is checked by inferred-type ASSIGNABILITY (so `null`/`T` resolve against
+// `Optional<T>`). A bare `unknown` inferred type (untyped op result / binder source) stays
+// permissive — that is the backward-compatible escape hatch, NOT a literal whose precision failed.
+fn _check_value_is(g: &IrGraph, e: &IrExpr, expected: &IrType, arg_type: &IrType, contracts: &Array<OpContract>,
+                   lt_names: &Array<String>, lt_types: &Array<InferType>) nothrow -> Optional<String> {
+	match _const_value_of(g, e) {
+		Optional::Some(v) => { return validate(&v, expected); },
+		Optional::None => {}
+	}
+	match _infer_expr_type(g, e, arg_type, contracts, lt_names, lt_types) {
+		core.Result::Ok(it) => {
+			match &it {
+				InferType::Known(t) => {
+					if !_type_assignable(t, expected) {
+						return Optional<String>::Some("type mismatch (expected " + canonical(expected) + ", got " + canonical(t) + ")");
+					}
+					return Optional<String>::None();
+				},
+				InferType::Unknown() => { return Optional<String>::None(); },   // untyped source — permissive
+				InferType::Imprecise() => {
+					// A const literal whose type couldn't be determined, reaching here through a
+					// non-static path (loop/merge), can't be value-validated — reject conservatively.
+					return Optional<String>::Some("an imprecise const literal cannot satisfy the declared type " + canonical(expected));
+				}
+			}
+		},
+		core.Result::Err(e2) => { return Optional<String>::Some(e2.message); }
+	}
+}
+
+// The STATIC const value an expression denotes, if any: an `EConst` literal, or an `ELocal` whose
+// `let` binder resolves (transitively) to a const, then projected by the local's path. `EArg` /
+// `EResult` (runtime values) and loop/merge binders (path-dependent) are NOT static -> None.
+fn _const_value_of(g: &IrGraph, e: &IrExpr) nothrow -> Optional<json.JsonNode> {
+	match e {
+		IrExpr::EConst(canonical_json) => {
+			match json.parse_strict(canonical_json) {
+				core.Result::Ok(n) => { return Optional<json.JsonNode>::Some(move n); },
+				core.Result::Err(_) => { return Optional<json.JsonNode>::None(); }
+			}
+		},
+		IrExpr::ELocal(name, path) => {
+			match _find_let_value(g, name) {
+				Optional::Some(v) => {
+					match _const_value_of(g, v) {
+						Optional::Some(base) => { return _project(&base, path); },
+						Optional::None => { return Optional<json.JsonNode>::None(); }
+					}
+				},
+				Optional::None => { return Optional<json.JsonNode>::None(); }   // not a let (loop/merge), or unbound
+			}
+		},
+		default => { return Optional<json.JsonNode>::None(); }
+	}
+}
+
+// The value expression bound by the (unique) NLet named `name`, or None if no NLet binds it (the
+// binder is an NLoop/NMerge result, or it is unbound).
+fn _find_let_value(g: &IrGraph, name: &String) nothrow -> Optional<&IrExpr> {
+	var i = 0;
+	while i < g.nodes.len {
+		match &g.nodes[i] {
+			IrNode::NLet(id, lname, value, next) => { if _str_eq(lname, name) { return Optional<&IrExpr>::Some(value); } },
+			default => {}
+		}
+		i = i + 1;
+	}
+	return Optional<&IrExpr>::None();
+}
+
+// Assignability at a typed boundary (broader than canonical equality): `actual` is assignable to
+// `expected` if equal, or `expected` is `Optional<T>` and `actual` is `null` / assignable to `T`,
+// or both are objects and every field is assignable (an expected OPTIONAL field may be absent;
+// closed otherwise). Used for INFERRED (non-const) types; const values are checked by `validate`.
+fn _type_assignable(actual: &IrType, expected: &IrType) nothrow -> Bool {
+	if _str_eq(&canonical(actual), &canonical(expected)) { return true; }
+	match expected {
+		IrType::TOptional(inner) => {
+			match actual { IrType::TNull() => { return true; }, default => {} }
+			return _type_assignable(actual, inner.get());
+		},
+		IrType::TObject(efields) => {
+			match actual {
+				IrType::TObject(afields) => {
+					var i = 0;
+					while i < efields.len {
+						var found = false;
+						var ok = false;
+						var j = 0;
+						while j < afields.len {
+							if _str_eq(&afields[j].name, &efields[i].name) { found = true; ok = _type_assignable(&afields[j].ty, &efields[i].ty); }
+							j = j + 1;
+						}
+						if found { if !ok { return false; } }
+						else { if !_is_optional(&efields[i].ty) { return false; } }
+						i = i + 1;
+					}
+					// closed: every actual field must be declared on `expected`.
+					var k = 0;
+					while k < afields.len {
+						var in_exp = false;
+						var m = 0;
+						while m < efields.len { if _str_eq(&efields[m].name, &afields[k].name) { in_exp = true; } m = m + 1; }
+						if !in_exp { return false; }
+						k = k + 1;
+					}
+					return true;
+				},
+				default => { return false; }
+			}
+		},
+		default => { return false; }
+	}
+}
+
+// Type-check an NLoop body and return the loop result's inferred type (the binding for `acc`).
+fn _tc_loop(g: &IrGraph, id: &String, kind: &LoopKind, source: &IrExpr, elem: &String, acc: &String, init: &IrExpr,
+            body: &IrExpr, arg_type: &IrType, contracts: &Array<OpContract>,
+            lt_names: &Array<String>, lt_types: &Array<InferType>) nothrow -> core.Result<InferType, IrError> {
+	// source: must be an array. Known(Array<e>) -> elem Known(e); imprecise/unknown array source ->
+	// elem Unknown (undetermined element, permissive body).
+	var elem_it: InferType = InferType::Unknown();
+	var src_it: InferType = InferType::Unknown();
+	match _infer_expr_type(g, source, arg_type, contracts, lt_names, lt_types) {
+		core.Result::Ok(it) => {
+			match &it {
+				InferType::Known(st) => {
+					match st {
+						IrType::TArray(e) => { elem_it = InferType::Known(ty = _clone_type(e.get())); },
+						default => { return core.Result<InferType, IrError>::Err(IrError(message = "loop source must be an array (got " + canonical(st) + "): " + _dup(id))); }
+					}
+				},
+				InferType::Unknown() => {},   // untyped source (op result / binder) — might be an array; permissive
+				InferType::Imprecise() => {
+					// The source involves an imprecise const LITERAL. Accept ONLY if it is statically
+					// confirmed to be an array; otherwise reject conservatively (a non-array literal,
+					// or one laundered through a non-static merge/loop) — never leave it to a replay
+					// fault. Element type stays undetermined (permissive body).
+					var is_array = false;
+					match _const_value_of(g, source) {
+						Optional::Some(v) => { match v.as_array() { Optional::Some(_) => { is_array = true; }, Optional::None => {} } },
+						Optional::None => {}
+					}
+					if !is_array { return core.Result<InferType, IrError>::Err(IrError(message = "loop source is an imprecise literal not statically known to be an array: " + _dup(id))); }
+				}
+			}
+			src_it = move it;
+		},
+		core.Result::Err(e) => { return core.Result<InferType, IrError>::Err(e); }
+	}
+	val is_fold = _is_fold(kind);
+	var acc_it: InferType = InferType::Unknown();
+	if is_fold {
+		match _infer_expr_type(g, init, arg_type, contracts, lt_names, lt_types) {
+			core.Result::Ok(it) => { acc_it = move it; },
+			core.Result::Err(e) => { return core.Result<InferType, IrError>::Err(e); }
+		}
+	}
+	// body scope = outer locals + elem (+ acc for fold)
+	var bn: Array<String> = [];
+	var bt: Array<InferType> = [];
+	var j = 0;
+	while j < lt_names.len { bn.push(_dup(&lt_names[j])); bt.push(_clone_infer(&lt_types[j])); j = j + 1; }
+	bn.push(_dup(elem)); bt.push(_clone_infer(&elem_it));
+	if is_fold { bn.push(_dup(acc)); bt.push(_clone_infer(&acc_it)); }
+	var body_it: InferType = InferType::Unknown();
+	match _infer_expr_type(g, body, arg_type, contracts, &bn, &bt) {
+		core.Result::Ok(it) => { body_it = move it; },
+		core.Result::Err(e) => { return core.Result<InferType, IrError>::Err(e); }
+	}
+	if is_fold {
+		// A `null` init is a BOTTOM accumulator (e.g. fold-select-last, whose body OVERWRITES the
+		// accumulator each step): the result is the body type. A concretely-typed init requires the
+		// body to PRODUCE that same type (a true reduction).
+		var init_is_null = false;
+		match &acc_it { InferType::Known(a) => { if _str_eq(&canonical(a), &"n") { init_is_null = true; } }, default => {} }
+		if init_is_null { return core.Result<InferType, IrError>::Ok(move body_it); }
+		match &acc_it {
+			InferType::Known(a) => {
+				match &body_it {
+					InferType::Known(b) => { if !_str_eq(&canonical(b), &canonical(a)) { return core.Result<InferType, IrError>::Err(IrError(message = "fold body type must match the accumulator type: " + _dup(id))); } },
+					InferType::Imprecise() => { return core.Result<InferType, IrError>::Err(IrError(message = "fold body (an imprecise literal) cannot match the accumulator type: " + _dup(id))); },
+					InferType::Unknown() => {}
+				}
+			},
+			default => {}
+		}
+		return core.Result<InferType, IrError>::Ok(move acc_it);
+	}
+	if _is_filter(kind) {
+		match &body_it {
+			InferType::Known(b) => { if !_str_eq(&canonical(b), &"b") { return core.Result<InferType, IrError>::Err(IrError(message = "filter body must be Bool (got " + canonical(b) + "): " + _dup(id))); } },
+			InferType::Imprecise() => { return core.Result<InferType, IrError>::Err(IrError(message = "filter body must be Bool (got an imprecise literal): " + _dup(id))); },
+			InferType::Unknown() => {}
+		}
+		return core.Result<InferType, IrError>::Ok(move src_it);   // Array<elem>
+	}
+	// map: result is Array<bodyType>
+	match &body_it {
+		InferType::Known(b) => { return core.Result<InferType, IrError>::Ok(InferType::Known(ty = IrType::TArray(elem = core.box(_clone_type(b))))); },
+		InferType::Imprecise() => { return core.Result<InferType, IrError>::Ok(InferType::Imprecise()); },
+		InferType::Unknown() => { return core.Result<InferType, IrError>::Ok(InferType::Unknown()); }
+	}
+}
+
+// Type-check an NMerge: all KNOWN sources must agree (canonical); any IMPRECISE source makes the
+// merge imprecise (its value can be any source's, so the consumer must reject conservatively).
+fn _tc_merge(g: &IrGraph, id: &String, sources: &Array<MergeArm>, arg_type: &IrType, contracts: &Array<OpContract>,
+             lt_names: &Array<String>, lt_types: &Array<InferType>) nothrow -> core.Result<InferType, IrError> {
+	var any_imprecise = false;
+	var have_known = false;
+	var first_canon: String = "";
+	var merged_known: Optional<IrType> = Optional<IrType>::None();
+	var s = 0;
+	while s < sources.len {
+		match _infer_expr_type(g, &sources[s].value, arg_type, contracts, lt_names, lt_types) {
+			core.Result::Ok(it) => {
+				match &it {
+					InferType::Known(t) => {
+						val tc = canonical(t);
+						if !have_known { have_known = true; first_canon = _dup(&tc); merged_known = Optional<IrType>::Some(_clone_type(t)); }
+						else {
+							if !_str_eq(&tc, &first_canon) {
+								return core.Result<InferType, IrError>::Err(IrError(message = "merge sources disagree on type (" + _dup(&first_canon) + " vs " + _dup(&tc) + "): " + _dup(id)));
+							}
+						}
+					},
+					InferType::Imprecise() => { any_imprecise = true; },
+					InferType::Unknown() => {}
+				}
+			},
+			core.Result::Err(e) => { return core.Result<InferType, IrError>::Err(e); }
+		}
+		s = s + 1;
+	}
+	if any_imprecise { return core.Result<InferType, IrError>::Ok(InferType::Imprecise()); }
+	match move merged_known {
+		Optional::Some(t) => { return core.Result<InferType, IrError>::Ok(InferType::Known(ty = move t)); },
+		Optional::None => { return core.Result<InferType, IrError>::Ok(InferType::Unknown()); }
+	}
+}
+
+// Infer an expression's type (three-way: Known / Unknown / Imprecise). Err on a structural type
+// error (projecting a key into a non-object, or an absent field).
+fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Array<OpContract>,
+                    lt_names: &Array<String>, lt_types: &Array<InferType>) nothrow -> core.Result<InferType, IrError> {
+	match e {
+		IrExpr::EConst(canonical_json) => {
+			match json.parse_strict(canonical_json) {
+				core.Result::Ok(n) => { return core.Result<InferType, IrError>::Ok(_infer_const_type(&n)); },
+				core.Result::Err(_) => { return core.Result<InferType, IrError>::Ok(InferType::Imprecise()); }
+			}
+		},
+		IrExpr::EArg(path) => {
+			match _project_type(arg_type, path, 0) {
+				core.Result::Ok(t) => { return core.Result<InferType, IrError>::Ok(InferType::Known(ty = move t)); },
+				core.Result::Err(m) => { return core.Result<InferType, IrError>::Err(IrError(message = "EArg: " + m.message)); }
+			}
+		},
+		IrExpr::EResult(node, path) => {
+			match _op_result_type(g, contracts, node) {
+				Optional::Some(rt) => {
+					match _project_type(rt, path, 0) {
+						core.Result::Ok(t) => { return core.Result<InferType, IrError>::Ok(InferType::Known(ty = move t)); },
+						core.Result::Err(m) => { return core.Result<InferType, IrError>::Err(IrError(message = "EResult(" + _dup(node) + "): " + m.message)); }
+					}
+				},
+				Optional::None => { return core.Result<InferType, IrError>::Ok(InferType::Unknown()); }
+			}
+		},
+		IrExpr::ELocal(name, path) => {
+			var i = 0;
+			while i < lt_names.len {
+				if _str_eq(&lt_names[i], name) {
+					match &lt_types[i] {
+						InferType::Known(t) => {
+							match _project_type(t, path, 0) {
+								core.Result::Ok(r) => { return core.Result<InferType, IrError>::Ok(InferType::Known(ty = move r)); },
+								core.Result::Err(m) => { return core.Result<InferType, IrError>::Err(IrError(message = "ELocal(" + _dup(name) + "): " + m.message)); }
+							}
+						},
+						InferType::Imprecise() => { return core.Result<InferType, IrError>::Ok(InferType::Imprecise()); },
+						InferType::Unknown() => { return core.Result<InferType, IrError>::Ok(InferType::Unknown()); }
+					}
+				}
+				i = i + 1;
+			}
+			return core.Result<InferType, IrError>::Ok(InferType::Unknown());
+		}
+	}
+}
+
+// Project a path into a type, returning the (cloned) sub-type. Walks object fields by name and
+// transparently unwraps Optional; any other projection (into a scalar/array, or an absent field)
+// is a type error.
+fn _project_type(ty: &IrType, path: &Array<String>, from: Int) nothrow -> core.Result<IrType, IrError> {
+	if from >= path.len { return core.Result<IrType, IrError>::Ok(_clone_type(ty)); }
+	match ty {
+		IrType::TObject(fields) => {
+			var i = 0;
+			while i < fields.len {
+				if _str_eq(&fields[i].name, &path[from]) { return _project_type(&fields[i].ty, path, from + 1); }
+				i = i + 1;
+			}
+			return core.Result<IrType, IrError>::Err(IrError(message = "type has no field '" + _dup(&path[from]) + "'"));
+		},
+		IrType::TOptional(inner) => { return _project_type(inner.get(), path, from); },
+		default => { return core.Result<IrType, IrError>::Err(IrError(message = "cannot project '" + _dup(&path[from]) + "' into a non-object type")); }
+	}
+}
+
+// Infer a const literal's type. Scalars are precise; a homogeneous array and a closed object whose
+// fields are all precise infer precisely (so a const reaching an op input THROUGH a binder is still
+// checked). An empty/heterogeneous array, or an object/array containing an imprecise element/field,
+// is IMPRECISE — never `Unknown` (which is the untyped-source escape hatch), so it is NOT waved
+// through at a typed boundary (it is value-validated when static, else rejected).
+fn _infer_const_type(node: &json.JsonNode) nothrow -> InferType {
+	if node.is_null() { return InferType::Known(ty = IrType::TNull()); }
+	match node.as_bool() { Optional::Some(_) => { return InferType::Known(ty = IrType::TBool()); }, Optional::None => {} }
+	match node.as_number_raw() {
+		Optional::Some(raw) => {
+			if _is_float_shaped(&raw) { return InferType::Known(ty = IrType::TFloat()); }
+			return InferType::Known(ty = IrType::TInt());
+		},
+		Optional::None => {}
+	}
+	match node.as_string() { Optional::Some(_) => { return InferType::Known(ty = IrType::TString()); }, Optional::None => {} }
+	match node.as_array() {
+		Optional::Some(arr) => {
+			if arr.len == 0 { return InferType::Imprecise(); }
+			match _infer_const_type(&arr[0]) {
+				InferType::Known(e0) => {
+					val c0 = canonical(&e0);
+					var i = 1;
+					while i < arr.len {
+						match _infer_const_type(&arr[i]) {
+							InferType::Known(ei) => { if !_str_eq(&canonical(&ei), &c0) { return InferType::Imprecise(); } },
+							default => { return InferType::Imprecise(); }
+						}
+						i = i + 1;
+					}
+					return InferType::Known(ty = IrType::TArray(elem = core.box(_clone_type(&e0))));
+				},
+				default => { return InferType::Imprecise(); }
+			}
+		},
+		Optional::None => {}
+	}
+	match node.as_object() {
+		Optional::Some(_) => {
+			var fields: Array<IrField> = [];
+			var it = node.entries();
+			var done = false;
+			while !done {
+				match it.next() {
+					Optional::Some(entry) => {
+						match _infer_const_type(entry.value) {
+							InferType::Known(ft) => { fields.push(IrField(name = _dup(entry.key), ty = _clone_type(&ft))); },
+							default => { return InferType::Imprecise(); }   // an imprecise field -> whole object imprecise
+						}
+					},
+					Optional::None => { done = true; }
+				}
+			}
+			_sort_fields(&mut fields);   // canonical needs sorted-by-name fields
+			return InferType::Known(ty = IrType::TObject(fields = move fields));
+		},
+		Optional::None => {}
+	}
+	return InferType::Imprecise();
+}
+
+fn _clone_type(ty: &IrType) nothrow -> IrType {
+	match ty {
+		IrType::TNull() => { return IrType::TNull(); },
+		IrType::TBool() => { return IrType::TBool(); },
+		IrType::TInt() => { return IrType::TInt(); },
+		IrType::TFloat() => { return IrType::TFloat(); },
+		IrType::TString() => { return IrType::TString(); },
+		IrType::TArray(elem) => { return IrType::TArray(elem = core.box(_clone_type(elem.get()))); },
+		IrType::TOptional(inner) => { return IrType::TOptional(inner = core.box(_clone_type(inner.get()))); },
+		IrType::TObject(fields) => {
+			var fs: Array<IrField> = [];
+			var i = 0;
+			while i < fields.len { fs.push(IrField(name = _dup(&fields[i].name), ty = _clone_type(&fields[i].ty))); i = i + 1; }
+			return IrType::TObject(fields = move fs);
+		}
+	}
+}
+
+fn _op_input_type(contracts: &Array<OpContract>, opname: &String) nothrow -> Optional<&IrType> {
+	var i = 0;
+	while i < contracts.len {
+		if _str_eq(&contracts[i].name, opname) {
+			match &contracts[i].input_type { Optional::Some(it) => { return Optional<&IrType>::Some(it); }, Optional::None => { return Optional<&IrType>::None(); } }
+		}
+		i = i + 1;
+	}
+	return Optional<&IrType>::None();
+}
+
+fn _op_result_type(g: &IrGraph, contracts: &Array<OpContract>, node_id: &String) nothrow -> Optional<&IrType> {
+	val t = _find_node(g, node_id);
+	if t < 0 { return Optional<&IrType>::None(); }
+	match &g.nodes[t] {
+		IrNode::NOperation(id, operation, input, next) => {
+			var i = 0;
+			while i < contracts.len {
+				if _str_eq(&contracts[i].name, operation) {
+					match &contracts[i].result_type { Optional::Some(rt) => { return Optional<&IrType>::Some(rt); }, Optional::None => { return Optional<&IrType>::None(); } }
+				}
+				i = i + 1;
+			}
+			return Optional<&IrType>::None();
+		},
+		default => { return Optional<&IrType>::None(); }
+	}
+}
+
+// Topological order of node indices (Kahn). Err if a cycle remains (a validated graph is acyclic).
+fn _topo_order(g: &IrGraph) nothrow -> core.Result<Array<Int>, IrError> {
+	val nn = g.nodes.len;
+	var indeg: Array<Int> = [];
+	var i = 0;
+	while i < nn { indeg.push(0); i = i + 1; }
+	i = 0;
+	while i < nn {
+		var succs: Array<String> = [];
+		_succs(&g.nodes[i], &mut succs);
+		var s = 0;
+		while s < succs.len { val t = _find_node(g, &succs[s]); if t >= 0 { indeg[t] = indeg[t] + 1; } s = s + 1; }
+		i = i + 1;
+	}
+	var q: Array<Int> = [];
+	i = 0;
+	while i < nn { if indeg[i] == 0 { q.push(i); } i = i + 1; }
+	var order: Array<Int> = [];
+	var h = 0;
+	while h < q.len {
+		val cur = q[h];
+		h = h + 1;
+		order.push(cur);
+		var succs: Array<String> = [];
+		_succs(&g.nodes[cur], &mut succs);
+		var s = 0;
+		while s < succs.len {
+			val t = _find_node(g, &succs[s]);
+			if t >= 0 { indeg[t] = indeg[t] - 1; if indeg[t] == 0 { q.push(t); } }
+			s = s + 1;
+		}
+	}
+	if order.len != nn { return core.Result<Array<Int>, IrError>::Err(IrError(message = "graph not acyclic")); }
+	return core.Result<Array<Int>, IrError>::Ok(move order);
 }
 
 fn _is_fold(k: &LoopKind) nothrow -> Bool {

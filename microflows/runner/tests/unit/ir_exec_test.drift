@@ -68,6 +68,17 @@ fn _pgv_accepts(text: &String) -> Bool {
 	}
 }
 
+// Parse an IR value type from its JSON encoding (for type-checker tests).
+fn _pt(text: &String) -> ir.IrType {
+	match json.parse_strict(text) {
+		core.Result::Ok(n) => { return ir.parse_type(&n); },
+		core.Result::Err(e) => { return ir.empty_object_type(); }
+	}
+}
+fn _tc_ok(g: &ir.IrGraph, at: &ir.IrType, cs: &Array<ir.OpContract>) nothrow -> Bool {
+	match ir.type_check_graph(g, at, cs) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
+}
+
 fn _seq(a: &String, b: &String) nothrow -> Bool {
 	if a.byte_length() != b.byte_length() { return false; }
 	var i = 0;
@@ -591,6 +602,140 @@ fn scenario() -> Int {
 	ms4.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
 	val gms4 = ir.IrGraph(nodes = move ms4, entry = "n0");
 	if !_rejects(&gms4) { return 139; }
+
+	// ===== typed expression validation (type_check_graph) =====
+	var no_contracts: Array<ir.OpContract> = [];
+	// valid: arg.flag is Bool -> NIf condition OK.
+	val at_bool = _pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"flag\",\"type\":{\"type\":\"bool\"}}]}");
+	var ty1: Array<ir.IrNode> = [];
+	ty1.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	ty1.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "1")));
+	ty1.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "2")));
+	val gty1 = ir.IrGraph(nodes = move ty1, entry = "n0");
+	if !_tc_ok(&gty1, &at_bool, &no_contracts) { return 140; }
+	// invalid: arg.flag is Int -> NIf condition is not Bool -> rejected.
+	val at_int = _pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"flag\",\"type\":{\"type\":\"int\"}}]}");
+	var ty2: Array<ir.IrNode> = [];
+	ty2.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	ty2.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "1")));
+	ty2.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "2")));
+	val gty2 = ir.IrGraph(nodes = move ty2, entry = "n0");
+	if _tc_ok(&gty2, &at_int, &no_contracts) { return 141; }
+	// invalid op input: reserve declares input {reservation:string}; a const {reservation:5} (int) is rejected.
+	var rc: Array<ir.OpContract> = [];
+	rc.push(ir.OpContract(name = "reserve", input_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"reservation\",\"type\":{\"type\":\"string\"}}]}")), result_type = Optional<ir.IrType>::None()));
+	var ty3: Array<ir.IrNode> = [];
+	ty3.push(ir.IrNode::NOperation(id = "n0", operation = "reserve", input = ir.IrExpr::EConst(canonical_json = "{\"reservation\":5}"), next = "n1"));
+	ty3.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gty3 = ir.IrGraph(nodes = move ty3, entry = "n0");
+	if _tc_ok(&gty3, &at_bool, &rc) { return 142; }
+	// invalid merge: op A result {x:int}, op B result {x:string} -> merge sources disagree on type.
+	var mc: Array<ir.OpContract> = [];
+	mc.push(ir.OpContract(name = "A", input_type = Optional<ir.IrType>::None(), result_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"x\",\"type\":{\"type\":\"int\"}}]}"))));
+	mc.push(ir.OpContract(name = "B", input_type = Optional<ir.IrType>::None(), result_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"x\",\"type\":{\"type\":\"string\"}}]}"))));
+	var ty4: Array<ir.IrNode> = [];
+	ty4.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	ty4.push(ir.IrNode::NOperation(id = "n1", operation = "A", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	ty4.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
+	var ty4s: Array<ir.MergeArm> = [];
+	ty4s.push(ir.MergeArm(from = "n1", value = ir.IrExpr::EResult(node = "n1", path = _p0())));
+	ty4s.push(ir.MergeArm(from = "n2", value = ir.IrExpr::EResult(node = "n2", path = _p0())));
+	ty4.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move ty4s, next = "n4"));
+	ty4.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
+	val gty4 = ir.IrGraph(nodes = move ty4, entry = "n0");
+	if _tc_ok(&gty4, &at_bool, &mc) { return 143; }
+	// bypass-through-binder regression: an object const reaching a typed op input THROUGH a let is
+	// still checked. let x = {reservation:5} (int) ; reserve(local x) with reserve input
+	// {reservation:string} -> ELocal x infers {reservation:int} -> mismatch -> rejected.
+	var ty5: Array<ir.IrNode> = [];
+	ty5.push(ir.IrNode::NLet(id = "n0", name = "x", value = ir.IrExpr::EConst(canonical_json = "{\"reservation\":5}"), next = "n1"));
+	ty5.push(ir.IrNode::NOperation(id = "n1", operation = "reserve", input = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n2"));
+	ty5.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gty5 = ir.IrGraph(nodes = move ty5, entry = "n0");
+	if _tc_ok(&gty5, &at_bool, &rc) { return 144; }
+	// imprecise-field object through a binder: let x = {reservation:[]} (empty array field -> object
+	// infers as Imprecise) ; reserve(local x). The static const is checked by VALUE, so {reservation:[]}
+	// is still rejected against {reservation:string} (not waved through).
+	var ty6: Array<ir.IrNode> = [];
+	ty6.push(ir.IrNode::NLet(id = "n0", name = "x", value = ir.IrExpr::EConst(canonical_json = "{\"reservation\":[]}"), next = "n1"));
+	ty6.push(ir.IrNode::NOperation(id = "n1", operation = "reserve", input = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n2"));
+	ty6.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gty6 = ir.IrGraph(nodes = move ty6, entry = "n0");
+	if _tc_ok(&gty6, &at_bool, &rc) { return 145; }
+	// optional/null through a binder: let x = {maybe:null} ; op input {maybe:Optional<string>}. The
+	// static const validates (null satisfies Optional<string>), so it is ACCEPTED.
+	var oc: Array<ir.OpContract> = [];
+	oc.push(ir.OpContract(name = "opM", input_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"maybe\",\"type\":{\"type\":\"optional\",\"inner\":{\"type\":\"string\"}}}]}")), result_type = Optional<ir.IrType>::None()));
+	var ty7: Array<ir.IrNode> = [];
+	ty7.push(ir.IrNode::NLet(id = "n0", name = "x", value = ir.IrExpr::EConst(canonical_json = "{\"maybe\":null}"), next = "n1"));
+	ty7.push(ir.IrNode::NOperation(id = "n1", operation = "opM", input = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n2"));
+	ty7.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gty7 = ir.IrGraph(nodes = move ty7, entry = "n0");
+	if !_tc_ok(&gty7, &at_bool, &oc) { return 146; }
+	// non-const ASSIGNABILITY: op A result {m:string} -> let y = result(A) -> op B input
+	// {m:Optional<string>}. The inferred {m:string} is ASSIGNABLE to {m:Optional<string>} -> ACCEPTED.
+	var ac: Array<ir.OpContract> = [];
+	ac.push(ir.OpContract(name = "A", input_type = Optional<ir.IrType>::None(), result_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"m\",\"type\":{\"type\":\"string\"}}]}"))));
+	ac.push(ir.OpContract(name = "B", input_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"m\",\"type\":{\"type\":\"optional\",\"inner\":{\"type\":\"string\"}}}]}")), result_type = Optional<ir.IrType>::None()));
+	var ty8: Array<ir.IrNode> = [];
+	ty8.push(ir.IrNode::NOperation(id = "n0", operation = "A", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n1"));
+	ty8.push(ir.IrNode::NLet(id = "n1", name = "y", value = ir.IrExpr::EResult(node = "n0", path = _p0()), next = "n2"));
+	ty8.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::ELocal(name = "y", path = _p0()), next = "n3"));
+	ty8.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gty8 = ir.IrGraph(nodes = move ty8, entry = "n0");
+	if !_tc_ok(&gty8, &at_bool, &ac) { return 147; }
+	// imprecise const through an NMerge binder: both arms merge {reservation:[]} (imprecise) into x,
+	// then reserve(local x) against {reservation:string}. The merge is Imprecise (not Unknown), so it
+	// is REJECTED at the boundary rather than waved through.
+	var ty9: Array<ir.IrNode> = [];
+	ty9.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	ty9.push(ir.IrNode::NLet(id = "n1", name = "p", value = ir.IrExpr::EConst(canonical_json = "1"), next = "n3"));
+	ty9.push(ir.IrNode::NLet(id = "n2", name = "q", value = ir.IrExpr::EConst(canonical_json = "2"), next = "n3"));
+	var ty9s: Array<ir.MergeArm> = [];
+	ty9s.push(ir.MergeArm(from = "n1", value = ir.IrExpr::EConst(canonical_json = "{\"reservation\":[]}")));
+	ty9s.push(ir.MergeArm(from = "n2", value = ir.IrExpr::EConst(canonical_json = "{\"reservation\":[]}")));
+	ty9.push(ir.IrNode::NMerge(id = "n3", name = "x", sources = move ty9s, next = "n4"));
+	ty9.push(ir.IrNode::NOperation(id = "n4", operation = "reserve", input = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n5"));
+	ty9.push(ir.IrNode::NReturn(id = "n5", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gty9 = ir.IrGraph(nodes = move ty9, entry = "n0");
+	if _tc_ok(&gty9, &at_bool, &rc) { return 148; }
+	// imprecise const through an NLoop binder: map xs body {reservation:[]} -> result is Imprecise ->
+	// reserve(local ys) is REJECTED (not waved through).
+	val at_xs = _pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"xs\",\"type\":{\"type\":\"array\",\"elem\":{\"type\":\"int\"}}}]}");
+	var ty10: Array<ir.IrNode> = [];
+	ty10.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EArg(path = _p1("xs")),
+	                           elem = "e", acc = "ys", init = ir.IrExpr::EConst(canonical_json = "null"),
+	                           body = ir.IrExpr::EConst(canonical_json = "{\"reservation\":[]}"), next = "n1"));
+	ty10.push(ir.IrNode::NOperation(id = "n1", operation = "reserve", input = ir.IrExpr::ELocal(name = "ys", path = _p0()), next = "n2"));
+	ty10.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gty10 = ir.IrGraph(nodes = move ty10, entry = "n0");
+	if _tc_ok(&gty10, &at_xs, &rc) { return 149; }
+	// a STATIC non-array loop source is rejected at type-check (not left to a replay fault): the
+	// const {"xs":[]} is an object (infers Imprecise), but a loop source must BE an array.
+	var ty11: Array<ir.IrNode> = [];
+	ty11.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EConst(canonical_json = "{\"xs\":[]}"),
+	                           elem = "e", acc = "ys", init = ir.IrExpr::EConst(canonical_json = "null"),
+	                           body = ir.IrExpr::ELocal(name = "e", path = _p0()), next = "n1"));
+	ty11.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gty11 = ir.IrGraph(nodes = move ty11, entry = "n0");
+	if _tc_ok(&gty11, &at_bool, &no_contracts) { return 150; }
+	// a non-array imprecise literal LAUNDERED through a merge into a loop source is also rejected:
+	// both arms merge {"xs":[]} (Imprecise) into m, then map over local m — the merge result is
+	// Imprecise and not statically an array, so the loop source is rejected (not left to replay).
+	var ty12: Array<ir.IrNode> = [];
+	ty12.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
+	ty12.push(ir.IrNode::NLet(id = "n1", name = "p", value = ir.IrExpr::EConst(canonical_json = "1"), next = "n3"));
+	ty12.push(ir.IrNode::NLet(id = "n2", name = "q", value = ir.IrExpr::EConst(canonical_json = "2"), next = "n3"));
+	var ty12s: Array<ir.MergeArm> = [];
+	ty12s.push(ir.MergeArm(from = "n1", value = ir.IrExpr::EConst(canonical_json = "{\"xs\":[]}")));
+	ty12s.push(ir.MergeArm(from = "n2", value = ir.IrExpr::EConst(canonical_json = "{\"xs\":[]}")));
+	ty12.push(ir.IrNode::NMerge(id = "n3", name = "m", sources = move ty12s, next = "n4"));
+	ty12.push(ir.IrNode::NLoop(id = "n4", kind = ir.LoopKind::LMap(), source = ir.IrExpr::ELocal(name = "m", path = _p0()),
+	                           elem = "e", acc = "ys", init = ir.IrExpr::EConst(canonical_json = "null"),
+	                           body = ir.IrExpr::ELocal(name = "e", path = _p0()), next = "n5"));
+	ty12.push(ir.IrNode::NReturn(id = "n5", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gty12 = ir.IrGraph(nodes = move ty12, entry = "n0");
+	if _tc_ok(&gty12, &at_bool, &no_contracts) { return 151; }
 
 	// merge config: valid merge parses + validates; unknown source key / missing 'from' rejected.
 	if !_pgv_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"f\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"A\",\"input\":{\"const\":{}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"B\",\"input\":{\"const\":{}},\"next\":\"n3\"},{\"kind\":\"merge\",\"id\":\"n3\",\"name\":\"picked\",\"sources\":[{\"from\":\"n1\",\"value\":{\"result\":{\"node\":\"n1\"}}},{\"from\":\"n2\",\"value\":{\"result\":{\"node\":\"n2\"}}}],\"next\":\"n4\"},{\"kind\":\"return\",\"id\":\"n4\",\"value\":{\"local\":{\"name\":\"picked\"}}}]}") { return 135; }
