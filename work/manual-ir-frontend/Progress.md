@@ -2,14 +2,15 @@
 
 Charter (objective, decisions, plan, verification): [README.md](./README.md).
 
-## Status: **Parser slices 1 + 2a + 2b-i LANDED — straight-line + `if`/`case` + `let`/expr-refs `.mf` lowers to the proven IR with content_hash + execution parity**
+## Status: **Parser slices 1 + 2a + 2b-i + 2b-ii-a LANDED — straight-line + `if`/`case` + `let` + named-op/result-refs `.mf` lowers to the proven IR with content_hash + execution parity**
 
 The lane is scoped (IR-first, parser-last). The **manual-IR runtime surface is complete and fully
-proven**, and **the textual front end now covers straight-line, `if`/`case`, and `let` + arg/local
-expression references**: a `.mf` source lowers into the EXACT config the manual IR already executes
-and hashes (a flat `"plan"` for const-only straight-line, a control-flow `"graph"` for
-`if`/`case`/`let`), with NO new runtime semantics. Full `just test` green on certified driftc
-0.33.42 / ABI 17 — integration **113/113** (was 101), microflows 20/20, SP 110/110, singular 16/16.
+proven**, and **the textual front end now covers straight-line, `if`/`case`, `let` + arg/local
+expression refs, and operation naming + `result` references**: a `.mf` source lowers into the EXACT
+config the manual IR already executes and hashes (a flat `"plan"` for const-only straight-line, a
+control-flow `"graph"` for `if`/`case`/`let`/named-ops), with NO new runtime semantics. Full
+`just test` green on certified driftc 0.33.42 / ABI 17 — integration **117/117** (was 101),
+microflows 20/20, SP 110/110, singular 16/16.
 
 Proven runtime surface (unchanged this slice): durable arguments, the typed value/argument model,
 and the control-flow graph IR with EXECUTION + structural validation + graph-authoritative
@@ -25,9 +26,8 @@ and the control-flow graph IR with EXECUTION + structural validation + graph-aut
 Branches/loops/merges/lets write no continuation/event (only `NOperation` is a durable boundary);
 replay re-derives the pure path deterministically.
 
-**Next: parser slice 2b-ii** — operation-RESULT references (`result`, via an operation-naming model)
-+ `merge` surface syntax. Then 2b-iii: finite array expressions (`map`/`filter`/`fold`); then
-diagnostics/spans. Scoped below.
+**Next: parser slice 2b-ii-b** — `merge` surface syntax (`NMerge`). Then 2b-iii: finite array
+expressions (`map`/`filter`/`fold`); then diagnostics/spans. Scoped below.
 
 ## Landed: parser slice 1 — straight-line textual front end (lowering parity, no new semantics)
 
@@ -138,7 +138,9 @@ straight-line workflow is byte-for-byte UNCHANGED (still a flat `"plan"`).
   requested-not-settled, and a claimable resume recomputed the SAME value → GET-first, no second PUT).
 - **Tests.** Unit (`parser_test` 10): a `let p = arg req; reserve local p` source lowers to a graph
   whose `graph_canonical` equals the hand-authored equivalent; a projected `arg req.reservation`
-  lowers to `{arg:[req,reservation]}`; an undefined `local` PARSES but `validate_graph` REJECTS it
+  lowers to `{arg:[req,reservation]}` AND a projected `local p.reservation` lowers to
+  `{local:{name:p,path:[reservation]}}` (both checked by graph_canonical); an undefined `local` PARSES
+  but `validate_graph` REJECTS it
   (parser doesn't track scope); malformed (`let` w/o `=`, bad expression keyword, missing expr after
   `=`) rejected; a `const` scalar value binds. Integration (C13, 4 checks): a parser-lowered `let`
   graph and a hand-authored graph produce IDENTICAL `--emit-content-hash`; `let p = arg req; reserve
@@ -146,10 +148,40 @@ straight-line workflow is byte-for-byte UNCHANGED (still a flat `"plan"`).
   (event-count parity with the no-let `reserve arg req`); a resume RECOMPUTES the bound value
   (GET-first, no second PUT); an undefined local is rejected at lowering. Integration 109→113.
 
+## Landed: parser slice 2b-ii-a — operation naming + result references (lowers to `EResult`)
+
+`.mf` now lets a `let` name an OPERATION's result. STILL a pure front end (no new IR nodes/runtime/
+storage); lowers to a plain `NOperation` + `EResult` references, reusing the graph machinery unchanged.
+- **Chosen source semantics.** `let <bind> = <op> <input-expr>` is a NAMED OPERATION: it lowers to an
+  ordinary `NOperation` (parser-generated pre-order id), and `<bind>` becomes a source-stable alias
+  for that op's RESULT. `result <bind>(.<field>)*` lowers to `{result:{node:<op-id>, path?}}`. The
+  `let` disambiguator is the first RHS token: a `{` or an expression keyword
+  (`const`/`arg`/`local`/`result`) ⇒ a pure-value `NLet` (2b-i); any other leading identifier ⇒ the
+  operation name. (`let x = result r` is therefore a pure `NLet` binding a result expression.)
+- **Result-name resolution.** A parser symbol table maps result-name → the named op's node id. A
+  reference to an UNKNOWN name (or a FORWARD reference) is a parse error; a DUPLICATE result name is a
+  parse error (the table can't resolve two). Because the alias lives ONLY in the parser (never in the
+  IR), result refs are STABLE under source formatting AND under renaming the alias — the emitted graph
+  (and `content_hash`) is identical.
+- **Scope is the runtime's, unchanged.** The parser does NOT enforce dominance; a CROSS-BRANCH result
+  ref without a merge (a name bound in one branch, referenced after the join) resolves in the parser
+  but `validate_graph` REJECTS it at the build gate (`EResult` must be dominated) — before any dispatch.
+- **Tests.** Unit (`parser_test` 11): `let r = reserve {…}; confirm result r` lowers to a graph whose
+  `graph_canonical` equals the hand-authored equivalent (`result r` → `{result:{node:n0}}`); reformat
+  + rename `r`→`myRes` yields the IDENTICAL identity; unknown / duplicate result name → parse error; a
+  cross-branch ref PARSES but `validate_graph` rejects it; `let x = result r` parses. Integration
+  (C14, 4 checks): parser-lowered and hand-authored graphs produce IDENTICAL `--emit-content-hash`,
+  both execute, and a named op's RESULT feeds the downstream `confirm` input (the durable confirm
+  op input.reserved == the reserve result); result refs are STABLE under formatting/alias-rename
+  (same `--emit-content-hash`); a cross-branch ref is rejected at lowering; a RESUME recomputes the
+  result-derived value from the durable operation result (op set unchanged, trailing op GET-first, no
+  second PUT). Integration 113→117.
+
 ## Deferred: later parser sub-slices (each lowers to already-proven IR; no new runtime semantics)
-- **Slice 2b-ii:** operation-RESULT references (`result`, via an operation-naming model — e.g.
-  `let x = <op> <input>` binding the op's result) + `merge` surface syntax (`NMerge`; selects a
-  branch-local op result). Lowers to the `"graph"` config; same content_hash/execution parity.
+- **Slice 2b-ii-b:** `merge` surface syntax (`NMerge`; selects a branch-local op result at a join to
+  feed shared downstream work). Lowers to the `"graph"` config; same content_hash/execution parity;
+  merge writes no event; resume recomputes the merged value; reversal compensates only the taken
+  branch + shared downstream op (matching the manual-IR C9 proof).
 - **Slice 2b-iii:** finite array expressions (`map`/`filter`/`fold` → `NLoop`) surface syntax.
 - **Slice 3+:** diagnostics/spans (currently shallow — byte offsets), and possible `../drift-lang`
   reuse for the lexer/parser/type-checker.
@@ -656,17 +688,23 @@ Earlier rounds:
     inputs become expressions (`{…}`/`const`/`arg`/`local`). content_hash + execution parity; `let`
     writes no event; resume recomputes from durable state; undefined local rejected at the build gate
     (unit `parser_test` 10; integration C13). LANDED, full `just test` green (integration 113).
-  - [ ] **slice 2b-ii —** operation-RESULT refs (`result`, via op-naming) + `merge` syntax (`NMerge`).
+  - [x] **slice 2b-ii-a — operation naming + result refs** → `let <bind> = <op> <input>` names an op
+    (plain `NOperation`); `result <bind>` → `EResult` via a parser symbol table. Parity + execution;
+    result refs stable under formatting/alias-rename; unknown/duplicate/cross-branch refs rejected at
+    parse or the build gate; resume recomputes from durable results (unit `parser_test` 11; integration
+    C14). LANDED, full `just test` green (integration 117).
+  - [ ] **slice 2b-ii-b —** `merge` syntax (`NMerge`).
   - [ ] **slice 2b-iii —** finite array expressions (`map`/`filter`/`fold` → `NLoop`) syntax.
   - [ ] **slice 3+ —** diagnostics/spans; possible `../drift-lang` reuse.
 
 ## Next action
-**Step 5, parser slice 2b-ii:** operation-RESULT references + `merge`. The crux is an
-operation-NAMING model so source can reference a settled op's result (node ids are parser-generated):
-e.g. `let x = <op> <input>` binds the op's result, and `x`/`result x` lowers to `{result:{node:…}}`.
-Then `merge` (`NMerge`) selects a branch-local op result at a join. Same acceptance: parser-emitted
-config vs hand-authored graph config → identical `--emit-content-hash` and identical run outcome;
-pure boundaries write no continuation. No runtime/IR/storage changes (front end only).
+**Step 5, parser slice 2b-ii-b:** `merge` surface syntax → `NMerge`. With operation naming + `result`
+refs now in place (2b-ii-a), add source syntax for a phi that rejoins branches, binding a name to a
+value selected by which branch was taken (so a branch-local op result can feed shared downstream
+work). Lowers to `NMerge` + `MergeArm{from,value}`. Same acceptance: parser-emitted vs hand-authored
+graph → identical `--emit-content-hash` and run outcome; merge writes no event; resume recomputes the
+merged value from durable results; reversal compensates only the taken branch + shared downstream op
+(matching the manual-IR C9 proof). No runtime/IR/storage changes (front end only).
 
 ## Open questions (see README)
 How far back replay restarts (last settled op vs start) · `../drift-lang` reuse for step 5.

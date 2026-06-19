@@ -302,11 +302,7 @@ fn scenario() -> Int {
 	if _str_eq(&let_h, &"<bad-graph>") { return 70; }
 	if !_str_eq(&let_l, &let_h) { return 71; }
 
-	// A let value with a PROJECTED arg path and a local with a projection path lower to the expected
-	// graph (arg req.reservation -> {arg:[req,reservation]}; local p.reservation -> {local:{name,path}}).
-	val proj_src = "args { req: { reservation: string } }\nop reserve { input: { reservation: string } }\n"
-		+ "steps { let p = arg req\n reserve { \"reservation\": \"x\" } }\n";
-	match parser.parse_source(&proj_src) { core.Result::Ok(_) => {}, core.Result::Err(_) => { return 72; } }
+	// A PROJECTED arg path in a let value lowers to {arg:[req,reservation]}.
 	val proj2 = "args { req: { reservation: string } }\nop reserve { input: { reservation: string } }\n"
 		+ "steps { let r = arg req.reservation\n reserve { \"reservation\": \"x\" } }\n";
 	var proj_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
@@ -319,6 +315,20 @@ fn scenario() -> Int {
 	val proj_l = _graph_canon_of_node(&proj_pw.body);
 	val proj_h = _graph_canon_of_node(&proj_hand);
 	if !_str_eq(&proj_l, &proj_h) { return 75; }
+
+	// A PROJECTED LOCAL lowers to {local:{name, path:[…]}}: `let p = arg req; reserve local p.reservation`.
+	val locp_src = "args { req: { reservation: string } }\nsteps { let p = arg req\n reserve local p.reservation }\n";
+	var locp_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
+	match parser.parse_source(&locp_src) { core.Result::Ok(p) => { locp_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 83; } }
+	var ec8: Array<parser.ContractDecl> = [];
+	var eb8 = json.new_array().to_node();
+	var locp_pw = parser.ParsedWorkflow(body = move eb8, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec8);
+	match move locp_pw_opt { Optional::Some(p) => { locp_pw = move p; }, Optional::None => { return 84; } }
+	val locp_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"let\",\"id\":\"n0\",\"name\":\"p\",\"value\":{\"arg\":[\"req\"]},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"p\",\"path\":[\"reservation\"]}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val locp_l = _graph_canon_of_node(&locp_pw.body);
+	val locp_h = _graph_canon_of_node(&locp_hand);
+	if _str_eq(&locp_h, &"<bad-graph>") { return 85; }
+	if !_str_eq(&locp_l, &locp_h) { return 86; }
 
 	// The parser does NOT track scope; an undefined local PARSES but `validate_graph` rejects it (so
 	// malformed binder scope fails at the build gate, before any dispatch).
@@ -338,7 +348,54 @@ fn scenario() -> Int {
 	// well-formed: a `const` scalar value binds; a const-object op input still works.
 	if !_parse_ok(&"steps { let y = const 5\n reserve { \"reservation\": \"z\" } }\n") { return 82; }
 
+	// ---- 11. (slice 2b-ii-a) named op (`let r = <op> …`) + result refs (`result r`) ----
+	// `let r = reserve {…}; confirm result r` lowers to a graph whose IR identity equals the
+	// hand-authored equivalent (the named op is a plain NOperation; `result r` -> {result:{node:n0}}).
+	val res_src = "op reserve { input: { reservation: string } result: { reserved: string } }\n"
+		+ "op confirm { input: { reserved: string } }\n"
+		+ "steps { let r = reserve { \"reservation\": \"A\" }\n confirm result r }\n";
+	val res_body = _parse_body(&res_src);
+	val res_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"confirm\",\"input\":{\"result\":{\"node\":\"n0\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val res_l = _graph_canon_of_node(&res_body);
+	val res_h = _graph_canon_of_node(&res_hand);
+	if _str_eq(&res_h, &"<bad-graph>") { return 87; }
+	if !_str_eq(&res_l, &res_h) { return 88; }
+
+	// RESULT REFS ARE STABLE under source formatting AND the result-var name: reformatting + renaming
+	// `r` -> `myRes` yields the IDENTICAL graph identity (the result name is a parser alias, never in
+	// the IR — `result r` resolves to the stable pre-order node id).
+	val res2 = "# reformatted\nop reserve { input: { reservation: string }  result: { reserved: string } }\n"
+		+ "op confirm { input: { reserved: string } }\n"
+		+ "steps {\n  let   myRes  =  reserve  {  \"reservation\":  \"A\"  }\n  confirm   result   myRes\n}\n";
+	val res2_body = _parse_body(&res2);
+	val res2_l = _graph_canon_of_node(&res2_body);
+	if !_str_eq(&res2_l, &res_l) { return 89; }
+
+	// unknown result name / duplicate result name -> parse error.
+	if !_parse_err(&"op confirm { input: { reserved: string } }\nsteps { confirm result ghost }\n") { return 90; }
+	if !_parse_err(&"op reserve { input: { reservation: string } }\nop confirm { input: { reserved: string } }\nsteps { let r = reserve { \"reservation\": \"A\" }\n let r = reserve { \"reservation\": \"B\" }\n confirm result r }\n") { return 92; }
+
+	// CROSS-BRANCH result ref WITHOUT merge: `r` is defined only in the then-branch but referenced
+	// after the join — it PARSES (the parser doesn't track dominance) but `validate_graph` REJECTS it
+	// (EResult must be dominated). So a cross-branch ref fails at the build gate, before any dispatch.
+	val xbr_src = "args { flag: bool }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
+		+ "op confirm { input: { reserved: string } }\n"
+		+ "steps { if flag { let r = reserve { \"reservation\": \"A\" } } else { reserve { \"reservation\": \"B\" } } confirm result r }\n";
+	val xbr_body = _parse_body(&xbr_src);
+	if !_graph_rejects(&xbr_body) { return 93; }
+
+	// a `let x = result r` (an NLet binding a result expression) parses + lowers fine.
+	if !_parse_ok(&"op reserve { input: { reservation: string } result: { reserved: string } }\nop confirm { input: { reserved: string } }\nsteps { let r = reserve { \"reservation\": \"A\" }\n let x = result r\n confirm local x }\n") { return 94; }
+
 	return 0;
+}
+
+// Parse a source and return its lowered body graph/plan node (aborts the scenario on a parse error).
+fn _parse_body(src: &String) -> json.JsonNode {
+	match parser.parse_source(src) {
+		core.Result::Ok(p) => { return p.body.clone_deep(); },
+		core.Result::Err(_) => { throw TestError(message = "parse failed"); }
+	}
 }
 
 // Parse a graph node ({entry,nodes}) and return its canonical IR identity (or a sentinel).

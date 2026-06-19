@@ -260,31 +260,34 @@ parser/type-checker/IR/diagnostics when we get here.)
   model.
 
 ## Current status and next action
-**Manual-IR runtime surface COMPLETE (steps 1–4) AND parser slices 1 + 2a + 2b-i (step 5) LANDED.**
-The typed IR, durable arguments, structural + typed validation, control-flow EXECUTION (straight-line,
-`if`, `case`, finite array expressions, cross-branch merge, `let`, `return`), graph-authoritative
-`content_hash`, and pinned replay/reversal regressions are all landed; and the textual front end now
-covers straight-line + `if`/`case` + `let`/arg/local expression refs — a `.mf` source lowers into the
-EXACT config the manual IR executes, with NO new runtime semantics. Full `just test` green (certified
-driftc 0.33.42 / ABI 17; integration **113/113**, was 101). See Progress.md for the per-chunk record.
+**Manual-IR runtime surface COMPLETE (steps 1–4) AND parser slices 1 + 2a + 2b-i + 2b-ii-a (step 5)
+LANDED.** The typed IR, durable arguments, structural + typed validation, control-flow EXECUTION
+(straight-line, `if`, `case`, finite array expressions, cross-branch merge, `let`, `return`),
+graph-authoritative `content_hash`, and pinned replay/reversal regressions are all landed; and the
+textual front end now covers straight-line + `if`/`case` + `let`/arg/local refs + operation naming &
+`result` refs — a `.mf` source lowers into the EXACT config the manual IR executes, with NO new
+runtime semantics. Full `just test` green (certified driftc 0.33.42 / ABI 17; integration **117/117**,
+was 101). See Progress.md for the per-chunk record.
 
 Parser (`microflows/runner/src/parser.drift` + `--lower-source` CLI): `args` → `argument_type`,
 `op … { input/result }` → operation contracts, `steps { … }` → a flat `"plan"` (const-only
-straight-line) or a control-flow `"graph"` (`if`/`case`/`let`). `if`/`case` lower to graph nodes with
-pre-order ids that re-converge at the join (selection from durable args); `let <name> = <expr>` lowers
-to `NLet`, and operation inputs are expressions (`{…}` const / `const <json>` / `arg <path>` /
-`local <name>[.path]`). Reuses `_build_plan`/`parse_graph`/`validate_graph`/`type_check_graph`/
-op-depth/`content_hash` unchanged (no new IR nodes, execution paths, or durable state). Source is the
-SOLE authority on contracts (base contracts stripped), and `--lower-source` runs the real
-build/validation path (DB-free) before printing, so an invalid source/config (unknown op,
-op-imbalanced branch, missing `case` default, undefined `local`, …) fails AT lowering. Parity proven:
-parser-lowered and hand-authored configs produce the IDENTICAL `--emit-content-hash` and execute the
-same; `let` is a pure boundary (no event) and resume recomputes bound values from durable state.
+straight-line) or a control-flow `"graph"`. `if`/`case` lower to graph nodes with pre-order ids that
+re-converge at the join (selection from durable args); `let <name> = <expr>` lowers to `NLet`, and
+operation inputs are expressions (`{…}` const / `const <json>` / `arg <path>` / `local <name>[.path]`
+/ `result <name>[.path]`); `let <bind> = <op> <input>` NAMES an operation so `result <bind>` lowers to
+`EResult` (the alias lives only in the parser → result refs are stable under source formatting and
+alias-rename). Reuses `_build_plan`/`parse_graph`/`validate_graph`/`type_check_graph`/op-depth/
+`content_hash` unchanged (no new IR nodes, execution paths, or durable state). Source is the SOLE
+authority on contracts (base contracts stripped), and `--lower-source` runs the real build/validation
+path (DB-free) before printing, so an invalid source/config (unknown op, op-imbalanced branch, missing
+`case` default, undefined `local`, undominated/cross-branch `result` ref, …) fails AT lowering. Parity
+proven: parser-lowered and hand-authored configs produce the IDENTICAL `--emit-content-hash` and
+execute the same; pure boundaries (`let`) write no event and resume recomputes derived/result values
+from durable state.
 
-Next action: **Step 5, parser slice 2b-ii** — operation-RESULT references (`result`, via an
-operation-naming model since node ids are parser-generated) + `merge` (`NMerge`). Then 2b-iii: finite
-array expressions (`map`/`filter`/`fold`). Later: diagnostics/spans (currently shallow), `../drift-lang`
-reuse TBD.
+Next action: **Step 5, parser slice 2b-ii-b** — `merge` surface syntax (`NMerge`; selects a
+branch-local op result at a join). Then 2b-iii: finite array expressions (`map`/`filter`/`fold`).
+Later: diagnostics/spans (currently shallow), `../drift-lang` reuse TBD.
 
 ## Open questions / blockers
 - **✅ RESOLVED on Drift 0.33.35 — recursive-IR clean form landed.** `core.Box<T>` + the

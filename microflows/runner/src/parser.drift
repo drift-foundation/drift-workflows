@@ -1,4 +1,4 @@
-// Microflows textual frontend — parser slices 1 + 2a (straight-line + if/case).
+// Microflows textual frontend — parser slices 1 + 2a + 2b (straight-line + if/case + let/refs).
 //
 // This module is a PURE FRONT END: it lowers `.mf` source text into the SAME config the manual IR
 // already executes and hashes — a flat `"plan"` (straight-line) or a control-flow `"graph"`
@@ -17,10 +17,12 @@
 //
 //   <stmt> := <op> <expr>                                   (an operation step; input is an expression)
 //           | let <ident> = <expr>                          (a pure-value binding -> NLet; slice 2b-i)
+//           | let <ident> = <op> <expr>                     (a NAMED op; <ident> aliases its RESULT; 2b-ii-a)
 //           | if <arg-path> { <stmt>* } [ else { <stmt>* } ]  (slice 2a)
 //           | case <arg-path> { (<json-value> { <stmt>* })* default { <stmt>* } }  (slice 2a)
 //   <expr> := { …json-object… }   (const object) | const <json-value> | arg <arg-path>
-//           | local <ident> ('.' <ident>)*   (a let/loop/merge binding ref, optionally projected)
+//           | local <ident> ('.' <ident>)*    (a let binding ref, optionally projected)
+//           | result <ident> ('.' <ident>)*   (a NAMED op's result, optionally projected; 2b-ii-a)
 //   <type> := int | float | bool | string | null
 //           | { <ident>: <type>, ... }   (object; trailing/optional commas tolerated)
 //           | [ <type> ]                  (array)
@@ -29,10 +31,11 @@
 // if/case lower to operation/if/case/return graph nodes with PRE-ORDER ids ("n0","n1",…); branch
 // bodies re-converge at the following statement (the join). Conditions/scrutinees are durable-arg
 // paths. The runtime's uniform-op-depth rule rejects op-imbalanced branches at the build gate.
+// `result <name>` resolves through a parser symbol table (result-name -> the named op's id) — node
+// ids are STABLE under source formatting; cross-branch/undominated refs are rejected by validate_graph.
 //
-// Deferred to later sub-slices (each lowering to already-proven IR): operation-RESULT references
-// (`result`) + `merge` (need an operation-naming model), finite array expressions (`map`/`filter`/
-// `fold`), richer diagnostics, and `../drift-lang` reuse.
+// Deferred to later sub-slices (each lowering to already-proven IR): `merge` syntax (NMerge), finite
+// array expressions (`map`/`filter`/`fold` -> NLoop), richer diagnostics, and `../drift-lang` reuse.
 //
 // Standalone & dependency-light: imports only std.* plus the runner-owned `ir` (unused at runtime),
 // so the unit test compiles it with src/ir.drift, no DB.
@@ -90,6 +93,7 @@ struct Stmt {
 }
 variant StmtKind {
 	KOp(name: String, input: json.JsonNode),                                  // an operation step; `input` is an EXPRESSION json
+	KNamedOp(bind: String, op: String, input: json.JsonNode),                 // let <bind> = <op> <input> — a NAMED op (result aliased by <bind>); slice 2b-ii-a
 	KLet(name: String, value: json.JsonNode),                                 // let <name> = <expr> (a pure-value binding -> NLet)
 	KIf(cond: Array<String>, then_body: Array<Stmt>, else_body: Array<Stmt>), // if <arg-path> { … } else { … }
 	KCase(scrut: Array<String>, arms: Array<SCaseArm>, default_body: Array<Stmt>)
@@ -106,7 +110,9 @@ struct SCaseArm {
 // other modules need no error-type-qualified catch (errors-as-values; mirrors ir.parse_object_type).
 pub fn parse_source(source: &String) -> core.Result<ParsedWorkflow, ParseError> {
 	try {
-		var c = Cursor(src = _dup(source), pos = 0, node_count = 0);
+		var rn0: Array<String> = [];
+		var ri0: Array<String> = [];
+		var c = Cursor(src = _dup(source), pos = 0, node_count = 0, res_names = move rn0, res_ids = move ri0);
 		val pw = _parse(&mut c);
 		return core.Result<ParsedWorkflow, ParseError>::Ok(move pw);
 	} catch ParseError(e) {
@@ -122,7 +128,9 @@ pub fn parse_source(source: &String) -> core.Result<ParsedWorkflow, ParseError> 
 // lowering error (surfaced before any DB/dispatch).
 pub fn lower(source: &String, base: &json.JsonNode) -> core.Result<json.JsonNode, ParseError> {
 	try {
-		var c = Cursor(src = _dup(source), pos = 0, node_count = 0);
+		var rn0: Array<String> = [];
+		var ri0: Array<String> = [];
+		var c = Cursor(src = _dup(source), pos = 0, node_count = 0, res_names = move rn0, res_ids = move ri0);
 		val pw = _parse(&mut c);
 		val merged = _merge(base, &pw);
 		return core.Result<json.JsonNode, ParseError>::Ok(move merged);
@@ -136,7 +144,9 @@ pub fn lower(source: &String, base: &json.JsonNode) -> core.Result<json.JsonNode
 struct Cursor {
 	src: String,
 	pos: Int,
-	node_count: Int   // pre-order graph-node id allocator (slice 2a)
+	node_count: Int,        // pre-order graph-node id allocator (slice 2a)
+	res_names: Array<String>,  // source result-name -> op node id (slice 2b-ii-a); parallel arrays
+	res_ids: Array<String>
 }
 
 fn _eof(c: &Cursor) nothrow -> Bool { return c.pos >= c.src.byte_length(); }
@@ -380,21 +390,79 @@ fn _parse_stmt(c: &mut Cursor) -> Stmt {
 	return Stmt(id = move id, kind = StmtKind::KOp(name = move kw, input = move input));
 }
 
-// let_stmt := 'let' ident '=' <expr> — a pure-value binding (lowered to NLet). The bound value is
-// recomputed on replay from durable args/locals; it is not a durable boundary (writes no event).
+// let_stmt := 'let' ident '=' ( <expr> | <op> <expr> ).
+//   - RHS an EXPRESSION (a `{…}` object or `const`/`arg`/`local`/`result`) -> a pure-value NLet.
+//   - RHS an OPERATION call (`<op-name> <input-expr>`) -> a NAMED OPERATION: the op node keeps a
+//     parser-generated id, and <bind> aliases its RESULT (referenced downstream as `result <bind>`).
+// The disambiguator is the first RHS token: a `{` or an expression keyword => expression; otherwise
+// the leading identifier is the operation name. A pure NLet value is recomputed on replay (no event);
+// a named op is a normal durable NOperation.
 fn _parse_let(c: &mut Cursor, var id: String) -> Stmt {
-	val name = _read_ident(c);
+	val bind = _read_ident(c);
 	_expect(c, 61, &"'='");   // '='
-	val value = _parse_value_expr(c);
-	return Stmt(id = move id, kind = StmtKind::KLet(name = move name, value = move value));
+	_skip_ws(c);
+	var is_expr = false;
+	if !_eof(c) and cast<Int>(c.src.byte_at(c.pos)) == 123 { is_expr = true; }   // '{'
+	else {
+		val w = _peek_ident(c);
+		if _is_expr_keyword(&w) { is_expr = true; }
+	}
+	if is_expr {
+		val value = _parse_value_expr(c);
+		return Stmt(id = move id, kind = StmtKind::KLet(name = move bind, value = move value));
+	}
+	// named operation: `let <bind> = <op-name> <input-expr>`
+	val op = _read_ident(c);
+	val input = _parse_value_expr(c);
+	_res_bind(c, &bind, &id);   // record <bind> -> this op's node id (rejects a duplicate result name)
+	return Stmt(id = move id, kind = StmtKind::KNamedOp(bind = move bind, op = move op, input = move input));
+}
+
+fn _is_expr_keyword(w: &String) nothrow -> Bool {
+	return _str_eq(w, &"const") or _str_eq(w, &"arg") or _str_eq(w, &"local") or _str_eq(w, &"result");
+}
+
+// Peek the upcoming identifier WITHOUT consuming it (leading whitespace is skipped). Returns "" if
+// the next token is not an identifier.
+fn _peek_ident(c: &mut Cursor) nothrow -> String {
+	_skip_ws(c);
+	if _eof(c) or !_is_ident_start(c.src.byte_at(c.pos)) { return ""; }
+	val start = c.pos;
+	var i = c.pos;
+	val n = c.src.byte_length();
+	while i < n and _is_ident_char(c.src.byte_at(i)) { i = i + 1; }
+	match text.substring(&c.src, start, i - start) {
+		core.Result::Ok(s) => { return move s; },
+		core.Result::Err(_) => { return ""; }
+	}
+}
+
+// Record a source result-name -> op node id; a duplicate result-name is rejected (the table can't
+// resolve two), keeping `result <name>` unambiguous.
+fn _res_bind(c: &mut Cursor, name: &String, id: &String) -> Void {
+	var i = 0;
+	while i < c.res_names.len {
+		if _str_eq(&c.res_names[i], name) { throw ParseError(message = "duplicate result name '" + _dup(name) + "'"); }
+		i = i + 1;
+	}
+	c.res_names.push(_dup(name));
+	c.res_ids.push(_dup(id));
+}
+
+fn _res_lookup(c: &Cursor, name: &String) nothrow -> Optional<String> {
+	var i = 0;
+	while i < c.res_names.len {
+		if _str_eq(&c.res_names[i], name) { return Optional<String>::Some(_dup(&c.res_ids[i])); }
+		i = i + 1;
+	}
+	return Optional<String>::None();
 }
 
 // expr := '{' …json-object… '}'      (const object shorthand -> {const: <obj>})
 //       | 'const' <json-value>        (an explicit constant of any JSON shape -> {const: <value>})
 //       | 'arg' <arg-path>            (durable argument ref -> {arg: [...]})
 //       | 'local' <name> <path>       (a let/loop/merge binding ref -> {local: {name, path?}})
-// (operation-RESULT references — {result:{node,…}} — are deferred to the merge sub-slice, which
-// needs an operation-naming model since node ids are parser-generated.)
+//       | 'result' <name> <path>      (a NAMED op's result -> {result: {node, path?}}; slice 2b-ii-a)
 fn _parse_value_expr(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
 	if _eof(c) { throw ParseError(message = "expected an expression"); }
@@ -423,7 +491,29 @@ fn _parse_value_expr(c: &mut Cursor) -> json.JsonNode {
 		val segs = _parse_arg_path(c);   // segs[0] = binding name; segs[1..] = projection path
 		return _local_expr(&segs);
 	}
-	throw ParseError(message = "expected an expression (const / arg / local / a {…} object), got '" + _dup(&kw) + "'");
+	if _str_eq(&kw, &"result") {
+		val segs = _parse_arg_path(c);   // segs[0] = result name; segs[1..] = projection path
+		match _res_lookup(c, &segs[0]) {
+			Optional::Some(rid) => { return _result_expr(&rid, &segs); },
+			Optional::None => { throw ParseError(message = "unknown result name '" + _dup(&segs[0]) + "' (declare it with `let <name> = <op> …` before referencing)"); }
+		}
+	}
+	throw ParseError(message = "expected an expression (const / arg / local / result / a {…} object), got '" + _dup(&kw) + "'");
+}
+
+// {"result": {"node": <id>, "path"?: [segs[1..]]}}
+fn _result_expr(id: &String, segs: &Array<String>) -> json.JsonNode {
+	var ro = json.new_object();
+	ro.set("node", _jstr(_dup(id)));
+	if segs.len > 1 {
+		var pa = json.new_array();
+		var i = 1;
+		while i < segs.len { pa.push(_jstr(_dup(&segs[i]))); i = i + 1; }
+		ro.set("path", pa.to_node());
+	}
+	var o = json.new_object();
+	o.set("result", ro.to_node());
+	return o.to_node();
 }
 
 // {"local": {"name": <segs[0]>, "path"?: [segs[1..]]}}
@@ -675,6 +765,10 @@ fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 	match &stmt.kind {
 		StmtKind::KOp(name, input) => {
 			out.push(_op_node(&stmt.id, name, input, succ));
+		},
+		StmtKind::KNamedOp(bind, op, input) => {
+			// A named op lowers to a plain NOperation; `bind` was only the parse-time result alias.
+			out.push(_op_node(&stmt.id, op, input, succ));
 		},
 		StmtKind::KLet(name, value) => {
 			out.push(_let_node(&stmt.id, name, value, succ));

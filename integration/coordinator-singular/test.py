@@ -1941,6 +1941,94 @@ def main():
         check("parser_let_undefined_local_rejected",
               undef_code != 0 and undef_cfg is None, (undef_code, undef_cfg))
 
+        # ===== C14. TEXTUAL FRONTEND slice 2b-ii-a: operation naming + result refs =====
+        # `let r = <op> <input>` names an operation (the op node keeps a generated id; `r` aliases its
+        # RESULT); `result r` lowers to {result:{node:<op-id>}} (EResult). Acceptance: parser-emitted
+        # graph and a hand-authored graph have IDENTICAL --emit-content-hash; both execute the same; a
+        # named op's RESULT feeds downstream work; result refs are STABLE under source formatting / the
+        # alias name; a cross-branch ref WITHOUT merge is rejected at lowering; a resume RECOMPUTES the
+        # result-derived value from the durable operation result.
+        RESVD_C = {"type": "object", "fields": [{"name": "reserved", "type": {"type": "string"}}]}
+
+        # let r = reserve {reservation:A}; confirm result r   — confirm's input is the reserve RESULT.
+        res_mf = (
+            "op reserve { input: { reservation: string } result: { reserved: string } }\n"
+            "op confirm { input: { reserved: string } }\n"
+            "steps {\n"
+            "  let r = reserve { \"reservation\": \"A\" }\n"
+            "  confirm result r\n"
+            "}\n"
+        )
+        res_code, res_low = lower_source(res_mf)
+        res_hand = _hand({"reserve": {"input_type": RESV_C, "result_type": RESVD_C}, "confirm": {"input_type": RESVD_C}},
+                         {"type": "object", "fields": []}, {"entry": "n0", "nodes": [
+            {"kind": "operation", "id": "n0", "operation": "reserve", "input": {"const": {"reservation": "A"}}, "next": "n1"},
+            {"kind": "operation", "id": "n1", "operation": "confirm", "input": {"result": {"node": "n0"}}, "next": "n2"},
+            {"kind": "return", "id": "n2", "value": {"const": None}},
+        ]})
+        hr_l = emit_content_hash(res_low) if res_low else "<none>"
+        hr_h = emit_content_hash(res_hand)
+        wrr = _wf_id(); ex0 = _exec_count(base); crr, brr = run_runner(res_low, wrr, arguments="{}")
+        exrr = _exec_count(base) - ex0
+        wrh = _wf_id(); crh, brh = run_runner(res_hand, wrh, arguments="{}")
+        # the confirm op's stored input.reserved == "A" proves the reserve RESULT flowed via `result r`.
+        confirm_in = _mdb(f"SELECT JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reserved')) FROM tb_mf_operation "
+                          f"WHERE workflow_id = UNHEX('{wrr}') AND operation_name = 'confirm'")
+        check("parser_result_ref_graph_parity_and_exec",
+              res_code == 0 and res_low is not None and hr_l != "" and hr_l == hr_h
+              and crr == 0 and brr.get("workflow") == "completed" and exrr == 2 and confirm_in == [["A"]]
+              and crh == 0 and brh.get("workflow") == "completed",
+              (res_code, hr_l, hr_h, crr, brr, exrr, confirm_in, crh, brh))
+
+        # RESULT REFS ARE STABLE under source formatting AND the alias name: reformatting + renaming
+        # `r` -> `myRes` yields the IDENTICAL content_hash (the alias is never in the IR).
+        res2_code, res2_low = lower_source(
+            "# reformatted + renamed alias\n"
+            "op reserve { input: { reservation: string }  result: { reserved: string } }\n"
+            "op confirm { input: { reserved: string } }\n"
+            "steps {\n  let   myRes = reserve { \"reservation\": \"A\" }\n  confirm    result    myRes\n}\n")
+        check("parser_result_ref_stable_under_formatting",
+              res2_code == 0 and res2_low is not None and emit_content_hash(res2_low) == hr_l,
+              (res2_code, emit_content_hash(res2_low) if res2_low else None, hr_l))
+
+        # A cross-branch result ref WITHOUT merge (`r` defined only in the then-branch, referenced after
+        # the join) PARSES but is rejected at lowering by validate_graph (EResult must be dominated).
+        xbr_code, xbr_cfg = lower_source(
+            "args { flag: bool }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
+            "op confirm { input: { reserved: string } }\n"
+            "steps { if flag { let r = reserve { \"reservation\": \"A\" } } else { reserve { \"reservation\": \"B\" } } confirm result r }\n")
+        check("parser_cross_branch_result_ref_rejected",
+              xbr_code != 0 and xbr_cfg is None, (xbr_code, xbr_cfg))
+
+        # RESUME recomputes the result-derived value from the durable operation result: op1 reserve
+        # settles, op2 confirm settles with its input DERIVED from op1's result, a trailing op3 stays
+        # requested-not-settled; a claimable resume re-derives the SAME path (op set unchanged) and
+        # reconciles the trailing op GET-first (no second PUT). (Ops untyped so the fault const passes.)
+        pend_res_mf = (
+            "steps {\n"
+            "  let r = reserve { \"reservation\": \"rr\" }\n"
+            "  confirm result r\n"
+            "  reserve { \"reservation\": \"rp\", \"_fault\": { \"respond_pending\": true } }\n"
+            "}\n"
+        )
+        prc, pr_low = lower_source(pend_res_mf)
+        wpr = _wf_id()
+        opq = (f"SELECT operation_seq, operation_name, status, "
+               f"COALESCE(JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reserved')), JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation'))) "
+               f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wpr}') ORDER BY operation_seq")
+        cps, bps = run_runner(pr_low, wpr, arguments="{}")
+        op_s = _mdb(opq)
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wpr}')")
+        pu0, rq0 = _put_count(base), _request_count(base)
+        cpr, bpr = run_runner(pr_low, wpr)
+        pu_d, rq_d = _put_count(base) - pu0, _request_count(base) - rq0
+        op_r = _mdb(opq)
+        check("parser_result_ref_resume_recomputes_from_durable_result",
+              prc == 0 and cps == 9 and bps.get("workflow") == "pending"
+              and op_s == [["1", "reserve", "2", "rr"], ["2", "confirm", "2", "rr"], ["3", "reserve", "1", "rp"]]
+              and cpr == 9 and bpr.get("workflow") == "pending" and op_r == op_s and pu_d == 0 and rq_d >= 1,
+              (prc, cps, bps, op_s, cpr, bpr, op_r, f"put+{pu_d} req+{rq_d}"))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the
         # LOCAL authoritative result; no dependency on the participant.
         stub.terminate()
@@ -1987,7 +2075,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 113
+    EXPECTED_CHECKS = 117
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")
