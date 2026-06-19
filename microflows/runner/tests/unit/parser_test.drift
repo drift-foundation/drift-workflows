@@ -10,6 +10,7 @@ module microflows.runner.tests.parser_test;
 
 import std.core as core;
 import std.json as json;
+import std.text as txt;
 import microflows.runner.ir as ir;
 import microflows.runner.parser as parser;
 
@@ -473,7 +474,80 @@ fn scenario() -> Int {
 	// source must be an expression (`arg`/`local`/`result`/`const`/`{…}`), not a bare name.
 	if !_parse_err(&"args { cands: [ { reservation: string } ] }\nsteps { let ys = map cands each c local c\n reserve local ys }\n") { return 115; }
 
+	// ---- 14. (diagnostics) parse errors are STRUCTURED events: stable `code` + byte_offset/line/column
+	// (+ expected/found). Tests pin the CODE and POSITION fields (not the human prose). ----
+	// A. bad top-level keyword: `frob` at line 1, column 1, byte 0; found = "frob".
+	val eA = _err_of(&"frob {}\nsteps { ping {} }\n");
+	if !_str_eq(&eA.code, &"unknown-keyword") { return 116; }
+	if eA.byte_offset != 0 or eA.line != 1 or eA.column != 1 { return 117; }
+	if !_str_eq(&eA.found, &"frob") { return 118; }
+	// B. bad type: `blob` at line 1, column 11, byte 10; found = "blob".
+	val eB = _err_of(&"args { x: blob }\nsteps { ping {} }\n");
+	if !_str_eq(&eB.code, &"unknown-type") { return 119; }
+	if eB.byte_offset != 10 or eB.line != 1 or eB.column != 11 { return 120; }
+	if !_str_eq(&eB.found, &"blob") { return 121; }
+	// C. bad expression keyword: `bogus` at line 1, column 17, byte 16.
+	val eC = _err_of(&"steps { reserve bogus }\n");
+	if !_str_eq(&eC.code, &"expected-expression") { return 122; }
+	if eC.byte_offset != 16 or eC.line != 1 or eC.column != 17 { return 123; }
+	// D. unterminated block: at EOF (line 1, column 8, byte 7).
+	val eD = _err_of(&"steps {");
+	if !_str_eq(&eD.code, &"unterminated-block") { return 124; }
+	if eD.byte_offset != 7 or eD.line != 1 or eD.column != 8 { return 125; }
+	// E. case default ordering (code + line 2; an arm after `default`).
+	val eE = _err_of(&"args { m: string }\nsteps { case m { default { ping {} } \"a\" { ping {} } } }\n");
+	if !_str_eq(&eE.code, &"case-arm-after-default") { return 126; }
+	if eE.line != 2 { return 127; }
+	// F. malformed loop syntax (code + line 2; `map` without `each`).
+	val eF = _err_of(&"args { xs: [int] }\nsteps { let ys = map arg xs local e\n reserve {} }\n");
+	if !_str_eq(&eF.code, &"expected-each") { return 128; }
+	if eF.line != 2 { return 129; }
+	// G. an expected-token error carries the `expected` field ('{' here).
+	val eG = _err_of(&"steps ping {}\n");   // 'steps' must be followed by '{'
+	if !_str_eq(&eG.code, &"expected-token") { return 130; }
+	if !_str_eq(&eG.expected, &"'{'") { return 131; }
+
+	// SMOKE: the human render includes the code, line/column, and a caret.
+	val rendered = parser.render_diagnostic(&"frob {}\nsteps { ping {} }\n", &eA);
+	if !_contains(&rendered, &"unknown-keyword") { return 132; }
+	if !_contains(&rendered, &"line 1, column 1") { return 133; }
+	if !_contains(&rendered, &"^") { return 134; }
+
+	// MULTIBYTE: `byte_offset` counts BYTES, `column` counts SCALARS. A 2-byte `é` before the error
+	// (the missing input of `bad`, at the final `}`) means byte_offset (34) and column (34) are EQUAL —
+	// i.e. column is one LESS than the byte-based column (35) would be. Pins the scalar-column contract.
+	val eM = _err_of(&"steps { ping { \"m\": \"café\" } bad }\n");
+	if !_str_eq(&eM.code, &"expected-expression") { return 135; }
+	if eM.line != 1 { return 136; }
+	if eM.byte_offset != 34 { return 137; }
+	if eM.column != 34 { return 138; }
+
+	// NO-POSITION diagnostic (a config/lowering error, byte_offset = -1) renders WITHOUT a source
+	// excerpt/caret — clamping to byte 0 / line 0 would be misleading.
+	match parser.lower(&"op ghost { input: { x: int } }\nsteps { reserve { \"reservation\": \"p\" } }\n", &base) {
+		core.Result::Ok(_) => { return 139; },
+		core.Result::Err(eN) => {
+			if eN.byte_offset != -1 { return 140; }
+			val rN = parser.render_diagnostic(&"some unrelated source\ntext\n", &eN);
+			if !_contains(&rN, &"unknown-operation") { return 141; }
+			if _contains(&rN, &"^") { return 142; }        // no caret for a no-position error
+			if _contains(&rN, &"line 0") { return 143; }   // no bogus "line 0"
+		}
+	}
+
 	return 0;
+}
+
+// Parse a source expected to FAIL; return its structured ParseError (aborts the scenario if it parses).
+fn _err_of(src: &String) -> parser.ParseError {
+	match parser.parse_source(src) {
+		core.Result::Ok(_) => { throw TestError(message = "expected a parse error"); },
+		core.Result::Err(e) => { return move e; }
+	}
+}
+
+fn _contains(hay: &String, needle: &String) nothrow -> Bool {
+	return txt.contains(hay, needle);
 }
 
 // Build an ir.OpContract with declared input + result types (from type-encoding JSON literals).

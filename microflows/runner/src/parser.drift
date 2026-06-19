@@ -9,7 +9,12 @@
 // and the hand-authored manual config for the same workflow produce the identical content_hash and
 // the identical run outcome; branch/case selection comes from durable args).
 //
-// Surface (deliberately narrow — diagnostics/spans are shallow):
+// Parse failures are STRUCTURED diagnostics — `ParseError` carries a stable kebab-case `code` + a
+// source position (byte_offset/line/column) + optional expected/found (mirroring std.source's and
+// drift-web's structured-error convention). `render_diagnostic` formats one for human CLI output
+// (code + line/column + a caret excerpt); the runner also emits it as a std.log event.
+//
+// Surface:
 //   args { name: <type>, ... }                  -> the closed-object argument_type
 //   op <name> { input: <type>  result: <type> } -> operation input/result CONTRACTS (both optional)
 //   steps { <stmt> ... }                         -> the workflow body (>=1 statement)
@@ -51,8 +56,10 @@
 // name is still usable as a bare op step. The loop body is expression-only, so no remote op can appear
 // inside iteration (the side-effect-free-loop invariant holds structurally).
 //
-// Deferred to later sub-slices (each lowering to already-proven IR): `case`-join merge, richer
-// diagnostics, and `../drift-lang` reuse.
+// Deferred to later sub-slices (each lowering to already-proven IR): `case`-join merge, and possible
+// future reuse of Drift frontend utilities — ONLY via a versioned package dependency or explicit
+// vendoring into this repo, NOT a `../drift-lang` sibling-checkout dependency. Diagnostics stay LOCAL
+// to this module.
 //
 // Standalone & dependency-light: imports only std.* plus the runner-owned `ir` (unused at runtime),
 // so the unit test compiles it with src/ir.drift, no DB.
@@ -72,12 +79,26 @@ export {
 	ContractDecl,
 	ParsedWorkflow,
 	parse_source,
-	lower
+	lower,
+	render_diagnostic
 };
 
-// A parse/lowering failure. All-scalar (a single String), so a typed `catch ParseError(e)` can
-// project `e.message` — the error is reconstructed as a fresh native value at the Result boundary.
-pub error ParseError { message: String }
+// A STRUCTURED parse/lowering failure (developer-facing source diagnostic). `code` is a stable,
+// kebab-case, machine-readable identifier (tests pin it); `byte_offset`/`line`/`column` locate the
+// offending byte (1-based line/column, column counting UTF-8 scalars — std.source's convention);
+// `expected`/`found` carry the relevant tokens when applicable (else ""); `message` is a SHORT human
+// description (secondary — wording may change). All fields are SCALAR so a typed `catch ParseError(e)`
+// can project them. `render_diagnostic` formats one for human CLI output. (Lowering/config errors that
+// have no source position use byte_offset = -1.)
+pub error ParseError {
+	code: String,
+	byte_offset: Int,
+	line: Int,
+	column: Int,
+	expected: String,
+	found: String,
+	message: String
+}
 
 // One operation's declared CONTRACT, lowered to the config type encoding. Both optional: an `op`
 // that declares neither input nor result adds no contract (the operation stays unchecked).
@@ -143,7 +164,9 @@ pub fn parse_source(source: &String) -> core.Result<ParsedWorkflow, ParseError> 
 		val pw = _parse(&mut c);
 		return core.Result<ParsedWorkflow, ParseError>::Ok(move pw);
 	} catch ParseError(e) {
-		return core.Result<ParsedWorkflow, ParseError>::Err(ParseError(message = e.message));
+		// Fill line/column from the byte offset ONCE here (the source is in scope), and return a
+		// movable error value (typed-catch binders are read-only views).
+		return core.Result<ParsedWorkflow, ParseError>::Err(_finalize(source, &e.code, e.byte_offset, &e.expected, &e.found, &e.message));
 	}
 }
 
@@ -162,7 +185,7 @@ pub fn lower(source: &String, base: &json.JsonNode) -> core.Result<json.JsonNode
 		val merged = _merge(base, &pw);
 		return core.Result<json.JsonNode, ParseError>::Ok(move merged);
 	} catch ParseError(e) {
-		return core.Result<json.JsonNode, ParseError>::Err(ParseError(message = e.message));
+		return core.Result<json.JsonNode, ParseError>::Err(_finalize(source, &e.code, e.byte_offset, &e.expected, &e.found, &e.message));
 	}
 }
 
@@ -203,7 +226,7 @@ fn _is_ident_char(b: Byte) nothrow -> Bool {
 fn _read_ident(c: &mut Cursor) -> String {
 	_skip_ws(c);
 	if _eof(c) or !_is_ident_start(c.src.byte_at(c.pos)) {
-		throw ParseError(message = "expected an identifier at byte " + fmt.format_int(c.pos));
+		throw ParseError(code = "expected-identifier", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an identifier");
 	}
 	val start = c.pos;
 	while !_eof(c) and _is_ident_char(c.src.byte_at(c.pos)) { c.pos = c.pos + 1; }
@@ -214,7 +237,7 @@ fn _read_ident(c: &mut Cursor) -> String {
 fn _expect(c: &mut Cursor, code: Int, what: &String) -> Void {
 	_skip_ws(c);
 	if _eof(c) or cast<Int>(c.src.byte_at(c.pos)) != code {
-		throw ParseError(message = "expected " + _dup(what) + " at byte " + fmt.format_int(c.pos));
+		throw ParseError(code = "expected-token", byte_offset = c.pos, line = 0, column = 0, expected = _dup(what), found = "", message = "expected " + _dup(what));
 	}
 	c.pos = c.pos + 1;
 }
@@ -229,7 +252,7 @@ fn _accept(c: &mut Cursor, code: Int) nothrow -> Bool {
 fn _slice(c: &Cursor, start: Int, len: Int) -> String {
 	match text.substring(&c.src, start, len) {
 		core.Result::Ok(s) => { return move s; },
-		core.Result::Err(_) => { throw ParseError(message = "internal: bad source slice"); }
+		core.Result::Err(_) => { throw ParseError(code = "internal", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "internal: bad source slice"); }
 	}
 }
 
@@ -247,16 +270,17 @@ fn _parse(c: &mut Cursor) -> ParsedWorkflow {
 
 	_skip_ws(c);
 	while !_eof(c) {
+		val kw_start = c.pos;
 		val kw = _read_ident(c);
 		if _str_eq(&kw, &"args") {
-			if seen_args { throw ParseError(message = "duplicate 'args' block"); }
+			if seen_args { throw ParseError(code = "duplicate-block", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'args' block"); }
 			seen_args = true;
 			arg_type = Optional<json.JsonNode>::Some(_parse_object_type(c));
 		} else if _str_eq(&kw, &"op") {
 			val cd = _parse_op_decl(c, &contracts);
 			contracts.push(move cd);
 		} else if _str_eq(&kw, &"steps") {
-			if seen_steps { throw ParseError(message = "duplicate 'steps' block"); }
+			if seen_steps { throw ParseError(code = "duplicate-block", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'steps' block"); }
 			seen_steps = true;
 			val stmts = _parse_steps(c);
 			// A purely straight-line workflow lowers to a flat "plan" (slice-1 output unchanged);
@@ -270,11 +294,11 @@ fn _parse(c: &mut Cursor) -> ParsedWorkflow {
 				is_graph = true;
 			}
 		} else {
-			throw ParseError(message = "unknown top-level keyword '" + _dup(&kw) + "' (expected args/op/steps)");
+			throw ParseError(code = "unknown-keyword", byte_offset = kw_start, line = 0, column = 0, expected = "args/op/steps", found = _dup(&kw), message = "unknown top-level keyword '" + _dup(&kw) + "'");
 		}
 		_skip_ws(c);
 	}
-	if !seen_steps { throw ParseError(message = "missing 'steps' block"); }
+	if !seen_steps { throw ParseError(code = "missing-steps", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "missing 'steps' block"); }
 	return ParsedWorkflow(body = move body, is_graph = is_graph, arg_type = move arg_type, contracts = move contracts);
 }
 
@@ -293,7 +317,7 @@ fn _parse_type(c: &mut Cursor) -> json.JsonNode {
 // base := scalar-keyword | object-type | array-type
 fn _parse_base_type(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
-	if _eof(c) { throw ParseError(message = "expected a type"); }
+	if _eof(c) { throw ParseError(code = "expected-type", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a type"); }
 	val b = c.src.byte_at(c.pos);
 	if cast<Int>(b) == 123 { return _parse_object_type(c); }   // '{'
 	if cast<Int>(b) == 91 {                                     // '[' array
@@ -305,6 +329,7 @@ fn _parse_base_type(c: &mut Cursor) -> json.JsonNode {
 		o.set("elem", move elem);
 		return o.to_node();
 	}
+	val kw_start = c.pos;
 	var kw = _read_ident(c);
 	if _str_eq(&kw, &"int") or _str_eq(&kw, &"float") or _str_eq(&kw, &"bool")
 	   or _str_eq(&kw, &"string") or _str_eq(&kw, &"null") {
@@ -312,7 +337,7 @@ fn _parse_base_type(c: &mut Cursor) -> json.JsonNode {
 		o.set("type", _jstr(move kw));
 		return o.to_node();
 	}
-	throw ParseError(message = "unknown type '" + _dup(&kw) + "'");
+	throw ParseError(code = "unknown-type", byte_offset = kw_start, line = 0, column = 0, expected = "int/float/bool/string/null/{…}/[…]", found = _dup(&kw), message = "unknown type '" + _dup(&kw) + "'");
 }
 
 // object-type := '{' (ident ':' type (','? ident ':' type)* ','?)? '}' — lowered to the config
@@ -322,7 +347,7 @@ fn _parse_object_type(c: &mut Cursor) -> json.JsonNode {
 	_expect(c, 123, &"'{'");
 	var fields = json.new_array();
 	while !_accept(c, 125) {   // until '}'
-		if _eof(c) { throw ParseError(message = "unterminated object type"); }
+		if _eof(c) { throw ParseError(code = "unterminated-type", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated object type"); }
 		var name = _read_ident(c);
 		_expect(c, 58, &"':'");
 		val fty = _parse_type(c);
@@ -341,10 +366,11 @@ fn _parse_object_type(c: &mut Cursor) -> json.JsonNode {
 // op_decl := 'op' ident '{' (('input'|'result') ':' type)* '}'. The leading 'op' is already
 // consumed by the caller. Each clause is unique; the op name must be unique across the file.
 fn _parse_op_decl(c: &mut Cursor, existing: &Array<ContractDecl>) -> ContractDecl {
+	val name_start = c.pos;
 	var name = _read_ident(c);
 	var i = 0;
 	while i < existing.len {
-		if _str_eq(&existing[i].name, &name) { throw ParseError(message = "duplicate 'op' declaration for '" + _dup(&name) + "'"); }
+		if _str_eq(&existing[i].name, &name) { throw ParseError(code = "duplicate-op", byte_offset = name_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'op' declaration for '" + _dup(&name) + "'"); }
 		i = i + 1;
 	}
 	_expect(c, 123, &"'{'");
@@ -353,19 +379,20 @@ fn _parse_op_decl(c: &mut Cursor, existing: &Array<ContractDecl>) -> ContractDec
 	var has_input = false;
 	var has_result = false;
 	while !_accept(c, 125) {   // until '}'
-		if _eof(c) { throw ParseError(message = "unterminated 'op' block for '" + _dup(&name) + "'"); }
+		if _eof(c) { throw ParseError(code = "unterminated-op", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated 'op' block for '" + _dup(&name) + "'"); }
+		val clause_start = c.pos;
 		val clause = _read_ident(c);
 		_expect(c, 58, &"':'");
 		if _str_eq(&clause, &"input") {
-			if has_input { throw ParseError(message = "duplicate 'input' in op '" + _dup(&name) + "'"); }
+			if has_input { throw ParseError(code = "duplicate-clause", byte_offset = clause_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'input' in op '" + _dup(&name) + "'"); }
 			has_input = true;
 			input_t = Optional<json.JsonNode>::Some(_parse_type(c));
 		} else if _str_eq(&clause, &"result") {
-			if has_result { throw ParseError(message = "duplicate 'result' in op '" + _dup(&name) + "'"); }
+			if has_result { throw ParseError(code = "duplicate-clause", byte_offset = clause_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'result' in op '" + _dup(&name) + "'"); }
 			has_result = true;
 			result_t = Optional<json.JsonNode>::Some(_parse_type(c));
 		} else {
-			throw ParseError(message = "unknown op clause '" + _dup(&clause) + "' (expected input/result)");
+			throw ParseError(code = "unknown-op-clause", byte_offset = clause_start, line = 0, column = 0, expected = "", found = "", message = "unknown op clause '" + _dup(&clause) + "' (expected input/result)");
 		}
 		val _ = _accept(c, 44);   // optional ','
 	}
@@ -381,11 +408,11 @@ fn _parse_steps(c: &mut Cursor) -> Array<Stmt> {
 	_expect(c, 123, &"'{'");
 	var stmts: Array<Stmt> = [];
 	while !_accept(c, 125) {   // until '}'
-		if _eof(c) { throw ParseError(message = "unterminated 'steps' block"); }
+		if _eof(c) { throw ParseError(code = "unterminated-block", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated 'steps' block"); }
 		val s = _parse_stmt(c);
 		stmts.push(move s);
 	}
-	if stmts.len == 0 { throw ParseError(message = "'steps' block must declare at least one step"); }
+	if stmts.len == 0 { throw ParseError(code = "empty-steps", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "'steps' block must declare at least one step"); }
 	return move stmts;
 }
 
@@ -395,7 +422,7 @@ fn _parse_block(c: &mut Cursor) -> Array<Stmt> {
 	_expect(c, 123, &"'{'");
 	var stmts: Array<Stmt> = [];
 	while !_accept(c, 125) {
-		if _eof(c) { throw ParseError(message = "unterminated block"); }
+		if _eof(c) { throw ParseError(code = "unterminated-block", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated block"); }
 		val s = _parse_stmt(c);
 		stmts.push(move s);
 	}
@@ -465,10 +492,10 @@ fn _parse_loop(c: &mut Cursor, var id: String, var as_name: String) -> Stmt {
 	val source = _parse_value_expr(c);
 	var init: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
 	if _str_eq(&kind, &"fold") {
-		if !_accept_keyword(c, &"from") { throw ParseError(message = "`fold` requires `from <init>`"); }
+		if !_accept_keyword(c, &"from") { throw ParseError(code = "expected-from", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "`fold` requires `from <init>`"); }
 		init = Optional<json.JsonNode>::Some(_parse_value_expr(c));
 	}
-	if !_accept_keyword(c, &"each") { throw ParseError(message = "loop requires `each <elem> <body>`"); }
+	if !_accept_keyword(c, &"each") { throw ParseError(code = "expected-each", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "loop requires `each <elem> <body>`"); }
 	val elem = _read_ident(c);
 	val body = _parse_value_expr(c);
 	return Stmt(id = move id, kind = StmtKind::KLoop(as_name = move as_name, kind = move kind, source = move source, elem = move elem, init = move init, body = move body));
@@ -511,7 +538,7 @@ fn _peek_ident(c: &mut Cursor) nothrow -> String {
 fn _res_bind(c: &mut Cursor, name: &String, id: &String) -> Void {
 	var i = 0;
 	while i < c.res_names.len {
-		if _str_eq(&c.res_names[i], name) { throw ParseError(message = "duplicate result name '" + _dup(name) + "'"); }
+		if _str_eq(&c.res_names[i], name) { throw ParseError(code = "duplicate-result-name", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "duplicate result name '" + _dup(name) + "'"); }
 		i = i + 1;
 	}
 	c.res_names.push(_dup(name));
@@ -534,17 +561,18 @@ fn _res_lookup(c: &Cursor, name: &String) nothrow -> Optional<String> {
 //       | 'result' <name> <path>      (a NAMED op's result -> {result: {node, path?}}; slice 2b-ii-a)
 fn _parse_value_expr(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
-	if _eof(c) { throw ParseError(message = "expected an expression"); }
+	if _eof(c) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an expression"); }
 	if cast<Int>(c.src.byte_at(c.pos)) == 123 {   // '{' const object shorthand
 		val start = c.pos;
 		val end = _scan_json_object(c);
 		val raw = _slice(c, start, end - start);
-		val obj = _parse_json_object(&raw);
+		val obj = _parse_json_object(c, &raw, start);
 		var o = json.new_object();
 		o.set("const", move obj);
 		return o.to_node();
 	}
-	if !_is_ident_start(c.src.byte_at(c.pos)) { throw ParseError(message = "expected an expression at byte " + fmt.format_int(c.pos)); }
+	if !_is_ident_start(c.src.byte_at(c.pos)) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an expression"); }
+	val kw_start = c.pos;
 	val kw = _read_ident(c);
 	if _str_eq(&kw, &"const") {
 		val v = _parse_json_value(c);
@@ -564,10 +592,10 @@ fn _parse_value_expr(c: &mut Cursor) -> json.JsonNode {
 		val segs = _parse_arg_path(c);   // segs[0] = result name; segs[1..] = projection path
 		match _res_lookup(c, &segs[0]) {
 			Optional::Some(rid) => { return _result_expr(&rid, &segs); },
-			Optional::None => { throw ParseError(message = "unknown result name '" + _dup(&segs[0]) + "' (declare it with `let <name> = <op> …` before referencing)"); }
+			Optional::None => { throw ParseError(code = "unknown-result-name", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "unknown result name '" + _dup(&segs[0]) + "' (declare it with `let <name> = <op> …` before referencing)"); }
 		}
 	}
-	throw ParseError(message = "expected an expression (const / arg / local / result / a {…} object), got '" + _dup(&kw) + "'");
+	throw ParseError(code = "expected-expression", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "expected an expression (const / arg / local / result / a {…} object), got '" + _dup(&kw) + "'");
 }
 
 // {"result": {"node": <id>, "path"?: [segs[1..]]}}
@@ -617,9 +645,9 @@ fn _parse_if(c: &mut Cursor, var id: String) -> Stmt {
 	// that shape (an op input expression never starts with `<ident> =`), so it parses as an op step.
 	if _peek_merge_clause(c) {
 		val _ = _accept_keyword(c, &"merge");
-		if !has_else { throw ParseError(message = "`merge` requires an `else` branch"); }
-		_require_merge_branch(&then_body, &"then");
-		_require_merge_branch(&else_body, &"else");
+		if !has_else { throw ParseError(code = "merge-requires-else", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "`merge` requires an `else` branch"); }
+		_require_merge_branch(c, &then_body, &"then");
+		_require_merge_branch(c, &else_body, &"else");
 		val mname = _read_ident(c);
 		_expect(c, 61, &"'='");   // '='
 		val then_val = _parse_value_expr(c);
@@ -634,8 +662,8 @@ fn _parse_if(c: &mut Cursor, var id: String) -> Stmt {
 // A merge branch must be non-empty and end in a SINGLE-EXIT statement (operation/let), so it
 // contributes exactly one immediate predecessor (one merge source). A nested if/case ending a branch
 // would create multiple predecessors — out of scope for this minimum form (rejected here).
-fn _require_merge_branch(body: &Array<Stmt>, which: &String) -> Void {
-	if body.len == 0 { throw ParseError(message = "`merge` " + _dup(which) + "-branch must not be empty"); }
+fn _require_merge_branch(c: &Cursor, body: &Array<Stmt>, which: &String) -> Void {
+	if body.len == 0 { throw ParseError(code = "merge-branch-empty", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "`merge` " + _dup(which) + "-branch must not be empty"); }
 	var single = false;
 	match &body[body.len - 1].kind {
 		StmtKind::KOp(_, _) => { single = true; },
@@ -643,7 +671,7 @@ fn _require_merge_branch(body: &Array<Stmt>, which: &String) -> Void {
 		StmtKind::KLet(_, _) => { single = true; },
 		default => {}
 	}
-	if !single { throw ParseError(message = "`merge` " + _dup(which) + "-branch must end in an operation or let (not nested if/case)"); }
+	if !single { throw ParseError(code = "merge-branch-not-single-exit", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "`merge` " + _dup(which) + "-branch must end in an operation or let (not nested if/case)"); }
 }
 
 // case_stmt := 'case' arg-path '{' (json-value block)* 'default' block '}' — the scrutinee is a
@@ -656,23 +684,24 @@ fn _parse_case(c: &mut Cursor, var id: String) -> Stmt {
 	var default_body: Array<Stmt> = [];
 	var has_default = false;
 	while !_accept(c, 125) {
-		if _eof(c) { throw ParseError(message = "unterminated 'case' block"); }
+		if _eof(c) { throw ParseError(code = "unterminated-block", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated 'case' block"); }
+		val arm_start = c.pos;
 		if _accept_keyword(c, &"default") {
-			if has_default { throw ParseError(message = "duplicate 'default' arm in case"); }
+			if has_default { throw ParseError(code = "duplicate-default", byte_offset = arm_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'default' arm in case"); }
 			has_default = true;
 			default_body = _parse_block(c);
 		} else {
 			// `default` must be LAST (grammar: (json-value block)* default block). An arm after it
 			// would lower BEFORE the default but read as a fallthrough in source — reject the
 			// misleading ordering rather than silently reorder.
-			if has_default { throw ParseError(message = "case arm after 'default' (default must be the last arm)"); }
+			if has_default { throw ParseError(code = "case-arm-after-default", byte_offset = arm_start, line = 0, column = 0, expected = "", found = "", message = "case arm after 'default' (default must be the last arm)"); }
 			val mv = _parse_json_value(c);
 			val body = _parse_block(c);
 			arms.push(SCaseArm(match_json = move mv, body = move body));
 		}
 	}
-	if arms.len == 0 { throw ParseError(message = "case must declare at least one arm"); }
-	if !has_default { throw ParseError(message = "case requires a 'default' arm"); }
+	if arms.len == 0 { throw ParseError(code = "case-missing-arm", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "case must declare at least one arm"); }
+	if !has_default { throw ParseError(code = "case-missing-default", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "case requires a 'default' arm"); }
 	return Stmt(id = move id, kind = StmtKind::KCase(scrut = move scrut, arms = move arms, default_body = move default_body));
 }
 
@@ -715,13 +744,13 @@ fn _alloc_id(c: &mut Cursor) nothrow -> String {
 // Parse a CONSTANT JSON value (case-arm match): string / number / bool / null / object / array.
 fn _parse_json_value(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
-	if _eof(c) { throw ParseError(message = "expected a JSON value"); }
+	if _eof(c) { throw ParseError(code = "expected-json-value", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a JSON value"); }
 	val start = c.pos;
 	val end = _scan_json_value(c);
 	val raw = _slice(c, start, end - start);
 	match json.parse_strict(&raw) {
 		core.Result::Ok(n) => { return move n; },
-		core.Result::Err(_) => { throw ParseError(message = "invalid JSON value in case arm 'match'"); }
+		core.Result::Err(_) => { throw ParseError(code = "invalid-json", byte_offset = start, line = 0, column = 0, expected = "", found = "", message = "invalid JSON value in case arm 'match'"); }
 	}
 }
 
@@ -738,7 +767,7 @@ fn _scan_json_value(c: &mut Cursor) -> Int {
 		if text.is_space(c.src.byte_at(i)) or ch == 123 or ch == 125 or ch == 44 or ch == 93 or ch == 91 { break; }
 		i = i + 1;
 	}
-	if i == c.pos { throw ParseError(message = "empty JSON value"); }
+	if i == c.pos { throw ParseError(code = "empty-json-value", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "empty JSON value"); }
 	c.pos = i;
 	return i;
 }
@@ -766,7 +795,7 @@ fn _scan_balanced(c: &mut Cursor) -> Int {
 		}
 		i = i + 1;
 	}
-	throw ParseError(message = "unterminated JSON value");
+	throw ParseError(code = "unterminated-json", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated JSON value");
 }
 
 // Scan a quoted string span (c.pos is the opening '"'), honoring backslash escapes.
@@ -781,7 +810,7 @@ fn _scan_string(c: &mut Cursor) -> Int {
 		else if ch == 34 { c.pos = i + 1; return i + 1; }
 		i = i + 1;
 	}
-	throw ParseError(message = "unterminated string");
+	throw ParseError(code = "unterminated-string", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated string");
 }
 
 // ===== lowering the statement AST to a config body =====
@@ -826,11 +855,11 @@ fn _build_plan_body(stmts: &Array<Stmt>) -> json.JsonNode {
 				step.set("operation", _jstr(_dup(name)));
 				match input.get(&"const") {
 					Optional::Some(obj) => { step.set("input", obj.clone_deep()); },
-					Optional::None => { throw ParseError(message = "internal: plan op input is not a const object"); }
+					Optional::None => { throw ParseError(code = "internal", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "internal: plan op input is not a const object"); }
 				}
 				plan.push(step.to_node());
 			},
-			default => { throw ParseError(message = "internal: non-operation in straight-line plan"); }
+			default => { throw ParseError(code = "internal", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "internal: non-operation in straight-line plan"); }
 		}
 		i = i + 1;
 	}
@@ -1060,18 +1089,18 @@ fn _scan_json_object(c: &mut Cursor) -> Int {
 		}
 		i = i + 1;
 	}
-	throw ParseError(message = "unterminated JSON object in 'steps'");
+	throw ParseError(code = "unterminated-json", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated JSON object");
 }
 
-fn _parse_json_object(raw: &String) -> json.JsonNode {
+fn _parse_json_object(c: &Cursor, raw: &String, pos: Int) -> json.JsonNode {
 	match json.parse_strict(raw) {
 		core.Result::Ok(n) => {
 			var is_obj = false;
 			match n.as_object() { Optional::Some(_) => { is_obj = true; }, Optional::None => {} }
-			if !is_obj { throw ParseError(message = "step input must be a JSON object"); }
+			if !is_obj { throw ParseError(code = "expected-json-object", byte_offset = pos, line = 0, column = 0, expected = "", found = "", message = "operation input must be a JSON object"); }
 			return move n;
 		},
-		core.Result::Err(_) => { throw ParseError(message = "invalid JSON object in step input"); }
+		core.Result::Err(_) => { throw ParseError(code = "invalid-json", byte_offset = pos, line = 0, column = 0, expected = "", found = "", message = "invalid JSON object"); }
 	}
 }
 
@@ -1100,7 +1129,7 @@ fn _merge(base: &json.JsonNode, pw: &ParsedWorkflow) -> json.JsonNode {
 		}
 	}
 	if !has_ops and pw.contracts.len > 0 {
-		throw ParseError(message = "config has no 'operations' registry to attach contracts to");
+		throw ParseError(code = "no-operations-registry", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "config has no 'operations' registry to attach contracts to");
 	}
 	// Straight-line lowers to "plan"; an if/case workflow lowers to a control-flow "graph".
 	if pw.is_graph {
@@ -1144,21 +1173,21 @@ fn _overlay_operations(opsnode: &json.JsonNode, pw: &ParsedWorkflow) -> json.Jso
 			}
 			var k = 0;
 			while k < pw.contracts.len {
-				if !matched[k] { throw ParseError(message = "op '" + _dup(&pw.contracts[k].name) + "' declared in source but absent from the operations registry"); }
+				if !matched[k] { throw ParseError(code = "unknown-operation", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "op '" + _dup(&pw.contracts[k].name) + "' declared in source but absent from the operations registry"); }
 				k = k + 1;
 			}
 			return arr.to_node();
 		},
-		Optional::None => { throw ParseError(message = "config 'operations' must be a JSON array"); }
+		Optional::None => { throw ParseError(code = "operations-not-array", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "config 'operations' must be a JSON array"); }
 	}
 }
 
 fn _op_name(item: &json.JsonNode) -> String {
 	match item.get(&"name") {
 		Optional::Some(n) => {
-			match n.as_string() { Optional::Some(s) => { return move s; }, Optional::None => { throw ParseError(message = "operation 'name' must be a string"); } }
+			match n.as_string() { Optional::Some(s) => { return move s; }, Optional::None => { throw ParseError(code = "operation-name-not-string", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "operation 'name' must be a string"); } }
 		},
-		Optional::None => { throw ParseError(message = "operation entry missing 'name'"); }
+		Optional::None => { throw ParseError(code = "operation-missing-name", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "operation entry missing 'name'"); }
 	}
 }
 
@@ -1215,4 +1244,84 @@ fn _dup(s: &String) nothrow -> String {
 	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
 	val ptr = io.buffer_ptr(&buf);
 	return core.string_from_utf8_bytes(ptr, n);
+}
+
+// ===== structured source diagnostics =====
+//
+// A parse failure is a STRUCTURED event: a stable kebab-case `code` + a source position
+// (`byte_offset`/`line`/`column`, mirroring std.source's convention) + optional `expected`/`found`
+// tokens. `message` is a short human description (SECONDARY — wording may change; tests pin the code
+// + position, not the prose). All fields are scalar so a typed `catch ParseError(e)` can project them.
+// `render_diagnostic` turns one into a human CLI string (with a caret excerpt) at the boundary.
+
+// Fill in 1-based line/column on a thrown ParseError from its `byte_offset` + the original source
+// (column counts UTF-8 scalars, not bytes — a non-continuation byte starts a scalar). Throw sites
+// carry code + byte_offset + expected/found/message (line/column = 0 placeholders); this runs ONCE at
+// the parse boundary. A config/lowering error (byte_offset < 0) keeps line = column = 0.
+// Takes the error's SCALAR fields (a typed-catch binder is a read-only view — only scalar fields are
+// projectable, so we pass them rather than the binder).
+fn _finalize(source: &String, code: &String, off: Int, expected: &String, found: &String, msg: &String) nothrow -> ParseError {
+	var line = 0;
+	var col = 0;
+	if off >= 0 {
+		val n = source.byte_length();
+		var p = off;
+		if p > n { p = n; }
+		line = 1;
+		var line_start = 0;
+		var i = 0;
+		while i < p {
+			if cast<Int>(source.byte_at(i)) == 10 { line = line + 1; line_start = i + 1; }   // '\n'
+			i = i + 1;
+		}
+		col = 1;
+		var j = line_start;
+		while j < p {
+			val b = cast<Int>(source.byte_at(j));
+			if b < 128 or b >= 192 { col = col + 1; }   // count scalar starts (skip 0b10xxxxxx continuation bytes)
+			j = j + 1;
+		}
+	}
+	return ParseError(code = _dup(code), byte_offset = off, line = line, column = col,
+	                  expected = _dup(expected), found = _dup(found), message = _dup(msg));
+}
+
+// Render a structured ParseError as a human CLI diagnostic: a header line with the code + position,
+// then the offending source line and a caret. The `source` is the original `.mf` text.
+pub fn render_diagnostic(source: &String, e: &ParseError) nothrow -> String {
+	// A NO-POSITION diagnostic (byte_offset < 0 — a config/lowering error, not a `.mf` text location):
+	// render just the header, no source excerpt or caret (clamping to byte 0 would be misleading).
+	if e.byte_offset < 0 {
+		var h = "parse error [" + _dup(&e.code) + "]: " + _dup(&e.message);
+		if e.expected.byte_length() > 0 { h = h + " — expected " + _dup(&e.expected); }
+		return move h;
+	}
+	val n = source.byte_length();
+	var p = e.byte_offset;
+	if p > n { p = n; }
+	var line_start = 0;
+	var i = 0;
+	while i < p {
+		if cast<Int>(source.byte_at(i)) == 10 { line_start = i + 1; }
+		i = i + 1;
+	}
+	var line_end = line_start;
+	while line_end < n and cast<Int>(source.byte_at(line_end)) != 10 { line_end = line_end + 1; }
+	var excerpt: String = "";
+	match text.substring(source, line_start, line_end - line_start) {
+		core.Result::Ok(s) => { excerpt = move s; },
+		core.Result::Err(_) => {}
+	}
+	var head = "parse error [" + _dup(&e.code) + "]: " + _dup(&e.message)
+		+ " at line " + fmt.format_int(e.line) + ", column " + fmt.format_int(e.column)
+		+ " (byte " + fmt.format_int(e.byte_offset) + ")";
+	if e.expected.byte_length() > 0 { head = head + " — expected " + _dup(&e.expected); }
+	return head + "\n  " + excerpt + "\n  " + _spaces(e.column - 1) + "^";
+}
+
+fn _spaces(k: Int) nothrow -> String {
+	var s: String = "";
+	var i = 0;
+	while i < k { s = s + " "; i = i + 1; }
+	return move s;
 }

@@ -201,8 +201,9 @@ identical input (same `input_hash`), settled ops skipped, zero duplicate remote 
 
 **5 — Textual DSL parser (LAST).** Add the `.mf` lexer / grammar / type binding that
 **lowers into the step-1 IR** and reuses the step-2 validator unchanged; add diagnostics.
-The mechanical syntax layer, deliberately last. (Scope reuse of `../drift-lang`'s
-parser/type-checker/IR/diagnostics when we get here.)
+The mechanical syntax layer, deliberately last. (Any reuse of Drift frontend utilities —
+parser/type-checker/IR/diagnostics — would come via a versioned package or explicit vendoring,
+NOT a `../drift-lang` sibling checkout. For now this layer is local to `parser.drift`.)
 
 ## Files likely affected
 - **`microflows/runner/src/ir.drift` (NEW, decided)** — the typed value model + control-flow
@@ -230,7 +231,8 @@ parser/type-checker/IR/diagnostics when we get here.)
   each construct; `integration/coordinator-singular/test.py` replay regressions;
   `db/tests/sp_operation_test.py` only if a durable shape changes.
 - Eventually `microflows/doc/microflows_design.md` (IR / value-model / control-flow
-  sections as proven) and `../drift-lang` (step 5).
+  sections as proven). The textual frontend lives entirely in `microflows/runner/src/parser.drift`
+  (no `../drift-lang` sibling-checkout dependency).
 
 ## Verification criteria
 - Full root `just test` green at every step; all existing flat-plan + reversal +
@@ -261,14 +263,15 @@ parser/type-checker/IR/diagnostics when we get here.)
 
 ## Current status and next action
 **Manual-IR runtime surface COMPLETE (steps 1–4) AND the parser (step 5) COMPLETE — the full V1
-lowering surface is landed.** The typed IR, durable arguments, structural + typed validation,
-control-flow EXECUTION (straight-line, `if`, `case`, finite array expressions, cross-branch merge,
-`let`, `return`), graph-authoritative `content_hash`, and pinned replay/reversal regressions are all
-landed; and the textual front end now covers the WHOLE V1 IR — straight-line + `if`/`case` +
-`let`/arg/local refs + operation naming & `result` refs + `merge` + `map`/`filter`/`fold` — a `.mf`
-source lowers into the EXACT config the manual IR executes, with NO new runtime semantics. Full
-`just test` green (certified driftc 0.33.42 / ABI 17; integration **128/128**, was 101). See
-Progress.md for the per-chunk record.
+lowering surface + structured diagnostics are landed.** The typed IR, durable arguments, structural +
+typed validation, control-flow EXECUTION (straight-line, `if`, `case`, finite array expressions,
+cross-branch merge, `let`, `return`), graph-authoritative `content_hash`, and pinned replay/reversal
+regressions are all landed; and the textual front end now covers the WHOLE V1 IR — straight-line +
+`if`/`case` + `let`/arg/local refs + operation naming & `result` refs + `merge` + `map`/`filter`/`fold`
+— with STRUCTURED source diagnostics (stable code + line/column + caret). A `.mf` source lowers into
+the EXACT config the manual IR executes, with NO new runtime semantics. Full `just test` green
+(certified driftc 0.33.42 / ABI 17; integration **129/129**, was 101). See Progress.md for the
+per-chunk record.
 
 Parser (`microflows/runner/src/parser.drift` + `--lower-source` CLI): `args` → `argument_type`,
 `op … { input/result }` → operation contracts, `steps { … }` → a flat `"plan"` (const-only
@@ -291,8 +294,15 @@ configs produce the IDENTICAL `--emit-content-hash` and execute the same; pure b
 (`let`/`merge`/`map`/`filter`/`fold`) write no event, resume recomputes derived/merged/loop values
 from durable state, and reversal compensates only the taken branch + shared downstream op.
 
-Next action: **diagnostics/spans** (upgrade parse errors from byte offsets to line/column + context).
-Remaining niceties: `case`-join merge, possible `../drift-lang` reuse. The core V1 lowering is DONE.
+Parse failures are STRUCTURED diagnostics: `ParseError` carries a stable kebab-case `code` + source
+position (`byte_offset`/`line`/`column`) + `expected`/`found` (modelled on `std.source`/drift-web's
+structured-error convention; all local to `parser.drift`). `render_diagnostic` formats a concise human
+CLI string (code + line/column + caret); `--lower-source` emits the event through `std.log` (the same
+facility as the bookkeeper service — machine-parseable fields) AND prints the human render.
+
+Next action: **`case`-join merge** (`NMerge` after a `case`) — the one remaining nicety. The core V1
+lowering + diagnostics are DONE. (Any future Drift frontend-utility reuse: packaged/vendored only —
+never a `../drift-lang` sibling checkout.)
 
 ## Open questions / blockers
 - **✅ RESOLVED on Drift 0.33.35 — recursive-IR clean form landed.** `core.Box<T>` + the
@@ -313,8 +323,10 @@ Remaining niceties: `case`-join merge, possible `../drift-lang` reuse. The core 
   vs from the workflow start — confirm the interpreter can cheaply replay to the next
   remote-op boundary and that this is the simplest correct cursor (no per-construct
   continuation). Decide in step 1/3.
-- **`../drift-lang` reuse** (parser / type checker / IR / diagnostics) for step 5 — scope
-  TBD when we reach it.
+- **Possible future reuse of Drift frontend utilities** (parser / type checker / IR / diagnostics) —
+  ONLY via a versioned package dependency or explicit vendoring into this repo (ownership clear),
+  **NOT** a `../drift-lang` sibling-checkout dependency or test path. Not assumed as a normal next
+  step; the parser + diagnostics are local to `microflows/runner/src/parser.drift`.
 
 *(Resolved: IR home → `microflows/runner/src/ir.drift`; the closed V1 value model; **determinism
 is structural** (IR exposes no clock/random/env/fs/net/live-config/callback; sources = pinned

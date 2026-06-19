@@ -298,6 +298,14 @@ def main():
         plan_cfgs.append(f.name)
         return out.returncode, f.name
 
+    def lower_source_stderr(mf_text):
+        # Like lower_source, but returns (returncode, stderr) — for asserting the diagnostic output.
+        mff = tempfile.NamedTemporaryFile("w", suffix=".mf", delete=False); mff.write(mf_text); mff.close()
+        plan_cfgs.append(mff.name)
+        cmd = [str(RUNNER_BIN), "--config", rcf.name, "--workflow-id", "0" * 32, "--lower-source", mff.name]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+        return out.returncode, out.stderr
+
     stub = subprocess.Popen([str(STUB_BIN), "--config", scf.name],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     deadline = time.time() + 15
@@ -2291,6 +2299,19 @@ def main():
               l_nonarr != 0 and l_coll != 0 and l_filtbody != 0 and l_foldmix != 0,
               (l_nonarr, l_coll, l_filtbody, l_foldmix))
 
+        # ===== C17. DIAGNOSTICS: --lower-source surfaces a STRUCTURED diagnostic (stable code + line/
+        # column + caret context) for malformed source, still emits no config. The structured event is
+        # logged via std.log (a JSON line carrying code/line/column fields); a concise human render
+        # (with the caret) is also printed. Tests assert the rendered output lightly. =====
+        dcode, dstderr = lower_source_stderr("frob {}\nsteps { reserve { \"reservation\": \"a\" } }\n")
+        check("parser_lower_source_structured_diagnostic",
+              dcode != 0
+              and "unknown-keyword" in dstderr               # the stable diagnostic code
+              and "line 1, column 1" in dstderr              # the source position
+              and '"byte_offset"' in dstderr                 # the structured std.log event field
+              and "^" in dstderr,                            # the human caret excerpt
+              (dcode, dstderr[:400]))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the
         # LOCAL authoritative result; no dependency on the participant.
         stub.terminate()
@@ -2337,7 +2358,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 128
+    EXPECTED_CHECKS = 129
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

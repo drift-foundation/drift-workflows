@@ -35,6 +35,7 @@ import std.cli as cli;
 import std.codec as codec;
 import std.uuid as uuid;
 import std.crypto as crypto;
+import std.log as log;
 import microflows.host as mf;
 import microflows.runner.ir as ir;
 import microflows.runner.parser as parser;
@@ -235,10 +236,36 @@ fn _lower_source(source_path: &String, config_path: &String) throws -> Int {
 			return 0;
 		},
 		core.Result::Err(e) => {
-			console.eprintln("runner: lower-source: " + e.message);
+			// The parser returns a STRUCTURED diagnostic event. Emit it through std.log (stable code +
+			// position fields — the machine-readable log, mirroring the bookkeeper logging pattern), and
+			// ALSO print a concise human render (code + line/column + caret excerpt) for the CLI user.
+			_log_parse_diagnostic(&e);
+			console.eprintln(parser.render_diagnostic(&source, &e));
 			return 3;
 		}
 	}
+}
+
+// Emit a parser diagnostic as a STRUCTURED log event via std.log (stderr sink, JSON/ISO-8601
+// formatter — the same facility/pattern as the bookkeeper service). The stable `code` and the source
+// position (byte_offset/line/column) plus expected/found/message are fields, so logs are
+// machine-parseable rather than ad hoc prose. (The human caret render is printed separately.)
+fn _log_parse_diagnostic(e: &parser.ParseError) nothrow -> Void {
+	var cfgb = log.config_builder();
+	cfgb.sink(log.stderr_sink());
+	cfgb.min_level(log.Level::Info());
+	cfgb.formatter(log.FormatterKind::JsonIso8601());
+	val logger = log.create_logger("microflows-runner", cfgb.build());
+	logger.error("lower-source-parse-error", {
+		"code": _dup(&e.code),
+		"byte_offset": fmt.format_int(e.byte_offset),
+		"line": fmt.format_int(e.line),
+		"column": fmt.format_int(e.column),
+		"expected": _dup(&e.expected),
+		"found": _dup(&e.found),
+		"message": _dup(&e.message)
+	});
+	val _ = logger.flush(conc.Duration(millis = 1000));
 }
 
 // Run the build-time validation path over a lowered config (no DB, no dispatch). Throws RunnerError

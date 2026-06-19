@@ -2,15 +2,16 @@
 
 Charter (objective, decisions, plan, verification): [README.md](./README.md).
 
-## Status: **Parser step 5 COMPLETE (slices 1 + 2a + 2b-i + 2b-ii(a+b) + 2b-iii) — the full V1 surface lowers to the proven IR with content_hash + execution parity**
+## Status: **Parser step 5 COMPLETE (slices 1–2b-iii + structured diagnostics) — the full V1 surface lowers to the proven IR with content_hash + execution parity**
 
 The lane is scoped (IR-first, parser-last). The **manual-IR runtime surface is complete and fully
 proven**, and **the textual front end now covers the WHOLE V1 IR**: straight-line, `if`/`case`,
 `let` + arg/local expression refs, operation naming + `result` references, `merge`, AND finite array
-expressions (`map`/`filter`/`fold`). A `.mf` source lowers into the EXACT config the manual IR already
-executes and hashes (a flat `"plan"` for const-only straight-line, a control-flow `"graph"`
-otherwise), with NO new runtime semantics. Full `just test` green on certified driftc 0.33.42 / ABI 17
-— integration **128/128** (was 101), microflows 20/20, SP 110/110, singular 16/16.
+expressions (`map`/`filter`/`fold`) — with **structured source diagnostics** (stable code + line/
+column + caret). A `.mf` source lowers into the EXACT config the manual IR already executes and hashes
+(a flat `"plan"` for const-only straight-line, a control-flow `"graph"` otherwise), with NO new runtime
+semantics. Full `just test` green on certified driftc 0.33.42 / ABI 17 — integration **129/129** (was
+101), microflows 20/20, SP 110/110, singular 16/16.
 
 Proven runtime surface (unchanged this slice): durable arguments, the typed value/argument model,
 and the control-flow graph IR with EXECUTION + structural validation + graph-authoritative
@@ -26,8 +27,9 @@ and the control-flow graph IR with EXECUTION + structural validation + graph-aut
 Branches/loops/merges/lets write no continuation/event (only `NOperation` is a durable boundary);
 replay re-derives the pure path deterministically.
 
-**Next: diagnostics/spans** (currently shallow — byte offsets) and remaining surface niceties
-(`case`-join merge; possible `../drift-lang` reuse). The core V1 lowering surface is DONE. Scoped below.
+**The V1 lowering surface + diagnostics are DONE.** The only remaining nicety is `case`-join `merge`
+(an `NMerge` after a `case`). Possible future reuse of Drift frontend utilities would come ONLY via a
+versioned package or explicit vendoring (NOT a `../drift-lang` sibling checkout). Scoped below.
 
 ## Landed: parser slice 1 — straight-line textual front end (lowering parity, no new semantics)
 
@@ -249,14 +251,44 @@ lowering surface (every IR construct now has source syntax).
   second PUT); the four malformed shapes (non-array source, `elem`/`as` collision, non-bool filter
   body, fold accumulator mismatch) are rejected at lowering. Integration 123→128.
 
+## Landed: parser diagnostics — structured source events (code + line/column + caret)
+
+Parse failures are now STRUCTURED diagnostic events, not prose. Developer-facing only; NO
+runtime/IR/storage/language changes — only error representation + reporting.
+- **Structured error.** `ParseError` carries a stable, kebab-case, machine-readable `code`
+  (`"unknown-keyword"`, `"unknown-type"`, `"expected-expression"`, `"unterminated-block"`,
+  `"expected-token"`, `"case-arm-after-default"`, `"expected-each"`, …), the source position
+  (`byte_offset`/`line`/`column` — 1-based, column counts UTF-8 scalars, mirroring `std.source`'s
+  convention), and `expected`/`found` tokens where applicable. `message` is a SHORT human description
+  (secondary). All fields scalar (so a typed `catch ParseError(e)` projects them). Modelled on
+  `std.source.SourceError` and drift-web's `RestError{event,tag,…}` structured-error pattern. Throw
+  sites carry `code`+`byte_offset`+expected/found+message; line/column are filled ONCE at the parse
+  boundary. Diagnostics are LOCAL to `microflows/runner/src/parser.drift` (no `../drift-lang` dep).
+- **Rendering + logging.** `parser.render_diagnostic(source, e)` formats a concise human CLI string
+  (`parse error [code]: message at line L, column C (byte B)` + the source line + a caret). The runner's
+  `--lower-source` BOTH emits the structured event through **`std.log`** (stderr sink, JSON/ISO-8601
+  formatter — the same facility + pattern as the bookkeeper service; code/line/column/expected/found
+  are log FIELDS, machine-parseable) AND prints the human render. Behavior otherwise unchanged: a
+  malformed source still exits nonzero and emits no config.
+- **Tests pin codes + positions, not prose.** Unit (`parser_test` 14): a bad top-level keyword
+  (`unknown-keyword`, line 1 col 1 byte 0, found "frob"), bad type (`unknown-type`, byte 10),
+  bad expression keyword (`expected-expression`, byte 16), unterminated block (`unterminated-block`,
+  byte 7), case default-ordering (`case-arm-after-default`, line 2), malformed loop (`expected-each`,
+  line 2), and an `expected-token` carrying `expected = "'{'"` — each asserts the CODE + line/column/
+  byte_offset (+ expected/found). A MULTIBYTE case (a 2-byte `é` before the error) pins the
+  scalar-column contract — `byte_offset` (34) and `column` (34) are equal, i.e. column is one LESS than
+  a byte-based column would be. A NO-POSITION error (`byte_offset = -1`, a config/lowering error)
+  renders WITHOUT a source excerpt/caret (no misleading "line 0" + caret on line 1). One smoke check
+  that `render_diagnostic` includes the code, line/column, and a caret. Integration (C17, 1 check):
+  `--lower-source` on a malformed source surfaces the structured `std.log` event (the `byte_offset`/code
+  fields) + the human caret render, and emits no config. Integration 128→129.
+
 ## Deferred: remaining niceties (no new runtime semantics)
-- **Diagnostics/spans:** parse errors are currently shallow (byte offsets) — upgrade to line/column +
-  source context.
 - **`case`-join merge:** an `NMerge` after a `case` (one source per arm + default) — deferred from
   2b-ii-b's minimum if-join form.
-- **`../drift-lang` reuse** for the lexer/parser/type-checker (possible future consolidation).
-- **Slice 3+:** diagnostics/spans (currently shallow — byte offsets), and possible `../drift-lang`
-  reuse for the lexer/parser/type-checker.
+- **Possible future reuse of Drift frontend utilities** (lexer/parser/type-checker/diagnostics) — ONLY
+  via a versioned package dependency or explicit vendoring into this repo (ownership clear), NOT a
+  `../drift-lang` sibling-checkout dependency or test path. Not assumed as a normal next step.
 
 ## Landed: control-flow graph IR — chunk 1 (Step 1b(ii): types + canonical + flat compat)
 - **Graph node types in `ir.drift`** (additive; runner behavior unchanged): `IrExpr` (closed leaf
@@ -777,17 +809,17 @@ Earlier rounds:
     resume recomputes; malformed shapes (non-array source, elem/as collision, non-bool filter body,
     fold accumulator mismatch) rejected at lowering (unit `parser_test` 13; integration C16). LANDED,
     full `just test` green (integration 128). **This COMPLETES the V1 lowering surface (step 5).**
-  - [ ] **niceties —** diagnostics/spans; `case`-join merge; possible `../drift-lang` reuse.
+  - [ ] **niceties —** diagnostics/spans; `case`-join merge; possible future reuse of Drift frontend utilities (via a versioned package or explicit vendoring — NOT a `../drift-lang` sibling checkout).
 
 ## Next action
-**The V1 lowering surface is COMPLETE** (every IR construct — straight-line, `if`/`case`, `let`,
-named-op/`result`, `merge`, `map`/`filter`/`fold` — has source syntax, with content_hash + execution
-parity). Remaining work is niceties, not lowering: (1) **diagnostics/spans** — upgrade parse errors
-from byte offsets to line/column + source context; (2) **`case`-join merge** (`NMerge` after a `case`);
-(3) possible **`../drift-lang` reuse** for the lexer/parser/type-checker. None change runtime/IR/storage.
+**The V1 lowering surface AND structured diagnostics are COMPLETE** (every IR construct has source
+syntax with content_hash + execution parity; parse errors are structured events with code + line/
+column + caret, rendered for humans and emitted via `std.log`). The ONE remaining nicety is
+**`case`-join merge** (an `NMerge` after a `case`). No further runtime/IR/storage work in the lane.
+(Any future reuse of Drift frontend utilities: packaged/vendored only — never a sibling checkout.)
 
 ## Open questions (see README)
-How far back replay restarts (last settled op vs start) · `../drift-lang` reuse for step 5.
+How far back replay restarts (last settled op vs start) · Drift frontend-utility reuse (packaged/vendored only — not a sibling checkout).
 
 ## ✅ RESOLVED on certified 0.33.35 — recursive-IR clean form landed in `ir.drift`
 Drift 0.33.35 (ABI 17, `cbf32feb`) shipped `core.Box<T>` and turned the typed-catch SIGSEGV
