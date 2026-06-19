@@ -742,6 +742,103 @@ fn scenario() -> Int {
 	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"merge\",\"id\":\"n0\",\"name\":\"p\",\"sources\":[{\"from\":\"n1\",\"value\":{\"const\":1},\"bogus\":1}],\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"p\"}}}]}") { return 136; }
 	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"merge\",\"id\":\"n0\",\"name\":\"p\",\"sources\":[{\"value\":{\"const\":1}}],\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"p\"}}}]}") { return 137; }
 
+	// ===== expression object/array construction (EObject / EArray) =====
+	var c_no: Array<ir.OpResult> = [];
+
+	// (1) EObject eval: `reserve { reservation: arg req }` builds the op input from a durable arg.
+	var co1: Array<ir.IrNode> = [];
+	var co1f: Array<ir.ExprField> = [];
+	co1f.push(ir.ExprField(key = "reservation", value = ir.IrExpr::EArg(path = _p1("req"))));
+	co1.push(ir.IrNode::NOperation(id = "n0", operation = "reserve", input = ir.IrExpr::EObject(fields = move co1f), next = "n1"));
+	co1.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gco1 = ir.IrGraph(nodes = move co1, entry = "n0");
+	if !_ok_validate(&gco1) { return 152; }
+	val co1o = ir.advance(&gco1, &"{\"req\":\"order-9\"}", &c_no);
+	if !_is_need(&co1o, &"n0", &"reserve", &"{\"reservation\":\"order-9\"}") { return 153; }
+
+	// (2) EArray eval: op `pack` input = [ arg a, const 2 ] -> [1,2] (order preserved).
+	var co2: Array<ir.IrNode> = [];
+	var co2e: Array<ir.IrExpr> = [];
+	co2e.push(ir.IrExpr::EArg(path = _p1("a")));
+	co2e.push(ir.IrExpr::EConst(canonical_json = "2"));
+	co2.push(ir.IrNode::NOperation(id = "n0", operation = "pack", input = ir.IrExpr::EArray(elems = move co2e), next = "n1"));
+	co2.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gco2 = ir.IrGraph(nodes = move co2, entry = "n0");
+	val co2o = ir.advance(&gco2, &"{\"a\":1}", &c_no);
+	if !_is_need(&co2o, &"n0", &"pack", &"[1,2]") { return 154; }
+
+	// (3) parse_graph + validate accept {object:{...}} and {array:[...]} configs; malformed rejected.
+	if !_pgv_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"object\":{\"reservation\":{\"arg\":[\"req\"]}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 155; }
+	if !_pgv_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"pack\",\"input\":{\"array\":[{\"arg\":[\"a\"]},{\"const\":2}]},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 156; }
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"object\":5},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 157; }
+	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"pack\",\"input\":{\"array\":5},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 158; }
+
+	// (4) graph_canonical is KEY-ORDER independent for EObject (fields sorted by key).
+	var co4a: Array<ir.IrNode> = [];
+	var co4af: Array<ir.ExprField> = [];
+	co4af.push(ir.ExprField(key = "a", value = ir.IrExpr::EArg(path = _p1("x"))));
+	co4af.push(ir.ExprField(key = "b", value = ir.IrExpr::EArg(path = _p1("y"))));
+	co4a.push(ir.IrNode::NOperation(id = "n0", operation = "op", input = ir.IrExpr::EObject(fields = move co4af), next = "n1"));
+	co4a.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gco4a = ir.IrGraph(nodes = move co4a, entry = "n0");
+	var co4b: Array<ir.IrNode> = [];
+	var co4bf: Array<ir.ExprField> = [];
+	co4bf.push(ir.ExprField(key = "b", value = ir.IrExpr::EArg(path = _p1("y"))));
+	co4bf.push(ir.ExprField(key = "a", value = ir.IrExpr::EArg(path = _p1("x"))));
+	co4b.push(ir.IrNode::NOperation(id = "n0", operation = "op", input = ir.IrExpr::EObject(fields = move co4bf), next = "n1"));
+	co4b.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gco4b = ir.IrGraph(nodes = move co4b, entry = "n0");
+	val cc4a = ir.graph_canonical(&gco4a);
+	val cc4b = ir.graph_canonical(&gco4b);
+	if !_seq(&cc4a, &cc4b) { return 159; }
+
+	// (5) typed: reserve input {reservation:string}. Constructed {reservation: arg s} (s:string) PASSES;
+	//     {reservation: arg n} (n:int) is REJECTED before dispatch (field type recursed into).
+	val at_sn = _pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"s\",\"type\":{\"type\":\"string\"}},{\"name\":\"n\",\"type\":{\"type\":\"int\"}}]}");
+	var co5: Array<ir.IrNode> = [];
+	var co5f: Array<ir.ExprField> = [];
+	co5f.push(ir.ExprField(key = "reservation", value = ir.IrExpr::EArg(path = _p1("s"))));
+	co5.push(ir.IrNode::NOperation(id = "n0", operation = "reserve", input = ir.IrExpr::EObject(fields = move co5f), next = "n1"));
+	co5.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gco5 = ir.IrGraph(nodes = move co5, entry = "n0");
+	if !_tc_ok(&gco5, &at_sn, &rc) { return 160; }
+	var co6: Array<ir.IrNode> = [];
+	var co6f: Array<ir.ExprField> = [];
+	co6f.push(ir.ExprField(key = "reservation", value = ir.IrExpr::EArg(path = _p1("n"))));
+	co6.push(ir.IrNode::NOperation(id = "n0", operation = "reserve", input = ir.IrExpr::EObject(fields = move co6f), next = "n1"));
+	co6.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gco6 = ir.IrGraph(nodes = move co6, entry = "n0");
+	if _tc_ok(&gco6, &at_sn, &rc) { return 161; }
+
+	// (6) dominance recurses into construction: a field referencing a NON-prior op result is rejected.
+	var co7: Array<ir.IrNode> = [];
+	var co7f: Array<ir.ExprField> = [];
+	co7f.push(ir.ExprField(key = "x", value = ir.IrExpr::EResult(node = "n1", path = _p0())));
+	co7.push(ir.IrNode::NLet(id = "n0", name = "z", value = ir.IrExpr::EObject(fields = move co7f), next = "n1"));
+	co7.push(ir.IrNode::NOperation(id = "n1", operation = "reserve", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n2"));
+	co7.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gco7 = ir.IrGraph(nodes = move co7, entry = "n0");
+	if !_rejects(&gco7) { return 162; }
+
+	// (7) EArray is ORDER-sensitive: [arg x, arg y] and [arg y, arg x] have DISTINCT canonical forms.
+	var co8a: Array<ir.IrNode> = [];
+	var co8ae: Array<ir.IrExpr> = [];
+	co8ae.push(ir.IrExpr::EArg(path = _p1("x")));
+	co8ae.push(ir.IrExpr::EArg(path = _p1("y")));
+	co8a.push(ir.IrNode::NOperation(id = "n0", operation = "op", input = ir.IrExpr::EArray(elems = move co8ae), next = "n1"));
+	co8a.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gco8a = ir.IrGraph(nodes = move co8a, entry = "n0");
+	var co8b: Array<ir.IrNode> = [];
+	var co8be: Array<ir.IrExpr> = [];
+	co8be.push(ir.IrExpr::EArg(path = _p1("y")));
+	co8be.push(ir.IrExpr::EArg(path = _p1("x")));
+	co8b.push(ir.IrNode::NOperation(id = "n0", operation = "op", input = ir.IrExpr::EArray(elems = move co8be), next = "n1"));
+	co8b.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
+	val gco8b = ir.IrGraph(nodes = move co8b, entry = "n0");
+	val cc8a = ir.graph_canonical(&gco8a);
+	val cc8b = ir.graph_canonical(&gco8b);
+	if _seq(&cc8a, &cc8b) { return 163; }
+
 	return 0;
 }
 

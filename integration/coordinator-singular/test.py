@@ -2439,8 +2439,79 @@ def main():
               and "^" in dstderr,                            # the human caret excerpt
               (dcode, dstderr[:400]))
 
-        # 5. terminal rerun with the participant DOWN: Microflows replays the
-        # LOCAL authoritative result; no dependency on the participant.
+        # ===== C18. EXPRESSION OBJECT CONSTRUCTION: build an op input from dynamic parts =====
+        # `reserve { reservation: arg code }` WRAPS a flat scalar arg into the {reservation:string} op
+        # input — no pre-shaped args document (the headline ergonomic win). Lowers to EObject, a PURE
+        # value step. Acceptance: parser-lowered and hand-authored {object} graphs produce IDENTICAL
+        # --emit-content-hash; the op executes with the constructed input; a type-mismatched
+        # construction is rejected at lowering; the construction writes no event; resume recomputes it.
+        CODE_AT = {"type": "object", "fields": [{"name": "code", "type": {"type": "string"}}]}
+        con_mf = (
+            "args { code: string }\n"
+            "op reserve { input: { reservation: string } }\n"
+            "steps { reserve { reservation: arg code } }\n"
+        )
+        con_code, con_low = lower_source(con_mf)
+        con_hand = _hand({"reserve": {"input_type": RESV_C}}, CODE_AT, {"entry": "n0", "nodes": [
+            {"kind": "operation", "id": "n0", "operation": "reserve",
+             "input": {"object": {"reservation": {"arg": ["code"]}}}, "next": "n1"},
+            {"kind": "return", "id": "n1", "value": {"const": None}},
+        ]})
+        hco_l = emit_content_hash(con_low) if con_low else "<none>"
+        hco_h = emit_content_hash(con_hand)
+        args_code = json.dumps({"code": "cx9"})
+        wco = _wf_id(); cco, bco = run_runner(con_low, wco, arguments=args_code)
+        wcoh = _wf_id(); ccoh, bcoh = run_runner(con_hand, wcoh, arguments=args_code)
+        check("parser_construct_object_graph_parity_and_exec",
+              con_code == 0 and con_low is not None and hco_l != "" and hco_l == hco_h
+              and cco == 0 and bco.get("workflow") == "completed" and _ck_resv(wco) == ["cx9"]
+              and ccoh == 0 and bcoh.get("workflow") == "completed" and _ck_resv(wcoh) == ["cx9"],
+              (con_code, hco_l, hco_h, cco, bco, _ck_resv(wco), ccoh, _ck_resv(wcoh)))
+
+        # A TYPE-MISMATCHED construction is rejected at LOWERING (before dispatch): reserve input is
+        # {reservation:string} but {reservation: arg n} builds {reservation:int}.
+        badcon_code, badcon_cfg = lower_source(
+            "args { n: int }\nop reserve { input: { reservation: string } }\n"
+            "steps { reserve { reservation: arg n } }\n")
+        check("parser_construct_type_mismatch_rejected",
+              badcon_code != 0 and badcon_cfg is None, (badcon_code, badcon_cfg))
+
+        # The construction is a PURE value step: it writes NO event. Event-count of the constructed-
+        # input reserve equals a const-input reserve (which folds to a const plan).
+        wcce = _wf_id(); run_runner(con_low, wcce, arguments=args_code)
+        cfold_code, cfold_low = lower_source(
+            "args { code: string }\nop reserve { input: { reservation: string } }\n"
+            "steps { reserve { reservation: \"k\" } }\n")
+        wcfe = _wf_id(); run_runner(cfold_low, wcfe, arguments=args_code)
+        check("parser_construct_no_event_at_boundary",
+              cfold_code == 0 and cfold_low is not None
+              and _evt_count(wcce) == _evt_count(wcfe) and _evt_count(wcce) > 0,
+              (cfold_code, _evt_count(wcce), _evt_count(wcfe)))
+
+        # RESUME recomputes the CONSTRUCTED input from durable args (not the CLI/process): a fault-
+        # pending op leaves it requested-not-settled; a claimable resume re-derives the SAME constructed
+        # value and reconciles GET-first (no second PUT). (reserve untyped so the `_fault` field is OK.)
+        rcon_mf = (
+            "args { code: string }\n"
+            "steps { reserve { reservation: arg code, \"_fault\": { \"respond_pending\": true } } }\n"
+        )
+        rcon_code, rcon_low = lower_source(rcon_mf)
+        wrc = _wf_id()
+        rcs, rbs = run_runner(rcon_low, wrc, arguments=args_code)
+        rop_s = _op_resv(wrc)
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wrc}')")
+        rpu0, rrq0 = _put_count(base), _request_count(base)
+        rcr, rbr = run_runner(rcon_low, wrc)
+        rpu_d, rrq_d = _put_count(base) - rpu0, _request_count(base) - rrq0
+        check("parser_construct_resume_recomputes_get_first",
+              rcon_code == 0 and rcs == 9 and rbs.get("workflow") == "pending" and rop_s == ["cx9"]
+              and rcr == 9 and rbr.get("workflow") == "pending" and rpu_d == 0 and rrq_d >= 1
+              and _op_resv(wrc) == ["cx9"],
+              (rcon_code, rcs, rbs, rop_s, rcr, rbr, f"put+{rpu_d} req+{rrq_d}", _op_resv(wrc)))
+
+        # 5. terminal rerun with the participant DOWN: Microflows replays the LOCAL authoritative
+        # result; no dependency on the participant. MUST be the LAST stub-using block — it terminates
+        # the stub and never restarts it, so any check after this would hit a dead participant.
         stub.terminate()
         try:
             stub.wait(timeout=5)
@@ -2485,7 +2556,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 134
+    EXPECTED_CHECKS = 138
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

@@ -1151,6 +1151,8 @@ singular/doc/singular-protocol.md    the participant-side protocol contract
 
 ### 12.9 Planned next refinement — expression object/array construction
 
+> **Roadmap item 1** (the next coding slice) — see `roadmap.md` for the full handoff roadmap.
+
 The intended V1 value model has objects and arrays as first-class values (§4),
 but the current frontend only constructs them as **constants** (§12.7). The next
 slice makes value construction first-class so an operation input can be built

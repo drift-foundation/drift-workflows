@@ -570,23 +570,23 @@ fn _res_lookup(c: &Cursor, name: &String) nothrow -> Optional<String> {
 	return Optional<String>::None();
 }
 
-// expr := '{' …json-object… '}'      (const object shorthand -> {const: <obj>})
-//       | 'const' <json-value>        (an explicit constant of any JSON shape -> {const: <value>})
-//       | 'arg' <arg-path>            (durable argument ref -> {arg: [...]})
-//       | 'local' <name> <path>       (a let/loop/merge binding ref -> {local: {name, path?}})
-//       | 'result' <name> <path>      (a NAMED op's result -> {result: {node, path?}}; slice 2b-ii-a)
+// expr := '{' (key ':' value-expr)* '}'  (object construction; folds to {const} when ALL fields const)
+//       | '[' (value-expr)* ']'           (array construction; folds to {const} when ALL elems const)
+//       | 'const' <json-value>            (an explicit constant of any JSON shape -> {const: <value>})
+//       | 'arg' <arg-path>                (durable argument ref -> {arg: [...]})
+//       | 'local' <name> <path>           (a let/loop/merge binding ref -> {local: {name, path?}})
+//       | 'result' <name> <path>          (a NAMED op's result -> {result: {node, path?}})
+//
+// Object/array literals may carry EXPRESSION-valued fields/elements (e.g.
+// `{ customer: arg c.id, amount: arg order.amount }`), lowering to {object:…}/{array:…} (EObject/
+// EArray). A FULLY-CONSTANT literal folds to {const: …} — byte-identical to the former const-object
+// shorthand, so existing content_hashes are unchanged (the IR re-canonicalizes the const anyway).
 fn _parse_value_expr(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
 	if _eof(c) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an expression"); }
-	if cast<Int>(c.src.byte_at(c.pos)) == 123 {   // '{' const object shorthand
-		val start = c.pos;
-		val end = _scan_json_object(c);
-		val raw = _slice(c, start, end - start);
-		val obj = _parse_json_object(c, &raw, start);
-		var o = json.new_object();
-		o.set("const", move obj);
-		return o.to_node();
-	}
+	val b0 = cast<Int>(c.src.byte_at(c.pos));
+	if b0 == 123 { return _parse_object_construction(c); }   // '{'
+	if b0 == 91 { return _parse_array_construction(c); }     // '['
 	if !_is_ident_start(c.src.byte_at(c.pos)) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an expression"); }
 	val kw_start = c.pos;
 	val kw = _read_ident(c);
@@ -611,7 +611,147 @@ fn _parse_value_expr(c: &mut Cursor) -> json.JsonNode {
 			Optional::None => { throw ParseError(code = "unknown-result-name", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "unknown result name '" + _dup(&segs[0]) + "' (declare it with `let <name> = <op> …` before referencing)"); }
 		}
 	}
-	throw ParseError(code = "expected-expression", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "expected an expression (const / arg / local / result / a {…} object), got '" + _dup(&kw) + "'");
+	throw ParseError(code = "expected-expression", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "expected an expression (const / arg / local / result / a {…} object / a […] array), got '" + _dup(&kw) + "'");
+}
+
+// `{ (key ':' value-expr (',' …)*)? }`. Keys are a JSON string ("k") or a bare identifier (k). Each
+// value is a CONSTRUCTION VALUE (nested {…}/[…], an expression keyword, or a bare JSON literal). If
+// every field value is constant, folds to {const: {…}} (hash-stable); else emits {object: {…}}.
+fn _parse_object_construction(c: &mut Cursor) -> json.JsonNode {
+	_expect(c, 123, &"'{'");   // '{'
+	var keys: Array<String> = [];
+	var vals: Array<json.JsonNode> = [];
+	_skip_ws(c);
+	if !_accept(c, 125) {   // not immediately '}'
+		var more = true;
+		while more {
+			val key = _parse_field_key(c);
+			var d = 0;
+			while d < keys.len { if _str_eq(&keys[d], &key) { throw ParseError(code = "duplicate-field", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "duplicate object field '" + _dup(&key) + "'"); } d = d + 1; }
+			_expect(c, 58, &"':'");   // ':'
+			val v = _parse_constr_value(c);
+			keys.push(move key);
+			vals.push(move v);
+			_skip_ws(c);
+			if _accept(c, 44) { more = true; }       // ','
+			else { _expect(c, 125, &"'}'"); more = false; }   // '}'
+		}
+	}
+	var all_const = true;
+	var i = 0;
+	while i < vals.len { if !_is_const_expr(&vals[i]) { all_const = false; } i = i + 1; }
+	if all_const {
+		var obj = json.new_object();
+		var j = 0;
+		while j < vals.len { obj.set(_dup(&keys[j]), _const_inner(&vals[j])); j = j + 1; }
+		var o = json.new_object();
+		o.set("const", obj.to_node());
+		return o.to_node();
+	}
+	var inner = json.new_object();
+	var k = 0;
+	while k < vals.len { inner.set(_dup(&keys[k]), vals[k].clone_deep()); k = k + 1; }
+	var oo = json.new_object();
+	oo.set("object", inner.to_node());
+	return oo.to_node();
+}
+
+// `[ (value-expr (',' …)*)? ]`. Folds to {const: [...]} when every element is constant; else {array: [...]}.
+fn _parse_array_construction(c: &mut Cursor) -> json.JsonNode {
+	_expect(c, 91, &"'['");   // '['
+	var vals: Array<json.JsonNode> = [];
+	_skip_ws(c);
+	if !_accept(c, 93) {   // not immediately ']'
+		var more = true;
+		while more {
+			val v = _parse_constr_value(c);
+			vals.push(move v);
+			_skip_ws(c);
+			if _accept(c, 44) { more = true; }       // ','
+			else { _expect(c, 93, &"']'"); more = false; }   // ']'
+		}
+	}
+	var all_const = true;
+	var i = 0;
+	while i < vals.len { if !_is_const_expr(&vals[i]) { all_const = false; } i = i + 1; }
+	if all_const {
+		var arr = json.new_array();
+		var j = 0;
+		while j < vals.len { arr.push(_const_inner(&vals[j])); j = j + 1; }
+		var o = json.new_object();
+		o.set("const", arr.to_node());
+		return o.to_node();
+	}
+	var inner = json.new_array();
+	var k = 0;
+	while k < vals.len { inner.push(vals[k].clone_deep()); k = k + 1; }
+	var oo = json.new_object();
+	oo.set("array", inner.to_node());
+	return oo.to_node();
+}
+
+// A field/element value: a nested {…}/[…] construction, an expression keyword (const/arg/local/
+// result), or a bare JSON literal (string/number/true/false/null) treated as a constant.
+fn _parse_constr_value(c: &mut Cursor) -> json.JsonNode {
+	_skip_ws(c);
+	if _eof(c) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a value"); }
+	val b = cast<Int>(c.src.byte_at(c.pos));
+	if b == 123 { return _parse_object_construction(c); }   // '{'
+	if b == 91 { return _parse_array_construction(c); }     // '['
+	if _is_ident_start(c.src.byte_at(c.pos)) {
+		val kw_start = c.pos;
+		val kw = _read_ident(c);
+		if _str_eq(&kw, &"const") { val v = _parse_json_value(c); var o = json.new_object(); o.set("const", move v); return o.to_node(); }
+		if _str_eq(&kw, &"arg") { val path = _parse_arg_path(c); return _arg_expr(&path); }
+		if _str_eq(&kw, &"local") { val segs = _parse_arg_path(c); return _local_expr(&segs); }
+		if _str_eq(&kw, &"result") {
+			val segs = _parse_arg_path(c);
+			match _res_lookup(c, &segs[0]) {
+				Optional::Some(rid) => { return _result_expr(&rid, &segs); },
+				Optional::None => { throw ParseError(code = "unknown-result-name", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "unknown result name '" + _dup(&segs[0]) + "'"); }
+			}
+		}
+		if _str_eq(&kw, &"true") or _str_eq(&kw, &"false") or _str_eq(&kw, &"null") {
+			match json.parse_strict(&kw) {
+				core.Result::Ok(n) => { var o = json.new_object(); o.set("const", move n); return o.to_node(); },
+				core.Result::Err(_) => { throw ParseError(code = "invalid-json", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "invalid JSON literal"); }
+			}
+		}
+		throw ParseError(code = "expected-expression", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "expected a value (const / arg / local / result / {…} / […] / JSON literal), got '" + _dup(&kw) + "'");
+	}
+	// a bare JSON scalar (string / number)
+	val v = _parse_json_value(c);
+	var o = json.new_object();
+	o.set("const", move v);
+	return o.to_node();
+}
+
+// An object field KEY: a JSON string ("name") or a bare identifier (name).
+fn _parse_field_key(c: &mut Cursor) -> String {
+	_skip_ws(c);
+	if _eof(c) { throw ParseError(code = "expected-field-key", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an object field name"); }
+	if cast<Int>(c.src.byte_at(c.pos)) == 34 {   // '"' quoted key
+		val v = _parse_json_value(c);
+		match v.as_string() {
+			Optional::Some(s) => { return move s; },
+			Optional::None => { throw ParseError(code = "expected-field-key", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "object field key must be a string"); }
+		}
+	}
+	if _is_ident_start(c.src.byte_at(c.pos)) { return _read_ident(c); }
+	throw ParseError(code = "expected-field-key", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an object field name (identifier or \"string\")");
+}
+
+// Is `n` a {const: …} expression node?
+fn _is_const_expr(n: &json.JsonNode) nothrow -> Bool {
+	match n.get(&"const") { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
+}
+
+// The inner value of a {const: V} node (deep-cloned). Only called when `_is_const_expr` is true.
+fn _const_inner(n: &json.JsonNode) -> json.JsonNode {
+	match n.get(&"const") {
+		Optional::Some(v) => { return v.clone_deep(); },
+		Optional::None => { throw ParseError(code = "internal", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "const-fold of a non-const expression"); }
+	}
 }
 
 // {"result": {"node": <id>, "path"?: [segs[1..]]}}
@@ -1153,46 +1293,6 @@ fn _arg_expr(path: &Array<String>) -> json.JsonNode {
 	var o = json.new_object();
 	o.set("arg", arr.to_node());
 	return o.to_node();
-}
-
-// Scan a balanced `{...}` starting at c.pos (which must be '{'); return the index just past the
-// matching '}' and advance the cursor there. String literals (and their escapes) are skipped so
-// braces inside strings don't affect nesting.
-fn _scan_json_object(c: &mut Cursor) -> Int {
-	val n = c.src.byte_length();
-	var i = c.pos;
-	var depth = 0;
-	var in_str = false;
-	var esc = false;
-	while i < n {
-		val ch = cast<Int>(c.src.byte_at(i));
-		if in_str {
-			if esc { esc = false; }
-			else if ch == 92 { esc = true; }     // backslash
-			else if ch == 34 { in_str = false; } // closing quote
-		} else {
-			if ch == 34 { in_str = true; }       // opening quote
-			else if ch == 123 { depth = depth + 1; }   // '{'
-			else if ch == 125 {                  // '}'
-				depth = depth - 1;
-				if depth == 0 { c.pos = i + 1; return i + 1; }
-			}
-		}
-		i = i + 1;
-	}
-	throw ParseError(code = "unterminated-json", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated JSON object");
-}
-
-fn _parse_json_object(c: &Cursor, raw: &String, pos: Int) -> json.JsonNode {
-	match json.parse_strict(raw) {
-		core.Result::Ok(n) => {
-			var is_obj = false;
-			match n.as_object() { Optional::Some(_) => { is_obj = true; }, Optional::None => {} }
-			if !is_obj { throw ParseError(code = "expected-json-object", byte_offset = pos, line = 0, column = 0, expected = "", found = "", message = "operation input must be a JSON object"); }
-			return move n;
-		},
-		core.Result::Err(_) => { throw ParseError(code = "invalid-json", byte_offset = pos, line = 0, column = 0, expected = "", found = "", message = "invalid JSON object"); }
-	}
 }
 
 // ===== lowering: merge the parsed pieces into the base deployment config =====

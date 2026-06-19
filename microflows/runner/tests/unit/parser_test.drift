@@ -209,8 +209,8 @@ fn scenario() -> Int {
 	if !_parse_err(&"args { a: int \nsteps { x {} }\n") { return 33; }             // unterminated object type
 	if !_parse_err(&"steps { reserve { \"a\": 1 \n") { return 34; }                // unterminated JSON object
 	if !_parse_err(&"steps {\n") { return 35; }                                    // unterminated steps block
-	if !_parse_err(&"steps { reserve [1,2] }\n") { return 36; }                    // step input not an object
-	if !_parse_err(&"steps { reserve 5 }\n") { return 37; }                        // step input not '{'
+	if !_parse_ok(&"steps { reserve [1,2] }\n") { return 36; }                     // array op input is now VALID (construction)
+	if !_parse_err(&"steps { reserve 5 }\n") { return 37; }                        // a bare scalar is still not an expression
 	if !_parse_err(&"args { a: int }\nargs { b: int }\nsteps { x {} }\n") { return 38; }  // duplicate args
 	if !_parse_err(&"op x {}\nop x {}\nsteps { x {} }\n") { return 39; }           // duplicate op
 	if !_parse_err(&"steps { }\n") { return 40; }                                  // empty steps
@@ -556,6 +556,51 @@ fn scenario() -> Int {
 	// an EMPTY arm body with a merge is a parse error (no source for that predecessor).
 	if !_parse_err(&"args { kind: int }\nop reserve { input: { reservation: string } }\nsteps { case kind { 1 { } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b | result d\n reserve local picked }\n") { return 148; }
 
+	// ---- 16. expression object/array construction ----
+	// An ALL-CONSTANT object literal FOLDS to a const (stays a flat "plan", byte-identical to before);
+	// a literal with ANY dynamic field becomes a "graph" (EObject construction).
+	if _lowers_to_graph(&"args { x: string }\nop reserve { input: { reservation: string } }\nsteps { reserve { reservation: \"A\" } }\n") { return 170; }   // all-const folds -> plan
+	if !_lowers_to_graph(&"args { x: string }\nop reserve { input: { reservation: string } }\nsteps { reserve { reservation: arg x } }\n") { return 171; }   // dynamic -> graph
+
+	// A dynamic object construction lowers to {object:{...}} matching the hand-authored EObject graph.
+	val co_src = "args { req: string }\nop reserve { input: { reservation: string } }\nsteps { reserve { reservation: arg req } }\n";
+	val co_l = _graph_canon_of_node(&_parse_body(&co_src));
+	val co_h = _graph_canon_of_node(&_pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"object\":{\"reservation\":{\"arg\":[\"req\"]}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
+	if _str_eq(&co_h, &"<bad-graph>") { return 172; }
+	if !_str_eq(&co_l, &co_h) { return 173; }
+
+	// A MIXED object (one const + one dynamic field) does NOT fold; the const field stays {const}.
+	val cm_src2 = "args { y: int }\nop op1 { input: { } }\nsteps { op1 { a: \"x\", b: arg y } }\n";
+	val cm_l2 = _graph_canon_of_node(&_parse_body(&cm_src2));
+	val cm_h2 = _graph_canon_of_node(&_pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"op1\",\"input\":{\"object\":{\"a\":{\"const\":\"x\"},\"b\":{\"arg\":[\"y\"]}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
+	if _str_eq(&cm_h2, &"<bad-graph>") { return 174; }
+	if !_str_eq(&cm_l2, &cm_h2) { return 175; }
+
+	// A top-level array construction with a dynamic element lowers to {array:[...]} (order preserved).
+	val ca_src = "args { a: int }\nop pack { }\nsteps { pack [ arg a, const 1 ] }\n";
+	val ca_l = _graph_canon_of_node(&_parse_body(&ca_src));
+	val ca_h = _graph_canon_of_node(&_pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"pack\",\"input\":{\"array\":[{\"arg\":[\"a\"]},{\"const\":1}]},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
+	if _str_eq(&ca_h, &"<bad-graph>") { return 176; }
+	if !_str_eq(&ca_l, &ca_h) { return 177; }
+
+	// FOLD inside a graph: all-const constructions in if-branches lower IDENTICALLY to {const} inputs
+	// (so an existing const-input workflow's content_hash is unchanged when written with `{…}` syntax).
+	val cf_src = "args { flag: bool }\nop reserve { input: { reservation: string } }\nsteps { if flag { reserve { reservation: \"A\" } } else { reserve { reservation: \"B\" } } }\n";
+	val cf_l = _graph_canon_of_node(&_parse_body(&cf_src));
+	val cf_h = _graph_canon_of_node(&_pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n3\"},{\"kind\":\"return\",\"id\":\"n3\",\"value\":{\"const\":null}}]}"));
+	if _str_eq(&cf_h, &"<bad-graph>") { return 178; }
+	if !_str_eq(&cf_l, &cf_h) { return 179; }
+
+	// Malformed construction: a DUPLICATE field key, and a bad value keyword, are parse errors.
+	if !_parse_err(&"args { y: int }\nop op1 { }\nsteps { op1 { a: arg y, a: const 1 } }\n") { return 180; }
+	if !_parse_err(&"args { y: int }\nop op1 { }\nsteps { op1 { a: frob y } }\n") { return 181; }
+	// A nested construction (object inside object) lowers through recursively.
+	val cn_src = "args { z: string }\nop op1 { }\nsteps { op1 { outer: { inner: arg z } } }\n";
+	val cn_l = _graph_canon_of_node(&_parse_body(&cn_src));
+	val cn_h = _graph_canon_of_node(&_pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"op1\",\"input\":{\"object\":{\"outer\":{\"object\":{\"inner\":{\"arg\":[\"z\"]}}}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
+	if _str_eq(&cn_h, &"<bad-graph>") { return 182; }
+	if !_str_eq(&cn_l, &cn_h) { return 183; }
+
 	return 0;
 }
 
@@ -585,6 +630,15 @@ fn _parse_body(src: &String) -> json.JsonNode {
 	match parser.parse_source(src) {
 		core.Result::Ok(p) => { return p.body.clone_deep(); },
 		core.Result::Err(_) => { throw TestError(message = "parse failed"); }
+	}
+}
+
+// True iff `src` parses AND lowers to a control-flow "graph" (vs a flat "plan"). Used to prove that
+// an ALL-CONSTANT construction folds to a const (staying a plan), while a dynamic one becomes a graph.
+fn _lowers_to_graph(src: &String) -> Bool {
+	match parser.parse_source(src) {
+		core.Result::Ok(p) => { return p.is_graph; },
+		core.Result::Err(_) => { return false; }
 	}
 }
 

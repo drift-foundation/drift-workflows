@@ -19,6 +19,7 @@ export {
 	canonical,
 	// ----- control-flow graph IR (Step 1b(ii): types + canonical hashing + flat-plan compat) -----
 	IrExpr,
+	ExprField,
 	LoopKind,
 	IrCaseArm,
 	MergeArm,
@@ -339,7 +340,20 @@ pub variant IrExpr {
 	EConst(canonical_json: String),                  // pinned constant: a CANONICAL JSON literal (see above)
 	EArg(path: Array<String>),                       // durable arguments, projected by path
 	EResult(node: String, path: Array<String>),      // a prior Operation node's settled result
-	ELocal(name: String, path: Array<String>)        // a Let-bound local / loop element / accumulator
+	ELocal(name: String, path: Array<String>),       // a Let-bound local / loop element / accumulator
+	EObject(fields: Array<ExprField>),               // construct an object from per-field sub-expressions (PURE)
+	EArray(elems: Array<IrExpr>)                      // construct an array from element sub-expressions (PURE)
+}
+
+// One field of an EObject construction: a static key bound to a pure sub-expression. Like `MergeArm`
+// it carries an `IrExpr` by value, heap-indirected through the enclosing `Array` (no `Box` needed).
+// EObject/EArray contain ONLY sub-expressions (never an operation), so a construction is a pure value
+// step — it writes no event/continuation and is recomputed on replay, exactly like EConst/EArg/etc.
+// Canonicalization encodes object fields SORTED by key (key-order independent) and array elements IN
+// ORDER (arrays are ordered).
+pub struct ExprField {
+	pub key: String,
+	pub value: IrExpr
 }
 
 // V1 loops are FINITE array transforms over a finite collection — never a `while` cycle.
@@ -613,8 +627,10 @@ fn _parse_expr_at(n: &json.JsonNode, key: &String) -> IrExpr {
 	}
 }
 
-// An expression is EXACTLY ONE variant: const | arg | result | local. Multiple keys (which would
-// silently resolve by priority) or unknown keys are rejected.
+// An expression is EXACTLY ONE variant: const | arg | result | local | object | array. Multiple keys
+// (which would silently resolve by priority) or unknown keys are rejected. `object`/`array` are PURE
+// value construction — each field/element is itself an expression (recursively); no operation can
+// appear inside (only NOperation is a node, never an IrExpr arm).
 fn _parse_expr(e: &json.JsonNode) -> IrExpr {
 	_reject_extra(_obj_len(e), 1);   // at most one variant key; 0 falls through to the throw below
 	match e.get(&"const") {
@@ -641,7 +657,52 @@ fn _parse_expr(e: &json.JsonNode) -> IrExpr {
 		},
 		Optional::None => {}
 	}
-	throw IrError(message = "expression must be exactly one of: const, arg, result, local");
+	match e.get(&"object") {
+		Optional::Some(o) => {
+			// {"object": { "<key>": <expr>, … }} — a JSON object mapping field name -> sub-expression.
+			match o.as_object() {
+				Optional::Some(_) => {},
+				Optional::None => { throw IrError(message = "object construction must be a JSON object of key -> expr"); }
+			}
+			var fields: Array<ExprField> = [];
+			var it = o.entries();
+			var done = false;
+			while !done {
+				match it.next() {
+					Optional::Some(entry) => {
+						val key = _dup(entry.key);
+						if _expr_field_has(&fields, &key) { throw IrError(message = "duplicate object-construction field '" + _dup(&key) + "'"); }
+						fields.push(ExprField(key = move key, value = _parse_expr(entry.value)));
+					},
+					Optional::None => { done = true; }
+				}
+			}
+			return IrExpr::EObject(fields = move fields);
+		},
+		Optional::None => {}
+	}
+	match e.get(&"array") {
+		Optional::Some(arr) => {
+			// {"array": [ <expr>, … ]} — element sub-expressions, in order.
+			var elems: Array<IrExpr> = [];
+			match arr.as_array() {
+				Optional::Some(a) => {
+					var i = 0;
+					while i < a.len { elems.push(_parse_expr(&a[i])); i = i + 1; }
+				},
+				Optional::None => { throw IrError(message = "array construction must be a JSON array of exprs"); }
+			}
+			return IrExpr::EArray(elems = move elems);
+		},
+		Optional::None => {}
+	}
+	throw IrError(message = "expression must be exactly one of: const, arg, result, local, object, array");
+}
+
+fn _expr_field_has(fields: &Array<ExprField>, key: &String) nothrow -> Bool {
+	var i = 0;
+	while i < fields.len { if _str_eq(&fields[i].key, key) { return true; } i = i + 1; }
+	return false;
 }
 
 fn _parse_path(p: &json.JsonNode) -> Array<String> {
@@ -790,7 +851,42 @@ fn _expr_canonical(e: &IrExpr) nothrow -> String {
 		IrExpr::EConst(canonical_json) => { return "k" + _lp(canonical_json); },
 		IrExpr::EArg(path) => { return "a" + _path_canonical(path); },
 		IrExpr::EResult(node, path) => { return "r" + _lp(node) + _path_canonical(path); },
-		IrExpr::ELocal(name, path) => { return "l" + _lp(name) + _path_canonical(path); }
+		IrExpr::ELocal(name, path) => { return "l" + _lp(name) + _path_canonical(path); },
+		IrExpr::EObject(fields) => {
+			// Key-order INDEPENDENT: encode fields sorted by key. Each field is length-prefixed
+			// (key ‖ sub-canonical) so the encoding is collision-free.
+			var idx: Array<Int> = [];
+			var i = 0;
+			while i < fields.len { idx.push(i); i = i + 1; }
+			var a = 1;
+			while a < idx.len {
+				var b = a;
+				while b > 0 and _str_lt(&fields[idx[b]].key, &fields[idx[b - 1]].key) { idx.swap(b, b - 1); b = b - 1; }
+				a = a + 1;
+			}
+			var s: String = "o" + fmt.format_int(fields.len) + ";";
+			var k = 0;
+			while k < idx.len {
+				val kc = _lp(&fields[idx[k]].key);
+				val vc = _expr_canonical(&fields[idx[k]].value);
+				val vlp = _lp(&vc);
+				s = s + kc + vlp;
+				k = k + 1;
+			}
+			return s;
+		},
+		IrExpr::EArray(elems) => {
+			// ORDER preserving (arrays are ordered). Each element length-prefixed.
+			var s: String = "y" + fmt.format_int(elems.len) + ";";
+			var k = 0;
+			while k < elems.len {
+				val ec = _expr_canonical(&elems[k]);
+				val elp = _lp(&ec);
+				s = s + elp;
+				k = k + 1;
+			}
+			return s;
+		}
 	}
 }
 
@@ -1066,6 +1162,31 @@ fn _eval(g: &IrGraph, e: &IrExpr, args: &json.JsonNode, settled: &Array<OpResult
 				k = k + 1;
 			}
 			return _ev_err(&"ELocal references an unbound local");
+		},
+		IrExpr::EObject(fields) => {
+			// Pure construction: evaluate each field's sub-expression; a child Fault propagates.
+			var o = json.new_object();
+			var i = 0;
+			while i < fields.len {
+				match _eval(g, &fields[i].value, args, settled, lnames, lvals) {
+					core.Result::Ok(v) => { o.set(_dup(&fields[i].key), move v); },
+					core.Result::Err(er) => { return core.Result<json.JsonNode, IrError>::Err(er); }
+				}
+				i = i + 1;
+			}
+			return core.Result<json.JsonNode, IrError>::Ok(o.to_node());
+		},
+		IrExpr::EArray(elems) => {
+			var arr = json.new_array();
+			var i = 0;
+			while i < elems.len {
+				match _eval(g, &elems[i], args, settled, lnames, lvals) {
+					core.Result::Ok(v) => { arr.push(move v); },
+					core.Result::Err(er) => { return core.Result<json.JsonNode, IrError>::Err(er); }
+				}
+				i = i + 1;
+			}
+			return core.Result<json.JsonNode, IrError>::Ok(arr.to_node());
 		}
 	}
 }
@@ -1572,6 +1693,22 @@ fn _check_merge_source(g: &IrGraph, e: &IrExpr, fidx: Int) nothrow -> Optional<S
 		IrExpr::ELocal(name, path) => {
 			if _binder_available_after(g, name, fidx) { return Optional<String>::None(); }
 			return Optional<String>::Some("merge source ELocal is not available at its predecessor: " + _dup(name));
+		},
+		IrExpr::EObject(fields) => {
+			var i = 0;
+			while i < fields.len {
+				match _check_merge_source(g, &fields[i].value, fidx) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+				i = i + 1;
+			}
+			return Optional<String>::None();
+		},
+		IrExpr::EArray(elems) => {
+			var i = 0;
+			while i < elems.len {
+				match _check_merge_source(g, &elems[i], fidx) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+				i = i + 1;
+			}
+			return Optional<String>::None();
 		}
 	}
 }
@@ -2008,6 +2145,65 @@ fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Arra
 				i = i + 1;
 			}
 			return core.Result<InferType, IrError>::Ok(InferType::Unknown());
+		},
+		IrExpr::EObject(fields) => {
+			// Constructed object type: each field typed; any Imprecise -> Imprecise; else any
+			// Unknown (untyped source) -> Unknown (permissive); else a Known TObject (sorted).
+			var any_imprecise = false;
+			var any_unknown = false;
+			var ftypes: Array<IrField> = [];
+			var i = 0;
+			while i < fields.len {
+				match _infer_expr_type(g, &fields[i].value, arg_type, contracts, lt_names, lt_types) {
+					core.Result::Ok(it) => {
+						match it {
+							InferType::Known(t) => { ftypes.push(IrField(name = _dup(&fields[i].key), ty = move t)); },
+							InferType::Imprecise() => { any_imprecise = true; },
+							InferType::Unknown() => { any_unknown = true; }
+						}
+					},
+					core.Result::Err(er) => { return core.Result<InferType, IrError>::Err(IrError(message = "EObject field '" + _dup(&fields[i].key) + "': " + er.message)); }
+				}
+				i = i + 1;
+			}
+			if any_imprecise { return core.Result<InferType, IrError>::Ok(InferType::Imprecise()); }
+			if any_unknown { return core.Result<InferType, IrError>::Ok(InferType::Unknown()); }
+			_sort_fields(&mut ftypes);
+			return core.Result<InferType, IrError>::Ok(InferType::Known(ty = IrType::TObject(fields = move ftypes)));
+		},
+		IrExpr::EArray(elems) => {
+			// Constructed array type: empty -> Imprecise (no element type); any Imprecise or a type
+			// DISAGREEMENT -> Imprecise; else any Unknown -> Unknown; else Known TArray(elem).
+			if elems.len == 0 { return core.Result<InferType, IrError>::Ok(InferType::Imprecise()); }
+			var any_imprecise = false;
+			var any_unknown = false;
+			var have_known = false;
+			var first_canon: String = "";
+			var elem_known: Optional<IrType> = Optional<IrType>::None();
+			var i = 0;
+			while i < elems.len {
+				match _infer_expr_type(g, &elems[i], arg_type, contracts, lt_names, lt_types) {
+					core.Result::Ok(it) => {
+						match &it {
+							InferType::Known(t) => {
+								val tc = canonical(t);
+								if !have_known { have_known = true; first_canon = _dup(&tc); elem_known = Optional<IrType>::Some(_clone_type(t)); }
+								else { if !_str_eq(&tc, &first_canon) { any_imprecise = true; } }
+							},
+							InferType::Imprecise() => { any_imprecise = true; },
+							InferType::Unknown() => { any_unknown = true; }
+						}
+					},
+					core.Result::Err(er) => { return core.Result<InferType, IrError>::Err(IrError(message = "EArray elem: " + er.message)); }
+				}
+				i = i + 1;
+			}
+			if any_imprecise { return core.Result<InferType, IrError>::Ok(InferType::Imprecise()); }
+			if any_unknown { return core.Result<InferType, IrError>::Ok(InferType::Unknown()); }
+			match move elem_known {
+				Optional::Some(t) => { return core.Result<InferType, IrError>::Ok(InferType::Known(ty = IrType::TArray(elem = core.box(move t)))); },
+				Optional::None => { return core.Result<InferType, IrError>::Ok(InferType::Unknown()); }
+			}
 		}
 	}
 }
@@ -2201,6 +2397,22 @@ fn _check_expr(g: &IrGraph, e: &IrExpr, idx: Int, extra_locals: &Array<String>) 
 			if _contains_str(extra_locals, name) { return Optional<String>::None(); }
 			if _has_dominating_binder(g, name, idx) { return Optional<String>::None(); }
 			return Optional<String>::Some("ELocal references an unbound/non-prior local: " + _dup(name));
+		},
+		IrExpr::EObject(fields) => {
+			var i = 0;
+			while i < fields.len {
+				match _check_expr(g, &fields[i].value, idx, extra_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+				i = i + 1;
+			}
+			return Optional<String>::None();
+		},
+		IrExpr::EArray(elems) => {
+			var i = 0;
+			while i < elems.len {
+				match _check_expr(g, &elems[i], idx, extra_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+				i = i + 1;
+			}
+			return Optional<String>::None();
 		}
 	}
 }
