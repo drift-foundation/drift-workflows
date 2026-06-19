@@ -10,6 +10,22 @@ participant protocol, and the milestone-1 plan.
 > (`phase_drift_mile_design.md`) is preserved as the historical record; see
 > §10 (History & rationale) for why the direction changed and what it cost.
 
+> **As-built note (2026-06-19).** Milestone 1 is LANDED and proven. The
+> manual-IR runtime (durable dispatch, recovery, reversal) AND the `.mf`
+> language frontend (parser, type binding, lowering, diagnostics) are complete
+> on certified driftc 0.33.42 / ABI 17. Verified for the latest slice: the
+> `coordinator-singular` integration gate (**134/134**, DB-backed, real HTTP)
+> and `parser_test` (base + asan); the component gates (`ir_*`, stored-procedure,
+> singular) were green at authoring and are unchanged. §§1–11 below remain the
+> design of record (guarantee model,
+> participant protocol, persistence, history); they describe **intent** and a
+> plan whose steps are now done. **§12 documents the system AS BUILT** — the IR,
+> identity, validation, the `.mf` language, and the V1 capability envelope. For
+> a task-oriented authoring guide aimed at participant/workflow teams, see
+> **`microflows_user_guide.md`**. Where §§4/7/8 describe the parser or
+> control-flow as "deferred / after runtime proven," read §12 for what actually
+> shipped.
+
 ---
 
 ## 1. What Microflows is
@@ -528,25 +544,31 @@ speculatively. Only the spike-independent control-state changes happen first.
 
 ```text
 1  Workflow state machine + claimability ............ DONE (reused as-is)
-2a Schema: REMOVE record + journal stores ........... safe now (decoupled)
+2a Schema: REMOVE record + journal stores ........... DONE
 3  Lease acquisition + transactional fencing ........ DONE (reused as-is)
 8  Minimum REST participant protocol + feasibility
-     spike .......................................... NEXT — drives 2b
+     spike .......................................... DONE (conformance ref)
 2b Schema: operation request/result + definition
-     tables ......................................... SHAPED BY the spike
+     tables ......................................... DONE (shaped by the spike)
      (atomic request+continuation persist; input hash + schema version;
       normalized outcome incl. durable indeterminate)
 4  Durable remote-operation dispatch + result
-     persistence, with manual IR .................... after 2b
-5  Crash recovery + idempotent resumption ........... concept preserved
+     persistence, with manual IR .................... DONE (graph-driven; §12)
+5  Crash recovery + idempotent resumption ........... DONE (replay; §12.2)
 6  Reversal + blocked_resolution
-     (reverse = remote compensation dispatch) ....... concept preserved
-9  Generic REST dispatcher .......................... after the spike proves
-     the model
-7  Parser + type checker ............................ after runtime proven
+     (reverse = remote compensation dispatch) ....... DONE
+9  Generic REST dispatcher .......................... DONE (config routing)
+7  Parser + type checker ............................ DONE — the .mf frontend
+     (whole V1 IR + diagnostics; §12.6)
 10 Script deployment: manifest-driven ScriptRegistry
-     (compile-on-startup + staged SIGHUP reload) .... after 7; see §4.1
+     (compile-on-startup + staged SIGHUP reload) .... see §4.1 (registry built;
+     manifest loader is the remaining packaging step)
 ```
+
+> **Status (as-built, 2026-06-19):** every step above is landed and proven
+> except the manifest-driven filesystem ScriptRegistry packaging (§4.1) — the
+> runtime today loads a config-supplied revision (`--config` + `--lower-source`).
+> See **§12** for the as-built runtime + language.
 
 **Script deployment (§4.1):** milestone 1 compiles `.mf` source from an explicit
 manifest into an in-memory IR registry on startup, with staged atomic
@@ -771,8 +793,13 @@ package boundaries explicit. See `conventions_and_db_migration.md` §0.
 ../pushcoin/bookkeeper ... practical MariaDB-access + Mariachi-consumer +
                            HTTP-service reference (and the spike's HTTP/Singular
                            wiring template)
-../drift-lang ............ parser, type checker, IR, diagnostics, interpreter
-                           patterns (see doc/drift_lang_reuse.md)
+../drift-lang ............ HISTORICAL inspiration ONLY (early language/IR
+                           pattern study). SUPERSEDED by the Frontend-reuse
+                           policy (§12.6): Microflows NEVER depends on this or
+                           any sibling checkout — not as a build dep, not as a
+                           test path. The parser/lowering/diagnostics are local
+                           to parser.drift. (doc/drift_lang_reuse.md is marked
+                           superseded.)
 ../pushcoin/singular ..... build/test conventions (older PushCoin variant);
                            AND the preferred participant-side idempotency impl
                            (NOT used by Microflows directly)
@@ -869,3 +896,294 @@ question to settle now — it is an *output* of the spike (§7, §8).
 4. **Reference participant for the spike.** *Resolved:* a minimal Drift stub
    implementing only §5.1, backed by Singular (§8.1–8.2). It becomes the
    conformance reference; Bookkeeper integration follows later.
+
+---
+
+## 12. As-built: the proven V1 runtime + language (2026-06-19)
+
+This section is the **authoritative record of what shipped**. It supersedes the
+"deferred / after runtime proven" framing in §§4, 7, and 8 for everything it
+covers. The work landed incrementally on certified driftc 0.33.42 / ABI 17. Each
+slice gated on the full root `just test` (unit: `ir_exec_test`, `ir_graph_test`,
+`parser_test`, base + asan; stored-procedure; singular; integration:
+`coordinator-singular`, real HTTP against the Singular-backed participant). The
+latest slice (case-join merge) was re-verified DB-backed: integration **134/134**
+plus `parser_test` base + asan green on 0.33.42; the other component gates were
+green at authoring and are unchanged. The runtime and language live in
+`microflows/runner/src/` (`ir.drift`, `parser.drift`, `runner.drift`); nothing
+here depends on `../drift-lang` or any sibling checkout (§12.6).
+
+### 12.1 The IR — a typed control-flow graph (`ir.drift`)
+
+A workflow is a **flat node table keyed by a stable id**, with node-id edges
+(not nested nodes) — so the structure is finite and needs no `Box` for control
+flow. Node kinds:
+
+```text
+NOperation  a remote call — the ONLY durable suspension point
+NLet        a pure value binding
+NIf         a two-way branch on a Bool
+NCase       an N-way branch on a scrutinee, matched against constants + default
+NLoop       a finite array transform (map/filter/fold) — never a `while` cycle
+NMerge      an SSA phi: rejoin branches, binding a value selected by the taken path
+NReturn     terminal
+```
+
+Expressions are a **closed leaf set** (`IrExpr`), each path-projectable:
+
+```text
+EConst(canonical_json)   a pinned constant (canonical JSON literal)
+EArg(path)               a durable argument, projected
+EResult(node, path)      a prior NOperation's settled result, projected
+ELocal(name, path)       a let / loop-element / accumulator / merge binding
+```
+
+Loop kinds are `LMap` / `LFilter` / `LFold` over a finite collection; the body
+is a **pure `IrExpr`**, which structurally forbids a remote op inside iteration.
+
+**The load-bearing invariant — the pure/durable boundary.** Only `NOperation`
+is a durable boundary: it persists a request + suspended continuation *before*
+dispatch and a result + Checkpoint *after* success (§2.5). Every other node —
+branch, let, loop, merge — writes **no continuation and no event**. On restart
+the interpreter **re-derives the pure path deterministically** forward from the
+last settled operation (durable args + settled results + recomputed locals),
+then reconciles the next operation against durable state. This realizes §4's
+"every remote call is an implicit durable suspension boundary" and "no
+control-flow cycle may invoke a remote operation," and keeps the durable model
+exactly as proven for the flat plan: a control-flow construct never introduces a
+new durable record. **Determinism is structural** — the IR exposes no
+clock/random/env/fs/net/live-config, so the only inputs to a replay are durable
+facts.
+
+### 12.2 Identity — graph-authoritative `content_hash`
+
+A loaded revision's identity is:
+
+```text
+content_hash = graph_canonical(graph)
+             ‖ per-NOperation resolved bindings (participant + schema_version
+               + compensation binding)
+             ‖ canonical(argument_type)
+             ‖ operation input/result + compensation type contracts (when present)
+```
+
+`graph_canonical` is a deterministic, length-prefixed encoding that **normalizes
+away non-semantic variation**: nodes sorted by id, `NCase` arms sorted by
+`match_const`, `NMerge` sources sorted by `from`, and every constant input
+canonicalized (key-ordered compact JSON). So source formatting, key order, and
+declaration order **never** change identity; a genuine semantic change always
+does. Revision pinning (§4.1) is enforced on this hash: resume requires an
+exact `(plan_version, content_hash)` match, else `revision_unavailable` — never
+a silent substitution. The runner exposes `--emit-content-hash` (DB-free) as the
+single source of the value (no reimplementation in tests or fixtures).
+
+### 12.3 Durable arguments
+
+Per-instance arguments are the **one** durable child the language added: a small
+immutable per-`workflow_id` record holding the **canonical args document as
+ordered-key compact UTF-8 bytes**, written atomically with the workflow + plan
+pin. Submitted `--arguments` are validated against the declared `argument_type`
+and canonicalized before creation. Reusing a `workflow_id` with **different
+canonical bytes → `workflow_conflict`** (decided by `VARBINARY` byte equality,
+never collated text; reordered keys with the same content are idempotent).
+Resume reads the **durable** args, never the CLI/submission. The declared
+argument **type** is in `content_hash` (a contract change is a new revision);
+only per-instance **values** are excluded (a value change is a conflict, not a
+revision). Pure control flow still persists nothing else.
+
+### 12.4 Validation — at registry build, before any dispatch
+
+A malformed source or config fails at **build time** → `invalid_config`
+(submission, pre-claim) or `revision_unavailable` (resume, post-claim) — never a
+dispatch, never new durable state. Two layers:
+
+**Structural** (`validate_graph`): strict node/expression parsing (each kind has
+exactly its allowed keys; an expression is exactly one variant — no silent
+drop); **balanced operation depth** across all branches (a uniform per-path
+operation count, so the durable seq = execution position invariant holds);
+`EResult`/`ELocal` **dominance**; `NMerge` **totality + unambiguity** (one source
+per immediate predecessor, each value available after its predecessor);
+**reversibility** (every non-final operation has a compensation binding, so
+reversal can never strand); loop `elem ≠ as` and finite source.
+
+**Typed** (`type_check_graph`, optional contracts): operations may declare
+`input_type` / `result_type`; a topological pass types binders before use with
+three-way inference — `Known` (assignability-checked), `Unknown` (only from an
+untyped op result — the backward-compatible escape hatch), and `Imprecise` (a
+const whose precise type is undetermined — never permissive: a static const is
+checked by value, an imprecise const reaching a typed input through a
+non-static path is rejected). A **compensation** receives the forward op's
+checkpoint payload, so its declared input type must match the forward op's; type
+tags fold into `content_hash`. An untyped config behaves exactly as before
+(every contract is optional).
+
+### 12.5 Execution & reversal (unchanged in mechanism, generalized to the graph)
+
+Forward execution is **advance-driven**: gather durable args + settled results,
+then loop the interpreter — `NeedOperation` (recover-or-derive the request,
+resolve binding, request-before-dispatch, settle, checkpoint) until `Completed`
+(report the final settled op's result) or `Fault` (defer). Branch/loop/let/merge
+advance purely between operations. Reversal is **checkpoint-stack driven**
+(`reverse_head`) and reads compensation from the operations registry — it never
+consults the graph, so it compensates exactly the taken path, highest-seq first.
+A forward failure after a taken branch reverses only that branch's checkpoints +
+shared downstream ops; untaken branches have no operation row.
+
+### 12.6 The `.mf` source language (`parser.drift` + `--lower-source`)
+
+The textual frontend **lowers `.mf` source into the exact config the IR already
+executes and hashes** — no new IR nodes, execution paths, or durable state. The
+acceptance criterion is **lowering parity**: a parser-lowered config and a
+hand-authored config produce the identical `--emit-content-hash` and execute the
+same.
+
+```text
+args  { name: <type>, … }                  -> the closed-object argument_type
+op    <name> { input: <T>  result: <T> }   -> operation input/result contracts (both optional)
+steps { <statement>* }                     -> a flat "plan" (const-only straight line)
+                                              or a control-flow "graph" (anything else)
+
+statement := <op> <expr>                              a remote call (operation step)
+           | let <name> = <expr>                      a pure binding (NLet)
+           | let <name> = <op> <expr>                 a NAMED op; <name> aliases its result
+           | let <name> = (map|filter) <src> each <e> <body>
+           | let <name> = fold <src> from <init> each <e> <body>
+           | if <arg-path> { … } [ else { … } ] [ merge <n> = <e> | <e> ]
+           | case <arg-path> { (<json> { … })* default { … } } [ merge <n> = <e> | … | <e> ]
+expr      := { …json… } | const <json> | arg <path> | local <name>[.path] | result <name>[.path]
+type      := int | float | bool | string | null | { field: T, … } | [T] | T?
+```
+
+`merge` / `map` / `filter` / `fold` are **contextual keywords** (an op literally
+named `merge` is unaffected). Result aliases live **only in the parser** (a
+global symbol table mapping name → node id), so `result` refs are stable under
+reformatting and alias-rename — the emitted graph and hash are identical.
+`--lower-source <wf.mf> --config <base.json>` merges the source over the trusted
+**deployment routing** (participants + operation→participant bindings) and runs
+the **real build/validation path DB-free** before printing, so an invalid
+source/config (unknown op, op-imbalanced branch, missing `case` default,
+undominated/cross-branch `result` ref, non-predecessor merge source, non-array
+loop source, `elem`/`as` collision, type-contract mismatch, …) fails **at
+lowering**, before anything durable. The printed config is itself runnable and
+`--emit-content-hash`-able unchanged.
+
+**Diagnostics.** A parse failure is a **structured `ParseError`**: a stable,
+kebab-case, machine-readable `code` (`unknown-keyword`, `expected-expression`,
+`unterminated-block`, `case-arm-after-default`, `case-merge-arity`, …), source
+position (`byte_offset` / `line` / `column`, 1-based, column counts UTF-8
+scalars), and `expected` / `found` where applicable. `render_diagnostic` formats
+a human CLI string (code + line/column + caret); `--lower-source` emits the
+structured event through `std.log` (machine-parseable fields, same facility as
+the bookkeeper service) **and** prints the human render.
+
+**Frontend-reuse policy (settled).** The parser, lowering, AND diagnostics stay
+**local to `parser.drift`**. Microflows **never** depends on `../drift-lang` or
+any sibling checkout — not as a build dependency, not as a test path. An
+instructive Drift-frontend pattern may be read as inspiration and **manually
+cloned with local ownership**; if reuse pressure becomes substantial, the move
+is to **ask the compiler team to extract a supported, versioned package** —
+never to reach across a sibling-repo path.
+
+### 12.7 V1 capability envelope — and the explicit limits (the hand-off boundary)
+
+**Supported and proven:**
+
+```text
+durable saga: call a remote op, settle, CHECKPOINT, COMPENSATE on failure,
+  resume after crash, effectively-once execution (re-poll by stable id)
+branch & route: if / case on a durable-argument or result value
+data flow: pass values between steps via arg / result / local, with path projection
+named results + cross-branch merge (NMerge phi) feeding shared downstream work
+finite PURE collection transforms: map / filter / fold (projection/selection)
+typed contracts: optional per-operation input/result types, checked before dispatch
+```
+
+**NOT in V1 (deliberate — design accordingly):**
+
+```text
+in-workflow COMPUTATION — IrExpr is const/arg/result/local projections ONLY.
+  No arithmetic, no string building, no comparison beyond `case` exact-match.
+  => every COMPUTED value must be produced by a participant.
+remote ops INSIDE a loop — loop bodies are pure; no dynamic fan-out
+  ("charge each of N items"). Model a batch as one participant op, or unroll.
+`while` / unbounded loops — loops are finite array transforms only.
+AUTHENTICATION — participant `auth_profile` must be null/absent (any value is
+  rejected at build). Fine for trusted-network participants; a production
+  blocker for calls over the open wire. (See security_model.md.)
+variable per-branch operation counts — op-depth must be uniform across branches.
+```
+
+**The design consequence — thin orchestrator, smart participants.** Because
+every computed value and every side effect lives in a participant, Microflows
+stays a pure coordinator (consistent with §1's responsibility boundary).
+Workflow authors orchestrate: call typed operations, branch on their results,
+carry values across joins, compensate on failure. A feature that needs
+in-workflow *computation* (arithmetic, comparison) is a real language extension
+(a typed expression sub-language), deferred beyond V1.
+
+**Not a design limit — a current parser slice gap (value construction).**
+Separately from computation, the *current parser slice* accepts an operation
+input that is either a fully-**constant** `{…}` object, a `const`, or a
+**single** projection (`arg`/`local`/`result` + path). It does **not** yet parse
+an object/array literal with **expression-valued fields**
+(`{ customer: arg c.id, amount: arg o.amount }`). This is a **temporary frontend
+limitation, not a design decision** — the intended V1 value model includes
+objects and arrays as first-class values (§4), and **expression object/array
+construction is the next planned parser/runtime refinement** (§12.9). Until it
+lands, an author shapes the `args` document and participant **result** types so
+each operation consumes one subtree; that is a workaround for the slice, **not**
+the intended authoring model, and docs/guides must not present it as one.
+
+### 12.8 Source layout (where the as-built lives)
+
+```text
+microflows/runner/src/ir.drift       typed value model, graph node/expr types,
+                                       graph_canonical, validate_graph,
+                                       type_check_graph, the interpreter (advance)
+microflows/runner/src/parser.drift   the .mf lexer/grammar/lowering + diagnostics
+microflows/runner/src/runner.drift   registry build, content_hash, dispatch,
+                                       recovery, reversal; --lower-source /
+                                       --emit-content-hash CLIs
+microflows/runner/tests/unit/        ir_exec_test, ir_graph_test, parser_test
+integration/coordinator-singular/    test.py — the 134-check E2E gate
+singular/doc/singular-protocol.md    the participant-side protocol contract
+```
+
+### 12.9 Planned next refinement — expression object/array construction
+
+The intended V1 value model has objects and arrays as first-class values (§4),
+but the current frontend only constructs them as **constants** (§12.7). The next
+slice makes value construction first-class so an operation input can be built
+from multiple dynamic parts — the natural shape for real workflows — **without**
+weakening any runtime guarantee.
+
+**Surface.**
+- Object literals with **expression-valued fields**:
+  `{ customer: arg c.id, amount: arg order.amount }`.
+- Array literals with **expression elements**, if it fits the same model:
+  `[ arg a, result b, const 3 ]`.
+- Nesting composes (a constructed object as a field value, etc.).
+
+**Lowering / IR.** Lower to existing IR expression construction if present; the
+current `IrExpr` leaf set is const/projection only (`EConst`/`EArg`/`EResult`/
+`ELocal`), so this **extends the IR value-expression model narrowly** — e.g. an
+`EObject(fields: [(key, IrExpr)])` / `EArray(elems: [IrExpr])` construction node
+(or equivalent), folded into `graph_canonical` so identity stays stable and
+key-order-insensitive.
+
+**Invariants to preserve (acceptance criteria).**
+- **Pure** — construction contains **no operations**; it is a value step, never a
+  durable boundary. A constructed input writes **no event**; resume **recomputes**
+  it from durable args/results (event-count parity with a const-input op; the
+  trailing op reconciles GET-first, no second PUT — the same proof shape used for
+  `let`/`merge`/`loop`).
+- **Typed** — a constructed value is type-checked against the operation's input
+  contract (and against `let`/loop/merge binder types), extending
+  `type_check_graph`'s const/projection inference to the construction nodes;
+  folds into `content_hash`.
+- **Determinism stays structural** — construction reads only durable
+  args/results/locals; no clock, randomness, or other nondeterminism.
+
+This refinement removes the §12.7 "value construction" workaround and lets
+authors wire inputs directly; until it lands, treat the one-subtree shaping as a
+temporary slice constraint only.

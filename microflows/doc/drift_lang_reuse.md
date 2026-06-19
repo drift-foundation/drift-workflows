@@ -1,12 +1,22 @@
 # drift-lang Reuse Analysis
 
+> **⚠️ SUPERSEDED (2026-06-19) — HISTORICAL ONLY.** This note explored reusing
+> `../drift-lang` components directly. That direction is **superseded by the
+> settled Frontend-reuse policy** (`microflows_design.md` §12.6): Microflows
+> **never** depends on `../drift-lang` or any sibling checkout — not as a build
+> dependency, not as a test path. The `.mf` parser, lowering, type binding, and
+> diagnostics shipped **entirely local** to `microflows/runner/src/parser.drift`.
+> An instructive drift-lang pattern may be read as **inspiration** and manually
+> cloned with local ownership; substantial reuse would come only as a supported,
+> versioned package requested from the compiler team. Read everything below as a
+> record of early thinking, not current policy or a reuse plan.
+
 > **Note (2026-06-07):** PhaseDrift was renamed **Microflows** and narrowed to
 > a workflow coordinator (see `microflows_design.md`). This reuse analysis is
 > unaffected — Microflows still parses/type-checks/verifies into a versioned
-> portable interpreted IR and reuses the same drift-lang patterns. The one
-> change: the mariadb-rpc free-SQL (`exec`) question is **withdrawn** —
-> Microflows persists only control state via stored procedures and never needs
-> generic business-record SQL.
+> portable interpreted IR. The one change: the mariadb-rpc free-SQL (`exec`)
+> question is **withdrawn** — Microflows persists only control state via stored
+> procedures and never needs generic business-record SQL.
 
 **Status:** working note
 **Purpose:** record which `../drift-lang` components PhaseDrift reuses
