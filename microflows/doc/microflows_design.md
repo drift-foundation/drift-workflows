@@ -13,10 +13,11 @@ participant protocol, and the milestone-1 plan.
 > **As-built note (2026-06-19).** Milestone 1 is LANDED and proven. The
 > manual-IR runtime (durable dispatch, recovery, reversal) AND the `.mf`
 > language frontend (parser, type binding, lowering, diagnostics) are complete
-> on certified driftc 0.33.42 / ABI 17. Verified for the latest slice: the
-> `coordinator-singular` integration gate (**134/134**, DB-backed, real HTTP)
-> and `parser_test` (base + asan); the component gates (`ir_*`, stored-procedure,
-> singular) were green at authoring and are unchanged. §§1–11 below remain the
+> on certified driftc 0.33.42 / ABI 17. Verified for the latest slice (operational
+> admission / draining, §13): the `coordinator-singular` integration gate
+> (**142/142**, DB-backed, real HTTP); the unit gates (`ir_*`/`parser_test`, base
+> + asan) and the other component gates (stored-procedure, singular) were green at
+> their slice's authoring and are unchanged. §§1–11 below remain the
 > design of record (guarantee model,
 > participant protocol, persistence, history); they describe **intent** and a
 > plan whose steps are now done. **§12 documents the system AS BUILT** — the IR,
@@ -907,9 +908,10 @@ covers. The work landed incrementally on certified driftc 0.33.42 / ABI 17. Each
 slice gated on the full root `just test` (unit: `ir_exec_test`, `ir_graph_test`,
 `parser_test`, base + asan; stored-procedure; singular; integration:
 `coordinator-singular`, real HTTP against the Singular-backed participant). The
-latest slice (case-join merge) was re-verified DB-backed: integration **134/134**
-plus `parser_test` base + asan green on 0.33.42; the other component gates were
-green at authoring and are unchanged. The runtime and language live in
+latest LANGUAGE/FRONTEND slice (expression object/array construction, §12.9) was
+re-verified DB-backed at **138/138** plus `ir_exec_test`/`parser_test` base + asan;
+the latest RUNTIME slice (operational admission, §13) brought the integration gate
+to **142/142**. The runtime and language live in
 `microflows/runner/src/` (`ir.drift`, `parser.drift`, `runner.drift`); nothing
 here depends on `../drift-lang` or any sibling checkout (§12.6).
 
@@ -1121,18 +1123,13 @@ carry values across joins, compensate on failure. A feature that needs
 in-workflow *computation* (arithmetic, comparison) is a real language extension
 (a typed expression sub-language), deferred beyond V1.
 
-**Not a design limit — a current parser slice gap (value construction).**
-Separately from computation, the *current parser slice* accepts an operation
-input that is either a fully-**constant** `{…}` object, a `const`, or a
-**single** projection (`arg`/`local`/`result` + path). It does **not** yet parse
-an object/array literal with **expression-valued fields**
-(`{ customer: arg c.id, amount: arg o.amount }`). This is a **temporary frontend
-limitation, not a design decision** — the intended V1 value model includes
-objects and arrays as first-class values (§4), and **expression object/array
-construction is the next planned parser/runtime refinement** (§12.9). Until it
-lands, an author shapes the `args` document and participant **result** types so
-each operation consumes one subtree; that is a workaround for the slice, **not**
-the intended authoring model, and docs/guides must not present it as one.
+**Value construction — LANDED (§12.9).** An operation input can be built from
+multiple dynamic parts (`{ customer: arg c.id, amount: arg o.amount }`,
+`[ arg a, const 3 ]`) via the `EObject`/`EArray` expressions. Authors wire inputs
+directly; no pre-shaping of the arguments document is required. (Fully-constant
+literals still fold to `EConst`, so existing hashes are unchanged.) The remaining
+hard limit is in-workflow *computation* (arithmetic/comparison) — that lives in
+participants.
 
 ### 12.8 Source layout (where the as-built lives)
 
@@ -1145,47 +1142,125 @@ microflows/runner/src/runner.drift   registry build, content_hash, dispatch,
                                        recovery, reversal; --lower-source /
                                        --emit-content-hash CLIs
 microflows/runner/tests/unit/        ir_exec_test, ir_graph_test, parser_test
-integration/coordinator-singular/    test.py — the 134-check E2E gate
+integration/coordinator-singular/    test.py — the 142-check E2E gate
 singular/doc/singular-protocol.md    the participant-side protocol contract
 ```
 
-### 12.9 Planned next refinement — expression object/array construction
+### 12.9 LANDED — expression object/array construction
 
-> **Roadmap item 1** (the next coding slice) — see `roadmap.md` for the full handoff roadmap.
+> **Roadmap item 1** — LANDED (2026-06-19). See `roadmap.md`.
 
-The intended V1 value model has objects and arrays as first-class values (§4),
-but the current frontend only constructs them as **constants** (§12.7). The next
-slice makes value construction first-class so an operation input can be built
-from multiple dynamic parts — the natural shape for real workflows — **without**
-weakening any runtime guarantee.
+Operation inputs (and any value expression) can now be **built from multiple
+dynamic parts** — the natural shape for real workflows — with **no** weakening of
+any runtime guarantee. This removes the former §12.7 "value construction"
+workaround; authors wire inputs directly instead of pre-shaping the arguments
+document.
 
-**Surface.**
+**Surface (shipped).**
 - Object literals with **expression-valued fields**:
   `{ customer: arg c.id, amount: arg order.amount }`.
-- Array literals with **expression elements**, if it fits the same model:
+- Array literals with **expression elements**:
   `[ arg a, result b, const 3 ]`.
 - Nesting composes (a constructed object as a field value, etc.).
+- A **fully-constant** literal folds to `{const: …}` — byte-identical to the
+  former const-object shorthand, so existing `content_hash`es are unchanged (the
+  parser folds; the IR re-canonicalizes the const regardless). Any dynamic
+  field/element makes it an `EObject`/`EArray`.
 
-**Lowering / IR.** Lower to existing IR expression construction if present; the
-current `IrExpr` leaf set is const/projection only (`EConst`/`EArg`/`EResult`/
-`ELocal`), so this **extends the IR value-expression model narrowly** — e.g. an
-`EObject(fields: [(key, IrExpr)])` / `EArray(elems: [IrExpr])` construction node
-(or equivalent), folded into `graph_canonical` so identity stays stable and
-key-order-insensitive.
+**IR.** Two new `IrExpr` arms — `EObject(fields: Array<ExprField>)` and
+`EArray(elems: Array<IrExpr>)` (`ExprField{key, value}`) — in `ir.drift`. They
+carry only sub-expressions (never an operation), so a construction is a pure
+value step. `graph_canonical` encodes object fields **sorted by key**
+(key-order-insensitive) and array elements **in order**; canonicalization,
+`validate_graph` (dominance recurses into children), the interpreter (`_eval`),
+and `type_check_graph` (infers a `TObject`/`TArray`; `Imprecise`→`Unknown`→`Known`
+precedence) all extend to the new arms. Config surface: `{"object": {k: <expr>}}`
+/ `{"array": [<expr>]}` (strict).
 
-**Invariants to preserve (acceptance criteria).**
-- **Pure** — construction contains **no operations**; it is a value step, never a
-  durable boundary. A constructed input writes **no event**; resume **recomputes**
-  it from durable args/results (event-count parity with a const-input op; the
-  trailing op reconciles GET-first, no second PUT — the same proof shape used for
-  `let`/`merge`/`loop`).
-- **Typed** — a constructed value is type-checked against the operation's input
-  contract (and against `let`/loop/merge binder types), extending
-  `type_check_graph`'s const/projection inference to the construction nodes;
-  folds into `content_hash`.
+**Proven invariants.**
+- **Pure** — construction writes **no event**; resume **recomputes** it from
+  durable args/results (event-count parity with a const-input op; trailing op
+  reconciles GET-first, no second PUT). Integration C18 + unit.
+- **Typed before dispatch** — a constructed value is type-checked against the
+  operation's input contract (a field-type mismatch is rejected at lowering, no
+  dispatch); folds into `content_hash`.
 - **Determinism stays structural** — construction reads only durable
-  args/results/locals; no clock, randomness, or other nondeterminism.
+  args/results/locals; no clock/randomness.
+- **Hash stability** — parser-lowered and hand-authored `{object}` graphs produce
+  the identical `--emit-content-hash`; all-const literals fold to the same hash as
+  before.
 
-This refinement removes the §12.7 "value construction" workaround and lets
-authors wire inputs directly; until it lands, treat the one-subtree shaping as a
-temporary slice constraint only.
+**Tests.** Unit `ir_exec_test` (EObject/EArray eval, parse/validate, canonical
+key-order independence + array order-sensitivity, type pass/fail, dominance
+recursion) and `parser_test` §16 (dynamic→graph, all-const→plan fold, object/
+array/mixed/nested parity, dup-key + bad-keyword rejection); integration C18 (4
+checks: hash parity + exec, type-mismatch rejected, no-event parity, resume
+recompute). Full gate green on certified driftc 0.33.42 — integration **138/138**,
+unit base + asan.
+
+---
+
+## 13. Operational admission / draining (first pass — roadmap item 2)
+
+A coordinator must support a safe **update/drain/shutdown cycle**: stop taking new work, let in-flight
+work converge, then reload or stop. This first pass establishes the **policy and shape** — not full
+production machinery — at the boundary the future service will own.
+
+**The runner is a one-shot CLI today** (claims one workflow, drives it, prints one outcome, exits);
+there is no long-lived server or signal handler yet (the §4.1 service shell is unbuilt). So admission
+is modeled as an **input to the drive boundary**, not in-process server state.
+
+### 13.1 Admission states + the boundary
+
+```text
+accepting   normal (default)
+draining    stop admitting NEW work; let existing work converge
+stopped     same as draining for this slice (admit nothing new)
+```
+
+Admission is an **input to `_run`** — the boundary the future `drive_workflow(...) -> Outcome`
+coordinator library exposes (roadmap item 2.5). The CLI/front-door determines the state and **passes
+it in** (`_run(…, admission)`); the library never decides it. Source today: the `MICROFLOWS_ADMISSION`
+environment variable (`"draining"` / `"stopped"`; unset/else = accepting), read once by the CLI.
+
+### 13.2 Runner behavior
+
+```text
+FRESH submission (a brand-new workflow — a submission with NO durable pin):
+  draining/stopped -> REFUSED before any create/claim/dispatch:
+     {"workflow":"refused","reason":"draining"}   exit 10   (no workflow row, no dispatch)
+
+EXISTING work (durable pin present — a resume OR a reassert):
+  proceeds (so the drain converges). BUT a resume that would DEFER/retry returns, instead of
+  scheduling new retry work:
+     {"workflow":"pending_restart","reason":"draining"}   exit 11
+  (the lease is released at `now`; the workflow stays in its durable state, resumable once admission
+   returns to accepting). This is the "no new defers while draining" rule — applied uniformly at the
+   `_defer` / `_defer_pending` / `_defer_dispatch` helpers.
+```
+
+A workflow that **can** finish during drain still completes/reverses normally — only would-be *new
+defers* are converted. Reuse: the same gate serves **config reload** and **graceful shutdown**.
+
+### 13.3 Front-door contract (spec only)
+
+The future long-running service translates a `refused` (and `pending_restart`) admission outcome into
+an **HTTP 503** to new callers / load balancers — **no `Retry-After` yet** (added when the retry
+schedule is modeled). The service also owns reload/shutdown signal handling and calls the same
+`_run`/`drive_workflow` boundary with admission as a parameter — so item 2.5's extraction is
+mechanical, not a redesign.
+
+### 13.4 Tests
+
+Integration C19: a fresh submission is refused while **draining** (refused outcome, exit 10, no
+workflow row, no dispatch) and likewise under **stopped** (`reason:"stopped"`); the same config accepts
+normally when accepting (control); and an existing respond-pending workflow, resumed while draining,
+converges to `pending_restart` (exit 11) instead of a new defer. Full gate green — integration
+**142/142**.
+
+### 13.5 Scope / deferred
+
+`accepting`↔`draining` is driven by an external `MICROFLOWS_ADMISSION` signal; a durable admission
+store, a health endpoint, `Retry-After`, and SIGHUP/SIGTERM handling arrive with the front-door
+service (roadmap items 2.5 / 3 / 5). The legacy single-op submission path is out of scope (deprecated;
+the planned/graph path is the supported submission surface).

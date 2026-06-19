@@ -40,6 +40,7 @@ import microflows.host as mf;
 import microflows.runner.ir as ir;
 import microflows.runner.parser as parser;
 import web.client as client;
+import std.env as env;
 
 const SCRIPT_NAME: String = "protocol_spike";
 // Legacy single-op pin (tb_mf_workflow.script_revision); the plan model keys on a
@@ -61,6 +62,75 @@ const PENDING_RETRY_SECONDS: Int = 1;
 const DISPATCH_DEFER_SECONDS: Int = 5;
 const PUT_IO_TIMEOUT_MS: Int = 3000;
 const RECONCILE_IO_TIMEOUT_MS: Int = 8000;
+
+// ===== Admission control (slice 2: draining / reload / graceful shutdown) =====
+//
+// Admission is an INPUT to the drive boundary (`_run`, the future `drive_workflow(...) -> Outcome`
+// coordinator-library entry point — see roadmap.md item 2.5). The CLI/front-door determines the
+// admission state and passes it in; the library never decides it. Behavior:
+//   - Accepting  : current behavior (the default).
+//   - Draining   : a FRESH submission (creating a brand-new workflow) is REFUSED before any
+//                  create/claim/dispatch — `{"workflow":"refused","reason":"draining"}`, nonzero
+//                  exit. Resumes/reasserts of EXISTING work proceed so the drain converges, BUT a
+//                  resume that would need to defer/retry returns `pending_restart` instead of
+//                  scheduling new retry work (so the drain stops generating "come back later" work).
+//   - Stopped    : same as Draining for this slice (refuse fresh; suppress new defers).
+// Reuse: the same gate serves config reload AND graceful shutdown. The future front-door SERVICE
+// maps a `refused`/`pending_restart` admission outcome to HTTP 503 (no Retry-After yet).
+//
+// Source: the CLI reads the `MICROFLOWS_ADMISSION` environment variable once at the front door
+// (`_admission_from_env`, in `main`) — "draining" | "stopped"; anything else, or unset, is accepting.
+// Admission is then THREADED as a parameter through the whole drive (`_run` → `_run_planned` /
+// `_run_forward` / `_run_reversal` and the `_defer*` helpers): the library never reads the
+// environment, so a caller passing `AdmissionState::Draining` is honored unconditionally. Roadmap item
+// 2.5 (the `drive_workflow -> Outcome` extraction) only changes how the OUTCOME is returned — admission
+// already crosses the boundary as a parameter, so that refactor is mechanical, not a redesign.
+variant AdmissionState { Accepting, Draining, Stopped }
+
+const ADMISSION_REFUSED_EXIT: Int = 10;          // a fresh submission refused while draining/stopped
+const ADMISSION_PENDING_RESTART_EXIT: Int = 11;  // an in-flight resume could not finish during drain
+
+fn _admission_from_env() nothrow -> AdmissionState {
+	match env.get("MICROFLOWS_ADMISSION") {
+		Optional::Some(v) => {
+			if _str_eq(&v, &"draining") { return AdmissionState::Draining(); }
+			if _str_eq(&v, &"stopped") { return AdmissionState::Stopped(); }
+			return AdmissionState::Accepting();
+		},
+		Optional::None => { return AdmissionState::Accepting(); }
+	}
+}
+fn _admission_accepting(a: &AdmissionState) nothrow -> Bool {
+	match a { AdmissionState::Accepting() => { return true; }, default => { return false; } }
+}
+fn _admission_label(a: &AdmissionState) nothrow -> String {
+	match a {
+		AdmissionState::Draining() => { return "draining"; },
+		AdmissionState::Stopped() => { return "stopped"; },
+		default => { return "accepting"; }
+	}
+}
+
+// While draining/stopped, a resume that cannot finish RELEASES the lease at `now` (no future retry
+// scheduled) and reports a clear `pending_restart` outcome — so the drain does not keep generating
+// retry work. The workflow stays in its durable state, resumable once admission returns to accepting.
+fn _drain_release(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, a: &AdmissionState) -> Int {
+	val clock = host.clock_read(LEASE_SECONDS);
+	match host.release(workflow_id, fencing_token, &clock.now, &clock.now) {
+		mf.ReleaseOutcome::Released => {
+			console.println("{\"workflow\":\"pending_restart\",\"reason\":\"" + _admission_label(a) + "\"}");
+			return ADMISSION_PENDING_RESTART_EXIT;
+		},
+		mf.ReleaseOutcome::FenceLost => {
+			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_fence_lost\"}");
+			return 7;
+		},
+		default => {
+			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_not_found\"}");
+			return 7;
+		}
+	}
+}
 
 // microflows.state terminal storage codes.
 const STATE_REVERSING: Int = 2;
@@ -189,7 +259,11 @@ fn main(argv: Array<String>) nothrow -> Int {
 		return 2;
 	}
 
-	return try _run(&config_path, &workflow_hex, &operation_name, &input_json, &arguments_json, has_arguments) catch {
+	// The CLI (front-door stand-in) reads the admission state from the environment and passes it to
+	// the drive boundary. A future service would translate admission into HTTP 503 and own reload/
+	// shutdown; it calls the same `_run`/drive_workflow boundary with admission as a parameter.
+	val admission = _admission_from_env();
+	return try _run(&config_path, &workflow_hex, &operation_name, &input_json, &arguments_json, has_arguments, &admission) catch {
 		console.eprintln("runner: fatal");
 		1
 	};
@@ -288,7 +362,7 @@ fn _read_text(path: &String) throws -> String {
 
 fn _run(config_path: &String, workflow_hex: &String,
         operation_name: &String, input_json: &String,
-        arguments_json: &String, has_arguments: Bool) throws -> Int {
+        arguments_json: &String, has_arguments: Bool, admission: &AdmissionState) throws -> Int {
 	val cfg = _load_config_json(config_path);
 	val db_sub = _require_db(&cfg);
 	val worker_id = _config_str(&cfg, &"worker_id", "runner-1");
@@ -331,16 +405,26 @@ fn _run(config_path: &String, workflow_hex: &String,
 	// reused id carries different args); omitted => a RESUME (drive from durable state, never
 	// re-create, never re-check args).
 	val is_submission = has_arguments;
+	// ADMISSION GATE (slice 2): while draining/stopped, REFUSE a fresh submission (creating a
+	// brand-new workflow — a submission with NO durable pin) BEFORE any create/claim/dispatch, so a
+	// drain/reload/shutdown admits no new work. Existing work (pin present: a resume OR a reassert)
+	// proceeds below so the drain can converge. The front-door maps this `refused` outcome to HTTP
+	// 503. This is the boundary the future `drive_workflow` library exposes (see the AdmissionState
+	// note above).
+	if !_admission_accepting(admission) and is_submission and !pin.present {
+		console.println("{\"workflow\":\"refused\",\"reason\":\"" + _admission_label(admission) + "\"}");
+		return ADMISSION_REFUSED_EXIT;
+	}
 	if pin.present {
 		// Existing planned workflow: resume, or REASSERT if this is a submission (so a reused
 		// id with changed arguments surfaces workflow_conflict instead of silently resuming).
-		return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, is_submission, arguments_json);
+		return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, is_submission, arguments_json, admission);
 	}
 	if is_submission {
 		// Fresh planned SUBMISSION: requires a planned config — a flat "plan" OR a manual-IR
 		// "graph" (the legacy single-op path takes --operation, not --arguments).
 		if _is_planned_config(&cfg) {
-			return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, true, arguments_json);
+			return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, true, arguments_json, admission);
 		}
 		console.println("{\"workflow\":\"aborted\",\"reason\":\"arguments_require_planned_config\"}");
 		return 2;
@@ -349,7 +433,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 	// "graph") => a resume of a planned workflow (which, absent a pin, claim resolves to
 	// not_found); otherwise the legacy single-op path below.
 	if _is_planned_config(&cfg) {
-		return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, false, arguments_json);
+		return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, false, arguments_json, admission);
 	}
 
 	// Legacy single-op path: validate the registry now (it routes the single dispatch).
@@ -445,7 +529,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 	// forward dispatch. claim_by_id claims state IN (1,2); the reverse loop reads the
 	// authoritative checkpoint stack (reverse_head), never the continuation.
 	if claimed_state == STATE_REVERSING {
-		return _run_reversal(host.get(), &cfg, &workflow_id, &workflow_canon_hex, fencing_token);
+		return _run_reversal(host.get(), &cfg, &workflow_id, &workflow_canon_hex, fencing_token, admission);
 	}
 
 	// --- 2a. AUTHORITATIVE post-claim reload (closes the probe/claim race). Now
@@ -472,7 +556,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 	// than hold the lease — a re-submit with --operation, or a concurrently
 	// persisting request, auto-recovers it on the next poll. ---
 	if !recovered and !fresh {
-		return _defer_dispatch(host.get(), &workflow_id, fencing_token, "operation_request_absent");
+		return _defer_dispatch(host.get(), &workflow_id, fencing_token, "operation_request_absent", admission);
 	}
 
 	// --- 2c. RESUME resolution, AFTER claim (only when claimable). The durable
@@ -494,7 +578,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 			console.eprintln(e.message);
 		}
 		if !ok {
-			return _defer_dispatch(host.get(), &workflow_id, fencing_token, "pinned_contract_unavailable");
+			return _defer_dispatch(host.get(), &workflow_id, fencing_token, "pinned_contract_unavailable", admission);
 		}
 	}
 
@@ -517,7 +601,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 		mf.OperationRequestOutcome::EventTimeSkew(defer_until) => {
 			// Non-increasing timestamp = clock skew: release/defer until the last
 			// accepted event time + margin, don't retry now.
-			return _defer(host.get(), &workflow_id, fencing_token, &defer_until, "request_event_time_skew");
+			return _defer(host.get(), &workflow_id, fencing_token, &defer_until, "request_event_time_skew", admission);
 		},
 		default => {
 			throw RunnerError(message = "operation_request unexpected outcome");
@@ -533,13 +617,13 @@ fn _run(config_path: &String, workflow_hex: &String,
 		DispatchResult::Done(r) => { result_json = move r; },
 		DispatchResult::Pending => {
 			// Not terminal yet: release the lease and become due again to re-poll.
-			return _defer_pending(host.get(), &workflow_id, fencing_token);
+			return _defer_pending(host.get(), &workflow_id, fencing_token, admission);
 		},
 		DispatchResult::Rejected(reason) => {
 			// Definite rejection is NON-RETRYABLE: persist the failure (forward ->
 			// blocked_resolution, lease cleared) so the workflow stops advancing and
 			// cannot repeat after lease expiry. Never exit still forward/requested.
-			return _fail_operation(host.get(), &workflow_id, fencing_token, &operation_id, move reason);
+			return _fail_operation(host.get(), &workflow_id, fencing_token, &operation_id, move reason, admission);
 		}
 	}
 
@@ -558,7 +642,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 			return 3;
 		},
 		mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
-			return _defer(host.get(), &workflow_id, fencing_token, &defer_until, "settle_event_time_skew");
+			return _defer(host.get(), &workflow_id, fencing_token, &defer_until, "settle_event_time_skew", admission);
 		},
 		default => {
 			throw RunnerError(message = "operation_settle unexpected outcome");
@@ -583,7 +667,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 // a claimed REVERSING workflow unwinds instead.
 fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
                 workflow_canon_hex: &String, storage_pin: &PinView,
-                is_submission: Bool, args_json: &String) -> Int {
+                is_submission: Bool, args_json: &String, admission: &AdmissionState) -> Int {
 	var pin_name: String = _dup(&storage_pin.name);
 	var pin_version: String = _dup(&storage_pin.version);
 	var pin_hash_hex: String = _dup(&storage_pin.hash_hex);
@@ -756,7 +840,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 			console.eprintln(e.message);
 		}
 		if !ok {
-			return _defer_dispatch(host, workflow_id, fencing_token, "revision_unavailable");
+			return _defer_dispatch(host, workflow_id, fencing_token, "revision_unavailable", admission);
 		}
 		reg_ready = true;
 	}
@@ -773,19 +857,19 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 	var ridx = 0;
 	match _registry_resolve(&reg, &pin_name, &pin_version) { Optional::Some(i) => { ridx = i; has_rev = true; }, Optional::None => {} }
 	if !has_rev {
-		return _defer_dispatch(host, workflow_id, fencing_token, "revision_unavailable");
+		return _defer_dispatch(host, workflow_id, fencing_token, "revision_unavailable", admission);
 	}
 	val rev_hash_hex = _bytes_to_hex(&reg.revisions[ridx].content_hash);
 	if !_str_eq(&rev_hash_hex, &pin_hash_hex) or reg.revisions[ridx].plan_length != pin_len {
-		return _defer_dispatch(host, workflow_id, fencing_token, "revision_unavailable");
+		return _defer_dispatch(host, workflow_id, fencing_token, "revision_unavailable", admission);
 	}
 
 	// Pinned plan verified. A claimed REVERSING workflow unwinds; otherwise dispatch
 	// forward. Both bind their operations from the verified pinned plan.
 	if claimed_state == STATE_REVERSING {
-		return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token);
+		return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 	}
-	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].graph, reg.revisions[ridx].plan_length);
+	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].graph, reg.revisions[ridx].plan_length, admission);
 }
 
 // ===== ScriptRegistry build + lookup (v1: one configured generation per process) =====
@@ -1184,7 +1268,7 @@ fn _lp(s: &String) nothrow -> String {
 // compensated, and with none (e.g. the FIRST operation rejected) it reaches `reversed`
 // immediately — never `blocked_resolution` for a definite forward rejection.
 fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
-                workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int) -> Int {
+                workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int, admission: &AdmissionState) -> Int {
 	val n = plan_length;
 	var final_result: String = "{}";
 	var last_op_id_hex: String = "";
@@ -1200,7 +1284,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		mf.ArgsGetOutcome::NotFound => {}
 	}
 	if !have_args {
-		return _defer_dispatch(host, workflow_id, fencing_token, "planned_args_missing");
+		return _defer_dispatch(host, workflow_id, fencing_token, "planned_args_missing", admission);
 	}
 
 	// Settled operation results, fed to `advance` so it replays past them. Built INCREMENTALLY as
@@ -1227,7 +1311,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// A validated graph should not Fault here. Treat defensively — never execute on a
 				// broken replay; defer (release the lease) rather than corrupt durable state.
 				console.eprintln("graph replay fault: " + m);
-				return _defer_dispatch(host, workflow_id, fencing_token, "graph_replay_fault");
+				return _defer_dispatch(host, workflow_id, fencing_token, "graph_replay_fault", admission);
 			},
 			ir.StepOutcome::NeedOperation(node_id, op, input) => {
 				// Durable seq = EXECUTION POSITION on the taken path (settled.len+1); ops settle
@@ -1291,7 +1375,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 					ok = true;
 				} catch RunnerError(e) { console.eprintln(e.message); }
 				if !ok {
-					return _defer_dispatch(host, workflow_id, fencing_token, "pinned_contract_unavailable");
+					return _defer_dispatch(host, workflow_id, fencing_token, "pinned_contract_unavailable", admission);
 				}
 
 				// Persist the request (idempotent: a resume re-requests the same identity and gets
@@ -1318,7 +1402,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						return 8;
 					},
 					mf.OperationRequestOutcome::EventTimeSkew(defer_until) => {
-						return _defer(host, workflow_id, fencing_token, &defer_until, "request_event_time_skew");
+						return _defer(host, workflow_id, fencing_token, &defer_until, "request_event_time_skew", admission);
 					},
 					default => {
 						throw RunnerError(message = "operation_request unexpected outcome");
@@ -1357,7 +1441,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 								return 8;
 							},
 							mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
-								return _defer(host, workflow_id, fencing_token, &defer_until, "settle_event_time_skew");
+								return _defer(host, workflow_id, fencing_token, &defer_until, "settle_event_time_skew", admission);
 							},
 							default => {
 								throw RunnerError(message = "operation_settle unexpected outcome");
@@ -1365,7 +1449,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						}
 					},
 					DispatchResult::Pending => {
-						return _defer_pending(host, workflow_id, fencing_token);
+						return _defer_pending(host, workflow_id, fencing_token, admission);
 					},
 					DispatchResult::Rejected(reason) => {
 						// A DEFINITE forward rejection ALWAYS begins reversal (the model: every
@@ -1373,7 +1457,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						// compensable checkpoints; with NONE (e.g. the first operation rejected) it
 						// reaches `reversed` immediately. Never `blocked_resolution` for a definite
 						// forward rejection — that is reserved for an UNCERTAIN forward outcome.
-						return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, move reason);
+						return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, move reason, admission);
 					}
 				}
 			}
@@ -1382,7 +1466,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 
 	// Defensive: a validated acyclic graph reaches Completed within plan_length steps.
 	console.eprintln("forward drive exceeded step budget");
-	return _defer_dispatch(host, workflow_id, fencing_token, "forward_budget_exceeded");
+	return _defer_dispatch(host, workflow_id, fencing_token, "forward_budget_exceeded", admission);
 }
 
 // A definite forward failure with a compensable checkpoint stack: transition
@@ -1392,11 +1476,11 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 // begin_reversal requires.
 fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
                           workflow_canon_hex: &String, fencing_token: Int, operation_seq: Int,
-                          operation_id: &Array<Byte>, reason: String) -> Int {
+                          operation_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Int {
 	val t = _now(host);
 	match host.begin_reversal(workflow_id, fencing_token, operation_seq, operation_id, &t, &reason) {
 		mf.BeginReversalOutcome::Reversing(_) => {
-			return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token);
+			return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 		},
 		mf.BeginReversalOutcome::Reversed => {
 			// No active checkpoints: a trivial unwind (nothing to compensate).
@@ -1406,7 +1490,7 @@ fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflo
 		mf.BeginReversalOutcome::AlreadyBegun(state) => {
 			// Idempotent replay of a committed begin: resume from the recorded state.
 			if state == STATE_REVERSING {
-				return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token);
+				return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 			}
 			if state == STATE_REVERSED {
 				console.println("{\"workflow\":\"reversed\"}");
@@ -1420,7 +1504,7 @@ fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflo
 			return 7;
 		},
 		mf.BeginReversalOutcome::EventTimeSkew(defer_until) => {
-			return _defer(host, workflow_id, fencing_token, &defer_until, "begin_reversal_skew");
+			return _defer(host, workflow_id, fencing_token, &defer_until, "begin_reversal_skew", admission);
 		},
 		default => {
 			// trigger_mismatch / operation_not_found / operation_conflict /
@@ -1633,7 +1717,11 @@ fn _report_terminal(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>,
 // releasing the lease with a near-term next-attempt, so the workflow becomes
 // due again and re-polls. Reports only on a committed release (else a distinct
 // defer_failed outcome — never claim a transition that did not happen).
-fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int) -> Int {
+fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, admission: &AdmissionState) -> Int {
+	// Admission (slice 2): while draining/stopped, do NOT schedule new retry work — release at now
+	// and report pending_restart so the drain converges. Admission is THREADED from the drive
+	// boundary (`_run`), so a library caller passing Draining is honored without any env dependency.
+	if !_admission_accepting(admission) { return _drain_release(host, workflow_id, fencing_token, admission); }
 	// Schedule the next attempt PENDING_RETRY_SECONDS out (NOT the lease window):
 	// the DB clock returns this as an absolute next-attempt deadline.
 	val clock = host.clock_read(PENDING_RETRY_SECONDS);
@@ -1659,7 +1747,9 @@ fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 // release actually COMMITS; a failed release yields a distinct outcome (never
 // claim a durable transition that did not happen).
 fn _defer(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
-          defer_until: &String, reason: String) -> Int {
+          defer_until: &String, reason: String, admission: &AdmissionState) -> Int {
+	// Admission (slice 2): suppress new defers while draining/stopped (see _defer_pending).
+	if !_admission_accepting(admission) { return _drain_release(host, workflow_id, fencing_token, admission); }
 	val clock = host.clock_read(LEASE_SECONDS);
 	match host.release(workflow_id, fencing_token, &clock.now, defer_until) {
 		mf.ReleaseOutcome::Released => {
@@ -1683,7 +1773,9 @@ fn _defer(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: In
 // absolute future next_attempt, and appends an 'operation_dispatch_deferred'
 // audit event with the reason on ENTRY into the wait condition (deduped on
 // retry), so restoring config auto-recovers it — NOT a failure, NOT blocked.
-fn _defer_dispatch(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, reason: String) -> Int {
+fn _defer_dispatch(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, reason: String, admission: &AdmissionState) -> Int {
+	// Admission (slice 2): suppress new dispatch defers while draining/stopped (see _defer_pending).
+	if !_admission_accepting(admission) { return _drain_release(host, workflow_id, fencing_token, admission); }
 	val clock = host.clock_read(DISPATCH_DEFER_SECONDS);
 	match host.defer_dispatch(workflow_id, fencing_token, &clock.now, &clock.deadline, &clock.now, &reason) {
 		mf.ReleaseOutcome::Released => {
@@ -1708,7 +1800,7 @@ fn _defer_dispatch(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_
 // forward(1) -> blocked_resolution(3) (disposition failed) and clears the lease,
 // so the workflow stops advancing forward. Idempotent (AlreadyBlocked).
 fn _fail_operation(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
-                   operation_id: &Array<Byte>, reason: String) -> Int {
+                   operation_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Int {
 	val t = _now(host);
 	val cont = "{\"pos\":\"op:1:failed\"}";
 	val payload = "{\"reason\":\"" + _dup(&reason) + "\",\"kind\":\"non_retryable_failure\"}";
@@ -1739,7 +1831,7 @@ fn _fail_operation(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_
 			return 8;
 		},
 		mf.OperationFailOutcome::EventTimeSkew(defer_until) => {
-			return _defer(host, workflow_id, fencing_token, &defer_until, "fail_event_time_skew");
+			return _defer(host, workflow_id, fencing_token, &defer_until, "fail_event_time_skew", admission);
 		}
 	}
 }
@@ -1789,7 +1881,7 @@ fn _compensation_for(cfg: &json.JsonNode, fwd_op: &String) -> Optional<Compensat
 
 // Enter blocked_resolution (reverse direction) when a compensation cannot continue.
 fn _reverse_block(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
-                  seq: Int, rev_id: &Array<Byte>, reason: String) -> Int {
+                  seq: Int, rev_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Int {
 	val ts = _now(host);
 	match host.reverse_block(workflow_id, fencing_token, seq, rev_id, 2, &reason, &ts) {
 		mf.ReverseBlockOutcome::Blocked => {
@@ -1807,7 +1899,7 @@ fn _reverse_block(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 		mf.ReverseBlockOutcome::EventTimeSkew(defer_until) => {
 			// Time-disciplined like every transition: defer to the supplied deadline
 			// rather than reporting failure with the lease still held.
-			return _defer(host, workflow_id, fencing_token, &defer_until, "reverse_block_skew");
+			return _defer(host, workflow_id, fencing_token, &defer_until, "reverse_block_skew", admission);
 		},
 		default => {
 			console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"reverse_block_failed\"}");
@@ -1833,7 +1925,7 @@ fn _dispatch_or_reconcile(recover: Bool, base: &String, operation_name: &String,
 
 fn _compensate(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
                seq: Int, comp_op: &String, base: &String, rev_id: &Array<Byte>,
-               rev_id_hex: &String, rev_input: &String, recover: Bool) -> CompStep {
+               rev_id_hex: &String, rev_input: &String, recover: Bool, admission: &AdmissionState) -> CompStep {
 	match _dispatch_or_reconcile(recover, base, comp_op, rev_id_hex, rev_input) {
 		DispatchResult::Done(result) => {
 			val ts = _now(host);
@@ -1849,7 +1941,7 @@ fn _compensate(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_toke
 					return CompStep::Terminal(7);
 				},
 				mf.ReverseSettleOutcome::EventTimeSkew(defer_until) => {
-					return CompStep::Terminal(_defer(host, workflow_id, fencing_token, &defer_until, "reverse_settle_skew"));
+					return CompStep::Terminal(_defer(host, workflow_id, fencing_token, &defer_until, "reverse_settle_skew", admission));
 				},
 				default => {
 					console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"reverse_settle_failed\"}");
@@ -1858,11 +1950,11 @@ fn _compensate(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_toke
 			}
 		},
 		DispatchResult::Pending => {
-			return CompStep::Terminal(_defer_dispatch(host, workflow_id, fencing_token, "compensation_pending"));
+			return CompStep::Terminal(_defer_dispatch(host, workflow_id, fencing_token, "compensation_pending", admission));
 		},
 		DispatchResult::Rejected(reason) => {
 			// Persist the CLASSIFIED participant reason as blocked-resolution evidence.
-			return CompStep::Terminal(_reverse_block(host, workflow_id, fencing_token, seq, rev_id, move reason));
+			return CompStep::Terminal(_reverse_block(host, workflow_id, fencing_token, seq, rev_id, move reason, admission));
 		}
 	}
 }
@@ -1873,7 +1965,7 @@ fn _compensate(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_toke
 // dispatch via the generic dispatcher -> settle/descend, defer on pending, block on
 // definite rejection. Terminal reversed clears the lease.
 fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
-                 workflow_canon_hex: &String, fencing_token: Int) -> Int {
+                 workflow_canon_hex: &String, fencing_token: Int, admission: &AdmissionState) -> Int {
 	while true {
 		match host.reverse_head(workflow_id) {
 			mf.ReverseHeadOutcome::NoneActive => {
@@ -1883,7 +1975,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				// with an audit reason: the lease is released, a deduped diagnostic event
 				// is recorded, and the state is observable rather than silently pinning a
 				// worker until expiry.
-				return _defer_dispatch(host, workflow_id, fencing_token, "reverse_no_active_checkpoint");
+				return _defer_dispatch(host, workflow_id, fencing_token, "reverse_no_active_checkpoint", admission);
 			},
 			mf.ReverseHeadOutcome::Pending(seq, forward_operation_name, forward_payload) => {
 				val rev_id = _reverse_id(workflow_canon_hex, seq);
@@ -1897,7 +1989,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 						// reverse_block (which requires a persisted reverse id) cannot
 						// apply and would leave the lease held. Durably DEFER as a
 						// repairable config state — restoring the binding resumes the unwind.
-						return _defer_dispatch(host, workflow_id, fencing_token, "no_compensation_binding");
+						return _defer_dispatch(host, workflow_id, fencing_token, "no_compensation_binding", admission);
 					}
 				}
 				val rev_input = _dup(&forward_payload);
@@ -1911,7 +2003,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 					rok = true;
 				} catch RunnerError(e) { console.eprintln(e.message); }
 				if !rok {
-					return _defer_dispatch(host, workflow_id, fencing_token, "pinned_contract_unavailable");
+					return _defer_dispatch(host, workflow_id, fencing_token, "pinned_contract_unavailable", admission);
 				}
 				// persist the binding BEFORE dispatch (crash-safe)
 				val treq = _now(host);
@@ -1927,7 +2019,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 						return 7;
 					},
 					mf.ReverseRequestOutcome::EventTimeSkew(defer_until) => {
-						return _defer(host, workflow_id, fencing_token, &defer_until, "reverse_request_skew");
+						return _defer(host, workflow_id, fencing_token, &defer_until, "reverse_request_skew", admission);
 					},
 					default => {
 						console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"reverse_request_failed\"}");
@@ -1936,7 +2028,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				}
 				if ready {
 					// Fresh dispatch of a just-persisted binding: PUT-first.
-					match _compensate(host, workflow_id, fencing_token, seq, &comp_op, &base, &rev_id, &rev_id_hex, &rev_input, false) {
+					match _compensate(host, workflow_id, fencing_token, seq, &comp_op, &base, &rev_id, &rev_id_hex, &rev_input, false, admission) {
 						CompStep::Continue => {},
 						CompStep::Terminal(code) => { return code; }
 					}
@@ -1960,11 +2052,11 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 					rok = true;
 				} catch RunnerError(e) { console.eprintln(e.message); }
 				if !rok {
-					return _defer_dispatch(host, workflow_id, fencing_token, "pinned_contract_unavailable");
+					return _defer_dispatch(host, workflow_id, fencing_token, "pinned_contract_unavailable", admission);
 				}
 				// Durable binding already dispatched (recovery): GET-first reconcile,
 				// never a blind re-PUT.
-				match _compensate(host, workflow_id, fencing_token, seq, &rev_op, &base, &rev_id, &rev_id_hex, &rev_input, true) {
+				match _compensate(host, workflow_id, fencing_token, seq, &rev_op, &base, &rev_id, &rev_id_hex, &rev_input, true, admission) {
 					CompStep::Continue => {},
 					CompStep::Terminal(code) => { return code; }
 				}

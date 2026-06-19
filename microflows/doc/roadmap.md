@@ -16,16 +16,31 @@ See also: the as-built runtime + language (`microflows_design.md` §12), the aut
 
 ## The order
 
-### 1. Expression object/array construction — *next coding slice (in progress)*
-Remove the immediate authoring blocker for real workflows: **assembling participant inputs from
+### 1. Expression object/array construction — ✅ LANDED (2026-06-19)
+Removed the immediate authoring blocker for real workflows: **assembling participant inputs from
 args/results/locals without pre-shaping everything**. Object/array literals with expression-valued
-fields/elements (`{ customer: arg c.id, amount: arg order.amount }`), pure, type-checked, replay-safe.
-Design + acceptance criteria: `microflows_design.md` §12.9.
+fields/elements (`{ customer: arg c.id, amount: arg order.amount }`), pure, type-checked, replay-safe;
+fully-constant literals fold to a const (hash-stable). Full gate green — integration **138/138**, unit
+base + asan. As-built: `microflows_design.md` §12.9.
 
-### 2. Operational admission / draining / reload behavior
-Required for any reasonable **prod update cycle**. Reload/shutdown should **stop admission**, return
-**503** to new callers / load balancers, and handle **in-flight work** with the agreed draining
-policy. (Exact draining policy TBD per-slice.)
+### 2. Operational admission / draining / reload behavior — *in progress (first pass)*
+Required for any reasonable **prod update cycle**. **First pass (policy + shape, not full machinery):**
+admission state (`accepting` / `draining` / `stopped`) is an **input to the drive boundary** (`_run`,
+via `MICROFLOWS_ADMISSION`). While draining/stopped: a **fresh submission is refused** before
+create/claim/dispatch (`{"workflow":"refused","reason":"draining"}`, nonzero exit); **existing work
+resumes** but a would-be defer returns `{"workflow":"pending_restart",…}` (no new retry scheduled) so
+the drain converges. Same gate serves reload + graceful shutdown. The future front-door maps
+refused/pending_restart → **HTTP 503** (no `Retry-After` yet). See `microflows_design.md` §13.
+
+### 2.5. `drive_workflow(...) -> Outcome` library extraction — *after admission is proven*
+A **dedicated mechanical refactor**: extract the `_run` drive boundary into a coordinator-library
+`drive_workflow(...) -> Outcome` that **returns** a structured outcome instead of the ~57 inline
+`console.println("{…}")` sites + bare `Int` exit codes. The CLI renders `Outcome` → JSON + exit code;
+the future service renders admission/drain states → HTTP. Admission **already** crosses this boundary
+as a **parameter** (threaded through `_run` → the drive functions → the `_defer*` helpers; the library
+reads no environment), so 2.5 only changes how the OUTCOME is returned. The existing
+**integration suite pins JSON/exit-code compatibility**, making this low-risk but broad — its own slice,
+not bundled with new behavior.
 
 ### 3. ScriptRegistry packaging / manifest activation
 Required so app teams deploy **named, pinned workflow revisions** rather than ad-hoc lowered configs.

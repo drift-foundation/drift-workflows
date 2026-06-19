@@ -171,16 +171,14 @@ result <name>[.path]  a named operation's result      -> { "result": {…} }
 `<path>` is `ident(.ident)*` — object-field projection (e.g. `arg order.amount`,
 `result auth.auth_id`).
 
-> **Current parser slice (temporary).** Today the frontend accepts an operation
-> input that is a **constant** `{…}` object, a `const`, or a **single**
-> projection — it does not *yet* parse an object/array literal with
-> expression-valued fields like `{ customer: arg c.id, amount: arg order.amount }`.
-> **Expression object/array construction is the next planned parser/runtime
-> refinement** (`microflows_design.md` §12.9); the intended model lets you wire
-> inputs directly. Until it lands, shape the `args` document and participant
-> **result** types so each operation consumes one subtree (see
-> [§5](#5-worked-example-a-payment-capture-saga)) — a slice workaround, not the
-> long-term authoring model.
+> **Build inputs from dynamic parts.** An object/array literal may carry
+> **expression-valued** fields/elements, so you assemble an operation's input
+> inline: `reserve { customer: arg c.id, amount: arg order.amount }` or
+> `pack [ arg a, result b, const 3 ]`. Construction is a **pure** value step
+> (no operations inside; recomputed on replay), type-checked against the
+> operation's input contract before dispatch. A **fully-constant** literal is
+> exactly the constant object/array it looks like. So you do **not** need to
+> pre-shape the arguments document to match each op — wire values directly.
 
 ### 3.5 Statements
 
@@ -270,37 +268,35 @@ N remote calls.
 ## 5. Worked example: a payment-capture saga
 
 Authorize, then capture; on capture failure, **void the authorization**
-automatically. In the current parser slice each operation consumes one subtree
-and each result is shaped like the next input; once expression construction lands
-([§3.4](#34-expressions--how-a-value-reaches-an-operation)) you'll instead build
-inputs directly (e.g. `authorize { customer: arg customer.id, amount: arg order.amount }`)
-and won't need to pre-shape the arguments.
+automatically. Each operation's input is built inline from the arguments via
+expression construction ([§3.4](#34-expressions--how-a-value-reaches-an-operation)),
+so the arguments document doesn't need to be pre-shaped per op.
 
 `capture.mf`:
 
 ```mf
 args {
-  # Current slice: shaped so each op consumes one subtree. With expression
-  # construction (planned) this pre-shaping is unnecessary.
-  auth_request: { customer: string, amount: { value: int, currency: string } }
+  customer: { id: string }
+  order: { amount: { value: int, currency: string } }
 }
 
 op authorize {
   input:  { customer: string, amount: { value: int, currency: string } }
-  result: { auth_id: string }            # <- shaped like `capture`'s input
+  result: { auth_id: string }
 }
 op capture {
   input:  { auth_id: string }
-  result: { capture_id: string }         # <- shaped like `record_ledger`'s input
+  result: { capture_id: string }
 }
 op record_ledger {
   input:  { capture_id: string }
 }
 
 steps {
-  let auth     = authorize arg auth_request
-  let captured = capture result auth          # capture.input = { auth_id } = authorize.result
-  record_ledger result captured               # record_ledger.input = { capture_id } = capture.result
+  # The authorize input is BUILT inline from two argument subtrees (expression construction).
+  let auth     = authorize { customer: arg customer.id, amount: arg order.amount }
+  let captured = capture { auth_id: result auth.auth_id }
+  record_ledger { capture_id: result captured.capture_id }
 }
 ```
 
@@ -387,7 +383,7 @@ revision(s) your in-flight instances need.
 
 ## 7. Capability envelope & limits
 
-**Supported and proven (integration 134/134, real HTTP + Singular-backed participant):**
+**Supported and proven (integration 142/142, real HTTP + Singular-backed participant):**
 
 - Durable saga: call → settle → **checkpoint** → **compensate on failure** →
   resume after crash → effectively-once execution.
@@ -404,13 +400,6 @@ revision(s) your in-flight instances need.
 | **Loop unboundedly** (`while`) | Use finite `map`/`filter`/`fold` over a known array |
 | **Authenticate participant calls** (`auth_profile` must be null) | Trusted-network participants only for now; **do not** put a real external gateway on the open wire until auth lands |
 | **Branch on a computed predicate** | Have a participant return a Bool/tag; branch on `if`/`case` of that |
-
-**Next planned refinement (not a permanent limit).** Expression **object/array
-construction** — building an operation input from multiple dynamic parts, e.g.
-`{ customer: arg c.id, amount: arg order.amount }` — is the next planned
-parser/runtime slice (`microflows_design.md` §12.9). It is a temporary frontend
-gap, not a design decision; until it lands, use the one-subtree shaping shown
-above as a workaround.
 
 **Production-readiness note for money movement.** The orchestration core is
 **proven for internal/trusted-network workflows** (durability, recovery, and

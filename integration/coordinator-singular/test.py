@@ -83,11 +83,13 @@ def _wf_id():
     return uuid.uuid4().hex  # 32 hex chars
 
 
-def run_runner(runner_cfg, wf_hex, operation=None, input_json=None, arguments=None):
+def run_runner(runner_cfg, wf_hex, operation=None, input_json=None, arguments=None, admission=None):
     # Routing comes from the config registry (no --participant-url). For a LEGACY single-op
     # workflow, --operation is given only for a FRESH submission. For a PLANNED workflow,
     # --arguments marks a SUBMISSION (create/reassert with those instance args); omitting it
     # is a RESUME (drive from durable state). A resume runs on the workflow id alone.
+    # `admission` sets MICROFLOWS_ADMISSION (the front-door stand-in) for the drive: "draining" /
+    # "stopped" refuse fresh submissions and suppress new defers; None/"accepting" is normal.
     cmd = [str(RUNNER_BIN), "--config", runner_cfg, "--workflow-id", wf_hex]
     if operation is not None:
         cmd += ["--operation", operation]
@@ -95,7 +97,10 @@ def run_runner(runner_cfg, wf_hex, operation=None, input_json=None, arguments=No
         cmd += ["--input", input_json]
     if arguments is not None:
         cmd += ["--arguments", arguments]
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+    env = None
+    if admission is not None:
+        env = dict(os.environ); env["MICROFLOWS_ADMISSION"] = admission
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=40, env=env)
     line = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
     try:
         return out.returncode, json.loads(line)
@@ -2509,6 +2514,59 @@ def main():
               and _op_resv(wrc) == ["cx9"],
               (rcon_code, rcs, rbs, rop_s, rcr, rbr, f"put+{rpu_d} req+{rrq_d}", _op_resv(wrc)))
 
+        # ===== C19. ADMISSION / DRAINING (slice 2): refuse fresh work + no new defers while draining =====
+        # Admission is an input to the drive boundary (MICROFLOWS_ADMISSION; the future front-door maps
+        # a refused admission to HTTP 503). While draining: a FRESH submission (new workflow, no durable
+        # pin) is REFUSED before any create/claim/dispatch; existing in-flight work proceeds, but a
+        # resume that would defer returns pending_restart (no new retry scheduled) so the drain converges.
+
+        # (a) draining REFUSES a fresh submission — no workflow row, no dispatch, stable refused outcome.
+        ex0 = _exec_count(base)
+        wdr = _wf_id()
+        dr_code, dr_body = run_runner(con_low, wdr, arguments=args_code, admission="draining")
+        dr_exec = _exec_count(base) - ex0
+        dr_rows = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wdr}')")
+        check("admission_draining_refuses_fresh_submission",
+              dr_code == 10 and dr_body.get("workflow") == "refused" and dr_body.get("reason") == "draining"
+              and dr_exec == 0 and dr_rows == [["0"]],
+              (dr_code, dr_body, dr_exec, dr_rows))
+
+        # `stopped` is a distinct public admission state: a fresh submission is likewise refused, with
+        # its own reason ("stopped"), no workflow row, no dispatch.
+        ex0s = _exec_count(base)
+        wst = _wf_id()
+        st_code, st_body = run_runner(con_low, wst, arguments=args_code, admission="stopped")
+        st_exec = _exec_count(base) - ex0s
+        st_rows = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wst}')")
+        check("admission_stopped_refuses_fresh_submission",
+              st_code == 10 and st_body.get("workflow") == "refused" and st_body.get("reason") == "stopped"
+              and st_exec == 0 and st_rows == [["0"]],
+              (st_code, st_body, st_exec, st_rows))
+
+        # (b) control: the SAME config accepts a fresh submission normally (so draining, not the config,
+        # is what refused above).
+        wac = _wf_id()
+        ac_code, ac_body = run_runner(con_low, wac, arguments=args_code)
+        check("admission_accepting_submits_normally",
+              ac_code == 0 and ac_body.get("workflow") == "completed" and _ck_resv(wac) == ["cx9"],
+              (ac_code, ac_body, _ck_resv(wac)))
+
+        # (c) existing in-flight work is NOT refused while draining: a respond_pending workflow is
+        # submitted ACCEPTING (-> pending, op requested-not-settled), then RESUMED while draining. The
+        # resume would normally re-poll/defer; under draining it returns pending_restart (exit 11), never
+        # refused — so the drain stops generating retry work but converges existing work cleanly.
+        prdr_code, prdr_low = lower_source(
+            "args { code: string }\n"
+            "steps { reserve { reservation: arg code, \"_fault\": { \"respond_pending\": true } } }\n")
+        wpr = _wf_id()
+        pr_cs, pr_bs = run_runner(prdr_low, wpr, arguments=args_code)
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wpr}')")
+        pr_cr, pr_br = run_runner(prdr_low, wpr, admission="draining")
+        check("admission_draining_resume_converges_pending_restart",
+              prdr_code == 0 and pr_cs == 9 and pr_bs.get("workflow") == "pending"
+              and pr_cr == 11 and pr_br.get("workflow") == "pending_restart" and pr_br.get("reason") == "draining",
+              (prdr_code, pr_cs, pr_bs, pr_cr, pr_br))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the LOCAL authoritative
         # result; no dependency on the participant. MUST be the LAST stub-using block — it terminates
         # the stub and never restarts it, so any check after this would hit a dead participant.
@@ -2556,7 +2614,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 138
+    EXPECTED_CHECKS = 142
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")
