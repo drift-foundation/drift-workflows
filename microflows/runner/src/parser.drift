@@ -18,8 +18,11 @@
 //   <stmt> := <op> <expr>                                   (an operation step; input is an expression)
 //           | let <ident> = <expr>                          (a pure-value binding -> NLet; slice 2b-i)
 //           | let <ident> = <op> <expr>                     (a NAMED op; <ident> aliases its RESULT; 2b-ii-a)
+//           | let <ident> = <loop>                          (a finite array expression -> NLoop; 2b-iii)
 //           | if <arg-path> { <stmt>* } [ else { <stmt>* } ] [ merge <ident> = <expr> '|' <expr> ]
 //           | case <arg-path> { (<json-value> { <stmt>* })* default { <stmt>* } }  (slice 2a)
+//   <loop> := (map|filter) <expr> each <ident> <expr>       (the body is a pure expr over local <elem>)
+//           | fold <expr> from <expr> each <ident> <expr>   (the body is a pure expr over local <elem>/<as>)
 //   <expr> := { …json-object… }   (const object) | const <json-value> | arg <arg-path>
 //           | local <ident> ('.' <ident>)*    (a let/merge binding ref, optionally projected)
 //           | result <ident> ('.' <ident>)*   (a NAMED op's result, optionally projected; 2b-ii-a)
@@ -44,8 +47,12 @@
 // each arm's value is available after its predecessor branch. Minimum form: merge follows an `if`
 // (not `case`), both branches non-empty + single-exit. case-merge is deferred.
 //
-// Deferred to later sub-slices (each lowering to already-proven IR): `case`-join merge, finite array
-// expressions (`map`/`filter`/`fold` -> NLoop), richer diagnostics, and `../drift-lang` reuse.
+// `map`/`filter`/`fold` are contextual keywords in let-RHS position (`let ys = map …`); an op of that
+// name is still usable as a bare op step. The loop body is expression-only, so no remote op can appear
+// inside iteration (the side-effect-free-loop invariant holds structurally).
+//
+// Deferred to later sub-slices (each lowering to already-proven IR): `case`-join merge, richer
+// diagnostics, and `../drift-lang` reuse.
 //
 // Standalone & dependency-light: imports only std.* plus the runner-owned `ir` (unused at runtime),
 // so the unit test compiles it with src/ir.drift, no DB.
@@ -105,6 +112,7 @@ variant StmtKind {
 	KOp(name: String, input: json.JsonNode),                                  // an operation step; `input` is an EXPRESSION json
 	KNamedOp(bind: String, op: String, input: json.JsonNode),                 // let <bind> = <op> <input> — a NAMED op (result aliased by <bind>); slice 2b-ii-a
 	KLet(name: String, value: json.JsonNode),                                 // let <name> = <expr> (a pure-value binding -> NLet)
+	KLoop(as_name: String, kind: String, source: json.JsonNode, elem: String, init: Optional<json.JsonNode>, body: json.JsonNode), // let <as> = map/filter/fold … -> NLoop; 2b-iii
 	KIf(cond: Array<String>, then_body: Array<Stmt>, else_body: Array<Stmt>, merge: Optional<MergeSpec>), // if … else … [merge …]
 	KCase(scrut: Array<String>, arms: Array<SCaseArm>, default_body: Array<Stmt>)
 }
@@ -409,13 +417,13 @@ fn _parse_stmt(c: &mut Cursor) -> Stmt {
 	return Stmt(id = move id, kind = StmtKind::KOp(name = move kw, input = move input));
 }
 
-// let_stmt := 'let' ident '=' ( <expr> | <op> <expr> ).
+// let_stmt := 'let' ident '=' ( <expr> | <loop> | <op> <expr> ).
 //   - RHS an EXPRESSION (a `{…}` object or `const`/`arg`/`local`/`result`) -> a pure-value NLet.
+//   - RHS a LOOP (`map`/`filter`/`fold` …) -> a finite array expression NLoop (2b-iii).
 //   - RHS an OPERATION call (`<op-name> <input-expr>`) -> a NAMED OPERATION: the op node keeps a
 //     parser-generated id, and <bind> aliases its RESULT (referenced downstream as `result <bind>`).
-// The disambiguator is the first RHS token: a `{` or an expression keyword => expression; otherwise
-// the leading identifier is the operation name. A pure NLet value is recomputed on replay (no event);
-// a named op is a normal durable NOperation.
+// The disambiguator is the first RHS token: `{`/expr-keyword => expression; map/filter/fold => loop;
+// any other identifier => the operation name. (NLet/NLoop are pure value steps; a named op is durable.)
 fn _parse_let(c: &mut Cursor, var id: String) -> Stmt {
 	val bind = _read_ident(c);
 	_expect(c, 61, &"'='");   // '='
@@ -430,6 +438,8 @@ fn _parse_let(c: &mut Cursor, var id: String) -> Stmt {
 		val value = _parse_value_expr(c);
 		return Stmt(id = move id, kind = StmtKind::KLet(name = move bind, value = move value));
 	}
+	val w2 = _peek_ident(c);
+	if _is_loop_keyword(&w2) { return _parse_loop(c, move id, move bind); }
 	// named operation: `let <bind> = <op-name> <input-expr>`
 	val op = _read_ident(c);
 	val input = _parse_value_expr(c);
@@ -439,6 +449,29 @@ fn _parse_let(c: &mut Cursor, var id: String) -> Stmt {
 
 fn _is_expr_keyword(w: &String) nothrow -> Bool {
 	return _str_eq(w, &"const") or _str_eq(w, &"arg") or _str_eq(w, &"local") or _str_eq(w, &"result");
+}
+
+fn _is_loop_keyword(w: &String) nothrow -> Bool {
+	return _str_eq(w, &"map") or _str_eq(w, &"filter") or _str_eq(w, &"fold");
+}
+
+// loop := ('map'|'filter') <source-expr> 'each' <elem> <body-expr>
+//       | 'fold' <source-expr> 'from' <init-expr> 'each' <elem> <body-expr>
+// A finite array expression (NLoop). The `let` name is the NLoop result binding (`as`). The body is
+// a PURE expression over `local <elem>` (and `local <as>` for the fold accumulator) — no remote op
+// can appear (it's an expression, not a statement), so iteration is side-effect-free by construction.
+fn _parse_loop(c: &mut Cursor, var id: String, var as_name: String) -> Stmt {
+	val kind = _read_ident(c);   // map / filter / fold
+	val source = _parse_value_expr(c);
+	var init: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
+	if _str_eq(&kind, &"fold") {
+		if !_accept_keyword(c, &"from") { throw ParseError(message = "`fold` requires `from <init>`"); }
+		init = Optional<json.JsonNode>::Some(_parse_value_expr(c));
+	}
+	if !_accept_keyword(c, &"each") { throw ParseError(message = "loop requires `each <elem> <body>`"); }
+	val elem = _read_ident(c);
+	val body = _parse_value_expr(c);
+	return Stmt(id = move id, kind = StmtKind::KLoop(as_name = move as_name, kind = move kind, source = move source, elem = move elem, init = move init, body = move body));
 }
 
 // Non-consuming lookahead: true iff the upcoming tokens are `merge <ident> =` (a merge clause). Used
@@ -844,6 +877,9 @@ fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 		StmtKind::KLet(name, value) => {
 			out.push(_let_node(&stmt.id, name, value, succ));
 		},
+		StmtKind::KLoop(as_name, kind, source, elem, init, body) => {
+			out.push(_loop_node(&stmt.id, kind, source, elem, as_name, init, body, succ));
+		},
 		StmtKind::KIf(cond, then_body, else_body, merge) => {
 			match merge {
 				Optional::Some(ms) => {
@@ -938,6 +974,23 @@ fn _let_node(id: &String, name: &String, value: &json.JsonNode, next: &String) -
 	o.set("id", _jstr(_dup(id)));
 	o.set("name", _jstr(_dup(name)));
 	o.set("value", value.clone_deep());
+	o.set("next", _jstr(_dup(next)));
+	return o.to_node();
+}
+
+// {"kind":<map|filter|fold>, "id", "source", "elem", "as":<result name>, ["init",] "body", "next"}.
+// `as` is the result binding (and, for fold, also the accumulator); map/filter omit `init` (the IR
+// defaults it to the unit null).
+fn _loop_node(id: &String, kind: &String, source: &json.JsonNode, elem: &String, as_name: &String,
+              init: &Optional<json.JsonNode>, body: &json.JsonNode, next: &String) -> json.JsonNode {
+	var o = json.new_object();
+	o.set("kind", _jstr(_dup(kind)));
+	o.set("id", _jstr(_dup(id)));
+	o.set("source", source.clone_deep());
+	o.set("elem", _jstr(_dup(elem)));
+	o.set("as", _jstr(_dup(as_name)));
+	match init { Optional::Some(n) => { o.set("init", n.clone_deep()); }, Optional::None => {} }
+	o.set("body", body.clone_deep());
 	o.set("next", _jstr(_dup(next)));
 	return o.to_node();
 }

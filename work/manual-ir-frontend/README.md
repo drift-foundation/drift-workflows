@@ -260,14 +260,15 @@ parser/type-checker/IR/diagnostics when we get here.)
   model.
 
 ## Current status and next action
-**Manual-IR runtime surface COMPLETE (steps 1–4) AND parser slices 1 + 2a + 2b-i + 2b-ii (a+b)
-(step 5) LANDED.** The typed IR, durable arguments, structural + typed validation, control-flow
-EXECUTION (straight-line, `if`, `case`, finite array expressions, cross-branch merge, `let`,
-`return`), graph-authoritative `content_hash`, and pinned replay/reversal regressions are all landed;
-and the textual front end now covers straight-line + `if`/`case` + `let`/arg/local refs + operation
-naming & `result` refs + `merge` — a `.mf` source lowers into the EXACT config the manual IR executes,
-with NO new runtime semantics. Full `just test` green (certified driftc 0.33.42 / ABI 17; integration
-**122/122**, was 101). See Progress.md for the per-chunk record.
+**Manual-IR runtime surface COMPLETE (steps 1–4) AND the parser (step 5) COMPLETE — the full V1
+lowering surface is landed.** The typed IR, durable arguments, structural + typed validation,
+control-flow EXECUTION (straight-line, `if`, `case`, finite array expressions, cross-branch merge,
+`let`, `return`), graph-authoritative `content_hash`, and pinned replay/reversal regressions are all
+landed; and the textual front end now covers the WHOLE V1 IR — straight-line + `if`/`case` +
+`let`/arg/local refs + operation naming & `result` refs + `merge` + `map`/`filter`/`fold` — a `.mf`
+source lowers into the EXACT config the manual IR executes, with NO new runtime semantics. Full
+`just test` green (certified driftc 0.33.42 / ABI 17; integration **128/128**, was 101). See
+Progress.md for the per-chunk record.
 
 Parser (`microflows/runner/src/parser.drift` + `--lower-source` CLI): `args` → `argument_type`,
 `op … { input/result }` → operation contracts, `steps { … }` → a flat `"plan"` (const-only
@@ -278,18 +279,20 @@ operation inputs are expressions (`{…}` const / `const <json>` / `arg <path>` 
 `EResult` (the alias lives only in the parser → result refs are stable under source formatting and
 alias-rename); and `if … else … merge <name> = <v1> | <v2>` lowers to `NMerge` (selecting a
 branch-local op result at the join — result aliases are globally unique so the arms name distinct
-branch results). Reuses `_build_plan`/`parse_graph`/`validate_graph`/`type_check_graph`/op-depth/
-`content_hash` unchanged (no new IR nodes, execution paths, or durable state). Source is the SOLE
-authority on contracts (base contracts stripped), and `--lower-source` runs the real build/validation
-path (DB-free) before printing, so an invalid source/config (unknown op, op-imbalanced branch, missing
-`case` default, undefined `local`, undominated/cross-branch `result` ref, non-predecessor merge
-source, …) fails AT lowering. Parity proven: parser-lowered and hand-authored configs produce the
-IDENTICAL `--emit-content-hash` and execute the same; pure boundaries (`let`/`merge`) write no event,
-resume recomputes derived/merged values from durable state, and reversal compensates only the taken
-branch + shared downstream op.
+branch results); and `let ys = map/filter/fold <source> [from <init>] each <elem> <body>` lowers to
+`NLoop` (the body is expression-only, so no remote op can appear inside iteration). Reuses
+`_build_plan`/`parse_graph`/`validate_graph`/`type_check_graph`/op-depth/`content_hash` unchanged (no
+new IR nodes, execution paths, or durable state). Source is the SOLE authority on contracts (base
+contracts stripped), and `--lower-source` runs the real build/validation path (DB-free) before
+printing, so an invalid source/config (unknown op, op-imbalanced branch, missing `case` default,
+undefined `local`, undominated/cross-branch `result` ref, non-predecessor merge source, non-array loop
+source, `elem`/`as` collision, …) fails AT lowering. Parity proven: parser-lowered and hand-authored
+configs produce the IDENTICAL `--emit-content-hash` and execute the same; pure boundaries
+(`let`/`merge`/`map`/`filter`/`fold`) write no event, resume recomputes derived/merged/loop values
+from durable state, and reversal compensates only the taken branch + shared downstream op.
 
-Next action: **Step 5, parser slice 2b-iii** — finite array expression syntax (`map`/`filter`/`fold`
-→ `NLoop`). Later: diagnostics/spans (currently shallow), `case`-join merge, `../drift-lang` reuse TBD.
+Next action: **diagnostics/spans** (upgrade parse errors from byte offsets to line/column + context).
+Remaining niceties: `case`-join merge, possible `../drift-lang` reuse. The core V1 lowering is DONE.
 
 ## Open questions / blockers
 - **✅ RESOLVED on Drift 0.33.35 — recursive-IR clean form landed.** `core.Box<T>` + the

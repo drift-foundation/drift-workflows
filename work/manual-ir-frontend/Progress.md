@@ -2,15 +2,15 @@
 
 Charter (objective, decisions, plan, verification): [README.md](./README.md).
 
-## Status: **Parser slices 1 + 2a + 2b-i + 2b-ii (a+b) LANDED — straight-line + `if`/`case` + `let` + named-op/result-refs + `merge` `.mf` lowers to the proven IR with content_hash + execution parity**
+## Status: **Parser step 5 COMPLETE (slices 1 + 2a + 2b-i + 2b-ii(a+b) + 2b-iii) — the full V1 surface lowers to the proven IR with content_hash + execution parity**
 
 The lane is scoped (IR-first, parser-last). The **manual-IR runtime surface is complete and fully
-proven**, and **the textual front end now covers straight-line, `if`/`case`, `let` + arg/local
-expression refs, operation naming + `result` references, and `merge`**: a `.mf` source lowers into the
-EXACT config the manual IR already executes and hashes (a flat `"plan"` for const-only straight-line,
-a control-flow `"graph"` for `if`/`case`/`let`/named-ops/`merge`), with NO new runtime semantics. Full
-`just test` green on certified driftc 0.33.42 / ABI 17 — integration **122/122** (was 101),
-microflows 20/20, SP 110/110, singular 16/16.
+proven**, and **the textual front end now covers the WHOLE V1 IR**: straight-line, `if`/`case`,
+`let` + arg/local expression refs, operation naming + `result` references, `merge`, AND finite array
+expressions (`map`/`filter`/`fold`). A `.mf` source lowers into the EXACT config the manual IR already
+executes and hashes (a flat `"plan"` for const-only straight-line, a control-flow `"graph"`
+otherwise), with NO new runtime semantics. Full `just test` green on certified driftc 0.33.42 / ABI 17
+— integration **128/128** (was 101), microflows 20/20, SP 110/110, singular 16/16.
 
 Proven runtime surface (unchanged this slice): durable arguments, the typed value/argument model,
 and the control-flow graph IR with EXECUTION + structural validation + graph-authoritative
@@ -26,8 +26,8 @@ and the control-flow graph IR with EXECUTION + structural validation + graph-aut
 Branches/loops/merges/lets write no continuation/event (only `NOperation` is a durable boundary);
 replay re-derives the pure path deterministically.
 
-**Next: parser slice 2b-iii** — finite array expressions (`map`/`filter`/`fold` → `NLoop`). Then
-diagnostics/spans. (Deferred within 2b-ii-b: `case`-join merge.) Scoped below.
+**Next: diagnostics/spans** (currently shallow — byte offsets) and remaining surface niceties
+(`case`-join merge; possible `../drift-lang` reuse). The core V1 lowering surface is DONE. Scoped below.
 
 ## Landed: parser slice 1 — straight-line textual front end (lowering parity, no new semantics)
 
@@ -199,22 +199,62 @@ shared downstream work. STILL a pure front end (no new IR nodes/runtime/storage)
 - **Pure boundary / durability.** `NMerge` writes no continuation/event; the merged value is recomputed
   on replay from durable results. Reversal reads the checkpoint stack (the merge isn't a durable
   boundary), so it compensates only the taken branch + the shared downstream op.
+- **`merge` is a CONTEXTUAL keyword.** After an if/else it opens a clause ONLY when shaped
+  `merge <ident> =` (a 2-token lookahead); an operation literally named `merge` (`merge { … }`,
+  `merge arg x`) is unaffected — its input expression never starts with `<ident> =`.
 - **Tests.** Unit (`parser_test` 12): `if … else … merge picked = result a | result b; confirm local
   picked` lowers to a graph whose `graph_canonical` equals the hand-authored C9 `NMerge` graph;
   malformed merge syntax (no `else` / no `|` / empty branch / nested-control-flow branch / unknown
   result alias) → parse error; a SWAPPED (non-predecessor) arm value PARSES but `validate_graph`
-  rejects it. Integration (C15, 5 checks): parser-lowered and hand-authored (C9) graphs produce
-  IDENTICAL `--emit-content-hash`; `flag:true` merges branch A's reserve result / `false` branch B's,
-  feeding the shared `confirm` (the durable confirm input.reserved == the taken branch's reservation);
-  the merge writes NO event (event-count parity with a no-merge equivalent); a RESUME recomputes the
-  merged value (op set unchanged, trailing op GET-first, no second PUT); REVERSAL compensates ONLY the
-  taken branch (`release`) + the shared `confirm` (`unconfirm`), highest-seq first, with the untaken
-  branch having no op row; a non-predecessor arm source is rejected at lowering. Integration 117→122.
+  rejects it; a TYPE-MISMATCHED merge ({reserved:string} vs {sum:int} via declared contracts) reaches
+  `type_check_graph` and is rejected; an op literally named `merge` after if/else parses as an op step.
+  Integration (C15, 6 checks): parser-lowered and hand-authored (C9) graphs produce IDENTICAL
+  `--emit-content-hash`; `flag:true` merges branch A's reserve result / `false` branch B's, feeding the
+  shared `confirm` (the durable confirm input.reserved == the taken branch's reservation); the merge
+  writes NO event (event-count parity with a no-merge equivalent); a RESUME recomputes the merged value
+  (op set unchanged, trailing op GET-first, no second PUT); REVERSAL compensates ONLY the taken branch
+  (`release`) + the shared `confirm` (`unconfirm`), highest-seq first, with the untaken branch having no
+  op row; a non-predecessor arm source is rejected at lowering; a TYPE-MISMATCHED parser-lowered merge
+  ({reserved:string} vs {sum:int}) fails at the build/type-check gate (source-lowered, not hand-authored)
+  before dispatch. Integration 117→123.
 
-## Deferred: later parser sub-slices (each lowers to already-proven IR; no new runtime semantics)
-- **Slice 2b-iii:** finite array expressions (`map`/`filter`/`fold` → `NLoop`) surface syntax.
+## Landed: parser slice 2b-iii — finite array expressions (`map`/`filter`/`fold` → `NLoop`)
+
+`.mf` now supports finite array expressions — a pure VALUE step over a finite array. STILL a pure
+front end (no new IR nodes/runtime/storage); lowers to the proven `NLoop`. This COMPLETES the V1
+lowering surface (every IR construct now has source syntax).
+- **Surface.** A loop is the RHS of a `let` (binding the `NLoop` result, its `as` field):
+  `let ys = map <source> each <elem> <body>`, `let ys = filter <source> each <elem> <body>`,
+  `let ys = fold <source> from <init> each <elem> <body>`. The body is EXPRESSION-ONLY (a pure expr
+  over `local <elem>`, plus `local <as>` = the accumulator for fold) — so a remote op can NEVER appear
+  inside iteration (the side-effect-free-loop invariant holds structurally, not by a check). `map`/
+  `filter`/`fold` are contextual keywords in let-RHS position; an op of that name is still a usable
+  bare op step. (No arithmetic in V1, so bodies are projections/consts — e.g. `map xs each c local
+  c.id`, `filter xs each c local c.keep`, fold-select-last `fold xs from const null each c local c`.)
+- **Lowering / validation.** `map`/`filter` omit `init` (the IR defaults it to the unit null); `fold`
+  carries it. Malformed shapes fail at the build gate: a non-array source / a non-Bool filter body / a
+  fold body-vs-accumulator type mismatch are rejected by `type_check_graph`; an `elem`==`as` name
+  collision by `validate_graph`; missing `each` / fold-missing-`from` / a bare-identifier source are
+  parse errors.
+- **Pure boundary.** `NLoop` writes no continuation/event; the loop value is recomputed on replay from
+  durable args/results.
+- **Tests.** Unit (`parser_test` 13): map/filter/fold each lower to a graph whose `graph_canonical`
+  equals the hand-authored `NLoop`; an `elem`==`as` collision PARSES but `validate_graph` rejects;
+  missing `each` / fold-missing-`from` / bare-identifier source → parse error. Integration (C16, 5
+  checks): map/filter/fold parser-lowered and hand-authored `NLoop` graphs produce IDENTICAL
+  `--emit-content-hash`; fold-select-last feeds a reserve (the durable reserve input == the last
+  candidate — matching the manual-IR C7 proof), map (identity) → fold → reserve and filter (on a
+  `keep` field) → fold → reserve execute; the loop writes NO event (event-count parity with a no-loop
+  equivalent); a RESUME recomputes the loop-derived value (op set unchanged, trailing op GET-first, no
+  second PUT); the four malformed shapes (non-array source, `elem`/`as` collision, non-bool filter
+  body, fold accumulator mismatch) are rejected at lowering. Integration 123→128.
+
+## Deferred: remaining niceties (no new runtime semantics)
+- **Diagnostics/spans:** parse errors are currently shallow (byte offsets) — upgrade to line/column +
+  source context.
 - **`case`-join merge:** an `NMerge` after a `case` (one source per arm + default) — deferred from
   2b-ii-b's minimum if-join form.
+- **`../drift-lang` reuse** for the lexer/parser/type-checker (possible future consolidation).
 - **Slice 3+:** diagnostics/spans (currently shallow — byte offsets), and possible `../drift-lang`
   reuse for the lexer/parser/type-checker.
 
@@ -705,9 +745,9 @@ Earlier rounds:
   reversal across a taken branch/case + shared downstream, changed-contract → revision_unavailable)
   — deterministic pure-control-flow replay, no continuation write at pure boundaries. LANDED
   (integration C6–C10).
-- [~] **5 — Textual parser** (NEW sub-step) — lowers source text into the proven IR, reusing
+- [x] **5 — Textual parser** — lowers source text into the proven IR, reusing
   `_build_plan`/`parse_graph`/`validate_graph`/`type_check_graph`/`content_hash` with NO new runtime
-  semantics.
+  semantics. The full V1 surface lowers (slices 1–2b-iii below); only diagnostics/niceties remain.
   - [x] **slice 1 — straight-line** workflow + declared arguments + operation input/result contracts
     → `microflows/runner/src/parser.drift` + `--lower-source` CLI → emits the same `plan`/
     `argument_type`/contract config → `content_hash` + execution parity with the hand-authored manual
@@ -729,17 +769,22 @@ Earlier rounds:
     `NMerge` (the C9 graph). Globally-unique result aliases; parity + execution (taken-branch selection
     feeds shared op); merge writes no event; resume recomputes; reversal compensates taken branch +
     shared op; malformed/non-predecessor sources rejected at parse or the build gate (unit `parser_test`
-    12; integration C15). LANDED, full `just test` green (integration 122).
-  - [ ] **slice 2b-iii —** finite array expressions (`map`/`filter`/`fold` → `NLoop`) syntax.
-  - [ ] **slice 3+ —** diagnostics/spans; possible `../drift-lang` reuse; `case`-join merge.
+    12; integration C15). LANDED, full `just test` green (integration 123, incl. the source-lowered
+    merge type-mismatch regression + the `merge` contextual-keyword resolution).
+  - [x] **slice 2b-iii — `map`/`filter`/`fold`** → `let ys = map/filter/fold <source> [from <init>]
+    each <elem> <body>` lowers to `NLoop` (expression-only body — no remote op in iteration). Parity +
+    execution (fold-select-last feeds an op; map/filter chain through a fold); loop writes no event;
+    resume recomputes; malformed shapes (non-array source, elem/as collision, non-bool filter body,
+    fold accumulator mismatch) rejected at lowering (unit `parser_test` 13; integration C16). LANDED,
+    full `just test` green (integration 128). **This COMPLETES the V1 lowering surface (step 5).**
+  - [ ] **niceties —** diagnostics/spans; `case`-join merge; possible `../drift-lang` reuse.
 
 ## Next action
-**Step 5, parser slice 2b-iii:** finite array expression surface syntax (`map`/`filter`/`fold` →
-`NLoop`) — a pure VALUE step over a finite array (`source`/`elem`/`as`/`body`, fold adds `init`),
-whose result binds a downstream local. Lowers to the already-proven `NLoop`. Same acceptance:
-parser-emitted vs hand-authored graph → identical `--emit-content-hash` and run outcome; the loop is a
-pure boundary (no event); resume recomputes the loop-derived value from durable args/results; malformed
-loop shape (non-array source, elem==as, bad body) rejected at lowering. No runtime/IR/storage changes.
+**The V1 lowering surface is COMPLETE** (every IR construct — straight-line, `if`/`case`, `let`,
+named-op/`result`, `merge`, `map`/`filter`/`fold` — has source syntax, with content_hash + execution
+parity). Remaining work is niceties, not lowering: (1) **diagnostics/spans** — upgrade parse errors
+from byte offsets to line/column + source context; (2) **`case`-join merge** (`NMerge` after a `case`);
+(3) possible **`../drift-lang` reuse** for the lexer/parser/type-checker. None change runtime/IR/storage.
 
 ## Open questions (see README)
 How far back replay restarts (last settled op vs start) · `../drift-lang` reuse for step 5.

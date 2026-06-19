@@ -2157,6 +2157,140 @@ def main():
         check("parser_merge_non_predecessor_source_rejected",
               swap_code != 0 and swap_cfg is None, (swap_code, swap_cfg))
 
+        # A merge of DIFFERENTLY-TYPED branch results (declared contracts make it visible) is rejected
+        # at the TYPE-CHECK gate of the parser-lowered config — before any dispatch. Branch A's reserve
+        # returns {reserved:string}; branch B's confirm returns {sum:int}; the merge sources disagree.
+        # (Both ops are compensable so the reversibility gate passes and the type check is what fails.)
+        tmm_code, tmm_cfg = lower_source(
+            "args { flag: bool }\n"
+            "op reserve { input: { reservation: string } result: { reserved: string } }\n"
+            "op confirm { input: { reserved: string } result: { sum: int } }\n"
+            "steps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = confirm { \"reserved\": \"B\" } } "
+            "merge picked = result a | result b\n confirm local picked }\n")
+        check("parser_merge_type_mismatch_rejected",
+              tmm_code != 0 and tmm_cfg is None, (tmm_code, tmm_cfg))
+
+        # ===== C16. TEXTUAL FRONTEND slice 2b-iii: finite array expressions (map/filter/fold) -> NLoop =====
+        # `let ys = map/filter/fold <source> [from <init>] each <elem> <body>` lowers to the proven
+        # NLoop (a pure VALUE step over a finite array; the body is expression-only, so no remote op
+        # can appear inside iteration). Acceptance: parser-emitted and hand-authored NLoop graphs have
+        # IDENTICAL --emit-content-hash; map/filter/fold execute to the same outcome; the loop writes no
+        # event; resume recomputes the loop-derived value; malformed loop shapes fail before dispatch.
+        CANDS_AT = {"type": "object", "fields": [{"name": "cands", "type": {"type": "array", "elem": RESV_C}}]}
+
+        # fold: select the last candidate -> reserve dispatches it (matches the manual-IR C7 fold proof).
+        fold_mf = (
+            "args { cands: [ { reservation: string } ] }\n"
+            "op reserve { input: { reservation: string } }\n"
+            "steps {\n  let last = fold arg cands from const null each c local c\n  reserve local last\n}\n"
+        )
+        fold_code, fold_low = lower_source(fold_mf)
+        fold_hand = _hand({"reserve": {"input_type": RESV_C}}, CANDS_AT, {"entry": "n0", "nodes": [
+            {"kind": "fold", "id": "n0", "source": {"arg": ["cands"]}, "elem": "c", "as": "last",
+             "init": {"const": None}, "body": {"local": {"name": "c"}}, "next": "n1"},
+            {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"local": {"name": "last"}}, "next": "n2"},
+            {"kind": "return", "id": "n2", "value": {"const": None}},
+        ]})
+        cands2 = json.dumps({"cands": [{"reservation": "r1"}, {"reservation": "r2"}]})
+        wfo = _wf_id(); ex0 = _exec_count(base); cfo, bfo = run_runner(fold_low, wfo, arguments=cands2)
+        exfo = _exec_count(base) - ex0
+        wfh = _wf_id(); cfh, bfh = run_runner(fold_hand, wfh, arguments=cands2)
+        check("parser_fold_parity_and_exec",
+              fold_code == 0 and fold_low is not None and emit_content_hash(fold_low) == emit_content_hash(fold_hand)
+              and cfo == 0 and bfo.get("workflow") == "completed" and exfo == 1 and _ck_resv(wfo) == ["r2"]
+              and cfh == 0 and bfh.get("workflow") == "completed" and _ck_resv(wfh) == ["r2"],
+              (fold_code, cfo, bfo, exfo, _ck_resv(wfo), cfh, _ck_resv(wfh)))
+
+        # map: identity map -> fold-last -> reserve (proves map produces the array the fold consumes).
+        map_mf = (
+            "args { cands: [ { reservation: string } ] }\n"
+            "op reserve { input: { reservation: string } }\n"
+            "steps {\n  let xs = map arg cands each c local c\n  let last = fold local xs from const null each x local x\n  reserve local last\n}\n"
+        )
+        map_code, map_low = lower_source(map_mf)
+        map_hand = _hand({"reserve": {"input_type": RESV_C}}, CANDS_AT, {"entry": "n0", "nodes": [
+            {"kind": "map", "id": "n0", "source": {"arg": ["cands"]}, "elem": "c", "as": "xs", "body": {"local": {"name": "c"}}, "next": "n1"},
+            {"kind": "fold", "id": "n1", "source": {"local": {"name": "xs"}}, "elem": "x", "as": "last",
+             "init": {"const": None}, "body": {"local": {"name": "x"}}, "next": "n2"},
+            {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"local": {"name": "last"}}, "next": "n3"},
+            {"kind": "return", "id": "n3", "value": {"const": None}},
+        ]})
+        wmo = _wf_id(); ex0 = _exec_count(base); cmo, bmo = run_runner(map_low, wmo, arguments=cands2)
+        check("parser_map_parity_and_exec",
+              map_code == 0 and map_low is not None and emit_content_hash(map_low) == emit_content_hash(map_hand)
+              and cmo == 0 and bmo.get("workflow") == "completed" and _exec_count(base) - ex0 == 1 and _ck_resv(wmo) == ["r2"],
+              (map_code, cmo, bmo, _ck_resv(wmo)))
+
+        # filter: keep candidates where `keep` is true -> fold-last -> reserve. (reserve is UNTYPED so
+        # the kept object, which carries the extra `keep` field, isn't rejected by a closed contract.)
+        FILT_AT = {"type": "object", "fields": [{"name": "cands", "type": {"type": "array", "elem":
+                   {"type": "object", "fields": [{"name": "reservation", "type": {"type": "string"}}, {"name": "keep", "type": {"type": "bool"}}]}}}]}
+        filt_mf = (
+            "args { cands: [ { reservation: string, keep: bool } ] }\n"
+            "steps {\n  let kept = filter arg cands each c local c.keep\n  let last = fold local kept from const null each x local x\n  reserve local last\n}\n"
+        )
+        filt_code, filt_low = lower_source(filt_mf)
+        filt_hand = _hand({}, FILT_AT, {"entry": "n0", "nodes": [
+            {"kind": "filter", "id": "n0", "source": {"arg": ["cands"]}, "elem": "c", "as": "kept", "body": {"local": {"name": "c", "path": ["keep"]}}, "next": "n1"},
+            {"kind": "fold", "id": "n1", "source": {"local": {"name": "kept"}}, "elem": "x", "as": "last",
+             "init": {"const": None}, "body": {"local": {"name": "x"}}, "next": "n2"},
+            {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"local": {"name": "last"}}, "next": "n3"},
+            {"kind": "return", "id": "n3", "value": {"const": None}},
+        ]})
+        candsf = json.dumps({"cands": [{"reservation": "r1", "keep": False}, {"reservation": "r2", "keep": True}, {"reservation": "r3", "keep": False}]})
+        wlf = _wf_id(); ex0 = _exec_count(base); clf, blf = run_runner(filt_low, wlf, arguments=candsf)
+        check("parser_filter_parity_and_exec",
+              filt_code == 0 and filt_low is not None and emit_content_hash(filt_low) == emit_content_hash(filt_hand)
+              and clf == 0 and blf.get("workflow") == "completed" and _exec_count(base) - ex0 == 1 and _ck_resv(wlf) == ["r2"],
+              (filt_code, clf, blf, _ck_resv(wlf)))
+
+        # The loop is a PURE boundary: it writes NO event. Event-count of the fold workflow equals a
+        # no-loop equivalent (a single const-input reserve) — same op count, no loop event. And a RESUME
+        # recomputes the loop-derived value: op1 (reserve local last) settles, a trailing op stays
+        # requested-not-settled; a claimable resume re-derives the SAME path (op set unchanged), GET-first.
+        noloop_code, noloop_low = lower_source(
+            "op reserve { input: { reservation: string } }\nsteps { reserve { \"reservation\": \"x\" } }\n")
+        wle = _wf_id(); run_runner(fold_low, wle, arguments=cands2)
+        wne2 = _wf_id(); run_runner(noloop_low, wne2, arguments="{}")
+        lres_mf = (
+            "args { cands: [ { reservation: string } ] }\n"
+            "steps {\n  let last = fold arg cands from const null each c local c\n  reserve local last\n"
+            "  reserve { \"reservation\": \"lq\", \"_fault\": { \"respond_pending\": true } }\n}\n"
+        )
+        lrc, lr_low = lower_source(lres_mf)
+        wlrp = _wf_id()
+        lopq = (f"SELECT operation_seq, operation_name, status, JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation')) "
+                f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wlrp}') ORDER BY operation_seq")
+        lcs, lbs = run_runner(lr_low, wlrp, arguments=cands2)
+        lop_s = _mdb(lopq)
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wlrp}')")
+        pu0, rq0 = _put_count(base), _request_count(base)
+        lcr, lbr = run_runner(lr_low, wlrp)
+        pu_d, rq_d = _put_count(base) - pu0, _request_count(base) - rq0
+        lop_r = _mdb(lopq)
+        check("parser_loop_no_event_and_resume_recomputes",
+              noloop_code == 0 and _evt_count(wle) == _evt_count(wne2) and _evt_count(wle) > 0
+              and lrc == 0 and lcs == 9 and lbs.get("workflow") == "pending"
+              and lop_s == [["1", "reserve", "2", "r2"], ["2", "reserve", "1", "lq"]]
+              and lcr == 9 and lbr.get("workflow") == "pending" and lop_r == lop_s and pu_d == 0 and rq_d >= 1,
+              (noloop_code, _evt_count(wle), _evt_count(wne2), lrc, lcs, lop_s, lcr, lop_r, f"put+{pu_d} req+{rq_d}"))
+
+        # Malformed loop shapes fail at lowering (build/type-check gate), before any dispatch: a
+        # non-array source, an elem/as name collision, a non-bool filter body, and a fold accumulator
+        # type mismatch (init type != body type).
+        l_nonarr = lower_source("op reserve { input: { reservation: string } }\nsteps { let ys = map const 5 each e local e\n reserve local ys }\n")[0]
+        l_coll = lower_source("args { cands: [ { reservation: string } ] }\nop reserve { input: { reservation: string } }\nsteps { let e = map arg cands each e local e\n reserve local e }\n")[0]
+        l_filtbody = lower_source(
+            "args { cands: [ { reservation: string } ] }\n"
+            "steps { let ys = filter arg cands each c local c\n let last = fold local ys from const null each x local x\n reserve local last }\n")[0]
+        l_foldmix = lower_source(
+            "args { cands: [ { reservation: string } ] }\n"
+            "op reserve { input: { reservation: string } }\n"
+            "steps { let acc = fold arg cands from const 0 each c local c\n reserve local acc }\n")[0]
+        check("parser_loop_malformed_rejected",
+              l_nonarr != 0 and l_coll != 0 and l_filtbody != 0 and l_foldmix != 0,
+              (l_nonarr, l_coll, l_filtbody, l_foldmix))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the
         # LOCAL authoritative result; no dependency on the participant.
         stub.terminate()
@@ -2203,7 +2337,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 122
+    EXPECTED_CHECKS = 128
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

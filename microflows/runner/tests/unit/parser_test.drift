@@ -416,7 +416,73 @@ fn scenario() -> Int {
 	val swap_body = _parse_body(&swap_src);
 	if !_graph_rejects(&swap_body) { return 102; }
 
+	// TYPE MISMATCH across merge arms: branch A returns {reserved:string}, branch B returns {sum:int}.
+	// The parser-lowered graph + the declared contracts reaches `type_check_graph`, which REJECTS the
+	// merge (sources disagree on type) — the same build gate `--lower-source` runs, before any dispatch.
+	val tmm_src = "args { flag: bool }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
+		+ "op confirm { input: { reserved: string } result: { sum: int } }\n"
+		+ "steps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = confirm { \"reserved\": \"B\" } } merge picked = result a | result b\n confirm local picked }\n";
+	val tmm_body = _parse_body(&tmm_src);
+	var tmc: Array<ir.OpContract> = [];
+	tmc.push(_oc("reserve", &"{\"type\":\"object\",\"fields\":[{\"name\":\"reservation\",\"type\":{\"type\":\"string\"}}]}", &"{\"type\":\"object\",\"fields\":[{\"name\":\"reserved\",\"type\":{\"type\":\"string\"}}]}"));
+	tmc.push(_oc("confirm", &"{\"type\":\"object\",\"fields\":[{\"name\":\"reserved\",\"type\":{\"type\":\"string\"}}]}", &"{\"type\":\"object\",\"fields\":[{\"name\":\"sum\",\"type\":{\"type\":\"int\"}}]}"));
+	val tat_node = _pj(&"{\"type\":\"object\",\"fields\":[{\"name\":\"flag\",\"type\":{\"type\":\"bool\"}}]}");
+	var tat = ir.empty_object_type();
+	match ir.parse_object_type(&tat_node) { core.Result::Ok(t) => { tat = move t; }, core.Result::Err(_) => { return 103; } }
+	match ir.parse_graph(&tmm_body) {
+		core.Result::Ok(g) => {
+			match ir.validate_graph(&g) { Optional::Some(_) => { return 104; }, Optional::None => {} }   // structurally valid
+			match ir.type_check_graph(&g, &tat, &tmc) { Optional::Some(_) => {}, Optional::None => { return 105; } }   // type-rejected
+		},
+		core.Result::Err(_) => { return 106; }
+	}
+
+	// `merge` is a CONTEXTUAL keyword: an operation literally named `merge` after an if/else (`merge
+	// { … }` — not `merge <ident> =`) parses as an op step, NOT a merge clause.
+	if !_parse_ok(&"args { flag: bool }\nsteps { if flag { ping {} } else { ping {} } merge { \"x\": 1 } }\n") { return 107; }
+
+	// ---- 13. (slice 2b-iii) map/filter/fold -> NLoop ----
+	// Each loop form lowers to the hand-authored NLoop graph identity (map/filter omit `init`; fold
+	// carries it). Bodies are pure expressions over `local <elem>` (+ `local <as>` for fold).
+	val map_body = _parse_body(&"args { cands: [ { reservation: string } ] }\nsteps { let xs = map arg cands each c local c\n reserve local xs }\n");
+	val map_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"cands\"]},\"elem\":\"c\",\"as\":\"xs\",\"body\":{\"local\":{\"name\":\"c\"}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"xs\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val map_l = _graph_canon_of_node(&map_body);
+	val map_h = _graph_canon_of_node(&map_hand);
+	if _str_eq(&map_h, &"<bad-graph>") { return 108; }
+	if !_str_eq(&map_l, &map_h) { return 109; }
+
+	val flt_body = _parse_body(&"args { cands: [ { keep: bool } ] }\nsteps { let ys = filter arg cands each c local c.keep\n reserve local ys }\n");
+	val flt_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"filter\",\"id\":\"n0\",\"source\":{\"arg\":[\"cands\"]},\"elem\":\"c\",\"as\":\"ys\",\"body\":{\"local\":{\"name\":\"c\",\"path\":[\"keep\"]}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"ys\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val flt_l = _graph_canon_of_node(&flt_body);
+	val flt_h = _graph_canon_of_node(&flt_hand);
+	if !_str_eq(&flt_l, &flt_h) { return 110; }
+
+	val fold_body = _parse_body(&"args { cands: [ { reservation: string } ] }\nsteps { let last = fold arg cands from const null each c local c\n reserve local last }\n");
+	val fold_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"fold\",\"id\":\"n0\",\"source\":{\"arg\":[\"cands\"]},\"elem\":\"c\",\"as\":\"last\",\"init\":{\"const\":null},\"body\":{\"local\":{\"name\":\"c\"}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"last\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val fold_l = _graph_canon_of_node(&fold_body);
+	val fold_h = _graph_canon_of_node(&fold_hand);
+	if !_str_eq(&fold_l, &fold_h) { return 111; }
+
+	// elem == as collision PARSES but `validate_graph` rejects (the loop element and result names must
+	// differ). Malformed loop SYNTAX (missing `each`, fold missing `from`) is a parse error.
+	val coll_body = _parse_body(&"args { cands: [ { reservation: string } ] }\nsteps { let e = map arg cands each e local e\n reserve local e }\n");
+	if !_graph_rejects(&coll_body) { return 112; }
+	if !_parse_err(&"args { cands: [ { reservation: string } ] }\nsteps { let ys = map arg cands local e\n reserve local ys }\n") { return 113; }
+	if !_parse_err(&"args { cands: [ { reservation: string } ] }\nsteps { let ys = fold arg cands each c local c\n reserve local ys }\n") { return 114; }
+	// a map/filter/fold whose source is a plain identifier (`map cands …`) is a parse error — the
+	// source must be an expression (`arg`/`local`/`result`/`const`/`{…}`), not a bare name.
+	if !_parse_err(&"args { cands: [ { reservation: string } ] }\nsteps { let ys = map cands each c local c\n reserve local ys }\n") { return 115; }
+
 	return 0;
+}
+
+// Build an ir.OpContract with declared input + result types (from type-encoding JSON literals).
+fn _oc(name: String, in_str: &String, out_str: &String) -> ir.OpContract {
+	val in_node = _pj(in_str);
+	val out_node = _pj(out_str);
+	return ir.OpContract(name = move name,
+		input_type = Optional<ir.IrType>::Some(ir.parse_type(&in_node)),
+		result_type = Optional<ir.IrType>::Some(ir.parse_type(&out_node)));
 }
 
 // Parse a source and return its lowered body graph/plan node (aborts the scenario on a parse error).
