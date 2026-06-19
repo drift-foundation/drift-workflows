@@ -25,7 +25,7 @@
 //           | let <ident> = <op> <expr>                     (a NAMED op; <ident> aliases its RESULT; 2b-ii-a)
 //           | let <ident> = <loop>                          (a finite array expression -> NLoop; 2b-iii)
 //           | if <arg-path> { <stmt>* } [ else { <stmt>* } ] [ merge <ident> = <expr> '|' <expr> ]
-//           | case <arg-path> { (<json-value> { <stmt>* })* default { <stmt>* } }  (slice 2a)
+//           | case <arg-path> { (<json-value> { <stmt>* })* default { <stmt>* } } [ merge <ident> = <expr> ('|' <expr>)* ]
 //   <loop> := (map|filter) <expr> each <ident> <expr>       (the body is a pure expr over local <elem>)
 //           | fold <expr> from <expr> each <ident> <expr>   (the body is a pure expr over local <elem>/<as>)
 //   <expr> := { …json-object… }   (const object) | const <json-value> | arg <arg-path>
@@ -42,24 +42,30 @@
 // `result <name>` resolves through a parser symbol table (result-name -> the named op's id) — node
 // ids are STABLE under source formatting; cross-branch/undominated refs are rejected by validate_graph.
 //
-// `merge` is a CONTEXTUAL keyword: after an if/else it opens a merge clause ONLY when shaped
+// `merge` is a CONTEXTUAL keyword: after an if/else OR a case it opens a merge clause ONLY when shaped
 // `merge <ident> =` (a 2-token lookahead). An operation literally named `merge` (`merge { … }`,
 // `merge arg x`, …) is unaffected — its input expression never starts with `<ident> =`.
 //
-// The `merge` clause (2b-ii-b) selects a branch-local op RESULT at an if-join (NMerge). ALIAS RULE:
-// result aliases are GLOBALLY UNIQUE (the parser symbol table is global), so the two merge arms
-// reference DISTINCT branch-local result names (`result a | result b`); validate_graph enforces that
-// each arm's value is available after its predecessor branch. Minimum form: merge follows an `if`
-// (not `case`), both branches non-empty + single-exit. case-merge is deferred.
+// The `merge` clause selects a branch-local op RESULT at a JOIN (NMerge). ALIAS RULE: result aliases
+// are GLOBALLY UNIQUE (the parser symbol table is global), so the merge arms reference DISTINCT
+// branch-local result names (`result a | result b | …`); validate_graph enforces that each arm's value
+// is available after its predecessor branch and that the merge is TOTAL + UNAMBIGUOUS over its
+// incoming edges. Two forms, both lowering to the SAME NMerge:
+//   - if-join (2b-ii-b): `if … else … merge n = <then> | <else>` — 2 sources, both branches
+//     non-empty + single-exit.
+//   - case-join: `case … { arms… default {…} } merge n = <v1> | … | <vN> | <default>` — one source
+//     per arm PLUS the default (value list is arm-order with the default LAST; every arm + default
+//     non-empty + single-exit). The merge id is allocated AFTER all arm/default bodies (pre-order).
 //
 // `map`/`filter`/`fold` are contextual keywords in let-RHS position (`let ys = map …`); an op of that
 // name is still usable as a bare op step. The loop body is expression-only, so no remote op can appear
 // inside iteration (the side-effect-free-loop invariant holds structurally).
 //
-// Deferred to later sub-slices (each lowering to already-proven IR): `case`-join merge, and possible
-// future reuse of Drift frontend utilities — ONLY via a versioned package dependency or explicit
-// vendoring into this repo, NOT a `../drift-lang` sibling-checkout dependency. Diagnostics stay LOCAL
-// to this module.
+// This parser — grammar, lowering, AND diagnostics — is entirely LOCAL to this module. It does NOT
+// depend on `../drift-lang` or any sibling checkout. If a frontend utility is genuinely worth reusing
+// later, it must arrive as a versioned package dependency or explicitly vendored code with local
+// ownership in THIS repo (or be requested from the compiler team as a supported package) — never a
+// sibling-repo path. (Remaining nicety, same approach: none — the V1 surface + both merge forms land.)
 //
 // Standalone & dependency-light: imports only std.* plus the runner-owned `ir` (unused at runtime),
 // so the unit test compiles it with src/ir.drift, no DB.
@@ -135,7 +141,7 @@ variant StmtKind {
 	KLet(name: String, value: json.JsonNode),                                 // let <name> = <expr> (a pure-value binding -> NLet)
 	KLoop(as_name: String, kind: String, source: json.JsonNode, elem: String, init: Optional<json.JsonNode>, body: json.JsonNode), // let <as> = map/filter/fold … -> NLoop; 2b-iii
 	KIf(cond: Array<String>, then_body: Array<Stmt>, else_body: Array<Stmt>, merge: Optional<MergeSpec>), // if … else … [merge …]
-	KCase(scrut: Array<String>, arms: Array<SCaseArm>, default_body: Array<Stmt>)
+	KCase(scrut: Array<String>, arms: Array<SCaseArm>, default_body: Array<Stmt>, merge: Optional<CaseMergeSpec>) // case … [merge …]
 }
 struct SCaseArm {
 	match_json: json.JsonNode,
@@ -149,6 +155,16 @@ struct MergeSpec {
 	name: String,
 	then_value: json.JsonNode,
 	else_value: json.JsonNode
+}
+// A `case`'s optional trailing `merge <name> = <v1> | … | <vN> | <default-value>` clause (the
+// case-join form). The merge node (its own pre-order id, allocated AFTER all arm + default bodies) is
+// the case's JOIN: every arm AND the default flow into it, and it binds `name` to the value selected by
+// which predecessor (arm/default) control arrived from (the same NMerge, just with N sources). `values`
+// is parallel to the arms IN SOURCE ORDER, with the DEFAULT value LAST — so `values.len == arms.len+1`.
+struct CaseMergeSpec {
+	merge_id: String,
+	name: String,
+	values: Array<json.JsonNode>
 }
 
 // ===== public entry points =====
@@ -702,7 +718,30 @@ fn _parse_case(c: &mut Cursor, var id: String) -> Stmt {
 	}
 	if arms.len == 0 { throw ParseError(code = "case-missing-arm", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "case must declare at least one arm"); }
 	if !has_default { throw ParseError(code = "case-missing-default", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "case requires a 'default' arm"); }
-	return Stmt(id = move id, kind = StmtKind::KCase(scrut = move scrut, arms = move arms, default_body = move default_body));
+	// Optional trailing case-JOIN merge: `merge <name> = <v1> | … | <vN> | <default-value>`. Same
+	// contextual-keyword lookahead as the if form (`merge <ident> =`), so an op literally named `merge`
+	// after a case is unaffected. Each arm AND the default must be a single-exit branch (one merge
+	// source apiece), and the value list must be exactly one-per-arm + the default (LAST).
+	var merge: Optional<CaseMergeSpec> = Optional<CaseMergeSpec>::None();
+	if _peek_merge_clause(c) {
+		val _ = _accept_keyword(c, &"merge");
+		var k = 0;
+		while k < arms.len { _require_merge_branch(c, &arms[k].body, &"case-arm"); k = k + 1; }
+		_require_merge_branch(c, &default_body, &"default");
+		val mname = _read_ident(c);
+		_expect(c, 61, &"'='");   // '='
+		var values: Array<json.JsonNode> = [];
+		values.push(_parse_value_expr(c));
+		while _accept(c, 124) { values.push(_parse_value_expr(c)); }   // '|'-separated
+		// One value per arm, plus the default (last). The arm count is fixed by the source above.
+		if values.len != arms.len + 1 {
+			throw ParseError(code = "case-merge-arity", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "",
+				message = "case `merge` needs one value per arm plus the default (" + fmt.format_int(arms.len + 1) + " expected, got " + fmt.format_int(values.len) + ")");
+		}
+		val mid = _alloc_id(c);   // merge node id — allocated AFTER all arm + default bodies (pre-order)
+		merge = Optional<CaseMergeSpec>::Some(CaseMergeSpec(merge_id = move mid, name = move mname, values = move values));
+	}
+	return Stmt(id = move id, kind = StmtKind::KCase(scrut = move scrut, arms = move arms, default_body = move default_body, merge = move merge));
 }
 
 // arg-path := ident ('.' ident)* — a path into the durable arguments (lowered to {"arg":[…]}).
@@ -932,22 +971,52 @@ fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 				}
 			}
 		},
-		StmtKind::KCase(scrut, arms, default_body) => {
-			var arms_arr = json.new_array();
-			var a = 0;
-			while a < arms.len {
-				val tgt = _entry_of(&arms[a].body, succ);
-				var arm_o = json.new_object();
-				arm_o.set("match", arms[a].match_json.clone_deep());
-				arm_o.set("target", _jstr(_dup(&tgt)));
-				arms_arr.push(arm_o.to_node());
-				a = a + 1;
+		StmtKind::KCase(scrut, arms, default_body, merge) => {
+			match merge {
+				Optional::Some(cms) => {
+					// Case-JOIN: every arm AND the default flow INTO the merge node (their bodies' exit
+					// is `merge_id`), and the merge then flows to `succ`. Sources are arm-order then the
+					// default LAST — parallel to `cms.values` — each `from` = that body's single exit node.
+					var arms_arr = json.new_array();
+					var a = 0;
+					while a < arms.len {
+						val tgt = _entry_of(&arms[a].body, &cms.merge_id);
+						var arm_o = json.new_object();
+						arm_o.set("match", arms[a].match_json.clone_deep());
+						arm_o.set("target", _jstr(_dup(&tgt)));
+						arms_arr.push(arm_o.to_node());
+						a = a + 1;
+					}
+					val default_entry = _entry_of(default_body, &cms.merge_id);
+					out.push(_case_node(&stmt.id, scrut, arms_arr.to_node(), &default_entry));
+					var a2 = 0;
+					while a2 < arms.len { _lower_stmts(&arms[a2].body, &cms.merge_id, out); a2 = a2 + 1; }
+					_lower_stmts(default_body, &cms.merge_id, out);
+					// Predecessors parallel to cms.values: arm exits in order, then the default exit.
+					var preds: Array<String> = [];
+					var a3 = 0;
+					while a3 < arms.len { preds.push(_exit_of(&arms[a3].body)); a3 = a3 + 1; }
+					preds.push(_exit_of(default_body));
+					out.push(_merge_node_multi(&cms.merge_id, &cms.name, &preds, &cms.values, succ));
+				},
+				Optional::None => {
+					var arms_arr = json.new_array();
+					var a = 0;
+					while a < arms.len {
+						val tgt = _entry_of(&arms[a].body, succ);
+						var arm_o = json.new_object();
+						arm_o.set("match", arms[a].match_json.clone_deep());
+						arm_o.set("target", _jstr(_dup(&tgt)));
+						arms_arr.push(arm_o.to_node());
+						a = a + 1;
+					}
+					val default_entry = _entry_of(default_body, succ);
+					out.push(_case_node(&stmt.id, scrut, arms_arr.to_node(), &default_entry));
+					var a2 = 0;
+					while a2 < arms.len { _lower_stmts(&arms[a2].body, succ, out); a2 = a2 + 1; }
+					_lower_stmts(default_body, succ, out);
+				}
 			}
-			val default_entry = _entry_of(default_body, succ);
-			out.push(_case_node(&stmt.id, scrut, arms_arr.to_node(), &default_entry));
-			var a2 = 0;
-			while a2 < arms.len { _lower_stmts(&arms[a2].body, succ, out); a2 = a2 + 1; }
-			_lower_stmts(default_body, succ, out);
 		}
 	}
 }
@@ -977,6 +1046,28 @@ fn _merge_node(id: &String, name: &String, then_pred: &String, then_val: &json.J
 	s1.set("from", _jstr(_dup(else_pred)));
 	s1.set("value", else_val.clone_deep());
 	sources.push(s1.to_node());
+	var o = json.new_object();
+	o.set("kind", _jstr("merge"));
+	o.set("id", _jstr(_dup(id)));
+	o.set("name", _jstr(_dup(name)));
+	o.set("sources", sources.to_node());
+	o.set("next", _jstr(_dup(next)));
+	return o.to_node();
+}
+
+// {"kind":"merge","id","name","sources":[{from,value}×N],"next"} — the N-source phi for a case-join.
+// `preds` and `values` are PARALLEL (same length): source k binds `name` to `values[k]` when control
+// arrived from predecessor `preds[k]`. Same node shape as `_merge_node`, just N sources instead of 2.
+fn _merge_node_multi(id: &String, name: &String, preds: &Array<String>, values: &Array<json.JsonNode>, next: &String) -> json.JsonNode {
+	var sources = json.new_array();
+	var i = 0;
+	while i < preds.len {
+		var s = json.new_object();
+		s.set("from", _jstr(_dup(&preds[i])));
+		s.set("value", values[i].clone_deep());
+		sources.push(s.to_node());
+		i = i + 1;
+	}
 	var o = json.new_object();
 	o.set("kind", _jstr("merge"));
 	o.set("id", _jstr(_dup(id)));

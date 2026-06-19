@@ -10,7 +10,7 @@ proven**, and **the textual front end now covers the WHOLE V1 IR**: straight-lin
 expressions (`map`/`filter`/`fold`) — with **structured source diagnostics** (stable code + line/
 column + caret). A `.mf` source lowers into the EXACT config the manual IR already executes and hashes
 (a flat `"plan"` for const-only straight-line, a control-flow `"graph"` otherwise), with NO new runtime
-semantics. Full `just test` green on certified driftc 0.33.42 / ABI 17 — integration **129/129** (was
+semantics. Full `just test` green on certified driftc 0.33.42 / ABI 17 — integration **134/134** (was
 101), microflows 20/20, SP 110/110, singular 16/16.
 
 Proven runtime surface (unchanged this slice): durable arguments, the typed value/argument model,
@@ -27,9 +27,10 @@ and the control-flow graph IR with EXECUTION + structural validation + graph-aut
 Branches/loops/merges/lets write no continuation/event (only `NOperation` is a durable boundary);
 replay re-derives the pure path deterministically.
 
-**The V1 lowering surface + diagnostics are DONE.** The only remaining nicety is `case`-join `merge`
-(an `NMerge` after a `case`). Possible future reuse of Drift frontend utilities would come ONLY via a
-versioned package or explicit vendoring (NOT a `../drift-lang` sibling checkout). Scoped below.
+**The V1 lowering surface, diagnostics, AND both merge forms are DONE** — `case`-join `merge` (an
+`NMerge` after a `case`, N sources) has landed alongside the proven if-join form. No remaining lowering
+niceties. The parser stays entirely local to `parser.drift`; Microflows never depends on `../drift-lang`
+or any sibling checkout (see the Frontend-reuse policy below). Scoped below.
 
 ## Landed: parser slice 1 — straight-line textual front end (lowering parity, no new semantics)
 
@@ -283,12 +284,38 @@ runtime/IR/storage/language changes — only error representation + reporting.
   `--lower-source` on a malformed source surfaces the structured `std.log` event (the `byte_offset`/code
   fields) + the human caret render, and emits no config. Integration 128→129.
 
-## Deferred: remaining niceties (no new runtime semantics)
-- **`case`-join merge:** an `NMerge` after a `case` (one source per arm + default) — deferred from
-  2b-ii-b's minimum if-join form.
-- **Possible future reuse of Drift frontend utilities** (lexer/parser/type-checker/diagnostics) — ONLY
-  via a versioned package dependency or explicit vendoring into this repo (ownership clear), NOT a
-  `../drift-lang` sibling-checkout dependency or test path. Not assumed as a normal next step.
+## Landed: case-join merge — `case` reconverges through an NMerge (N sources)
+
+The `case`-join form, analogous to the proven if-join `merge` and lowering to the SAME `NMerge` — NO
+new IR node, runtime behavior, or storage.
+- **Surface.** An optional trailing clause on a `case`: `case <path> { <v1> {…} … default {…} } merge
+  <name> = <e1> | <e2> | … | <eN> | <edefault>`. The value list is parallel to the arms IN SOURCE
+  ORDER with the DEFAULT value LAST, so `values.len == arms.len + 1` (a `case-merge-arity` parse error
+  otherwise). `merge` stays a CONTEXTUAL keyword (same `merge <ident> =` 2-token lookahead as the if
+  form), so an op literally named `merge` after a case is unaffected. Every arm AND the default must be
+  non-empty + single-exit (`_require_merge_branch` per body) — one merge source apiece.
+- **Lowering.** Each arm body and the default body flow INTO the merge (their exit succ = the merge id,
+  allocated AFTER all bodies so pre-order holds); the merge then flows to the case's `succ`. The merge
+  node carries `arms.len + 1` sources: `from` = each body's single exit node, `value` = the parallel
+  value expr. Reuses `_merge_node_multi` (the N-source generalization of the if form's `_merge_node`).
+  No parser changes to the IR: `NMerge` already takes an `Array<MergeArm>`, and `_check_merge` already
+  validates the phi is TOTAL + UNAMBIGUOUS over its incoming edges (one source per predecessor, each
+  value available after its predecessor). Result aliases stay globally unique (the global symbol table).
+- **Pure boundary.** The merge writes no continuation/event; the merged value is recomputed on replay
+  from durable args/results (only the taken arm's predecessor selects the source).
+- **Tests.** Unit: a case-join `merge` lowers to a graph whose `graph_canonical` equals the
+  hand-authored N-source `NMerge`; arity mismatch and a non-single-exit arm are parse errors. Integration:
+  parser-lowered and hand-authored case-merge graphs produce IDENTICAL `--emit-content-hash` and execute
+  the same; the merge writes NO event; a RESUME recomputes the merged value; reversal compensates only
+  the taken arm + the shared downstream op. Integration 129→134 (C15b, 5 checks).
+
+## Frontend-reuse policy (settled — not a deferred option)
+Microflows **never** depends on `../drift-lang` or any sibling checkout (no build dependency, no test
+path). The parser, lowering, AND diagnostics stay LOCAL to `microflows/runner/src/parser.drift`. If a
+Drift-frontend pattern is instructive we may read it as inspiration and **manually clone the small idea
+into this repo with local ownership**; if reuse pressure becomes substantial, the move is to **ask the
+compiler team to extract a supported, versioned package** with exactly the API surface we need — never
+to reach across a sibling-repo path.
 
 ## Landed: control-flow graph IR — chunk 1 (Step 1b(ii): types + canonical + flat compat)
 - **Graph node types in `ir.drift`** (additive; runner behavior unchanged): `IrExpr` (closed leaf
@@ -809,17 +836,21 @@ Earlier rounds:
     resume recomputes; malformed shapes (non-array source, elem/as collision, non-bool filter body,
     fold accumulator mismatch) rejected at lowering (unit `parser_test` 13; integration C16). LANDED,
     full `just test` green (integration 128). **This COMPLETES the V1 lowering surface (step 5).**
-  - [ ] **niceties —** diagnostics/spans; `case`-join merge; possible future reuse of Drift frontend utilities (via a versioned package or explicit vendoring — NOT a `../drift-lang` sibling checkout).
+  - [x] **niceties — structured diagnostics** (code + line/column + caret, via `std.log`; unit
+    `parser_test` 14; integration C17) **and `case`-join merge** (`NMerge` after a `case`, N sources).
+    LANDED. No remaining lowering niceties. (Frontend reuse stays local — never a sibling checkout; see
+    the Frontend-reuse policy.)
 
 ## Next action
-**The V1 lowering surface AND structured diagnostics are COMPLETE** (every IR construct has source
-syntax with content_hash + execution parity; parse errors are structured events with code + line/
-column + caret, rendered for humans and emitted via `std.log`). The ONE remaining nicety is
-**`case`-join merge** (an `NMerge` after a `case`). No further runtime/IR/storage work in the lane.
-(Any future reuse of Drift frontend utilities: packaged/vendored only — never a sibling checkout.)
+**The lane is COMPLETE** — every IR construct has source syntax with content_hash + execution parity;
+parse errors are structured events (code + line/column + caret, via `std.log`); and BOTH merge forms
+(if-join + case-join, the same `NMerge`) have landed. No further runtime/IR/storage work. The parser
+stays entirely local to `parser.drift`.
 
 ## Open questions (see README)
-How far back replay restarts (last settled op vs start) · Drift frontend-utility reuse (packaged/vendored only — not a sibling checkout).
+How far back replay restarts (last settled op vs start). **Frontend reuse is settled policy, not an
+open question:** never a sibling checkout — local code only, or a supported versioned package requested
+from the compiler team (see README's Frontend-reuse policy).
 
 ## ✅ RESOLVED on certified 0.33.35 — recursive-IR clean form landed in `ir.drift`
 Drift 0.33.35 (ABI 17, `cbf32feb`) shipped `core.Box<T>` and turned the typed-catch SIGSEGV

@@ -201,9 +201,8 @@ identical input (same `input_hash`), settled ops skipped, zero duplicate remote 
 
 **5 — Textual DSL parser (LAST).** Add the `.mf` lexer / grammar / type binding that
 **lowers into the step-1 IR** and reuses the step-2 validator unchanged; add diagnostics.
-The mechanical syntax layer, deliberately last. (Any reuse of Drift frontend utilities —
-parser/type-checker/IR/diagnostics — would come via a versioned package or explicit vendoring,
-NOT a `../drift-lang` sibling checkout. For now this layer is local to `parser.drift`.)
+The mechanical syntax layer, deliberately last — entirely local to `parser.drift` (see the
+**Frontend-reuse policy** under Open questions; we never depend on `../drift-lang` or any sibling checkout).
 
 ## Files likely affected
 - **`microflows/runner/src/ir.drift` (NEW, decided)** — the typed value model + control-flow
@@ -231,8 +230,7 @@ NOT a `../drift-lang` sibling checkout. For now this layer is local to `parser.d
   each construct; `integration/coordinator-singular/test.py` replay regressions;
   `db/tests/sp_operation_test.py` only if a durable shape changes.
 - Eventually `microflows/doc/microflows_design.md` (IR / value-model / control-flow
-  sections as proven). The textual frontend lives entirely in `microflows/runner/src/parser.drift`
-  (no `../drift-lang` sibling-checkout dependency).
+  sections as proven). The textual frontend lives entirely in `microflows/runner/src/parser.drift`.
 
 ## Verification criteria
 - Full root `just test` green at every step; all existing flat-plan + reversal +
@@ -270,7 +268,7 @@ regressions are all landed; and the textual front end now covers the WHOLE V1 IR
 `if`/`case` + `let`/arg/local refs + operation naming & `result` refs + `merge` + `map`/`filter`/`fold`
 — with STRUCTURED source diagnostics (stable code + line/column + caret). A `.mf` source lowers into
 the EXACT config the manual IR executes, with NO new runtime semantics. Full `just test` green
-(certified driftc 0.33.42 / ABI 17; integration **129/129**, was 101). See Progress.md for the
+(certified driftc 0.33.42 / ABI 17; integration **134/134**, was 101). See Progress.md for the
 per-chunk record.
 
 Parser (`microflows/runner/src/parser.drift` + `--lower-source` CLI): `args` → `argument_type`,
@@ -300,9 +298,10 @@ structured-error convention; all local to `parser.drift`). `render_diagnostic` f
 CLI string (code + line/column + caret); `--lower-source` emits the event through `std.log` (the same
 facility as the bookkeeper service — machine-parseable fields) AND prints the human render.
 
-Next action: **`case`-join merge** (`NMerge` after a `case`) — the one remaining nicety. The core V1
-lowering + diagnostics are DONE. (Any future Drift frontend-utility reuse: packaged/vendored only —
-never a `../drift-lang` sibling checkout.)
+Next action: **none** — `case`-join merge has landed (`case … { arms… default } merge n = v1 | … | vN |
+vdefault` → the same `NMerge`, N sources). The full V1 lowering surface, structured diagnostics, AND
+both merge forms (if-join + case-join) are DONE. The parser stays entirely local to `parser.drift`
+(see the Frontend-reuse policy below).
 
 ## Open questions / blockers
 - **✅ RESOLVED on Drift 0.33.35 — recursive-IR clean form landed.** `core.Box<T>` + the
@@ -323,10 +322,13 @@ never a `../drift-lang` sibling checkout.)
   vs from the workflow start — confirm the interpreter can cheaply replay to the next
   remote-op boundary and that this is the simplest correct cursor (no per-construct
   continuation). Decide in step 1/3.
-- **Possible future reuse of Drift frontend utilities** (parser / type checker / IR / diagnostics) —
-  ONLY via a versioned package dependency or explicit vendoring into this repo (ownership clear),
-  **NOT** a `../drift-lang` sibling-checkout dependency or test path. Not assumed as a normal next
-  step; the parser + diagnostics are local to `microflows/runner/src/parser.drift`.
+- **Frontend-reuse policy (settled).** Microflows **never** depends on `../drift-lang` or any sibling
+  checkout — not as a build dependency, not as a test path. The parser, lowering, AND diagnostics stay
+  local to `microflows/runner/src/parser.drift`. If a pattern in the Drift frontend is instructive, we
+  may read it as inspiration and **manually clone the small idea into this repo with local ownership**.
+  If reuse pressure ever becomes substantial, the move is to **ask the compiler team to extract a
+  supported, versioned package** with exactly the API surface we need — never to reach across a
+  sibling-repo path. This is a policy, not a deferred "future reuse" option.
 
 *(Resolved: IR home → `microflows/runner/src/ir.drift`; the closed V1 value model; **determinism
 is structural** (IR exposes no clock/random/env/fs/net/live-config/callback; sources = pinned

@@ -535,6 +535,27 @@ fn scenario() -> Int {
 		}
 	}
 
+	// ---- 15. case-join merge -> N-source NMerge ----
+	// `case kind { 1 {…} 2 {…} default {…} } merge picked = result a | result b | result d` lowers to a
+	// case whose every arm + default reconverge through ONE merge (3 sources, one per predecessor),
+	// binding `picked`; the merge then feeds a shared `confirm`. Same NMerge shape as the if-join, N=3.
+	val cm_src = "args { kind: int }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
+		+ "op confirm { input: { reserved: string } }\n"
+		+ "steps { case kind { 1 { let a = reserve { \"reservation\": \"A\" } } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b | result d\n confirm local picked }\n";
+	val cm_body = _parse_body(&cm_src);
+	val cm_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"kind\"]},\"arms\":[{\"match\":1,\"target\":\"n1\"},{\"match\":2,\"target\":\"n2\"}],\"default\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"D\"}},\"next\":\"n4\"},{\"kind\":\"merge\",\"id\":\"n4\",\"name\":\"picked\",\"sources\":[{\"from\":\"n1\",\"value\":{\"result\":{\"node\":\"n1\"}}},{\"from\":\"n2\",\"value\":{\"result\":{\"node\":\"n2\"}}},{\"from\":\"n3\",\"value\":{\"result\":{\"node\":\"n3\"}}}],\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n5\",\"operation\":\"confirm\",\"input\":{\"local\":{\"name\":\"picked\"}},\"next\":\"n6\"},{\"kind\":\"return\",\"id\":\"n6\",\"value\":{\"const\":null}}]}");
+	val cm_l = _graph_canon_of_node(&cm_body);
+	val cm_h = _graph_canon_of_node(&cm_hand);
+	if _str_eq(&cm_h, &"<bad-graph>") { return 144; }
+	if !_str_eq(&cm_l, &cm_h) { return 145; }
+
+	// arity mismatch: 2 values for 2 arms + default (needs 3) is a parse error.
+	if !_parse_err(&"args { kind: int }\nop reserve { input: { reservation: string } }\nsteps { case kind { 1 { let a = reserve { \"reservation\": \"A\" } } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b\n reserve local picked }\n") { return 146; }
+	// a non-single-exit arm (ends in a nested if) is a parse error (it would create >1 predecessor).
+	if !_parse_err(&"args { kind: int, g: bool }\nop reserve { input: { reservation: string } }\nsteps { case kind { 1 { if g { reserve {} } else { reserve {} } } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b | result d\n reserve local picked }\n") { return 147; }
+	// an EMPTY arm body with a merge is a parse error (no source for that predecessor).
+	if !_parse_err(&"args { kind: int }\nop reserve { input: { reservation: string } }\nsteps { case kind { 1 { } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b | result d\n reserve local picked }\n") { return 148; }
+
 	return 0;
 }
 

@@ -2178,6 +2178,133 @@ def main():
         check("parser_merge_type_mismatch_rejected",
               tmm_code != 0 and tmm_cfg is None, (tmm_code, tmm_cfg))
 
+        # ===== C15b. CASE-JOIN merge: a `case` reconverges through the SAME NMerge (N sources) =====
+        # `case kind { 1 {…} 2 {…} default {…} } merge picked = result a | result b | result d; confirm
+        # local picked` lowers to a case whose every arm + default flow into ONE merge (3 sources), which
+        # selects the TAKEN arm's reserve result and feeds the shared `confirm`. Acceptance mirrors the
+        # if-join (C15): parser-emitted and hand-authored graphs have IDENTICAL --emit-content-hash; all
+        # arms (incl. default) execute + select correctly; merge writes no event; resume recomputes the
+        # merged value (downstream op GET-first); reversal compensates the taken arm + the shared op.
+        CM_AT = {"type": "object", "fields": [{"name": "kind", "type": {"type": "int"}}]}
+        cmerge_mf = (
+            "args { kind: int }\n"
+            "op reserve { input: { reservation: string } result: { reserved: string } }\n"
+            "op confirm { input: { reserved: string } }\n"
+            "steps {\n"
+            "  case kind {\n"
+            "    1 { let a = reserve { \"reservation\": \"cmA\" } }\n"
+            "    2 { let b = reserve { \"reservation\": \"cmB\" } }\n"
+            "    default { let d = reserve { \"reservation\": \"cmD\" } }\n"
+            "  }\n"
+            "  merge picked = result a | result b | result d\n"
+            "  confirm local picked\n"
+            "}\n"
+        )
+        cm_code, cm_low = lower_source(cmerge_mf)
+        cm_hand = _hand({"reserve": {"input_type": RESV_C, "result_type": RESVD_C}, "confirm": {"input_type": RESVD_C}},
+                        CM_AT, {"entry": "n0", "nodes": [
+            {"kind": "case", "id": "n0", "scrutinee": {"arg": ["kind"]},
+             "arms": [{"match": 1, "target": "n1"}, {"match": 2, "target": "n2"}], "default": "n3"},
+            {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": {"reservation": "cmA"}}, "next": "n4"},
+            {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "cmB"}}, "next": "n4"},
+            {"kind": "operation", "id": "n3", "operation": "reserve", "input": {"const": {"reservation": "cmD"}}, "next": "n4"},
+            {"kind": "merge", "id": "n4", "name": "picked", "sources": [
+                {"from": "n1", "value": {"result": {"node": "n1"}}},
+                {"from": "n2", "value": {"result": {"node": "n2"}}},
+                {"from": "n3", "value": {"result": {"node": "n3"}}}], "next": "n5"},
+            {"kind": "operation", "id": "n5", "operation": "confirm", "input": {"local": {"name": "picked"}}, "next": "n6"},
+            {"kind": "return", "id": "n6", "value": {"const": None}},
+        ]})
+        hcm_l = emit_content_hash(cm_low) if cm_low else "<none>"
+        hcm_h = emit_content_hash(cm_hand)
+        # kind:1 -> arm-1 reserve (cmA) merged+confirmed; kind:2 -> cmB; kind:5 (no arm) -> default cmD.
+        wc1 = _wf_id(); ex0 = _exec_count(base); cc1, bc1 = run_runner(cm_low, wc1, arguments=json.dumps({"kind": 1}))
+        exc1 = _exec_count(base) - ex0
+        wc2 = _wf_id(); cc2, bc2 = run_runner(cm_low, wc2, arguments=json.dumps({"kind": 2}))
+        wcd = _wf_id(); ccd, bcd = run_runner(cm_low, wcd, arguments=json.dumps({"kind": 5}))
+        wch = _wf_id(); cch, bch = run_runner(cm_hand, wch, arguments=json.dumps({"kind": 2}))
+        check("parser_case_merge_graph_parity_and_arm_selection",
+              cm_code == 0 and cm_low is not None and hcm_l != "" and hcm_l == hcm_h
+              and cc1 == 0 and bc1.get("workflow") == "completed" and exc1 == 2 and _confirm_reserved(wc1) == "cmA"
+              and cc2 == 0 and bc2.get("workflow") == "completed" and _confirm_reserved(wc2) == "cmB"
+              and ccd == 0 and bcd.get("workflow") == "completed" and _confirm_reserved(wcd) == "cmD"
+              and cch == 0 and bch.get("workflow") == "completed" and _confirm_reserved(wch) == "cmB",
+              (cm_code, hcm_l, hcm_h, cc1, exc1, _confirm_reserved(wc1), cc2, _confirm_reserved(wc2), ccd, _confirm_reserved(wcd), cch, _confirm_reserved(wch)))
+
+        # The case-join merge writes NO event (pure join), like the if-join: event-count equals a
+        # no-merge equivalent (arm reserves + a const-input confirm).
+        nocm_code, nocm_low = lower_source(
+            "args { kind: int }\nop reserve { input: { reservation: string } }\nop confirm { input: { reserved: string } }\n"
+            "steps { case kind { 1 { reserve { \"reservation\": \"cmA\" } } 2 { reserve { \"reservation\": \"cmB\" } } default { reserve { \"reservation\": \"cmD\" } } } confirm { \"reserved\": \"k\" } }\n")
+        wcme = _wf_id(); run_runner(cm_low, wcme, arguments=json.dumps({"kind": 1}))
+        wcne = _wf_id(); run_runner(nocm_low, wcne, arguments=json.dumps({"kind": 1}))
+        check("parser_case_merge_no_event_at_boundary",
+              nocm_code == 0 and nocm_low is not None and _evt_count(wcme) == _evt_count(wcne) and _evt_count(wcme) > 0,
+              (nocm_code, _evt_count(wcme), _evt_count(wcne)))
+
+        # RESUME recomputes the merged value from the durable arm result (default arm taken here): the
+        # arm reserve + merged confirm settle, a trailing op stays requested; a claimable resume
+        # re-derives the SAME path (merge recomputed) and reconciles the trailing op GET-first.
+        cmpend_mf = (
+            "args { kind: int }\n"
+            "steps {\n"
+            "  case kind { 1 { let a = reserve { \"reservation\": \"cmA\" } } 2 { let b = reserve { \"reservation\": \"cmB\" } } default { let d = reserve { \"reservation\": \"cmD\" } } }\n"
+            "  merge picked = result a | result b | result d\n"
+            "  confirm local picked\n"
+            "  reserve { \"reservation\": \"cmq\", \"_fault\": { \"respond_pending\": true } }\n"
+            "}\n"
+        )
+        cmpc, cmp_low = lower_source(cmpend_mf)
+        wcmp = _wf_id()
+        cmopq = (f"SELECT operation_seq, operation_name, status, "
+                 f"COALESCE(JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reserved')), JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation'))) "
+                 f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wcmp}') ORDER BY operation_seq")
+        cmcs, cmbs = run_runner(cmp_low, wcmp, arguments=json.dumps({"kind": 5}))
+        cmop_s = _mdb(cmopq)
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wcmp}')")
+        cpu0, crq0 = _put_count(base), _request_count(base)
+        cmcr, cmbr = run_runner(cmp_low, wcmp)
+        cpu_d, crq_d = _put_count(base) - cpu0, _request_count(base) - crq0
+        cmop_r = _mdb(cmopq)
+        check("parser_case_merge_resume_recomputes_merged_value_get_first",
+              cmpc == 0 and cmbs.get("workflow") == "pending"
+              and cmop_s == [["1", "reserve", "2", "cmD"], ["2", "confirm", "2", "cmD"], ["3", "reserve", "1", "cmq"]]
+              and cmbr.get("workflow") == "pending" and cmop_r == cmop_s and cpu_d == 0 and crq_d >= 1,
+              (cmpc, cmcs, cmbs, cmop_s, cmcr, cmbr, cmop_r, f"put+{cpu_d} req+{crq_d}"))
+
+        # REVERSAL compensates ONLY the taken arm + the shared downstream op: arm-1 reserve (cmA) +
+        # merged confirm settle, then a final op is rejected -> unwind highest-seq first: unconfirm then
+        # release(cmA). The untaken arms (cmB/cmD) have no op row.
+        cmrev_mf = (
+            "args { kind: int }\n"
+            "steps {\n"
+            "  case kind { 1 { let a = reserve { \"reservation\": \"cmA\" } } 2 { let b = reserve { \"reservation\": \"cmB\" } } default { let d = reserve { \"reservation\": \"cmD\" } } }\n"
+            "  merge picked = result a | result b | result d\n"
+            "  confirm local picked\n"
+            "  reserve { \"reservation\": \"cmfin\", \"_fault\": { \"reject\": true } }\n"
+            "}\n"
+        )
+        cmrc, cmr_low = lower_source(cmrev_mf)
+        wcmr = _wf_id(); ex0 = _exec_count(base)
+        ccrv, cbrv = run_runner(cmr_low, wcmr, arguments=json.dumps({"kind": 1}))
+        cex_rv = _exec_count(base) - ex0
+        cwf_rv = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wcmr}')")
+        ccks_rv = _mdb(f"SELECT seq, reversal_state, reverse_operation_name FROM tb_mf_workflow_checkpoint "
+                       f"WHERE workflow_id = UNHEX('{wcmr}') ORDER BY seq")
+        cuntaken_rv = _mdb(f"SELECT COUNT(*) FROM tb_mf_operation WHERE workflow_id = UNHEX('{wcmr}') AND (input_json LIKE '%cmB%' OR input_json LIKE '%cmD%')")
+        check("parser_case_merge_reversal_compensates_taken_arm_and_shared",
+              cmrc == 0 and ccrv == 0 and cbrv.get("workflow") == "reversed" and cex_rv == 4
+              and cwf_rv == [["5", "2"]]
+              and ccks_rv == [["1", "2", "release"], ["2", "2", "unconfirm"]] and cuntaken_rv == [["0"]],
+              (cmrc, ccrv, cbrv, cex_rv, cwf_rv, ccks_rv, cuntaken_rv))
+
+        # Malformed case-join: a value list that doesn't match arm-count+default fails at lowering.
+        cmar_code, cmar_cfg = lower_source(
+            "args { kind: int }\nop reserve { input: { reservation: string } }\n"
+            "steps { case kind { 1 { let a = reserve { \"reservation\": \"A\" } } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b\n reserve local picked }\n")
+        check("parser_case_merge_arity_mismatch_rejected",
+              cmar_code != 0 and cmar_cfg is None, (cmar_code, cmar_cfg))
+
         # ===== C16. TEXTUAL FRONTEND slice 2b-iii: finite array expressions (map/filter/fold) -> NLoop =====
         # `let ys = map/filter/fold <source> [from <init>] each <elem> <body>` lowers to the proven
         # NLoop (a pure VALUE step over a finite array; the body is expression-only, so no remote op
@@ -2358,7 +2485,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 129
+    EXPECTED_CHECKS = 134
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")
