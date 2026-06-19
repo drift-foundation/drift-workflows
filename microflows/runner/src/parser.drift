@@ -18,10 +18,10 @@
 //   <stmt> := <op> <expr>                                   (an operation step; input is an expression)
 //           | let <ident> = <expr>                          (a pure-value binding -> NLet; slice 2b-i)
 //           | let <ident> = <op> <expr>                     (a NAMED op; <ident> aliases its RESULT; 2b-ii-a)
-//           | if <arg-path> { <stmt>* } [ else { <stmt>* } ]  (slice 2a)
+//           | if <arg-path> { <stmt>* } [ else { <stmt>* } ] [ merge <ident> = <expr> '|' <expr> ]
 //           | case <arg-path> { (<json-value> { <stmt>* })* default { <stmt>* } }  (slice 2a)
 //   <expr> := { …json-object… }   (const object) | const <json-value> | arg <arg-path>
-//           | local <ident> ('.' <ident>)*    (a let binding ref, optionally projected)
+//           | local <ident> ('.' <ident>)*    (a let/merge binding ref, optionally projected)
 //           | result <ident> ('.' <ident>)*   (a NAMED op's result, optionally projected; 2b-ii-a)
 //   <type> := int | float | bool | string | null
 //           | { <ident>: <type>, ... }   (object; trailing/optional commas tolerated)
@@ -34,8 +34,18 @@
 // `result <name>` resolves through a parser symbol table (result-name -> the named op's id) — node
 // ids are STABLE under source formatting; cross-branch/undominated refs are rejected by validate_graph.
 //
-// Deferred to later sub-slices (each lowering to already-proven IR): `merge` syntax (NMerge), finite
-// array expressions (`map`/`filter`/`fold` -> NLoop), richer diagnostics, and `../drift-lang` reuse.
+// `merge` is a CONTEXTUAL keyword: after an if/else it opens a merge clause ONLY when shaped
+// `merge <ident> =` (a 2-token lookahead). An operation literally named `merge` (`merge { … }`,
+// `merge arg x`, …) is unaffected — its input expression never starts with `<ident> =`.
+//
+// The `merge` clause (2b-ii-b) selects a branch-local op RESULT at an if-join (NMerge). ALIAS RULE:
+// result aliases are GLOBALLY UNIQUE (the parser symbol table is global), so the two merge arms
+// reference DISTINCT branch-local result names (`result a | result b`); validate_graph enforces that
+// each arm's value is available after its predecessor branch. Minimum form: merge follows an `if`
+// (not `case`), both branches non-empty + single-exit. case-merge is deferred.
+//
+// Deferred to later sub-slices (each lowering to already-proven IR): `case`-join merge, finite array
+// expressions (`map`/`filter`/`fold` -> NLoop), richer diagnostics, and `../drift-lang` reuse.
 //
 // Standalone & dependency-light: imports only std.* plus the runner-owned `ir` (unused at runtime),
 // so the unit test compiles it with src/ir.drift, no DB.
@@ -95,12 +105,21 @@ variant StmtKind {
 	KOp(name: String, input: json.JsonNode),                                  // an operation step; `input` is an EXPRESSION json
 	KNamedOp(bind: String, op: String, input: json.JsonNode),                 // let <bind> = <op> <input> — a NAMED op (result aliased by <bind>); slice 2b-ii-a
 	KLet(name: String, value: json.JsonNode),                                 // let <name> = <expr> (a pure-value binding -> NLet)
-	KIf(cond: Array<String>, then_body: Array<Stmt>, else_body: Array<Stmt>), // if <arg-path> { … } else { … }
+	KIf(cond: Array<String>, then_body: Array<Stmt>, else_body: Array<Stmt>, merge: Optional<MergeSpec>), // if … else … [merge …]
 	KCase(scrut: Array<String>, arms: Array<SCaseArm>, default_body: Array<Stmt>)
 }
 struct SCaseArm {
 	match_json: json.JsonNode,
 	body: Array<Stmt>
+}
+// An `if`'s optional trailing `merge <name> = <then-value> | <else-value>` clause (slice 2b-ii-b).
+// The merge node (its own pre-order id, allocated AFTER both branches) is the if's JOIN: each branch
+// flows into it, and it binds `name` to the value selected by which branch was taken (NMerge).
+struct MergeSpec {
+	merge_id: String,
+	name: String,
+	then_value: json.JsonNode,
+	else_value: json.JsonNode
 }
 
 // ===== public entry points =====
@@ -422,6 +441,23 @@ fn _is_expr_keyword(w: &String) nothrow -> Bool {
 	return _str_eq(w, &"const") or _str_eq(w, &"arg") or _str_eq(w, &"local") or _str_eq(w, &"result");
 }
 
+// Non-consuming lookahead: true iff the upcoming tokens are `merge <ident> =` (a merge clause). Used
+// so that an operation literally named `merge` after an if/else isn't swallowed as a merge clause.
+fn _peek_merge_clause(c: &mut Cursor) nothrow -> Bool {
+	val save = c.pos;
+	val w1 = _peek_ident(c);
+	if !_str_eq(&w1, &"merge") { c.pos = save; return false; }
+	// advance past 'merge' (c.pos is at the ident start after _peek_ident's skip_ws)
+	while !_eof(c) and _is_ident_char(c.src.byte_at(c.pos)) { c.pos = c.pos + 1; }
+	val w2 = _peek_ident(c);
+	if w2.byte_length() == 0 { c.pos = save; return false; }
+	while !_eof(c) and _is_ident_char(c.src.byte_at(c.pos)) { c.pos = c.pos + 1; }
+	_skip_ws(c);
+	val ok = !_eof(c) and cast<Int>(c.src.byte_at(c.pos)) == 61;   // '='
+	c.pos = save;
+	return ok;
+}
+
 // Peek the upcoming identifier WITHOUT consuming it (leading whitespace is skipped). Returns "" if
 // the next token is not an identifier.
 fn _peek_ident(c: &mut Cursor) nothrow -> String {
@@ -531,15 +567,50 @@ fn _local_expr(segs: &Array<String>) -> json.JsonNode {
 	return o.to_node();
 }
 
-// if_stmt := 'if' arg-path block ('else' block)? — the condition is a durable-argument PATH (the
-// branch decision comes from durable args; the runtime requires it to be Bool). 'else' is optional;
-// an absent else flows the false path straight to the join (the build gate rejects op-imbalance).
+// if_stmt := 'if' arg-path block ('else' block)? ('merge' ident '=' <expr> '|' <expr>)?
+// The condition is a durable-argument PATH (the runtime requires Bool). 'else' is optional. An
+// optional trailing `merge` clause makes the join an NMerge that binds <name> to the then-value (when
+// control came from the then-branch) or the else-value (else-branch). Merge requires BOTH branches
+// non-empty and ending in a single-exit statement (op/let), so each contributes one merge source.
 fn _parse_if(c: &mut Cursor, var id: String) -> Stmt {
 	val cond = _parse_arg_path(c);
 	val then_body = _parse_block(c);
 	var else_body: Array<Stmt> = [];
-	if _accept_keyword(c, &"else") { else_body = _parse_block(c); }
-	return Stmt(id = move id, kind = StmtKind::KIf(cond = move cond, then_body = move then_body, else_body = move else_body));
+	var has_else = false;
+	if _accept_keyword(c, &"else") { else_body = _parse_block(c); has_else = true; }
+	var merge: Optional<MergeSpec> = Optional<MergeSpec>::None();
+	// `merge` is a CONTEXTUAL keyword: it opens a merge clause ONLY when shaped `merge <ident> =`.
+	// An operation literally named `merge` after an if/else (`merge { … }`, `merge arg x`, …) is NOT
+	// that shape (an op input expression never starts with `<ident> =`), so it parses as an op step.
+	if _peek_merge_clause(c) {
+		val _ = _accept_keyword(c, &"merge");
+		if !has_else { throw ParseError(message = "`merge` requires an `else` branch"); }
+		_require_merge_branch(&then_body, &"then");
+		_require_merge_branch(&else_body, &"else");
+		val mname = _read_ident(c);
+		_expect(c, 61, &"'='");   // '='
+		val then_val = _parse_value_expr(c);
+		_expect(c, 124, &"'|'");  // '|'
+		val else_val = _parse_value_expr(c);
+		val mid = _alloc_id(c);   // merge node id — allocated AFTER both branches (pre-order)
+		merge = Optional<MergeSpec>::Some(MergeSpec(merge_id = move mid, name = move mname, then_value = move then_val, else_value = move else_val));
+	}
+	return Stmt(id = move id, kind = StmtKind::KIf(cond = move cond, then_body = move then_body, else_body = move else_body, merge = move merge));
+}
+
+// A merge branch must be non-empty and end in a SINGLE-EXIT statement (operation/let), so it
+// contributes exactly one immediate predecessor (one merge source). A nested if/case ending a branch
+// would create multiple predecessors — out of scope for this minimum form (rejected here).
+fn _require_merge_branch(body: &Array<Stmt>, which: &String) -> Void {
+	if body.len == 0 { throw ParseError(message = "`merge` " + _dup(which) + "-branch must not be empty"); }
+	var single = false;
+	match &body[body.len - 1].kind {
+		StmtKind::KOp(_, _) => { single = true; },
+		StmtKind::KNamedOp(_, _, _) => { single = true; },
+		StmtKind::KLet(_, _) => { single = true; },
+		default => {}
+	}
+	if !single { throw ParseError(message = "`merge` " + _dup(which) + "-branch must end in an operation or let (not nested if/case)"); }
 }
 
 // case_stmt := 'case' arg-path '{' (json-value block)* 'default' block '}' — the scrutinee is a
@@ -773,12 +844,28 @@ fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 		StmtKind::KLet(name, value) => {
 			out.push(_let_node(&stmt.id, name, value, succ));
 		},
-		StmtKind::KIf(cond, then_body, else_body) => {
-			val then_entry = _entry_of(then_body, succ);
-			val else_entry = _entry_of(else_body, succ);
-			out.push(_if_node(&stmt.id, cond, &then_entry, &else_entry));
-			_lower_stmts(then_body, succ, out);
-			_lower_stmts(else_body, succ, out);
+		StmtKind::KIf(cond, then_body, else_body, merge) => {
+			match merge {
+				Optional::Some(ms) => {
+					// The MERGE node is the if's join: each branch flows INTO it, and it then flows to
+					// `succ`. Source `from` = each branch's last node (its single immediate predecessor).
+					val then_entry = _entry_of(then_body, &ms.merge_id);
+					val else_entry = _entry_of(else_body, &ms.merge_id);
+					out.push(_if_node(&stmt.id, cond, &then_entry, &else_entry));
+					_lower_stmts(then_body, &ms.merge_id, out);
+					_lower_stmts(else_body, &ms.merge_id, out);
+					val then_pred = _exit_of(then_body);
+					val else_pred = _exit_of(else_body);
+					out.push(_merge_node(&ms.merge_id, &ms.name, &then_pred, &ms.then_value, &else_pred, &ms.else_value, succ));
+				},
+				Optional::None => {
+					val then_entry = _entry_of(then_body, succ);
+					val else_entry = _entry_of(else_body, succ);
+					out.push(_if_node(&stmt.id, cond, &then_entry, &else_entry));
+					_lower_stmts(then_body, succ, out);
+					_lower_stmts(else_body, succ, out);
+				}
+			}
 		},
 		StmtKind::KCase(scrut, arms, default_body) => {
 			var arms_arr = json.new_array();
@@ -804,6 +891,34 @@ fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 fn _entry_of(body: &Array<Stmt>, succ: &String) nothrow -> String {
 	if body.len > 0 { return _dup(&body[0].id); }
 	return _dup(succ);
+}
+
+// The exit id of a NON-EMPTY merge branch: its last statement's node id (the single immediate
+// predecessor of the merge). `_require_merge_branch` guarantees non-empty + single-exit.
+fn _exit_of(body: &Array<Stmt>) nothrow -> String {
+	return _dup(&body[body.len - 1].id);
+}
+
+// {"kind":"merge","id","name","sources":[{from,value}×2],"next"} — a phi binding `name` to the value
+// selected by which predecessor (branch) control arrived from.
+fn _merge_node(id: &String, name: &String, then_pred: &String, then_val: &json.JsonNode,
+               else_pred: &String, else_val: &json.JsonNode, next: &String) -> json.JsonNode {
+	var sources = json.new_array();
+	var s0 = json.new_object();
+	s0.set("from", _jstr(_dup(then_pred)));
+	s0.set("value", then_val.clone_deep());
+	sources.push(s0.to_node());
+	var s1 = json.new_object();
+	s1.set("from", _jstr(_dup(else_pred)));
+	s1.set("value", else_val.clone_deep());
+	sources.push(s1.to_node());
+	var o = json.new_object();
+	o.set("kind", _jstr("merge"));
+	o.set("id", _jstr(_dup(id)));
+	o.set("name", _jstr(_dup(name)));
+	o.set("sources", sources.to_node());
+	o.set("next", _jstr(_dup(next)));
+	return o.to_node();
 }
 
 // `input` is already the full input EXPRESSION json ({const:…}/{arg:…}/{local:…}).

@@ -2029,6 +2029,134 @@ def main():
               and cpr == 9 and bpr.get("workflow") == "pending" and op_r == op_s and pu_d == 0 and rq_d >= 1,
               (prc, cps, bps, op_s, cpr, bpr, op_r, f"put+{pu_d} req+{rq_d}"))
 
+        # ===== C15. TEXTUAL FRONTEND slice 2b-ii-b: `merge` clause -> NMerge =====
+        # `if … else … merge picked = result a | result b; confirm local picked` lowers to the EXACT
+        # NMerge graph the manual IR proves (C9): merge selects the TAKEN branch's op result and feeds
+        # the shared downstream `confirm`. Acceptance: parser-emitted and hand-authored graphs have
+        # IDENTICAL --emit-content-hash; both execute; selection from durable args; merge writes no
+        # event; resume recomputes the merged value (downstream op GET-first); reversal compensates the
+        # taken branch + the shared downstream op; malformed sources fail before dispatch.
+        MRG_AT = {"type": "object", "fields": [{"name": "flag", "type": {"type": "bool"}}]}
+        merge_mf = (
+            "args { flag: bool }\n"
+            "op reserve { input: { reservation: string } result: { reserved: string } }\n"
+            "op confirm { input: { reserved: string } }\n"
+            "steps {\n"
+            "  if flag { let a = reserve { \"reservation\": \"mgA\" } }\n"
+            "  else { let b = reserve { \"reservation\": \"mgB\" } }\n"
+            "  merge picked = result a | result b\n"
+            "  confirm local picked\n"
+            "}\n"
+        )
+        mg_code, mg_low = lower_source(merge_mf)
+        mg_hand = _hand({"reserve": {"input_type": RESV_C, "result_type": RESVD_C}, "confirm": {"input_type": RESVD_C}},
+                        MRG_AT, {"entry": "n0", "nodes": [
+            {"kind": "if", "id": "n0", "cond": {"arg": ["flag"]}, "then": "n1", "else": "n2"},
+            {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": {"reservation": "mgA"}}, "next": "n3"},
+            {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "mgB"}}, "next": "n3"},
+            {"kind": "merge", "id": "n3", "name": "picked",
+             "sources": [{"from": "n1", "value": {"result": {"node": "n1"}}}, {"from": "n2", "value": {"result": {"node": "n2"}}}], "next": "n4"},
+            {"kind": "operation", "id": "n4", "operation": "confirm", "input": {"local": {"name": "picked"}}, "next": "n5"},
+            {"kind": "return", "id": "n5", "value": {"const": None}},
+        ]})
+        hm_l = emit_content_hash(mg_low) if mg_low else "<none>"
+        hm_h = emit_content_hash(mg_hand)
+
+        def _confirm_reserved(wf):  # the confirm op's stored input.reserved (the merged-then-confirmed value)
+            r = _mdb(f"SELECT JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reserved')) FROM tb_mf_operation "
+                     f"WHERE workflow_id = UNHEX('{wf}') AND operation_name = 'confirm'")
+            return r[0][0] if r else None
+
+        # flag:true -> branch A's reserve result (mgA) is merged + confirmed; flag:false -> mgB.
+        wmt = _wf_id(); ex0 = _exec_count(base); cmt, bmt = run_runner(mg_low, wmt, arguments=json.dumps({"flag": True}))
+        exmt = _exec_count(base) - ex0
+        wmf = _wf_id(); cmf, bmf = run_runner(mg_low, wmf, arguments=json.dumps({"flag": False}))
+        wmh = _wf_id(); cmh, bmh = run_runner(mg_hand, wmh, arguments=json.dumps({"flag": True}))
+        check("parser_merge_graph_parity_and_branch_selection",
+              mg_code == 0 and mg_low is not None and hm_l != "" and hm_l == hm_h
+              and cmt == 0 and bmt.get("workflow") == "completed" and exmt == 2 and _confirm_reserved(wmt) == "mgA"
+              and cmf == 0 and bmf.get("workflow") == "completed" and _confirm_reserved(wmf) == "mgB"
+              and cmh == 0 and bmh.get("workflow") == "completed" and _confirm_reserved(wmh) == "mgA",
+              (mg_code, hm_l, hm_h, cmt, exmt, _confirm_reserved(wmt), cmf, _confirm_reserved(wmf), cmh, _confirm_reserved(wmh)))
+
+        # The merge is a PURE join: it writes NO event. Event-count of the merge workflow equals a
+        # no-merge equivalent (branch reserves + a const-input confirm) — same op count, no merge event.
+        nomrg_code, nomrg_low = lower_source(
+            "args { flag: bool }\nop reserve { input: { reservation: string } }\nop confirm { input: { reserved: string } }\n"
+            "steps { if flag { reserve { \"reservation\": \"mgA\" } } else { reserve { \"reservation\": \"mgB\" } } confirm { \"reserved\": \"k\" } }\n")
+        wme = _wf_id(); run_runner(mg_low, wme, arguments=json.dumps({"flag": True}))
+        wne = _wf_id(); run_runner(nomrg_low, wne, arguments=json.dumps({"flag": True}))
+        check("parser_merge_no_event_at_boundary",
+              nomrg_code == 0 and nomrg_low is not None and _evt_count(wme) == _evt_count(wne) and _evt_count(wme) > 0,
+              (nomrg_code, _evt_count(wme), _evt_count(wne)))
+
+        # RESUME recomputes the merged value from durable operation results: the branch reserve + the
+        # merged `confirm` settle, a trailing op stays requested-not-settled; a claimable resume
+        # re-derives the SAME path (merge recomputed) and reconciles the trailing op GET-first.
+        # (Ops untyped so the trailing fault const passes the build.)
+        mpend_mf = (
+            "args { flag: bool }\n"
+            "steps {\n"
+            "  if flag { let a = reserve { \"reservation\": \"mgA\" } } else { let b = reserve { \"reservation\": \"mgB\" } }\n"
+            "  merge picked = result a | result b\n"
+            "  confirm local picked\n"
+            "  reserve { \"reservation\": \"mgq\", \"_fault\": { \"respond_pending\": true } }\n"
+            "}\n"
+        )
+        mpc, mp_low = lower_source(mpend_mf)
+        wmp = _wf_id()
+        mopq = (f"SELECT operation_seq, operation_name, status, "
+                f"COALESCE(JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reserved')), JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation'))) "
+                f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wmp}') ORDER BY operation_seq")
+        mcs, mbs = run_runner(mp_low, wmp, arguments=json.dumps({"flag": True}))
+        mop_s = _mdb(mopq)
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wmp}')")
+        pu0, rq0 = _put_count(base), _request_count(base)
+        mcr, mbr = run_runner(mp_low, wmp)
+        pu_d, rq_d = _put_count(base) - pu0, _request_count(base) - rq0
+        mop_r = _mdb(mopq)
+        check("parser_merge_resume_recomputes_merged_value_get_first",
+              mpc == 0 and mcs == 9 and mbs.get("workflow") == "pending"
+              and mop_s == [["1", "reserve", "2", "mgA"], ["2", "confirm", "2", "mgA"], ["3", "reserve", "1", "mgq"]]
+              and mcr == 9 and mbr.get("workflow") == "pending" and mop_r == mop_s and pu_d == 0 and rq_d >= 1,
+              (mpc, mcs, mbs, mop_s, mcr, mbr, mop_r, f"put+{pu_d} req+{rq_d}"))
+
+        # REVERSAL compensates ONLY the taken branch PLUS the shared downstream op (matching C9d): the
+        # branch reserve + the merged confirm settle (2 checkpoints), then a final op is rejected ->
+        # reversal unwinds highest-seq first: unconfirm (confirm) then release (reserve mgA) -> reversed.
+        # The untaken branch (mgB) has no op row. (Ops untyped so the reject-fault const passes.)
+        mrev_mf = (
+            "args { flag: bool }\n"
+            "steps {\n"
+            "  if flag { let a = reserve { \"reservation\": \"mgA\" } } else { let b = reserve { \"reservation\": \"mgB\" } }\n"
+            "  merge picked = result a | result b\n"
+            "  confirm local picked\n"
+            "  reserve { \"reservation\": \"mgfin\", \"_fault\": { \"reject\": true } }\n"
+            "}\n"
+        )
+        mrc, mr_low = lower_source(mrev_mf)
+        wmr2 = _wf_id(); ex0 = _exec_count(base)
+        crv, brv = run_runner(mr_low, wmr2, arguments=json.dumps({"flag": True}))
+        ex_rv = _exec_count(base) - ex0
+        wf_rv = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wmr2}')")
+        cks_rv = _mdb(f"SELECT seq, reversal_state, reverse_operation_name FROM tb_mf_workflow_checkpoint "
+                      f"WHERE workflow_id = UNHEX('{wmr2}') ORDER BY seq")
+        untaken_rv = _mdb(f"SELECT COUNT(*) FROM tb_mf_operation WHERE workflow_id = UNHEX('{wmr2}') AND input_json LIKE '%mgB%'")
+        check("parser_merge_reversal_compensates_taken_and_shared",
+              mrc == 0 and crv == 0 and brv.get("workflow") == "reversed" and ex_rv == 4
+              and wf_rv == [["5", "2"]]
+              and cks_rv == [["1", "2", "release"], ["2", "2", "unconfirm"]] and untaken_rv == [["0"]],
+              (mrc, crv, brv, ex_rv, wf_rv, cks_rv, untaken_rv))
+
+        # A merge source from a NON-PREDECESSOR (swapped arm values) is rejected at lowering by
+        # validate_graph (the EResult is not available at that predecessor) — before any dispatch.
+        swap_code, swap_cfg = lower_source(
+            "args { flag: bool }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
+            "op confirm { input: { reserved: string } }\n"
+            "steps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = reserve { \"reservation\": \"B\" } } merge p = result b | result a\n confirm local p }\n")
+        check("parser_merge_non_predecessor_source_rejected",
+              swap_code != 0 and swap_cfg is None, (swap_code, swap_cfg))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the
         # LOCAL authoritative result; no dependency on the participant.
         stub.terminate()
@@ -2075,7 +2203,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 117
+    EXPECTED_CHECKS = 122
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

@@ -387,6 +387,35 @@ fn scenario() -> Int {
 	// a `let x = result r` (an NLet binding a result expression) parses + lowers fine.
 	if !_parse_ok(&"op reserve { input: { reservation: string } result: { reserved: string } }\nop confirm { input: { reserved: string } }\nsteps { let r = reserve { \"reservation\": \"A\" }\n let x = result r\n confirm local x }\n") { return 94; }
 
+	// ---- 12. (slice 2b-ii-b) merge clause -> NMerge ----
+	// `if … else … merge picked = result a | result b; confirm local picked` lowers to the exact
+	// NMerge graph the manual IR proves (C9): if -> branch reserves -> merge(sources from n1/n2) -> confirm.
+	val merge_src = "args { flag: bool }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
+		+ "op confirm { input: { reserved: string } }\n"
+		+ "steps { if flag { let a = reserve { \"reservation\": \"mgA\" } } else { let b = reserve { \"reservation\": \"mgB\" } } merge picked = result a | result b\n confirm local picked }\n";
+	val merge_body = _parse_body(&merge_src);
+	val merge_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"mgA\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"mgB\"}},\"next\":\"n3\"},{\"kind\":\"merge\",\"id\":\"n3\",\"name\":\"picked\",\"sources\":[{\"from\":\"n1\",\"value\":{\"result\":{\"node\":\"n1\"}}},{\"from\":\"n2\",\"value\":{\"result\":{\"node\":\"n2\"}}}],\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n4\",\"operation\":\"confirm\",\"input\":{\"local\":{\"name\":\"picked\"}},\"next\":\"n5\"},{\"kind\":\"return\",\"id\":\"n5\",\"value\":{\"const\":null}}]}");
+	val merge_l = _graph_canon_of_node(&merge_body);
+	val merge_h = _graph_canon_of_node(&merge_hand);
+	if _str_eq(&merge_h, &"<bad-graph>") { return 95; }
+	if !_str_eq(&merge_l, &merge_h) { return 96; }
+
+	// malformed merge SYNTAX is rejected at parse: no else / no '|' / empty branch / nested-cf branch
+	// (multi-exit) / unknown result alias in an arm value.
+	if !_parse_err(&"args { flag: bool }\nop reserve { input: { reservation: string } }\nsteps { if flag { let a = reserve { \"reservation\": \"A\" } } merge p = result a | result a\n reserve local p }\n") { return 97; }
+	if !_parse_err(&"args { flag: bool }\nop reserve { input: { reservation: string } }\nsteps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = reserve { \"reservation\": \"B\" } } merge p = result a result b\n reserve local p }\n") { return 98; }
+	if !_parse_err(&"args { flag: bool }\nsteps { if flag { } else { } merge p = const 1 | const 2\n ping local p }\n") { return 99; }
+	if !_parse_err(&"args { flag: bool, g: bool }\nsteps { if flag { if g { ping {} } else { ping {} } } else { ping {} } merge p = const 1 | const 2\n ping local p }\n") { return 100; }
+	if !_parse_err(&"args { flag: bool }\nop reserve { input: { reservation: string } }\nsteps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = reserve { \"reservation\": \"B\" } } merge p = result ghost | result b\n reserve local p }\n") { return 101; }
+
+	// SWAPPED arm values (then-value = the else branch's result) PARSE but `validate_graph` rejects:
+	// a merge source's value must be available at its predecessor (the EResult must be in scope there).
+	val swap_src = "args { flag: bool }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
+		+ "op confirm { input: { reserved: string } }\n"
+		+ "steps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = reserve { \"reservation\": \"B\" } } merge p = result b | result a\n confirm local p }\n";
+	val swap_body = _parse_body(&swap_src);
+	if !_graph_rejects(&swap_body) { return 102; }
+
 	return 0;
 }
 
