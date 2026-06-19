@@ -15,9 +15,12 @@
 //   steps { <stmt> ... }                         -> the workflow body (>=1 statement)
 //   # ... line comments to end of line
 //
-//   <stmt> := <op> <json-object>                            (an operation step; constant input)
+//   <stmt> := <op> <expr>                                   (an operation step; input is an expression)
+//           | let <ident> = <expr>                          (a pure-value binding -> NLet; slice 2b-i)
 //           | if <arg-path> { <stmt>* } [ else { <stmt>* } ]  (slice 2a)
 //           | case <arg-path> { (<json-value> { <stmt>* })* default { <stmt>* } }  (slice 2a)
+//   <expr> := { …json-object… }   (const object) | const <json-value> | arg <arg-path>
+//           | local <ident> ('.' <ident>)*   (a let/loop/merge binding ref, optionally projected)
 //   <type> := int | float | bool | string | null
 //           | { <ident>: <type>, ... }   (object; trailing/optional commas tolerated)
 //           | [ <type> ]                  (array)
@@ -27,9 +30,9 @@
 // bodies re-converge at the following statement (the join). Conditions/scrutinees are durable-arg
 // paths. The runtime's uniform-op-depth rule rejects op-imbalanced branches at the build gate.
 //
-// Deferred to later sub-slices (each lowering to already-proven IR): `let`/`merge`/finite array
-// expression syntax (binder scope + expression shapes), result/argument references in step inputs,
-// richer diagnostics, and `../drift-lang` reuse.
+// Deferred to later sub-slices (each lowering to already-proven IR): operation-RESULT references
+// (`result`) + `merge` (need an operation-naming model), finite array expressions (`map`/`filter`/
+// `fold`), richer diagnostics, and `../drift-lang` reuse.
 //
 // Standalone & dependency-light: imports only std.* plus the runner-owned `ir` (unused at runtime),
 // so the unit test compiles it with src/ir.drift, no DB.
@@ -86,7 +89,8 @@ struct Stmt {
 	kind: StmtKind
 }
 variant StmtKind {
-	KOp(name: String, input: json.JsonNode),                                  // an operation step
+	KOp(name: String, input: json.JsonNode),                                  // an operation step; `input` is an EXPRESSION json
+	KLet(name: String, value: json.JsonNode),                                 // let <name> = <expr> (a pure-value binding -> NLet)
 	KIf(cond: Array<String>, then_body: Array<Stmt>, else_body: Array<Stmt>), // if <arg-path> { … } else { … }
 	KCase(scrut: Array<String>, arms: Array<SCaseArm>, default_body: Array<Stmt>)
 }
@@ -221,7 +225,7 @@ fn _parse(c: &mut Cursor) -> ParsedWorkflow {
 			// A purely straight-line workflow lowers to a flat "plan" (slice-1 output unchanged);
 			// any `if`/`case` makes it a control-flow "graph". Both produce config the manual IR
 			// already executes + hashes, so identity/parity is preserved either way.
-			if _all_ops(&stmts) {
+			if _all_plain_ops(&stmts) {
 				body = _build_plan_body(&stmts);
 				is_graph = false;
 			} else {
@@ -368,16 +372,73 @@ fn _parse_stmt(c: &mut Cursor) -> Stmt {
 	var id = _alloc_id(c);
 	if _str_eq(&kw, &"if") { return _parse_if(c, move id); }
 	if _str_eq(&kw, &"case") { return _parse_case(c, move id); }
-	// op_step: `kw` is the operation name, followed by a CONSTANT JSON object input (same as slice 1).
-	_skip_ws(c);
-	if _eof(c) or cast<Int>(c.src.byte_at(c.pos)) != 123 {
-		throw ParseError(message = "expected a JSON object input for step '" + _dup(&kw) + "'");
-	}
-	val start = c.pos;
-	val end = _scan_json_object(c);
-	val raw = _slice(c, start, end - start);
-	val input = _parse_json_object(&raw);
+	if _str_eq(&kw, &"let") { return _parse_let(c, move id); }
+	// op_step: `kw` is the operation name, followed by an INPUT EXPRESSION (a `{…}` const object,
+	// or `const`/`arg`/`local` — slice 2b-i). The runtime requires the op input to be an object;
+	// a non-object expression is caught by the build-time type check, not here.
+	val input = _parse_value_expr(c);
 	return Stmt(id = move id, kind = StmtKind::KOp(name = move kw, input = move input));
+}
+
+// let_stmt := 'let' ident '=' <expr> — a pure-value binding (lowered to NLet). The bound value is
+// recomputed on replay from durable args/locals; it is not a durable boundary (writes no event).
+fn _parse_let(c: &mut Cursor, var id: String) -> Stmt {
+	val name = _read_ident(c);
+	_expect(c, 61, &"'='");   // '='
+	val value = _parse_value_expr(c);
+	return Stmt(id = move id, kind = StmtKind::KLet(name = move name, value = move value));
+}
+
+// expr := '{' …json-object… '}'      (const object shorthand -> {const: <obj>})
+//       | 'const' <json-value>        (an explicit constant of any JSON shape -> {const: <value>})
+//       | 'arg' <arg-path>            (durable argument ref -> {arg: [...]})
+//       | 'local' <name> <path>       (a let/loop/merge binding ref -> {local: {name, path?}})
+// (operation-RESULT references — {result:{node,…}} — are deferred to the merge sub-slice, which
+// needs an operation-naming model since node ids are parser-generated.)
+fn _parse_value_expr(c: &mut Cursor) -> json.JsonNode {
+	_skip_ws(c);
+	if _eof(c) { throw ParseError(message = "expected an expression"); }
+	if cast<Int>(c.src.byte_at(c.pos)) == 123 {   // '{' const object shorthand
+		val start = c.pos;
+		val end = _scan_json_object(c);
+		val raw = _slice(c, start, end - start);
+		val obj = _parse_json_object(&raw);
+		var o = json.new_object();
+		o.set("const", move obj);
+		return o.to_node();
+	}
+	if !_is_ident_start(c.src.byte_at(c.pos)) { throw ParseError(message = "expected an expression at byte " + fmt.format_int(c.pos)); }
+	val kw = _read_ident(c);
+	if _str_eq(&kw, &"const") {
+		val v = _parse_json_value(c);
+		var o = json.new_object();
+		o.set("const", move v);
+		return o.to_node();
+	}
+	if _str_eq(&kw, &"arg") {
+		val path = _parse_arg_path(c);
+		return _arg_expr(&path);
+	}
+	if _str_eq(&kw, &"local") {
+		val segs = _parse_arg_path(c);   // segs[0] = binding name; segs[1..] = projection path
+		return _local_expr(&segs);
+	}
+	throw ParseError(message = "expected an expression (const / arg / local / a {…} object), got '" + _dup(&kw) + "'");
+}
+
+// {"local": {"name": <segs[0]>, "path"?: [segs[1..]]}}
+fn _local_expr(segs: &Array<String>) -> json.JsonNode {
+	var lo = json.new_object();
+	lo.set("name", _jstr(_dup(&segs[0])));
+	if segs.len > 1 {
+		var pa = json.new_array();
+		var i = 1;
+		while i < segs.len { pa.push(_jstr(_dup(&segs[i]))); i = i + 1; }
+		lo.set("path", pa.to_node());
+	}
+	var o = json.new_object();
+	o.set("local", lo.to_node());
+	return o.to_node();
 }
 
 // if_stmt := 'if' arg-path block ('else' block)? — the condition is a durable-argument PATH (the
@@ -531,20 +592,36 @@ fn _scan_string(c: &mut Cursor) -> Int {
 
 // ===== lowering the statement AST to a config body =====
 
-// True when every top-level statement is a plain operation (no if/case anywhere — control flow only
-// nests under if/case). Such a workflow lowers to a flat "plan" (slice-1 output, byte-for-byte).
-fn _all_ops(stmts: &Array<Stmt>) nothrow -> Bool {
+// True when every top-level statement is a plain operation whose input is a CONSTANT OBJECT (no
+// `let`, no `if`/`case`, no arg/local input). Such a workflow lowers to a flat "plan" (slice-1
+// output, byte-for-byte); anything richer lowers to a "graph".
+fn _all_plain_ops(stmts: &Array<Stmt>) nothrow -> Bool {
 	var i = 0;
 	while i < stmts.len {
-		var is_op = false;
-		match &stmts[i].kind { StmtKind::KOp(_, _) => { is_op = true; }, default => {} }
-		if !is_op { return false; }
+		var ok = false;
+		match &stmts[i].kind {
+			StmtKind::KOp(_, input) => { ok = _is_const_object_expr(input); },
+			default => {}
+		}
+		if !ok { return false; }
 		i = i + 1;
 	}
 	return true;
 }
 
-// Build a flat "plan" array (straight-line) — identical to slice 1's emission.
+// An expression is a const-object iff it is `{const: <object>}` (the bare-`{…}` op-input shorthand).
+// `arg`/`local`/`const <non-object>` are not — they force the "graph" lowering.
+fn _is_const_object_expr(expr: &json.JsonNode) nothrow -> Bool {
+	match expr.get(&"const") {
+		Optional::Some(c) => {
+			match c.as_object() { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
+		},
+		Optional::None => { return false; }
+	}
+}
+
+// Build a flat "plan" array (straight-line) — identical to slice 1's emission. Each op input is the
+// const object UNWRAPPED from its `{const: <obj>}` expression (the plan stores the raw request body).
 fn _build_plan_body(stmts: &Array<Stmt>) -> json.JsonNode {
 	var plan = json.new_array();
 	var i = 0;
@@ -553,7 +630,10 @@ fn _build_plan_body(stmts: &Array<Stmt>) -> json.JsonNode {
 			StmtKind::KOp(name, input) => {
 				var step = json.new_object();
 				step.set("operation", _jstr(_dup(name)));
-				step.set("input", input.clone_deep());
+				match input.get(&"const") {
+					Optional::Some(obj) => { step.set("input", obj.clone_deep()); },
+					Optional::None => { throw ParseError(message = "internal: plan op input is not a const object"); }
+				}
 				plan.push(step.to_node());
 			},
 			default => { throw ParseError(message = "internal: non-operation in straight-line plan"); }
@@ -596,6 +676,9 @@ fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 		StmtKind::KOp(name, input) => {
 			out.push(_op_node(&stmt.id, name, input, succ));
 		},
+		StmtKind::KLet(name, value) => {
+			out.push(_let_node(&stmt.id, name, value, succ));
+		},
 		StmtKind::KIf(cond, then_body, else_body) => {
 			val then_entry = _entry_of(then_body, succ);
 			val else_entry = _entry_of(else_body, succ);
@@ -629,14 +712,23 @@ fn _entry_of(body: &Array<Stmt>, succ: &String) nothrow -> String {
 	return _dup(succ);
 }
 
+// `input` is already the full input EXPRESSION json ({const:…}/{arg:…}/{local:…}).
 fn _op_node(id: &String, name: &String, input: &json.JsonNode, next: &String) -> json.JsonNode {
 	var o = json.new_object();
 	o.set("kind", _jstr("operation"));
 	o.set("id", _jstr(_dup(id)));
 	o.set("operation", _jstr(_dup(name)));
-	var ce = json.new_object();
-	ce.set("const", input.clone_deep());
-	o.set("input", ce.to_node());
+	o.set("input", input.clone_deep());
+	o.set("next", _jstr(_dup(next)));
+	return o.to_node();
+}
+
+fn _let_node(id: &String, name: &String, value: &json.JsonNode, next: &String) -> json.JsonNode {
+	var o = json.new_object();
+	o.set("kind", _jstr("let"));
+	o.set("id", _jstr(_dup(id)));
+	o.set("name", _jstr(_dup(name)));
+	o.set("value", value.clone_deep());
 	o.set("next", _jstr(_dup(next)));
 	return o.to_node();
 }

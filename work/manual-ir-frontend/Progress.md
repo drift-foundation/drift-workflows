@@ -2,14 +2,14 @@
 
 Charter (objective, decisions, plan, verification): [README.md](./README.md).
 
-## Status: **Parser slices 1 + 2a LANDED — straight-line + `if`/`case` `.mf` lowers to the proven IR with content_hash + execution parity**
+## Status: **Parser slices 1 + 2a + 2b-i LANDED — straight-line + `if`/`case` + `let`/expr-refs `.mf` lowers to the proven IR with content_hash + execution parity**
 
 The lane is scoped (IR-first, parser-last). The **manual-IR runtime surface is complete and fully
-proven**, and **the textual front end now covers straight-line + `if`/`case`**: a `.mf` source
-lowers into the EXACT config the manual IR already executes and hashes (a flat `"plan"` for
-straight-line, a control-flow `"graph"` for `if`/`case`), with NO new runtime semantics. Full
-`just test` green on certified driftc 0.33.42 / ABI 17 — integration **109/109** (was 101),
-microflows 20/20, SP 110/110, singular 16/16.
+proven**, and **the textual front end now covers straight-line, `if`/`case`, and `let` + arg/local
+expression references**: a `.mf` source lowers into the EXACT config the manual IR already executes
+and hashes (a flat `"plan"` for const-only straight-line, a control-flow `"graph"` for
+`if`/`case`/`let`), with NO new runtime semantics. Full `just test` green on certified driftc
+0.33.42 / ABI 17 — integration **113/113** (was 101), microflows 20/20, SP 110/110, singular 16/16.
 
 Proven runtime surface (unchanged this slice): durable arguments, the typed value/argument model,
 and the control-flow graph IR with EXECUTION + structural validation + graph-authoritative
@@ -25,8 +25,9 @@ and the control-flow graph IR with EXECUTION + structural validation + graph-aut
 Branches/loops/merges/lets write no continuation/event (only `NOperation` is a durable boundary);
 replay re-derives the pure path deterministically.
 
-**Next: parser slice 2b** — add `let`/`merge`/finite-array-expression surface syntax (binder scope +
-expression shapes), each lowering to already-proven IR; then diagnostics/spans. Scoped below.
+**Next: parser slice 2b-ii** — operation-RESULT references (`result`, via an operation-naming model)
++ `merge` surface syntax. Then 2b-iii: finite array expressions (`map`/`filter`/`fold`); then
+diagnostics/spans. Scoped below.
 
 ## Landed: parser slice 1 — straight-line textual front end (lowering parity, no new semantics)
 
@@ -116,10 +117,40 @@ or runtime semantics; the slice reuses `parse_graph`/`validate_graph`/`type_chec
   branch's checkpoint payloads); a hand-authored config executes identically; an op-imbalanced branch
   is rejected at lowering. Integration 106→109.
 
+## Landed: parser slice 2b-i — `let` + arg/local expression references (lowers to `NLet`)
+
+`.mf` now supports `let <name> = <expr>` (a pure-value binding → `NLet`), and operation inputs are
+now EXPRESSIONS (`{…}` const object / `const <json>` / `arg <path>` / `local <name>[.path]`) rather
+than constant objects only. STILL a pure front end: no new IR nodes, execution paths, durable state,
+or runtime semantics; reuses `parse_graph`/`validate_graph`/`type_check_graph`/`content_hash`
+unchanged. A `let` (or any non-const-object op input) makes the workflow a `"graph"`; a const-only
+straight-line workflow is byte-for-byte UNCHANGED (still a flat `"plan"`).
+- **Expression grammar.** `{ …json… }` → `{const: <obj>}` (the bare-object op-input shorthand);
+  `const <json-value>` → `{const: <value>}` (any JSON shape); `arg <ident>(.<ident>)*` → `{arg:[…]}`;
+  `local <ident>(.<ident>)*` → `{local:{name, path?}}` (path = object-field projection). Used for
+  BOTH `let` values and operation inputs. Operation-RESULT references (`result`) are DEFERRED to the
+  `merge` sub-slice (2b-ii) — they need an operation-naming model (node ids are parser-generated).
+- **Scope is the runtime's, unchanged.** The parser does NOT track binder scope; an `ELocal` with no
+  dominating binder (undefined / out-of-scope `local`) is rejected by `validate_graph` at the build
+  gate (because `--lower-source` runs the real build path), before any dispatch.
+- **Pure boundary.** `NLet` writes no continuation/event; resume re-derives the bound value
+  deterministically from durable args/locals (proven: a fault-carrying `const` binding left an op
+  requested-not-settled, and a claimable resume recomputed the SAME value → GET-first, no second PUT).
+- **Tests.** Unit (`parser_test` 10): a `let p = arg req; reserve local p` source lowers to a graph
+  whose `graph_canonical` equals the hand-authored equivalent; a projected `arg req.reservation`
+  lowers to `{arg:[req,reservation]}`; an undefined `local` PARSES but `validate_graph` REJECTS it
+  (parser doesn't track scope); malformed (`let` w/o `=`, bad expression keyword, missing expr after
+  `=`) rejected; a `const` scalar value binds. Integration (C13, 4 checks): a parser-lowered `let`
+  graph and a hand-authored graph produce IDENTICAL `--emit-content-hash`; `let p = arg req; reserve
+  local p` executes with the reserve input DERIVED from durable args; the `let` writes NO event
+  (event-count parity with the no-let `reserve arg req`); a resume RECOMPUTES the bound value
+  (GET-first, no second PUT); an undefined local is rejected at lowering. Integration 109→113.
+
 ## Deferred: later parser sub-slices (each lowers to already-proven IR; no new runtime semantics)
-- **Slice 2b:** `let`/`merge`/finite-array-expression (`map`/`filter`/`fold`) surface syntax — these
-  introduce BINDER SCOPE and expression-shape complexity, reviewed separately. Lowers to the `"graph"`
-  config (NLet/NMerge/NLoop + result/local references), same content_hash/execution parity discipline.
+- **Slice 2b-ii:** operation-RESULT references (`result`, via an operation-naming model — e.g.
+  `let x = <op> <input>` binding the op's result) + `merge` surface syntax (`NMerge`; selects a
+  branch-local op result). Lowers to the `"graph"` config; same content_hash/execution parity.
+- **Slice 2b-iii:** finite array expressions (`map`/`filter`/`fold` → `NLoop`) surface syntax.
 - **Slice 3+:** diagnostics/spans (currently shallow — byte offsets), and possible `../drift-lang`
   reuse for the lexer/parser/type-checker.
 
@@ -621,16 +652,21 @@ Earlier rounds:
     branch/case bodies re-converge at the join; selection from durable args). content_hash + execution
     parity with hand-authored graph configs; op-imbalanced/malformed rejected at lowering (unit
     `parser_test` 8–9; integration C12). LANDED, full `just test` green (integration 109).
-  - [ ] **slice 2b —** `let`/`merge`/finite-array-expression syntax (binder scope + expression shapes),
-    lowering to the `"graph"` config; same parity discipline.
+  - [x] **slice 2b-i — `let` + arg/local exprs** → `let <name> = <expr>` lowers to `NLet`; operation
+    inputs become expressions (`{…}`/`const`/`arg`/`local`). content_hash + execution parity; `let`
+    writes no event; resume recomputes from durable state; undefined local rejected at the build gate
+    (unit `parser_test` 10; integration C13). LANDED, full `just test` green (integration 113).
+  - [ ] **slice 2b-ii —** operation-RESULT refs (`result`, via op-naming) + `merge` syntax (`NMerge`).
+  - [ ] **slice 2b-iii —** finite array expressions (`map`/`filter`/`fold` → `NLoop`) syntax.
   - [ ] **slice 3+ —** diagnostics/spans; possible `../drift-lang` reuse.
 
 ## Next action
-**Step 5, parser slice 2b:** extend the textual front end with `let`/`merge`/finite-array-expression
-syntax (binder scope + expression shapes — held out of 2a deliberately), lowering to the `"graph"`
-config the manual IR already executes (NLet/NMerge/NLoop + result/local references) — same acceptance:
-parser-emitted config vs hand-authored graph config → identical `--emit-content-hash` and identical run
-outcome; pure-value boundaries write no continuation. No runtime/IR/storage changes (front end only).
+**Step 5, parser slice 2b-ii:** operation-RESULT references + `merge`. The crux is an
+operation-NAMING model so source can reference a settled op's result (node ids are parser-generated):
+e.g. `let x = <op> <input>` binds the op's result, and `x`/`result x` lowers to `{result:{node:…}}`.
+Then `merge` (`NMerge`) selects a branch-local op result at a join. Same acceptance: parser-emitted
+config vs hand-authored graph config → identical `--emit-content-hash` and identical run outcome;
+pure boundaries write no continuation. No runtime/IR/storage changes (front end only).
 
 ## Open questions (see README)
 How far back replay restarts (last settled op vs start) · `../drift-lang` reuse for step 5.

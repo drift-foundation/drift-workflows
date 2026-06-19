@@ -1859,6 +1859,88 @@ def main():
         check("parser_control_flow_imbalanced_rejected_before_dispatch",
               imb_code != 0 and imb_cfg is None, (imb_code, imb_cfg))
 
+        # ===== C13. TEXTUAL FRONTEND slice 2b-i: `let` + arg/local expression refs =====
+        # `let <name> = <expr>` lowers to a pure-value NLet binding; operation inputs become
+        # expressions (`{…}` const / `arg` / `local`). Same acceptance: parser-emitted graph and a
+        # hand-authored graph produce IDENTICAL --emit-content-hash; both execute the same; the `let`
+        # is a PURE boundary (writes no event); a resume RECOMPUTES the bound value from durable state
+        # (GET-first, no second PUT); an undefined local is rejected at lowering (build gate).
+        REQ_AT = {"type": "object", "fields": [{"name": "req", "type": RESV_C}]}  # arg req : {reservation:string}
+
+        # let p = arg req ; reserve local p  — reserve's input is the arg object via the binding.
+        let_mf = (
+            "args { req: { reservation: string } }\n"
+            "op reserve { input: { reservation: string } }\n"
+            "steps {\n"
+            "  let p = arg req\n"
+            "  reserve local p\n"
+            "}\n"
+        )
+        let_code, let_low = lower_source(let_mf)
+        let_hand = _hand({"reserve": {"input_type": RESV_C}}, REQ_AT, {"entry": "n0", "nodes": [
+            {"kind": "let", "id": "n0", "name": "p", "value": {"arg": ["req"]}, "next": "n1"},
+            {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"local": {"name": "p"}}, "next": "n2"},
+            {"kind": "return", "id": "n2", "value": {"const": None}},
+        ]})
+        hl_l = emit_content_hash(let_low) if let_low else "<none>"
+        hl_h = emit_content_hash(let_hand)
+        args_req = json.dumps({"req": {"reservation": "letX"}})
+        wlp = _wf_id(); cl, bl = run_runner(let_low, wlp, arguments=args_req)
+        wlh = _wf_id(); clh, blh = run_runner(let_hand, wlh, arguments=args_req)
+        check("parser_let_graph_parity_and_arg_derived",
+              let_code == 0 and let_low is not None and hl_l != "" and hl_l == hl_h
+              and cl == 0 and bl.get("workflow") == "completed" and _ck_resv(wlp) == ["letX"]
+              and clh == 0 and blh.get("workflow") == "completed" and _ck_resv(wlh) == ["letX"],
+              (let_code, hl_l, hl_h, cl, bl, _ck_resv(wlp), clh, _ck_resv(wlh)))
+
+        # The `let` is a PURE-VALUE boundary: it writes NO event. Event-count of `let p=arg req;
+        # reserve local p` equals the no-let equivalent `reserve arg req` (the op input as an arg expr).
+        nolet_code, nolet_low = lower_source(
+            "args { req: { reservation: string } }\nop reserve { input: { reservation: string } }\n"
+            "steps { reserve arg req }\n")
+        def _evt_count(wf):
+            return int(_mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wf}')")[0][0])
+        wle = _wf_id(); run_runner(let_low, wle, arguments=args_req)
+        wne = _wf_id(); run_runner(nolet_low, wne, arguments=args_req)
+        check("parser_let_no_event_at_binding_boundary",
+              nolet_code == 0 and nolet_low is not None and _evt_count(wle) == _evt_count(wne) and _evt_count(wle) > 0,
+              (nolet_code, _evt_count(wle), _evt_count(wne)))
+
+        # RESUME recomputes the bound value from durable/pinned state (not the CLI / current process):
+        # the bound const carries a respond_pending fault, so the op stays requested-not-settled; a
+        # claimable resume re-derives the SAME local value and reconciles GET-first (no second PUT).
+        # (reserve is left UNTYPED here so the fault-carrying const — which has an extra `_fault`
+        # field — isn't rejected by a closed input contract; the point is resume recompute, not typing.)
+        pend_mf = (
+            "steps {\n"
+            "  let p = const { \"reservation\": \"letP\", \"_fault\": { \"respond_pending\": true } }\n"
+            "  reserve local p\n"
+            "}\n"
+        )
+        pend_code, pend_low = lower_source(pend_mf)
+        def _op_resv(wf):  # the requested operations' reservation inputs (a pending op has a row, no checkpoint)
+            return [r[0] for r in _mdb(
+                f"SELECT JSON_UNQUOTE(JSON_EXTRACT(input_json,'$.reservation')) "
+                f"FROM tb_mf_operation WHERE workflow_id = UNHEX('{wf}') ORDER BY operation_seq")]
+        wlr = _wf_id()
+        cs, bs = run_runner(pend_low, wlr, arguments="{}")
+        op_s = _op_resv(wlr)
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{wlr}')")
+        pu0, rq0 = _put_count(base), _request_count(base)
+        cr, br = run_runner(pend_low, wlr)
+        pu_d, rq_d = _put_count(base) - pu0, _request_count(base) - rq0
+        check("parser_let_resume_recomputes_value_get_first",
+              pend_code == 0 and cs == 9 and bs.get("workflow") == "pending" and op_s == ["letP"]
+              and cr == 9 and br.get("workflow") == "pending" and pu_d == 0 and rq_d >= 1
+              and _op_resv(wlr) == ["letP"],
+              (pend_code, cs, bs, op_s, cr, br, f"put+{pu_d} req+{rq_d}", _op_resv(wlr)))
+
+        # An undefined local is rejected at lowering (no dominating binder) — before any dispatch.
+        undef_code, undef_cfg = lower_source(
+            "op reserve { input: { reservation: string } }\nsteps { reserve local nope }\n")
+        check("parser_let_undefined_local_rejected",
+              undef_code != 0 and undef_cfg is None, (undef_code, undef_cfg))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the
         # LOCAL authoritative result; no dependency on the participant.
         stub.terminate()
@@ -1905,7 +1987,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 109
+    EXPECTED_CHECKS = 113
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

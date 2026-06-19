@@ -286,6 +286,58 @@ fn scenario() -> Int {
 	// well-formed nested control flow parses (if inside a case arm).
 	if !_parse_ok(&"args { m: string, f: bool }\nsteps { case m { \"a\" { if f { ping {} } else { ping {} } } default { ping {} } } }\n") { return 60; }
 
+	// ---- 10. (slice 2b-i) let + arg/local exprs lower to a graph; identity via graph_canonical ----
+	val let_src = "args { req: { reservation: string } }\nop reserve { input: { reservation: string } }\n"
+		+ "steps { let p = arg req\n reserve local p }\n";
+	var let_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
+	match parser.parse_source(&let_src) { core.Result::Ok(p) => { let_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 67; } }
+	var ec5: Array<parser.ContractDecl> = [];
+	var eb5 = json.new_array().to_node();
+	var let_pw = parser.ParsedWorkflow(body = move eb5, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec5);
+	match move let_pw_opt { Optional::Some(p) => { let_pw = move p; }, Optional::None => { return 68; } }
+	if !let_pw.is_graph { return 69; }   // a let makes the workflow a graph
+	val let_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"let\",\"id\":\"n0\",\"name\":\"p\",\"value\":{\"arg\":[\"req\"]},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"p\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val let_l = _graph_canon_of_node(&let_pw.body);
+	val let_h = _graph_canon_of_node(&let_hand);
+	if _str_eq(&let_h, &"<bad-graph>") { return 70; }
+	if !_str_eq(&let_l, &let_h) { return 71; }
+
+	// A let value with a PROJECTED arg path and a local with a projection path lower to the expected
+	// graph (arg req.reservation -> {arg:[req,reservation]}; local p.reservation -> {local:{name,path}}).
+	val proj_src = "args { req: { reservation: string } }\nop reserve { input: { reservation: string } }\n"
+		+ "steps { let p = arg req\n reserve { \"reservation\": \"x\" } }\n";
+	match parser.parse_source(&proj_src) { core.Result::Ok(_) => {}, core.Result::Err(_) => { return 72; } }
+	val proj2 = "args { req: { reservation: string } }\nop reserve { input: { reservation: string } }\n"
+		+ "steps { let r = arg req.reservation\n reserve { \"reservation\": \"x\" } }\n";
+	var proj_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
+	match parser.parse_source(&proj2) { core.Result::Ok(p) => { proj_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 73; } }
+	var ec6: Array<parser.ContractDecl> = [];
+	var eb6 = json.new_array().to_node();
+	var proj_pw = parser.ParsedWorkflow(body = move eb6, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec6);
+	match move proj_pw_opt { Optional::Some(p) => { proj_pw = move p; }, Optional::None => { return 74; } }
+	val proj_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"let\",\"id\":\"n0\",\"name\":\"r\",\"value\":{\"arg\":[\"req\",\"reservation\"]},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"x\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val proj_l = _graph_canon_of_node(&proj_pw.body);
+	val proj_h = _graph_canon_of_node(&proj_hand);
+	if !_str_eq(&proj_l, &proj_h) { return 75; }
+
+	// The parser does NOT track scope; an undefined local PARSES but `validate_graph` rejects it (so
+	// malformed binder scope fails at the build gate, before any dispatch).
+	val undef_src = "op reserve { input: { reservation: string } }\nsteps { reserve local nope }\n";
+	var undef_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
+	match parser.parse_source(&undef_src) { core.Result::Ok(p) => { undef_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 76; } }
+	var ec7: Array<parser.ContractDecl> = [];
+	var eb7 = json.new_array().to_node();
+	var undef_pw = parser.ParsedWorkflow(body = move eb7, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec7);
+	match move undef_pw_opt { Optional::Some(p) => { undef_pw = move p; }, Optional::None => { return 77; } }
+	if !_graph_rejects(&undef_pw.body) { return 78; }
+
+	// malformed: let without '=', a bad expression keyword, a missing expr after '='.
+	if !_parse_err(&"steps { let x arg req\n reserve {} }\n") { return 79; }
+	if !_parse_err(&"steps { reserve bogus }\n") { return 80; }
+	if !_parse_err(&"steps { let x = }\n") { return 81; }
+	// well-formed: a `const` scalar value binds; a const-object op input still works.
+	if !_parse_ok(&"steps { let y = const 5\n reserve { \"reservation\": \"z\" } }\n") { return 82; }
+
 	return 0;
 }
 
@@ -294,6 +346,16 @@ fn _graph_canon_of_node(node: &json.JsonNode) -> String {
 	match ir.parse_graph(node) {
 		core.Result::Ok(g) => { return ir.graph_canonical(&g); },
 		core.Result::Err(_) => { return "<bad-graph>"; }
+	}
+}
+
+// True iff the graph node parses but `validate_graph` REJECTS it (a structural/scope error).
+fn _graph_rejects(node: &json.JsonNode) -> Bool {
+	match ir.parse_graph(node) {
+		core.Result::Ok(g) => {
+			match ir.validate_graph(&g) { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
+		},
+		core.Result::Err(_) => { return true; }
 	}
 }
 
