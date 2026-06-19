@@ -92,11 +92,12 @@ fn scenario() -> Int {
 	}
 	var empty_contracts: Array<parser.ContractDecl> = [];
 	var empty_plan = json.new_array().to_node();
-	var pw = parser.ParsedWorkflow(plan = move empty_plan, arg_type = Optional<json.JsonNode>::None(), contracts = move empty_contracts);
+	var pw = parser.ParsedWorkflow(body = move empty_plan, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move empty_contracts);
 	match move pw_opt { Optional::Some(p) => { pw = move p; }, Optional::None => { return 2; } }
 
 	// ---- 2. plan parity via graph_canonical (degenerate-graph identity) ----
-	val parsed_steps = _plan_to_steps(&pw.plan);
+	if pw.is_graph { return 28; }   // a straight-line source stays a flat "plan"
+	val parsed_steps = _plan_to_steps(&pw.body);
 	if parsed_steps.len != 2 { return 3; }
 	var hand: Array<ir.FlatStep> = [];
 	hand.push(ir.FlatStep(operation = "reserve", input_json = "{\"reservation\":\"p1\"}"));
@@ -224,7 +225,76 @@ fn scenario() -> Int {
 		core.Result::Err(_) => {}
 	}
 
+	// ---- 8. (slice 2a) if/case lower to a "graph"; identity via graph_canonical ----
+	// An `if` source lowers to a graph whose IR identity matches the hand-authored equivalent.
+	val if_src = "args { flag: bool }\nop reserve { input: { reservation: string } }\n"
+		+ "steps { if flag { reserve { \"reservation\": \"A\" } } else { reserve { \"reservation\": \"B\" } } reserve { \"reservation\": \"fin\" } }\n";
+	var if_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
+	match parser.parse_source(&if_src) { core.Result::Ok(p) => { if_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 45; } }
+	var ec2: Array<parser.ContractDecl> = [];
+	var eb2 = json.new_array().to_node();
+	var if_pw = parser.ParsedWorkflow(body = move eb2, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec2);
+	match move if_pw_opt { Optional::Some(p) => { if_pw = move p; }, Optional::None => { return 46; } }
+	if !if_pw.is_graph { return 47; }   // an if source lowers to a graph, not a plan
+	val if_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"fin\"}},\"next\":\"n4\"},{\"kind\":\"return\",\"id\":\"n4\",\"value\":{\"const\":null}}]}");
+	val if_l = _graph_canon_of_node(&if_pw.body);
+	val if_h = _graph_canon_of_node(&if_hand);
+	if _str_eq(&if_h, &"<bad-graph>") { return 48; }
+	if !_str_eq(&if_l, &if_h) { return 49; }
+
+	// A `case` source lowers to a graph whose IR identity matches the hand-authored equivalent.
+	val case_src = "args { mode: string }\nop reserve { input: { reservation: string } }\n"
+		+ "steps { case mode { \"a\" { reserve { \"reservation\": \"A\" } } \"b\" { reserve { \"reservation\": \"B\" } } default { reserve { \"reservation\": \"D\" } } } reserve { \"reservation\": \"fin\" } }\n";
+	var case_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
+	match parser.parse_source(&case_src) { core.Result::Ok(p) => { case_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 50; } }
+	var ec3: Array<parser.ContractDecl> = [];
+	var eb3 = json.new_array().to_node();
+	var case_pw = parser.ParsedWorkflow(body = move eb3, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec3);
+	match move case_pw_opt { Optional::Some(p) => { case_pw = move p; }, Optional::None => { return 51; } }
+	if !case_pw.is_graph { return 52; }
+	val case_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"mode\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"},{\"match\":\"b\",\"target\":\"n2\"}],\"default\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"D\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n4\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"fin\"}},\"next\":\"n5\"},{\"kind\":\"return\",\"id\":\"n5\",\"value\":{\"const\":null}}]}");
+	val case_l = _graph_canon_of_node(&case_pw.body);
+	val case_h = _graph_canon_of_node(&case_hand);
+	if _str_eq(&case_h, &"<bad-graph>") { return 53; }
+	if !_str_eq(&case_l, &case_h) { return 54; }
+
+	// ---- 8c. NESTED control flow (an `if` inside a `case` arm) lowers to the expected graph
+	// identity — backing the "statements nest" claim at the canonical/validation level. ----
+	val nest_src = "args { mode: string, flag: bool }\nop reserve { input: { reservation: string } }\n"
+		+ "steps { case mode { \"a\" { if flag { reserve { \"reservation\": \"A\" } } else { reserve { \"reservation\": \"B\" } } } default { reserve { \"reservation\": \"D\" } } } reserve { \"reservation\": \"fin\" } }\n";
+	var nest_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
+	match parser.parse_source(&nest_src) { core.Result::Ok(p) => { nest_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 61; } }
+	var ec4: Array<parser.ContractDecl> = [];
+	var eb4 = json.new_array().to_node();
+	var nest_pw = parser.ParsedWorkflow(body = move eb4, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec4);
+	match move nest_pw_opt { Optional::Some(p) => { nest_pw = move p; }, Optional::None => { return 62; } }
+	if !nest_pw.is_graph { return 63; }
+	val nest_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"mode\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"}],\"default\":\"n4\"},{\"kind\":\"if\",\"id\":\"n1\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n2\",\"else\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n4\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"D\"}},\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n5\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"fin\"}},\"next\":\"n6\"},{\"kind\":\"return\",\"id\":\"n6\",\"value\":{\"const\":null}}]}");
+	val nest_l = _graph_canon_of_node(&nest_pw.body);
+	val nest_h = _graph_canon_of_node(&nest_hand);
+	if _str_eq(&nest_h, &"<bad-graph>") { return 64; }
+	if !_str_eq(&nest_l, &nest_h) { return 65; }
+
+	// ---- 9. (slice 2a) malformed control-flow sources are rejected at parse ----
+	if !_parse_err(&"args { m: string }\nsteps { case m { \"a\" { ping {} } } }\n") { return 55; }   // case w/o default
+	if !_parse_err(&"args { m: string }\nsteps { case m { default { ping {} } } }\n") { return 56; } // case w/o any arm
+	if !_parse_err(&"args { f: bool }\nsteps { if f { ping {} } else { ping {} \n") { return 57; }   // unterminated else block
+	if !_parse_err(&"steps { if }\n") { return 58; }                                                 // if missing cond/body
+	if !_parse_err(&"args { m: string }\nsteps { case m { \"a\" { ping {} } default { ping {} } default { ping {} } } }\n") { return 59; }  // duplicate default
+	// an arm AFTER default is rejected (grammar: default must be the last arm).
+	if !_parse_err(&"args { m: string }\nsteps { case m { default { ping {} } \"a\" { ping {} } } }\n") { return 66; }
+	// well-formed nested control flow parses (if inside a case arm).
+	if !_parse_ok(&"args { m: string, f: bool }\nsteps { case m { \"a\" { if f { ping {} } else { ping {} } } default { ping {} } } }\n") { return 60; }
+
 	return 0;
+}
+
+// Parse a graph node ({entry,nodes}) and return its canonical IR identity (or a sentinel).
+fn _graph_canon_of_node(node: &json.JsonNode) -> String {
+	match ir.parse_graph(node) {
+		core.Result::Ok(g) => { return ir.graph_canonical(&g); },
+		core.Result::Err(_) => { return "<bad-graph>"; }
+	}
 }
 
 fn _find(cs: &Array<parser.ContractDecl>, name: &String) nothrow -> Int {

@@ -260,27 +260,30 @@ parser/type-checker/IR/diagnostics when we get here.)
   model.
 
 ## Current status and next action
-**Manual-IR runtime surface COMPLETE (steps 1–4) AND parser slice 1 (step 5) LANDED.** The typed
-IR, durable arguments, structural + typed validation, control-flow EXECUTION (straight-line, `if`,
-`case`, finite array expressions, cross-branch merge, `let`, `return`), graph-authoritative
-`content_hash`, and pinned replay/reversal regressions are all landed; and the textual front end has
-begun — a straight-line `.mf` source lowers into the EXACT config the manual IR executes, with NO new
-runtime semantics. Full `just test` green (certified driftc 0.33.41 / ABI 17; integration **106/106**,
-was 101). See Progress.md for the per-chunk record.
+**Manual-IR runtime surface COMPLETE (steps 1–4) AND parser slices 1 + 2a (step 5) LANDED.** The
+typed IR, durable arguments, structural + typed validation, control-flow EXECUTION (straight-line,
+`if`, `case`, finite array expressions, cross-branch merge, `let`, `return`), graph-authoritative
+`content_hash`, and pinned replay/reversal regressions are all landed; and the textual front end now
+covers straight-line + `if`/`case` — a `.mf` source lowers into the EXACT config the manual IR
+executes, with NO new runtime semantics. Full `just test` green (certified driftc 0.33.42 / ABI 17;
+integration **109/109**, was 101). See Progress.md for the per-chunk record.
 
-Parser slice 1 (`microflows/runner/src/parser.drift` + `--lower-source` CLI): `args` →
-`argument_type`, `op … { input/result }` → operation contracts, `steps { <op> <json> … }` → a flat
-`plan`; reuses `_build_plan`/`parse_graph`/`validate_graph`/`type_check_graph`/`content_hash`
+Parser (`microflows/runner/src/parser.drift` + `--lower-source` CLI): `args` → `argument_type`,
+`op … { input/result }` → operation contracts, `steps { … }` → a flat `"plan"` (straight-line) or a
+control-flow `"graph"` (`if`/`case`). `if <arg-path> { … } else { … }` and
+`case <arg-path> { <value> { … } … default { … } }` lower to `operation`/`if`/`case`/`return` graph
+nodes with pre-order ids; branch/case bodies re-converge at the join and SELECTION comes from durable
+args. Reuses `_build_plan`/`parse_graph`/`validate_graph`/`type_check_graph`/op-depth/`content_hash`
 unchanged (no new IR nodes, execution paths, or durable state). Source is the SOLE authority on
-contracts (any base `input_type`/`result_type` is stripped, never inherited into identity), and
-`--lower-source` runs the real build/validation path (DB-free) before printing, so an invalid
-source/config fails AT lowering. Parity proven: a parser-lowered config and the hand-authored manual
-config produce the IDENTICAL `--emit-content-hash` and execute to the same outcome; a malformed
-source fails at lowering, before any dispatch.
+contracts (base `input_type`/`result_type` stripped, never inherited), and `--lower-source` runs the
+real build/validation path (DB-free) before printing, so an invalid source/config (unknown op,
+op-imbalanced branch, missing `case` default, …) fails AT lowering. Parity proven: parser-lowered and
+hand-authored configs produce the IDENTICAL `--emit-content-hash` and execute to the same outcome.
 
-Next action: **Step 5, parser slice 2** — add `if`/`case`/finite-array-expr/`merge`/`let` surface
-syntax, lowering to the `"graph"` config the manual IR executes (same content_hash/execution parity
-discipline). Later: diagnostics/spans (slice 1's are shallow), `../drift-lang` reuse TBD.
+Next action: **Step 5, parser slice 2b** — add `let`/`merge`/finite-array-expression surface syntax
+(binder scope + expression shapes, held out of 2a), lowering to the `"graph"` config the manual IR
+executes (same content_hash/execution parity discipline). Later: diagnostics/spans (currently
+shallow), `../drift-lang` reuse TBD.
 
 ## Open questions / blockers
 - **✅ RESOLVED on Drift 0.33.35 — recursive-IR clean form landed.** `core.Box<T>` + the

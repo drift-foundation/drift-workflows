@@ -1758,6 +1758,107 @@ def main():
         check("parser_lower_validates_emitted_config",
               step_code != 0 and step_cfg is None, (step_code, step_cfg))
 
+        # ===== C12. TEXTUAL FRONTEND slice 2a: if/case -> the "graph" config =====
+        # `if`/`case` source lowers to the control-flow "graph" the manual IR already executes. Same
+        # acceptance as slice 1: parser-emitted graph config and a hand-authored graph config produce
+        # the IDENTICAL --emit-content-hash; both execute the same; branch/case SELECTION comes from
+        # durable args; an op-imbalanced (malformed) source is rejected at lowering, before dispatch.
+        def _ck_resv(wf):
+            return [r[0] for r in _mdb(
+                f"SELECT JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reservation')) "
+                f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wf}') ORDER BY seq")]
+
+        RESV_C = {"type": "object", "fields": [{"name": "reservation", "type": {"type": "string"}}]}
+
+        def _hand(reg_extra, arg_t, graph):
+            # A hand-authored config: routing + reserve input contract + argument_type + a "graph".
+            c = dict(runner_cfg)
+            ops = []
+            for o in runner_cfg["operations"]:
+                o2 = dict(o)
+                if o2["name"] in reg_extra:
+                    o2.update(reg_extra[o2["name"]])
+                ops.append(o2)
+            c["operations"] = ops
+            c["argument_type"] = arg_t
+            c["graph"] = graph
+            f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(c, f); f.close()
+            plan_cfgs.append(f.name)
+            return f.name
+
+        # ---- if ----
+        IF_AT = {"type": "object", "fields": [{"name": "flag", "type": {"type": "bool"}}]}
+        if_mf = (
+            "args { flag: bool }\n"
+            "op reserve { input: { reservation: string } }\n"
+            "steps {\n"
+            "  if flag { reserve { \"reservation\": \"A\" } } else { reserve { \"reservation\": \"B\" } }\n"
+            "  reserve { \"reservation\": \"fin\" }\n"
+            "}\n"
+        )
+        if_code, if_low = lower_source(if_mf)
+        if_hand = _hand({"reserve": {"input_type": RESV_C}}, IF_AT, {"entry": "n0", "nodes": [
+            {"kind": "if", "id": "n0", "cond": {"arg": ["flag"]}, "then": "n1", "else": "n2"},
+            {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": {"reservation": "A"}}, "next": "n3"},
+            {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "B"}}, "next": "n3"},
+            {"kind": "operation", "id": "n3", "operation": "reserve", "input": {"const": {"reservation": "fin"}}, "next": "n4"},
+            {"kind": "return", "id": "n4", "value": {"const": None}},
+        ]})
+        hi_l = emit_content_hash(if_low) if if_low else "<none>"
+        hi_h = emit_content_hash(if_hand)
+        # flag:true takes branch A; flag:false takes branch B — selection from durable args.
+        wit = _wf_id(); ct, bt = run_runner(if_low, wit, arguments=json.dumps({"flag": True}))
+        wif = _wf_id(); cf, bf = run_runner(if_low, wif, arguments=json.dumps({"flag": False}))
+        wih = _wf_id(); chh, bhh = run_runner(if_hand, wih, arguments=json.dumps({"flag": True}))
+        check("parser_if_graph_parity_and_branch_from_args",
+              if_code == 0 and if_low is not None and hi_l != "" and hi_l == hi_h
+              and ct == 0 and bt.get("workflow") == "completed" and bt.get("result") == {"reserved": "fin"} and _ck_resv(wit) == ["A", "fin"]
+              and cf == 0 and bf.get("workflow") == "completed" and _ck_resv(wif) == ["B", "fin"]
+              and chh == 0 and bhh.get("result") == bt.get("result") and _ck_resv(wih) == ["A", "fin"],
+              (if_code, hi_l, hi_h, ct, bt, _ck_resv(wit), cf, _ck_resv(wif), chh, _ck_resv(wih)))
+
+        # ---- case ----
+        CASE_AT = {"type": "object", "fields": [{"name": "mode", "type": {"type": "string"}}]}
+        case_mf = (
+            "args { mode: string }\n"
+            "op reserve { input: { reservation: string } }\n"
+            "steps {\n"
+            "  case mode {\n"
+            "    \"a\" { reserve { \"reservation\": \"A\" } }\n"
+            "    \"b\" { reserve { \"reservation\": \"B\" } }\n"
+            "    default { reserve { \"reservation\": \"D\" } }\n"
+            "  }\n"
+            "  reserve { \"reservation\": \"fin\" }\n"
+            "}\n"
+        )
+        case_code, case_low = lower_source(case_mf)
+        case_hand = _hand({"reserve": {"input_type": RESV_C}}, CASE_AT, {"entry": "n0", "nodes": [
+            {"kind": "case", "id": "n0", "scrutinee": {"arg": ["mode"]},
+             "arms": [{"match": "a", "target": "n1"}, {"match": "b", "target": "n2"}], "default": "n3"},
+            {"kind": "operation", "id": "n1", "operation": "reserve", "input": {"const": {"reservation": "A"}}, "next": "n4"},
+            {"kind": "operation", "id": "n2", "operation": "reserve", "input": {"const": {"reservation": "B"}}, "next": "n4"},
+            {"kind": "operation", "id": "n3", "operation": "reserve", "input": {"const": {"reservation": "D"}}, "next": "n4"},
+            {"kind": "operation", "id": "n4", "operation": "reserve", "input": {"const": {"reservation": "fin"}}, "next": "n5"},
+            {"kind": "return", "id": "n5", "value": {"const": None}},
+        ]})
+        hc_l = emit_content_hash(case_low) if case_low else "<none>"
+        hc_h = emit_content_hash(case_hand)
+        wca = _wf_id(); cca, bca = run_runner(case_low, wca, arguments=json.dumps({"mode": "a"}))
+        wcd = _wf_id(); ccd, bcd = run_runner(case_low, wcd, arguments=json.dumps({"mode": "zzz"}))  # no arm -> default
+        check("parser_case_graph_parity_and_selection_from_args",
+              case_code == 0 and case_low is not None and hc_l != "" and hc_l == hc_h
+              and cca == 0 and bca.get("workflow") == "completed" and _ck_resv(wca) == ["A", "fin"]
+              and ccd == 0 and bcd.get("workflow") == "completed" and _ck_resv(wcd) == ["D", "fin"],
+              (case_code, hc_l, hc_h, cca, _ck_resv(wca), ccd, _ck_resv(wcd)))
+
+        # An op-IMBALANCED branch (then has an op, else is empty) is rejected at lowering (the build
+        # gate), before any dispatch — control-flow analog of the slice-1 validation gate.
+        imb_code, imb_cfg = lower_source(
+            "args { flag: bool }\nop reserve { input: { reservation: string } }\n"
+            "steps { if flag { reserve { \"reservation\": \"A\" } } reserve { \"reservation\": \"fin\" } }\n")
+        check("parser_control_flow_imbalanced_rejected_before_dispatch",
+              imb_code != 0 and imb_cfg is None, (imb_code, imb_cfg))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the
         # LOCAL authoritative result; no dependency on the participant.
         stub.terminate()
@@ -1804,7 +1905,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 106
+    EXPECTED_CHECKS = 109
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

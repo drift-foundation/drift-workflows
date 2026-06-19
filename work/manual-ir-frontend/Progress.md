@@ -2,12 +2,13 @@
 
 Charter (objective, decisions, plan, verification): [README.md](./README.md).
 
-## Status: **Parser slice 1 LANDED — straight-line `.mf` lowers to the proven IR with content_hash + execution parity**
+## Status: **Parser slices 1 + 2a LANDED — straight-line + `if`/`case` `.mf` lowers to the proven IR with content_hash + execution parity**
 
 The lane is scoped (IR-first, parser-last). The **manual-IR runtime surface is complete and fully
-proven**, and **the textual front end has now begun**: a straight-line `.mf` source lowers into the
-EXACT config the manual IR already executes and hashes, with NO new runtime semantics. Full
-`just test` green on certified driftc 0.33.41 / ABI 17 — integration **106/106** (was 101),
+proven**, and **the textual front end now covers straight-line + `if`/`case`**: a `.mf` source
+lowers into the EXACT config the manual IR already executes and hashes (a flat `"plan"` for
+straight-line, a control-flow `"graph"` for `if`/`case`), with NO new runtime semantics. Full
+`just test` green on certified driftc 0.33.42 / ABI 17 — integration **109/109** (was 101),
 microflows 20/20, SP 110/110, singular 16/16.
 
 Proven runtime surface (unchanged this slice): durable arguments, the typed value/argument model,
@@ -24,8 +25,8 @@ and the control-flow graph IR with EXECUTION + structural validation + graph-aut
 Branches/loops/merges/lets write no continuation/event (only `NOperation` is a durable boundary);
 replay re-derives the pure path deterministically.
 
-**Next: parser slice 2** — add `if`/`case`/array-expr/merge/`let` surface syntax (each lowering to
-already-proven IR), then diagnostics/spans. Scoped below.
+**Next: parser slice 2b** — add `let`/`merge`/finite-array-expression surface syntax (binder scope +
+expression shapes), each lowering to already-proven IR; then diagnostics/spans. Scoped below.
 
 ## Landed: parser slice 1 — straight-line textual front end (lowering parity, no new semantics)
 
@@ -80,11 +81,47 @@ execution paths, NO new durable state, NO dispatch/continuation changes. The acc
   temporary is rejected (bind to a `val` first). An empty array literal needs a type annotation. A
   bare tail `match` is not a return — bind or `return` it.
 
-## Deferred: later parser slices (each lowers to already-proven IR; no new runtime semantics)
-- **Slice 2:** `if`/`case`/finite-array-expr/`merge`/`let` surface syntax (lowering to the `"graph"`
-  config the manual IR already executes), with the same content_hash/execution parity discipline.
-- **Slice 3+:** diagnostics/spans (slice 1's are shallow — byte offsets), and possible
-  `../drift-lang` reuse for the lexer/parser/type-checker.
+## Landed: parser slice 2a — `if`/`case` source syntax (lowers to the `"graph"` config)
+
+`.mf` now supports structured `if`/`case`, lowering to the SAME control-flow `"graph"` the manual IR
+already executes + hashes. STILL a pure front end: no new IR nodes, execution paths, durable state,
+or runtime semantics; the slice reuses `parse_graph`/`validate_graph`/`type_check_graph`/op-depth/
+`content_hash` unchanged. Straight-line workflows are byte-for-byte UNCHANGED (still a flat `"plan"`).
+- **Surface.** `if <arg-path> { <stmt>* } [ else { <stmt>* } ]` and
+  `case <arg-path> { (<json-value> { <stmt>* })* default { <stmt>* } }`. Statements nest (an `if`
+  inside a `case` arm, etc.). The condition/scrutinee is a durable-ARGUMENT path (`flag`, `user.tier`)
+  — the branch decision comes from durable args (the runtime requires the condition Bool / the arm
+  constants to match the scrutinee type). `default` is required on `case` AND must be the LAST arm (an
+  arm after it is rejected — it would lower before the default but read as a fallthrough in source);
+  `else` is optional.
+- **Lowering.** A small statement AST (`Stmt`/`StmtKind`/`SCaseArm`; `Array<Stmt>` recursion is fine
+  — heap-indirected) is built with STABLE PRE-ORDER ids (`n0`,`n1`,… in source order, allocated at
+  parse time), so a single forward pass emits `operation`/`if`/`case`/`return` nodes and the ids are
+  predictable (the parity tests author the matching hand-written graph against the same scheme).
+  Branch bodies re-converge at the FOLLOWING statement (the join); an empty `else`/arm/`default` flows
+  straight to the join. The terminal `return` is `{const:null}` (completion uses the final durable
+  op's result, exactly as the degenerate-graph straight-line case). A purely straight-line workflow
+  still lowers to `"plan"` (so slice-1 output/parity is untouched); ANY `if`/`case` makes it `"graph"`.
+- **Validation is the runtime's, unchanged.** Because `--lower-source` runs the real build path
+  (slice-1 finding 2), an op-IMBALANCED branch (uniform-op-depth violation), a `case` missing
+  `default`, a non-Bool condition, etc. are rejected AT lowering, before any dispatch.
+- **Tests.** Unit (`parser_test` 8–9): an `if`/`case` source — AND a NESTED `if`-inside-a-`case`-arm
+  source (8c) — lowers to a graph whose `graph_canonical` IR identity equals the hand-authored
+  equivalent (the nested case also passes `parse_graph`+validate, backing "statements nest" at the
+  canonical level); malformed control flow (case w/o `default`, case w/o arms, unterminated `else`,
+  `if` w/o cond/body, duplicate `default`, an arm AFTER `default`) rejected. Integration (C12, 3
+  checks): a parser-lowered `if`/`case` graph config and a hand-authored
+  graph config produce the IDENTICAL `--emit-content-hash`; `flag:true`→branch A / `false`→branch B,
+  and `mode:"a"`→arm A / unmatched→`default` (selection from durable args, asserted via the taken
+  branch's checkpoint payloads); a hand-authored config executes identically; an op-imbalanced branch
+  is rejected at lowering. Integration 106→109.
+
+## Deferred: later parser sub-slices (each lowers to already-proven IR; no new runtime semantics)
+- **Slice 2b:** `let`/`merge`/finite-array-expression (`map`/`filter`/`fold`) surface syntax — these
+  introduce BINDER SCOPE and expression-shape complexity, reviewed separately. Lowers to the `"graph"`
+  config (NLet/NMerge/NLoop + result/local references), same content_hash/execution parity discipline.
+- **Slice 3+:** diagnostics/spans (currently shallow — byte offsets), and possible `../drift-lang`
+  reuse for the lexer/parser/type-checker.
 
 ## Landed: control-flow graph IR — chunk 1 (Step 1b(ii): types + canonical + flat compat)
 - **Graph node types in `ir.drift`** (additive; runner behavior unchanged): `IrExpr` (closed leaf
@@ -580,15 +617,20 @@ Earlier rounds:
     → `microflows/runner/src/parser.drift` + `--lower-source` CLI → emits the same `plan`/
     `argument_type`/contract config → `content_hash` + execution parity with the hand-authored manual
     IR (unit `parser_test`; integration C11). LANDED, full `just test` green.
-  - [ ] **slice 2 —** `if`/`case`/finite-array-expr/`merge`/`let` surface syntax (lowering to the
-    `"graph"` config), same parity discipline.
+  - [x] **slice 2a — `if`/`case`** source syntax → lowers to the `"graph"` config (pre-order node ids;
+    branch/case bodies re-converge at the join; selection from durable args). content_hash + execution
+    parity with hand-authored graph configs; op-imbalanced/malformed rejected at lowering (unit
+    `parser_test` 8–9; integration C12). LANDED, full `just test` green (integration 109).
+  - [ ] **slice 2b —** `let`/`merge`/finite-array-expression syntax (binder scope + expression shapes),
+    lowering to the `"graph"` config; same parity discipline.
   - [ ] **slice 3+ —** diagnostics/spans; possible `../drift-lang` reuse.
 
 ## Next action
-**Step 5, parser slice 2:** extend the textual front end with control-flow surface syntax
-(`if`/`case`/finite array expressions/`merge`/`let`), lowering to the `"graph"` config the manual IR
-already executes — same acceptance: parser-emitted config vs hand-authored graph config → identical
-`--emit-content-hash` and identical run outcome. No runtime/IR/storage changes (front end only).
+**Step 5, parser slice 2b:** extend the textual front end with `let`/`merge`/finite-array-expression
+syntax (binder scope + expression shapes — held out of 2a deliberately), lowering to the `"graph"`
+config the manual IR already executes (NLet/NMerge/NLoop + result/local references) — same acceptance:
+parser-emitted config vs hand-authored graph config → identical `--emit-content-hash` and identical run
+outcome; pure-value boundaries write no continuation. No runtime/IR/storage changes (front end only).
 
 ## Open questions (see README)
 How far back replay restarts (last settled op vs start) · `../drift-lang` reuse for step 5.

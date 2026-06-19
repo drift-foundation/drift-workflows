@@ -1,30 +1,38 @@
-// Microflows textual frontend — parser slice 1 (straight-line workflows).
+// Microflows textual frontend — parser slices 1 + 2a (straight-line + if/case).
 //
-// This module is a PURE FRONT END: it lowers `.mf` source text into the SAME config shape the
-// manual IR already executes and hashes (a flat `"plan"` + `"argument_type"` + per-operation
-// `input_type`/`result_type` contracts), reusing the runner's existing `_build_plan` /
-// `parse_graph` / `validate_graph` / `type_check_graph` / `content_hash` machinery UNCHANGED.
-// It adds NO IR nodes, NO execution paths, NO durable state, and NO new runtime semantics — the
-// acceptance criterion is LOWERING PARITY (a parser-emitted config and the hand-authored manual
-// config for the same workflow produce the identical content_hash and the identical run outcome).
+// This module is a PURE FRONT END: it lowers `.mf` source text into the SAME config the manual IR
+// already executes and hashes — a flat `"plan"` (straight-line) or a control-flow `"graph"`
+// (if/case), plus `"argument_type"` + per-operation `input_type`/`result_type` contracts — reusing
+// the runner's existing `_build_plan` / `parse_graph` / `validate_graph` / `type_check_graph` /
+// `content_hash` machinery UNCHANGED. It adds NO IR nodes, NO execution paths, NO durable state, and
+// NO new runtime semantics — the acceptance criterion is LOWERING PARITY (a parser-emitted config
+// and the hand-authored manual config for the same workflow produce the identical content_hash and
+// the identical run outcome; branch/case selection comes from durable args).
 //
-// Slice 1 surface (deliberately narrow — diagnostics/spans are shallow):
+// Surface (deliberately narrow — diagnostics/spans are shallow):
 //   args { name: <type>, ... }                  -> the closed-object argument_type
 //   op <name> { input: <type>  result: <type> } -> operation input/result CONTRACTS (both optional)
-//   steps { <op> <json-object>  ... }            -> a straight-line flat plan (constant inputs)
+//   steps { <stmt> ... }                         -> the workflow body (>=1 statement)
 //   # ... line comments to end of line
 //
+//   <stmt> := <op> <json-object>                            (an operation step; constant input)
+//           | if <arg-path> { <stmt>* } [ else { <stmt>* } ]  (slice 2a)
+//           | case <arg-path> { (<json-value> { <stmt>* })* default { <stmt>* } }  (slice 2a)
 //   <type> := int | float | bool | string | null
 //           | { <ident>: <type>, ... }   (object; trailing/optional commas tolerated)
 //           | [ <type> ]                  (array)
 //           | <type> ?                    (optional; postfix, repeatable)
 //
-// Deferred to later slices (each lowering to already-proven IR): if/case/array-expr/merge/let
-// surface syntax, result/argument references in step inputs, richer diagnostics, and `../drift-lang`
-// reuse. Slice 1 step inputs are constant JSON objects (matching the proven flat-plan surface).
+// if/case lower to operation/if/case/return graph nodes with PRE-ORDER ids ("n0","n1",…); branch
+// bodies re-converge at the following statement (the join). Conditions/scrutinees are durable-arg
+// paths. The runtime's uniform-op-depth rule rejects op-imbalanced branches at the build gate.
 //
-// Standalone & dependency-light: imports only std.* plus the runner-owned `ir` (for nothing at
-// runtime — kept import-free of DB/host), so the unit test compiles it with src/ir.drift, no DB.
+// Deferred to later sub-slices (each lowering to already-proven IR): `let`/`merge`/finite array
+// expression syntax (binder scope + expression shapes), result/argument references in step inputs,
+// richer diagnostics, and `../drift-lang` reuse.
+//
+// Standalone & dependency-light: imports only std.* plus the runner-owned `ir` (unused at runtime),
+// so the unit test compiles it with src/ir.drift, no DB.
 
 module microflows.runner.parser;
 
@@ -56,14 +64,35 @@ pub struct ContractDecl {
 	pub result_type: Optional<json.JsonNode>
 }
 
-// The workflow-level config pieces a `.mf` source lowers to. `plan` is a JSON array of
-// `{operation, input}` steps (the flat manual-IR plan); `arg_type` is the closed-object
-// argument_type encoding (None => the script declares none, i.e. the empty object); `contracts`
-// overlay input/result types onto the deployment operations registry.
+// The workflow-level config pieces a `.mf` source lowers to. `body` is EITHER a flat `"plan"`
+// array of `{operation, input}` steps (a straight-line workflow — slice 1) OR a control-flow
+// `"graph"` object (`{entry, nodes}`) when the source uses `if`/`case` (slice 2a); `is_graph`
+// selects the config key. `arg_type` is the closed-object argument_type encoding (None => the
+// script declares none); `contracts` overlay input/result types onto the operations registry.
 pub struct ParsedWorkflow {
-	pub plan: json.JsonNode,
+	pub body: json.JsonNode,
+	pub is_graph: Bool,
 	pub arg_type: Optional<json.JsonNode>,
 	pub contracts: Array<ContractDecl>
+}
+
+// ----- statement AST (slice 2a: straight-line + if/case) -----
+//
+// Parsing builds this small tree, assigning each statement node a STABLE pre-order id ("n0","n1",…)
+// AT PARSE TIME (source order), so lowering is a single forward pass and the emitted graph ids are
+// predictable (the parity tests author the matching hand-written graph against the same scheme).
+struct Stmt {
+	id: String,
+	kind: StmtKind
+}
+variant StmtKind {
+	KOp(name: String, input: json.JsonNode),                                  // an operation step
+	KIf(cond: Array<String>, then_body: Array<Stmt>, else_body: Array<Stmt>), // if <arg-path> { … } else { … }
+	KCase(scrut: Array<String>, arms: Array<SCaseArm>, default_body: Array<Stmt>)
+}
+struct SCaseArm {
+	match_json: json.JsonNode,
+	body: Array<Stmt>
 }
 
 // ===== public entry points =====
@@ -73,7 +102,7 @@ pub struct ParsedWorkflow {
 // other modules need no error-type-qualified catch (errors-as-values; mirrors ir.parse_object_type).
 pub fn parse_source(source: &String) -> core.Result<ParsedWorkflow, ParseError> {
 	try {
-		var c = Cursor(src = _dup(source), pos = 0);
+		var c = Cursor(src = _dup(source), pos = 0, node_count = 0);
 		val pw = _parse(&mut c);
 		return core.Result<ParsedWorkflow, ParseError>::Ok(move pw);
 	} catch ParseError(e) {
@@ -89,7 +118,7 @@ pub fn parse_source(source: &String) -> core.Result<ParsedWorkflow, ParseError> 
 // lowering error (surfaced before any DB/dispatch).
 pub fn lower(source: &String, base: &json.JsonNode) -> core.Result<json.JsonNode, ParseError> {
 	try {
-		var c = Cursor(src = _dup(source), pos = 0);
+		var c = Cursor(src = _dup(source), pos = 0, node_count = 0);
 		val pw = _parse(&mut c);
 		val merged = _merge(base, &pw);
 		return core.Result<json.JsonNode, ParseError>::Ok(move merged);
@@ -102,7 +131,8 @@ pub fn lower(source: &String, base: &json.JsonNode) -> core.Result<json.JsonNode
 
 struct Cursor {
 	src: String,
-	pos: Int
+	pos: Int,
+	node_count: Int   // pre-order graph-node id allocator (slice 2a)
 }
 
 fn _eof(c: &Cursor) nothrow -> Bool { return c.pos >= c.src.byte_length(); }
@@ -169,7 +199,8 @@ fn _slice(c: &Cursor, start: Int, len: Int) -> String {
 fn _parse(c: &mut Cursor) -> ParsedWorkflow {
 	var arg_type: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
 	var contracts: Array<ContractDecl> = [];
-	var plan: json.JsonNode = json.new_array().to_node();
+	var body: json.JsonNode = json.new_array().to_node();
+	var is_graph = false;
 	var seen_args = false;
 	var seen_steps = false;
 
@@ -186,14 +217,24 @@ fn _parse(c: &mut Cursor) -> ParsedWorkflow {
 		} else if _str_eq(&kw, &"steps") {
 			if seen_steps { throw ParseError(message = "duplicate 'steps' block"); }
 			seen_steps = true;
-			plan = _parse_steps(c);
+			val stmts = _parse_steps(c);
+			// A purely straight-line workflow lowers to a flat "plan" (slice-1 output unchanged);
+			// any `if`/`case` makes it a control-flow "graph". Both produce config the manual IR
+			// already executes + hashes, so identity/parity is preserved either way.
+			if _all_ops(&stmts) {
+				body = _build_plan_body(&stmts);
+				is_graph = false;
+			} else {
+				body = _build_graph_body(&stmts, c.node_count);
+				is_graph = true;
+			}
 		} else {
 			throw ParseError(message = "unknown top-level keyword '" + _dup(&kw) + "' (expected args/op/steps)");
 		}
 		_skip_ws(c);
 	}
 	if !seen_steps { throw ParseError(message = "missing 'steps' block"); }
-	return ParsedWorkflow(plan = move plan, arg_type = move arg_type, contracts = move contracts);
+	return ParsedWorkflow(body = move body, is_graph = is_graph, arg_type = move arg_type, contracts = move contracts);
 }
 
 // type := base ('?')* ; the postfix '?' wraps in an optional encoding (repeatable).
@@ -294,27 +335,350 @@ fn _parse_op_decl(c: &mut Cursor, existing: &Array<ContractDecl>) -> ContractDec
 // step is an operation name followed by a CONSTANT JSON object literal (its request input). The
 // JSON object is grabbed as a balanced-brace span and parsed by the strict JSON parser, so the
 // emitted plan input is byte-identical in meaning to a hand-authored flat-plan step.
-fn _parse_steps(c: &mut Cursor) -> json.JsonNode {
+// steps := 'steps' '{' stmt+ '}'. The leading 'steps' is already consumed. At least one statement.
+fn _parse_steps(c: &mut Cursor) -> Array<Stmt> {
 	_expect(c, 123, &"'{'");
-	var plan = json.new_array();
+	var stmts: Array<Stmt> = [];
 	while !_accept(c, 125) {   // until '}'
 		if _eof(c) { throw ParseError(message = "unterminated 'steps' block"); }
-		var op = _read_ident(c);
-		_skip_ws(c);
-		if _eof(c) or cast<Int>(c.src.byte_at(c.pos)) != 123 {
-			throw ParseError(message = "expected a JSON object input for step '" + _dup(&op) + "'");
-		}
-		val start = c.pos;
-		val end = _scan_json_object(c);
-		val raw = _slice(c, start, end - start);
-		val input = _parse_json_object(&raw);
-		var step = json.new_object();
-		step.set("operation", _jstr(move op));
-		step.set("input", move input);
-		plan.push(step.to_node());
+		val s = _parse_stmt(c);
+		stmts.push(move s);
 	}
-	if plan.len() == 0 { throw ParseError(message = "'steps' block must declare at least one step"); }
+	if stmts.len == 0 { throw ParseError(message = "'steps' block must declare at least one step"); }
+	return move stmts;
+}
+
+// block := '{' stmt* '}' (a body for an if/else/case-arm/default — may be empty: control flows
+// straight to the join continuation).
+fn _parse_block(c: &mut Cursor) -> Array<Stmt> {
+	_expect(c, 123, &"'{'");
+	var stmts: Array<Stmt> = [];
+	while !_accept(c, 125) {
+		if _eof(c) { throw ParseError(message = "unterminated block"); }
+		val s = _parse_stmt(c);
+		stmts.push(move s);
+	}
+	return move stmts;
+}
+
+// stmt := if_stmt | case_stmt | op_step. Each statement is exactly one graph node; its id is
+// allocated HERE (pre-order, source order) before parsing any children.
+fn _parse_stmt(c: &mut Cursor) -> Stmt {
+	val kw = _read_ident(c);
+	var id = _alloc_id(c);
+	if _str_eq(&kw, &"if") { return _parse_if(c, move id); }
+	if _str_eq(&kw, &"case") { return _parse_case(c, move id); }
+	// op_step: `kw` is the operation name, followed by a CONSTANT JSON object input (same as slice 1).
+	_skip_ws(c);
+	if _eof(c) or cast<Int>(c.src.byte_at(c.pos)) != 123 {
+		throw ParseError(message = "expected a JSON object input for step '" + _dup(&kw) + "'");
+	}
+	val start = c.pos;
+	val end = _scan_json_object(c);
+	val raw = _slice(c, start, end - start);
+	val input = _parse_json_object(&raw);
+	return Stmt(id = move id, kind = StmtKind::KOp(name = move kw, input = move input));
+}
+
+// if_stmt := 'if' arg-path block ('else' block)? — the condition is a durable-argument PATH (the
+// branch decision comes from durable args; the runtime requires it to be Bool). 'else' is optional;
+// an absent else flows the false path straight to the join (the build gate rejects op-imbalance).
+fn _parse_if(c: &mut Cursor, var id: String) -> Stmt {
+	val cond = _parse_arg_path(c);
+	val then_body = _parse_block(c);
+	var else_body: Array<Stmt> = [];
+	if _accept_keyword(c, &"else") { else_body = _parse_block(c); }
+	return Stmt(id = move id, kind = StmtKind::KIf(cond = move cond, then_body = move then_body, else_body = move else_body));
+}
+
+// case_stmt := 'case' arg-path '{' (json-value block)* 'default' block '}' — the scrutinee is a
+// durable-argument PATH; each arm matches a constant JSON value; 'default' (required) is taken when
+// no arm matches.
+fn _parse_case(c: &mut Cursor, var id: String) -> Stmt {
+	val scrut = _parse_arg_path(c);
+	_expect(c, 123, &"'{'");
+	var arms: Array<SCaseArm> = [];
+	var default_body: Array<Stmt> = [];
+	var has_default = false;
+	while !_accept(c, 125) {
+		if _eof(c) { throw ParseError(message = "unterminated 'case' block"); }
+		if _accept_keyword(c, &"default") {
+			if has_default { throw ParseError(message = "duplicate 'default' arm in case"); }
+			has_default = true;
+			default_body = _parse_block(c);
+		} else {
+			// `default` must be LAST (grammar: (json-value block)* default block). An arm after it
+			// would lower BEFORE the default but read as a fallthrough in source — reject the
+			// misleading ordering rather than silently reorder.
+			if has_default { throw ParseError(message = "case arm after 'default' (default must be the last arm)"); }
+			val mv = _parse_json_value(c);
+			val body = _parse_block(c);
+			arms.push(SCaseArm(match_json = move mv, body = move body));
+		}
+	}
+	if arms.len == 0 { throw ParseError(message = "case must declare at least one arm"); }
+	if !has_default { throw ParseError(message = "case requires a 'default' arm"); }
+	return Stmt(id = move id, kind = StmtKind::KCase(scrut = move scrut, arms = move arms, default_body = move default_body));
+}
+
+// arg-path := ident ('.' ident)* — a path into the durable arguments (lowered to {"arg":[…]}).
+fn _parse_arg_path(c: &mut Cursor) -> Array<String> {
+	var path: Array<String> = [];
+	val first = _read_ident(c);
+	path.push(move first);
+	while _accept(c, 46) {   // '.'
+		val seg = _read_ident(c);
+		path.push(move seg);
+	}
+	return move path;
+}
+
+// Consume the upcoming identifier iff it equals `kw` (else leave the cursor untouched). Lets `else`
+// / `default` be recognized WITHOUT being reserved against operation names elsewhere.
+fn _accept_keyword(c: &mut Cursor, kw: &String) nothrow -> Bool {
+	val save = c.pos;
+	_skip_ws(c);
+	if _eof(c) or !_is_ident_start(c.src.byte_at(c.pos)) { c.pos = save; return false; }
+	val start = c.pos;
+	while !_eof(c) and _is_ident_char(c.src.byte_at(c.pos)) { c.pos = c.pos + 1; }
+	var matched = false;
+	match text.substring(&c.src, start, c.pos - start) {
+		core.Result::Ok(s) => { if _str_eq(&s, kw) { matched = true; } },
+		core.Result::Err(_) => {}
+	}
+	if !matched { c.pos = save; }
+	return matched;
+}
+
+// Allocate the next pre-order graph-node id ("n0","n1",…).
+fn _alloc_id(c: &mut Cursor) nothrow -> String {
+	val id = "n" + fmt.format_int(c.node_count);
+	c.node_count = c.node_count + 1;
+	return move id;
+}
+
+// Parse a CONSTANT JSON value (case-arm match): string / number / bool / null / object / array.
+fn _parse_json_value(c: &mut Cursor) -> json.JsonNode {
+	_skip_ws(c);
+	if _eof(c) { throw ParseError(message = "expected a JSON value"); }
+	val start = c.pos;
+	val end = _scan_json_value(c);
+	val raw = _slice(c, start, end - start);
+	match json.parse_strict(&raw) {
+		core.Result::Ok(n) => { return move n; },
+		core.Result::Err(_) => { throw ParseError(message = "invalid JSON value in case arm 'match'"); }
+	}
+}
+
+// Scan a single JSON value span from c.pos: a balanced object/array, a string, or a bare token
+// (number/true/false/null up to whitespace or a structural byte). Advances the cursor past it.
+fn _scan_json_value(c: &mut Cursor) -> Int {
+	val b = cast<Int>(c.src.byte_at(c.pos));
+	if b == 123 or b == 91 { return _scan_balanced(c); }   // '{' or '['
+	if b == 34 { return _scan_string(c); }                 // '"'
+	val n = c.src.byte_length();
+	var i = c.pos;
+	while i < n {
+		val ch = cast<Int>(c.src.byte_at(i));
+		if text.is_space(c.src.byte_at(i)) or ch == 123 or ch == 125 or ch == 44 or ch == 93 or ch == 91 { break; }
+		i = i + 1;
+	}
+	if i == c.pos { throw ParseError(message = "empty JSON value"); }
+	c.pos = i;
+	return i;
+}
+
+// Scan a balanced object/array (braces AND brackets), skipping string contents. c.pos is '{' or '['.
+fn _scan_balanced(c: &mut Cursor) -> Int {
+	val n = c.src.byte_length();
+	var i = c.pos;
+	var depth = 0;
+	var in_str = false;
+	var esc = false;
+	while i < n {
+		val ch = cast<Int>(c.src.byte_at(i));
+		if in_str {
+			if esc { esc = false; }
+			else if ch == 92 { esc = true; }
+			else if ch == 34 { in_str = false; }
+		} else {
+			if ch == 34 { in_str = true; }
+			else if ch == 123 or ch == 91 { depth = depth + 1; }
+			else if ch == 125 or ch == 93 {
+				depth = depth - 1;
+				if depth == 0 { c.pos = i + 1; return i + 1; }
+			}
+		}
+		i = i + 1;
+	}
+	throw ParseError(message = "unterminated JSON value");
+}
+
+// Scan a quoted string span (c.pos is the opening '"'), honoring backslash escapes.
+fn _scan_string(c: &mut Cursor) -> Int {
+	val n = c.src.byte_length();
+	var i = c.pos + 1;
+	var esc = false;
+	while i < n {
+		val ch = cast<Int>(c.src.byte_at(i));
+		if esc { esc = false; }
+		else if ch == 92 { esc = true; }
+		else if ch == 34 { c.pos = i + 1; return i + 1; }
+		i = i + 1;
+	}
+	throw ParseError(message = "unterminated string");
+}
+
+// ===== lowering the statement AST to a config body =====
+
+// True when every top-level statement is a plain operation (no if/case anywhere — control flow only
+// nests under if/case). Such a workflow lowers to a flat "plan" (slice-1 output, byte-for-byte).
+fn _all_ops(stmts: &Array<Stmt>) nothrow -> Bool {
+	var i = 0;
+	while i < stmts.len {
+		var is_op = false;
+		match &stmts[i].kind { StmtKind::KOp(_, _) => { is_op = true; }, default => {} }
+		if !is_op { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+// Build a flat "plan" array (straight-line) — identical to slice 1's emission.
+fn _build_plan_body(stmts: &Array<Stmt>) -> json.JsonNode {
+	var plan = json.new_array();
+	var i = 0;
+	while i < stmts.len {
+		match &stmts[i].kind {
+			StmtKind::KOp(name, input) => {
+				var step = json.new_object();
+				step.set("operation", _jstr(_dup(name)));
+				step.set("input", input.clone_deep());
+				plan.push(step.to_node());
+			},
+			default => { throw ParseError(message = "internal: non-operation in straight-line plan"); }
+		}
+		i = i + 1;
+	}
 	return plan.to_node();
+}
+
+// Build a control-flow "graph" object `{entry, nodes}`. The return node gets the id AFTER all
+// statements (node_count); each statement node is emitted with edges to the next sibling / the join.
+fn _build_graph_body(stmts: &Array<Stmt>, node_count: Int) -> json.JsonNode {
+	val return_id = "n" + fmt.format_int(node_count);
+	var nodes = json.new_array();
+	nodes.push(_return_node(&return_id));
+	_lower_stmts(stmts, &return_id, &mut nodes);
+	var entry: String = _dup(&return_id);
+	if stmts.len > 0 { entry = _dup(&stmts[0].id); }
+	var g = json.new_object();
+	g.set("entry", _jstr(move entry));
+	g.set("nodes", nodes.to_node());
+	return g.to_node();
+}
+
+// Lower a statement list whose exit (after the last statement) is `exit_succ`. Each statement's
+// successor is the next sibling's entry, or `exit_succ` for the last.
+fn _lower_stmts(stmts: &Array<Stmt>, exit_succ: &String, out: &mut json.JsonArray) -> Void {
+	var i = 0;
+	while i < stmts.len {
+		var next_id: String = _dup(exit_succ);
+		if i + 1 < stmts.len { next_id = _dup(&stmts[i + 1].id); }
+		_lower_one(&stmts[i], &next_id, out);
+		i = i + 1;
+	}
+}
+
+// Emit the node(s) for one statement; branch bodies re-converge at `succ` (the statement's exit).
+fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
+	match &stmt.kind {
+		StmtKind::KOp(name, input) => {
+			out.push(_op_node(&stmt.id, name, input, succ));
+		},
+		StmtKind::KIf(cond, then_body, else_body) => {
+			val then_entry = _entry_of(then_body, succ);
+			val else_entry = _entry_of(else_body, succ);
+			out.push(_if_node(&stmt.id, cond, &then_entry, &else_entry));
+			_lower_stmts(then_body, succ, out);
+			_lower_stmts(else_body, succ, out);
+		},
+		StmtKind::KCase(scrut, arms, default_body) => {
+			var arms_arr = json.new_array();
+			var a = 0;
+			while a < arms.len {
+				val tgt = _entry_of(&arms[a].body, succ);
+				var arm_o = json.new_object();
+				arm_o.set("match", arms[a].match_json.clone_deep());
+				arm_o.set("target", _jstr(_dup(&tgt)));
+				arms_arr.push(arm_o.to_node());
+				a = a + 1;
+			}
+			val default_entry = _entry_of(default_body, succ);
+			out.push(_case_node(&stmt.id, scrut, arms_arr.to_node(), &default_entry));
+			var a2 = 0;
+			while a2 < arms.len { _lower_stmts(&arms[a2].body, succ, out); a2 = a2 + 1; }
+			_lower_stmts(default_body, succ, out);
+		}
+	}
+}
+
+// The entry id of a body: its first statement's id, or `succ` when the body is empty.
+fn _entry_of(body: &Array<Stmt>, succ: &String) nothrow -> String {
+	if body.len > 0 { return _dup(&body[0].id); }
+	return _dup(succ);
+}
+
+fn _op_node(id: &String, name: &String, input: &json.JsonNode, next: &String) -> json.JsonNode {
+	var o = json.new_object();
+	o.set("kind", _jstr("operation"));
+	o.set("id", _jstr(_dup(id)));
+	o.set("operation", _jstr(_dup(name)));
+	var ce = json.new_object();
+	ce.set("const", input.clone_deep());
+	o.set("input", ce.to_node());
+	o.set("next", _jstr(_dup(next)));
+	return o.to_node();
+}
+
+fn _if_node(id: &String, cond: &Array<String>, then_id: &String, else_id: &String) -> json.JsonNode {
+	var o = json.new_object();
+	o.set("kind", _jstr("if"));
+	o.set("id", _jstr(_dup(id)));
+	o.set("cond", _arg_expr(cond));
+	o.set("then", _jstr(_dup(then_id)));
+	o.set("else", _jstr(_dup(else_id)));
+	return o.to_node();
+}
+
+fn _case_node(id: &String, scrut: &Array<String>, arms_node: json.JsonNode, default_id: &String) -> json.JsonNode {
+	var o = json.new_object();
+	o.set("kind", _jstr("case"));
+	o.set("id", _jstr(_dup(id)));
+	o.set("scrutinee", _arg_expr(scrut));
+	o.set("arms", move arms_node);
+	o.set("default", _jstr(_dup(default_id)));
+	return o.to_node();
+}
+
+fn _return_node(id: &String) -> json.JsonNode {
+	var o = json.new_object();
+	o.set("kind", _jstr("return"));
+	o.set("id", _jstr(_dup(id)));
+	var ce = json.new_object();
+	ce.set("const", json.JsonNode::Null());
+	o.set("value", ce.to_node());
+	return o.to_node();
+}
+
+// An {"arg": [seg, …]} expression from a parsed argument path.
+fn _arg_expr(path: &Array<String>) -> json.JsonNode {
+	var arr = json.new_array();
+	var i = 0;
+	while i < path.len { arr.push(_jstr(_dup(&path[i]))); i = i + 1; }
+	var o = json.new_object();
+	o.set("arg", arr.to_node());
+	return o.to_node();
 }
 
 // Scan a balanced `{...}` starting at c.pos (which must be '{'); return the index just past the
@@ -384,7 +748,12 @@ fn _merge(base: &json.JsonNode, pw: &ParsedWorkflow) -> json.JsonNode {
 	if !has_ops and pw.contracts.len > 0 {
 		throw ParseError(message = "config has no 'operations' registry to attach contracts to");
 	}
-	out.set("plan", pw.plan.clone_deep());
+	// Straight-line lowers to "plan"; an if/case workflow lowers to a control-flow "graph".
+	if pw.is_graph {
+		out.set("graph", pw.body.clone_deep());
+	} else {
+		out.set("plan", pw.body.clone_deep());
+	}
 	match &pw.arg_type {
 		Optional::Some(at) => { out.set("argument_type", at.clone_deep()); },
 		Optional::None => {}
