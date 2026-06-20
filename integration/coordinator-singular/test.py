@@ -108,6 +108,34 @@ def run_runner(runner_cfg, wf_hex, operation=None, input_json=None, arguments=No
         return out.returncode, {"raw_stdout": out.stdout, "stderr": out.stderr}
 
 
+def run_manifest(manifest_path, wf_hex, script=None, arguments=None):
+    # Manifest mode (item 3a): --manifest names the deployment+scripts; --script picks the script to
+    # SUBMIT; a RESUME (no --script) drives by the durable pin. Same JSON-outcome contract as run_runner.
+    cmd = [str(RUNNER_BIN), "--manifest", manifest_path, "--workflow-id", wf_hex]
+    if script is not None:
+        cmd += ["--script", script]
+    if arguments is not None:
+        cmd += ["--arguments", arguments]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+    line = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
+    try:
+        return out.returncode, json.loads(line)
+    except json.JSONDecodeError:
+        return out.returncode, {"raw_stdout": out.stdout, "stderr": out.stderr}
+
+
+def write_manifest(deployment, scripts):
+    # scripts: list of (name, version, mf_source). Writes each .mf to a temp file and a manifest JSON
+    # referencing them; returns the manifest path.
+    decl = []
+    for name, version, src in scripts:
+        mf = tempfile.NamedTemporaryFile("w", suffix=".mf", delete=False); mf.write(src); mf.close()
+        decl.append({"name": name, "version": version, "path": mf.name})
+    mpath = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump({"deployment": deployment, "scripts": decl}, mpath); mpath.close()
+    return mpath.name
+
+
 def emit_content_hash(runner_cfg):
     """Print the active revision's content_hash for a config via the runner's own algorithm
     (--emit-content-hash; DB-free). Used to assert hash identity properties without
@@ -2567,6 +2595,102 @@ def main():
               and pr_cr == 11 and pr_br.get("workflow") == "pending_restart" and pr_br.get("reason") == "draining",
               (prdr_code, pr_cs, pr_bs, pr_cr, pr_br))
 
+        # ===== C20. MANIFEST-DRIVEN ScriptRegistry (item 3a): named, pinned, validated deployments =====
+        # A manifest declares NAMED scripts over a shared deployment. Submission names a script and
+        # creation PINS its resolved immutable identity; the manifest-lowered revision is byte-identical
+        # to a direct --lower-source (same content_hash). Resume drives strictly by the durable pin.
+
+        # (a) submit by --script: runs, pins the resolved identity (content_hash == direct lowering).
+        mf_src = ("args { code: string }\n"
+                  "op reserve { input: { reservation: string } }\n"
+                  "steps { reserve { reservation: arg code } }\n")
+        man = write_manifest(runner_cfg, [("checkout-v1", "1.0.0", mf_src)])
+        _dc, direct_low = lower_source(mf_src)
+        direct_hash = emit_content_hash(direct_low) if direct_low else "<none>"
+        man_wf = _wf_id()
+        mcode, mbody = run_manifest(man, man_wf, script="checkout-v1", arguments=json.dumps({"code": "mc7"}))
+        man_pin = _mdb(f"SELECT plan_version, LOWER(HEX(content_hash)) FROM tb_mf_workflow_plan WHERE workflow_id = UNHEX('{man_wf}')")
+        check("manifest_submit_pins_and_runs",
+              mcode == 0 and mbody.get("workflow") == "completed" and _ck_resv(man_wf) == ["mc7"]
+              and man_pin == [["1.0.0", direct_hash]] and direct_hash != "<none>",
+              (mcode, mbody, _ck_resv(man_wf), man_pin, direct_hash))
+
+        # (b) an unknown --script is refused before any create/dispatch.
+        unk_wf = _wf_id()
+        ucode, ubody = run_manifest(man, unk_wf, script="nope", arguments=json.dumps({"code": "x"}))
+        unk_rows = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow WHERE workflow_id = UNHEX('{unk_wf}')")
+        check("manifest_unknown_script_rejected",
+              ucode == 2 and ubody.get("workflow") == "aborted" and ubody.get("reason") == "unknown_script"
+              and unk_rows == [["0"]],
+              (ucode, ubody, unk_rows))
+
+        # (c) a manifest with ANY invalid script fails at LOAD (fail-fast), before any create/dispatch.
+        bad_man = write_manifest(runner_cfg, [("broken", "1.0.0", "args { x: notatype }\nsteps { reserve {} }\n")])
+        bad_wf = _wf_id()
+        bcode, bbody = run_manifest(bad_man, bad_wf, script="broken", arguments=json.dumps({"code": "x"}))
+        bad_rows = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow WHERE workflow_id = UNHEX('{bad_wf}')")
+        check("manifest_invalid_rejected",
+              bcode == 2 and bbody.get("workflow") == "aborted" and bbody.get("reason") == "invalid_manifest"
+              and bad_rows == [["0"]],
+              (bcode, bbody, bad_rows))
+
+        # (d) RESUME drives strictly by the durable pin (name, version), not --script: submit a
+        # respond_pending script via the manifest (-> pending, pinned), then resume WITHOUT --script.
+        rman = write_manifest(runner_cfg, [("pend-v1", "2.0.0",
+                "args { code: string }\nsteps { reserve { reservation: arg code, \"_fault\": { \"respond_pending\": true } } }\n")])
+        rman_wf = _wf_id()
+        rmc_s, rmb_s = run_manifest(rman, rman_wf, script="pend-v1", arguments=json.dumps({"code": "rp1"}))
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{rman_wf}')")
+        rmc_r, rmb_r = run_manifest(rman, rman_wf)
+        check("manifest_resume_by_pin",
+              rmc_s == 9 and rmb_s.get("workflow") == "pending"
+              and rmc_r == 9 and rmb_r.get("workflow") == "pending" and _op_resv(rman_wf) == ["rp1"],
+              (rmc_s, rmb_s, rmc_r, rmb_r, _op_resv(rman_wf)))
+
+        # (e) a RELATIVE script path resolves against the MANIFEST's directory (portable manifests),
+        # not the runner's cwd.
+        reldir = tempfile.mkdtemp()
+        with open(os.path.join(reldir, "wf.mf"), "w") as f:
+            f.write(mf_src)
+        relman = os.path.join(reldir, "manifest.json")
+        with open(relman, "w") as f:
+            json.dump({"deployment": runner_cfg, "scripts": [{"name": "rel-v1", "version": "1.0.0", "path": "wf.mf"}]}, f)
+        rel_wf = _wf_id()
+        relc, relb = run_manifest(relman, rel_wf, script="rel-v1", arguments=json.dumps({"code": "rl1"}))
+        check("manifest_relative_path_resolved",
+              relc == 0 and relb.get("workflow") == "completed" and _ck_resv(rel_wf) == ["rl1"],
+              (relc, relb, _ck_resv(rel_wf)))
+
+        # (f) RESUME when the pinned revision is ABSENT from the manifest, CLAIMABLE workflow: the
+        # runner drives the proven STORAGE-FIRST path with the deployment-only config, producing a
+        # DURABLE `revision_unavailable` defer (lease cleared, admission-aware) — never a substitution.
+        m_a = write_manifest(runner_cfg, [("evolve", "1.0.0",
+                "args { code: string }\nsteps { reserve { reservation: arg code, \"_fault\": { \"respond_pending\": true } } }\n")])
+        m_b = write_manifest(runner_cfg, [("evolve", "2.0.0", mf_src)])  # same name, DIFFERENT version => pin (evolve,1.0.0) absent
+        ev_wf = _wf_id()
+        es_c, es_b = run_manifest(m_a, ev_wf, script="evolve", arguments=json.dumps({"code": "ev1"}))
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{ev_wf}')")
+        lease0 = _mdb(f"SELECT lease_expires_at FROM tb_mf_workflow WHERE workflow_id = UNHEX('{ev_wf}')")
+        er_c, er_b = run_manifest(m_b, ev_wf)
+        lease1 = _mdb(f"SELECT lease_expires_at FROM tb_mf_workflow WHERE workflow_id = UNHEX('{ev_wf}')")
+        check("manifest_resume_missing_revision_claimable_defers",
+              es_c == 9 and es_b.get("workflow") == "pending"
+              and er_c == 9 and er_b.get("workflow") == "deferred" and er_b.get("reason") == "revision_unavailable"
+              and lease1 == [["NULL"]],  # lease cleared by the durable defer (_mdb renders SQL NULL as "NULL")
+              (es_c, es_b, er_c, er_b, lease0, lease1))
+
+        # (g) RESUME when the pinned revision is ABSENT, TERMINAL workflow: terminal replay reports the
+        # durable result without the active registry (registry-independent terminal replay).
+        m_c = write_manifest(runner_cfg, [("term", "1.0.0", mf_src)])
+        m_d = write_manifest(runner_cfg, [("term", "9.9.9", mf_src)])  # pin (term,1.0.0) absent in m_d
+        tm_wf = _wf_id()
+        ts_c, ts_b = run_manifest(m_c, tm_wf, script="term", arguments=json.dumps({"code": "tm1"}))
+        tr_c, tr_b = run_manifest(m_d, tm_wf)
+        check("manifest_resume_missing_revision_terminal_replays",
+              ts_c == 0 and ts_b.get("workflow") == "completed"
+              and tr_c == 0 and tr_b.get("workflow") == "already_terminal" and tr_b.get("result") == {"reserved": "tm1"},
+              (ts_c, ts_b, tr_c, tr_b))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the LOCAL authoritative
         # result; no dependency on the participant. MUST be the LAST stub-using block — it terminates
         # the stub and never restarts it, so any check after this would hit a dead participant.
@@ -2614,7 +2738,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 142
+    EXPECTED_CHECKS = 149
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

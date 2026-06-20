@@ -13,11 +13,14 @@ participant protocol, and the milestone-1 plan.
 > **As-built note (2026-06-19).** Milestone 1 is LANDED and proven. The
 > manual-IR runtime (durable dispatch, recovery, reversal) AND the `.mf`
 > language frontend (parser, type binding, lowering, diagnostics) are complete
-> on certified driftc 0.33.42 / ABI 17. Verified for the latest slice (operational
-> admission / draining, §13): the `coordinator-singular` integration gate
-> (**142/142**, DB-backed, real HTTP); the unit gates (`ir_*`/`parser_test`, base
-> + asan) and the other component gates (stored-procedure, singular) were green at
-> their slice's authoring and are unchanged. §§1–11 below remain the
+> on certified driftc **0.33.44** / ABI 17 (re-validated when the certified
+> toolchain advanced 0.33.42→0.33.44, a borrowed-place-inference bugfix; ABI 17
+> unchanged, so content_hashes and seed fixtures are stable). Verified for the
+> latest slice (manifest-driven ScriptRegistry, §14): the `coordinator-singular`
+> integration gate (**149/149**, DB-backed, real HTTP); the unit gates
+> (`ir_*`/`parser_test`, base + asan) and the other component gates
+> (stored-procedure, singular) were green at their slice's authoring and are
+> unchanged. §§1–11 below remain the
 > design of record (guarantee model,
 > participant protocol, persistence, history); they describe **intent** and a
 > plan whose steps are now done. **§12 documents the system AS BUILT** — the IR,
@@ -1142,7 +1145,7 @@ microflows/runner/src/runner.drift   registry build, content_hash, dispatch,
                                        recovery, reversal; --lower-source /
                                        --emit-content-hash CLIs
 microflows/runner/tests/unit/        ir_exec_test, ir_graph_test, parser_test
-integration/coordinator-singular/    test.py — the 142-check E2E gate
+integration/coordinator-singular/    test.py — the 149-check E2E gate
 singular/doc/singular-protocol.md    the participant-side protocol contract
 ```
 
@@ -1277,3 +1280,83 @@ front-door SERVICE calls directly (rendering the same `Outcome` to HTTP) instead
 CLI. The conversion was byte-compatible: identical JSON and exit codes, pinned by the integration suite
 (**142/142**) across two verifiable passes (introduce `Outcome` + centralized render; then return it +
 render at `main`). This is the seam item 3 builds the manifest-driven service on.
+
+---
+
+## 14. Manifest-driven ScriptRegistry (roadmap item 3a — LANDED)
+
+App teams deploy **named, pinned, validated workflow revisions** instead of hand-lowered config files.
+This realizes the §4.1 registry as a **one-shot-CLI library concept** (the long-running service is
+item 3b).
+
+### 14.1 The manifest
+
+```json
+{
+  "deployment": { "...": "db, participants, operations (the shared routing)" },
+  "scripts": [
+    { "name": "checkout-v1", "version": "1.0.0", "path": "workflows/checkout.mf" }
+  ]
+}
+```
+
+One `deployment` block binds every script to the routing it needs to validate and run (per-script
+routing is a later refinement — starting there is guessing). Each script is a NAMED `.mf` source path.
+
+### 14.2 Load = compile + validate the entire declared set (fail-fast)
+
+`microflows-runner --manifest <file>` loads the manifest and, for **every** declared script, reads the
+`.mf`, lowers it over the deployment (`parser.lower`), and builds+validates the revision
+(`_registry_build`: graph parse + structural validation + type-check + compensation + content_hash).
+**Startup fails** (`{"workflow":"aborted","reason":"invalid_manifest"}`, exit 2) if any script is
+missing/unreadable/invalid or any name duplicates — before any claim/dispatch (the §4.1 contract). The
+result is a `ScriptRegistry` keyed by **name → (version, content_hash, plan_length, runnable config)**.
+
+### 14.3 Submission names a script; creation pins the resolved identity
+
+A SUBMISSION supplies `--script <name>` (+ `--arguments`); the runner resolves the active declared
+revision and **pins its immutable identity** at creation — **script name, plan version, content_hash,
+plan_length** (`tb_mf_workflow_plan`). The manifest-lowered revision is byte-identical to a direct
+`--lower-source` (same content_hash — script name/version are pin identity, not part of the hash). An
+unknown `--script` is refused (`unknown_script`, exit 2) before any create/dispatch.
+
+### 14.4 Resume drives strictly by the durable pin
+
+A RESUME (`--manifest <file> --workflow-id …`, no `--script`) reads the durable pin and resolves the
+script matching the pin's **(name, version)** — **never the manifest's current active version** (no
+silent substitution). When the pinned revision IS in the manifest, the drive proceeds with that
+script's config. When it is **NOT** (a rolled-forward manifest no longer declaring it), the runner does
+**not** short-circuit: it drives the proven STORAGE-FIRST planned path with the deployment-only config,
+so the durable pin governs state-sensitively — exactly as an absent pinned plan does on the `--config`
+path:
+
+```text
+terminal workflow  -> terminal replay from durable state (registry-INDEPENDENT — the pinned
+                      plan_length gives the final op seq; current routing/config is never consulted)
+claimable workflow -> a DURABLE `revision_unavailable` defer (lease cleared, next_attempt set,
+                      admission-aware via _defer_dispatch) — recoverable, never a substitution
+no durable pin     -> not_found
+```
+
+The drive itself is unchanged: the manifest layer resolves the config and calls the same `_run_cfg` /
+`_run_planned` boundary (which returns the structured `Outcome`, §13.6).
+
+### 14.4.1 Script paths
+
+A manifest script `path` is resolved **relative to the manifest file's directory** (so a manifest is
+portable — not tied to the runner's cwd); an absolute path (leading `/`) is used as-is.
+
+### 14.5 Scope / deferred
+
+One deployment block; the manifest is loaded per-invocation (the one-shot CLI re-validates the set each
+run — cheap and stateless). A **long-running service** that holds the registry, does **atomic/staged
+reload** (SIGHUP/SIGUSR1, §4.1), owns the **admission gate** (§13), and serves submit/resume over HTTP
+via `drive_workflow` is **item 3b** — now a thin wrapper around three landed pieces (registry +
+admission + the `Outcome` boundary), not a redesign.
+
+### 14.6 Tests
+
+Integration C20: a named submission pins+runs with **content_hash parity** vs direct lowering; an
+unknown `--script` is refused with no workflow row; a manifest with any invalid script fails at load
+(`invalid_manifest`, no workflow row); and a respond-pending workflow submitted via the manifest
+**resumes strictly by its durable pin** (no `--script`). Full gate green — integration **149/149**.

@@ -41,6 +41,8 @@ import microflows.runner.ir as ir;
 import microflows.runner.parser as parser;
 import web.client as client;
 import std.env as env;
+import std.iter as iter;
+use trait iter.SinglePassIterator;
 
 const SCRIPT_NAME: String = "protocol_spike";
 // Legacy single-op pin (tb_mf_workflow.script_revision); the plan model keys on a
@@ -293,13 +295,15 @@ variant CompStep {
 
 fn main(argv: Array<String>) nothrow -> Int {
 	var p = cli.parser("microflows-runner", "0.1.0", "Microflows coordinator runner (first slice)");
-	val _ = p.option_string("config", "c", "FILE", "JSON config: db + participants + operations registries", true);
-	val _ = p.option_string("workflow-id", "w", "HEX", "32-hex-char workflow id", true);
+	val _ = p.option_string("config", "c", "FILE", "JSON config: db + participants + operations registries (or use --manifest)", false);
+	val _ = p.option_string("workflow-id", "w", "HEX", "32-hex-char workflow id", false);
 	val _ = p.option_string("operation", "o", "NAME", "operation to submit (required ONLY for a fresh LEGACY workflow; a resume uses the durable request)", false);
 	val _ = p.option_string("input", "i", "JSON", "operation input (JSON object; default {}); fresh legacy workflow only", false);
 	val _ = p.option_string("arguments", "a", "JSON", "instance arguments (JSON object) for a PLANNED workflow SUBMISSION; supplying it creates/reasserts (and conflicts on changed args), omitting it RESUMES", false);
 	val _ = p.flag("emit-content-hash", "", "build the registry from --config and print the active revision's content_hash (hex), then exit; no DB or --workflow-id needed (used to (re)compute fixtures)");
 	val _ = p.option_string("lower-source", "", "FILE", "lower a .mf source file into a runnable config: use --config as the base routing registry, print the merged config JSON to stdout, then exit (no DB/dispatch; the textual frontend)", false);
+	val _ = p.option_string("manifest", "m", "FILE", "deployment manifest (named scripts + shared deployment routing). Compiles+validates EVERY declared script at startup; a SUBMISSION names a script via --script, a RESUME drives by the durable pin. Alternative to --config", false);
+	val _ = p.option_string("script", "s", "NAME", "the manifest script to SUBMIT (manifest mode, fresh submission only; a resume uses the durable pin)", false);
 
 	var config_path: String = "";
 	var workflow_hex: String = "";
@@ -309,6 +313,9 @@ fn main(argv: Array<String>) nothrow -> Int {
 	var has_arguments: Bool = false;
 	var emit_hash: Bool = false;
 	var lower_source_path: String = "";
+	var manifest_path: String = "";
+	var script_name: String = "";
+	var has_script: Bool = false;
 
 	match p.parse(argv) {
 		core.Result::Ok(parsed) => {
@@ -318,6 +325,8 @@ fn main(argv: Array<String>) nothrow -> Int {
 			match parsed.get_string("input", p) { Some(v) => { input_json = _dup(v); }, None => {} }
 			match parsed.get_string("arguments", p) { Some(v) => { arguments_json = _dup(v); has_arguments = true; }, None => {} }
 			match parsed.get_string("lower-source", p) { Some(v) => { lower_source_path = _dup(v); }, None => {} }
+			match parsed.get_string("manifest", p) { Some(v) => { manifest_path = _dup(v); }, None => {} }
+			match parsed.get_string("script", p) { Some(v) => { script_name = _dup(v); has_script = true; }, None => {} }
 			emit_hash = parsed.has_flag("emit-content-hash", p);
 		},
 		core.Result::Err(_) => {
@@ -336,20 +345,26 @@ fn main(argv: Array<String>) nothrow -> Int {
 		if config_path.byte_length() == 0 { console.eprintln("runner: --config required for --emit-content-hash"); return 2; }
 		return try _emit_content_hash(&config_path) catch { console.eprintln("runner: emit-content-hash failed"); 1 };
 	}
-	if config_path.byte_length() == 0 or workflow_hex.byte_length() != 32 {
-		console.eprintln("runner: --config and a 32-hex --workflow-id are required");
+	val manifest_mode = manifest_path.byte_length() != 0;
+	if workflow_hex.byte_length() != 32 or (!manifest_mode and config_path.byte_length() == 0) {
+		console.eprintln("runner: a 32-hex --workflow-id and either --config or --manifest are required");
 		return 2;
 	}
 
 	// The CLI (front-door stand-in) reads the admission state from the environment and passes it to
 	// the drive boundary. A future service would translate admission into HTTP 503 and own reload/
 	// shutdown; it calls the same `_run`/drive_workflow boundary with admission as a parameter.
-	// `_run` RETURNS a structured `Outcome`; the CLI adapter renders it (machine-readable JSON to
+	// The drive RETURNS a structured `Outcome`; the CLI adapter renders it (machine-readable JSON to
 	// stdout + a process exit code) exactly once here. A service would render the same Outcome to HTTP.
+	// `--manifest` selects the named-script registry path (item 3a); `--config` the single-config path.
 	val admission = _admission_from_env();
 	var outcome: Outcome = Outcome::Error(reason = "runner-fatal");
 	try {
-		outcome = _run(&config_path, &workflow_hex, &operation_name, &input_json, &arguments_json, has_arguments, &admission);
+		if manifest_mode {
+			outcome = _run_manifest(&manifest_path, &workflow_hex, &script_name, has_script, &operation_name, &input_json, &arguments_json, has_arguments, &admission);
+		} else {
+			outcome = _run(&config_path, &workflow_hex, &operation_name, &input_json, &arguments_json, has_arguments, &admission);
+		}
 	} catch unexpected {
 		console.eprintln("runner: fatal");
 		return 1;
@@ -448,12 +463,11 @@ fn _read_text(path: &String) throws -> String {
 	}
 }
 
-fn _run(config_path: &String, workflow_hex: &String,
+fn _run_cfg(cfg: &json.JsonNode, workflow_hex: &String,
         operation_name: &String, input_json: &String,
         arguments_json: &String, has_arguments: Bool, admission: &AdmissionState) throws -> Outcome {
-	val cfg = _load_config_json(config_path);
-	val db_sub = _require_db(&cfg);
-	val worker_id = _config_str(&cfg, &"worker_id", "runner-1");
+	val db_sub = _require_db(cfg);
+	val worker_id = _config_str(cfg, &"worker_id", "runner-1");
 
 	// NOTE: the participant/operation registry is validated LAZILY — only on a path that
 	// actually needs it (fresh create, a claimed forward/reverse dispatch, or the legacy
@@ -505,25 +519,25 @@ fn _run(config_path: &String, workflow_hex: &String,
 	if pin.present {
 		// Existing planned workflow: resume, or REASSERT if this is a submission (so a reused
 		// id with changed arguments surfaces workflow_conflict instead of silently resuming).
-		return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, is_submission, arguments_json, admission);
+		return _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, is_submission, arguments_json, admission);
 	}
 	if is_submission {
 		// Fresh planned SUBMISSION: requires a planned config — a flat "plan" OR a manual-IR
 		// "graph" (the legacy single-op path takes --operation, not --arguments).
-		if _is_planned_config(&cfg) {
-			return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, true, arguments_json, admission);
+		if _is_planned_config(cfg) {
+			return _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, true, arguments_json, admission);
 		}
 		return Outcome::Aborted(reason = "arguments_require_planned_config", code = 2);
 	}
 	// No durable pin and no --arguments: a RESUME (or legacy). A planned config ("plan" or
 	// "graph") => a resume of a planned workflow (which, absent a pin, claim resolves to
 	// not_found); otherwise the legacy single-op path below.
-	if _is_planned_config(&cfg) {
-		return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, false, arguments_json, admission);
+	if _is_planned_config(cfg) {
+		return _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, false, arguments_json, admission);
 	}
 
 	// Legacy single-op path: validate the registry now (it routes the single dispatch).
-	_validate_registry(&cfg);
+	_validate_registry(cfg);
 
 	// CLI-derived request fields are the DEFAULT for a FRESH workflow. On resume
 	// they are replaced by the durable persisted request, which is authoritative
@@ -564,7 +578,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 	if fresh and !recovered {
 		var ok = false;
 		try {
-			val r = _resolve_operation(&cfg, &eff_operation_name, Optional<Int>::None());
+			val r = _resolve_operation(cfg, &eff_operation_name, Optional<Int>::None());
 			eff_schema_version = r.schema_version;
 			base_url = _dup(&r.base_url);
 			ok = true;
@@ -613,7 +627,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 	// forward dispatch. claim_by_id claims state IN (1,2); the reverse loop reads the
 	// authoritative checkpoint stack (reverse_head), never the continuation.
 	if claimed_state == STATE_REVERSING {
-		return _run_reversal(host.get(), &cfg, &workflow_id, &workflow_canon_hex, fencing_token, admission);
+		return _run_reversal(host.get(), cfg, &workflow_id, &workflow_canon_hex, fencing_token, admission);
 	}
 
 	// --- 2a. AUTHORITATIVE post-claim reload (closes the probe/claim race). Now
@@ -655,7 +669,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 	if recovered {
 		var ok = false;
 		try {
-			val r = _resolve_operation(&cfg, &eff_operation_name, Optional<Int>::Some(eff_schema_version));
+			val r = _resolve_operation(cfg, &eff_operation_name, Optional<Int>::Some(eff_schema_version));
 			base_url = _dup(&r.base_url);
 			ok = true;
 		} catch RunnerError(e) {
@@ -731,6 +745,208 @@ fn _run(config_path: &String, workflow_hex: &String,
 	}
 
 	return Outcome::Completed(operation_id = _dup(&operation_id_hex), result = _dup(&final_result));
+}
+
+// Thin wrapper: load the single `--config` and drive (the original CLI mode).
+fn _run(config_path: &String, workflow_hex: &String,
+        operation_name: &String, input_json: &String,
+        arguments_json: &String, has_arguments: Bool, admission: &AdmissionState) throws -> Outcome {
+	val cfg = _load_config_json(config_path);
+	return _run_cfg(&cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+}
+
+// ===== manifest-driven ScriptRegistry (roadmap item 3a: named, pinned, validated deployments) =====
+//
+// A deployment manifest declares a shared routing/deployment block plus NAMED scripts (each a `.mf`
+// source path). The runner COMPILES the WHOLE declared set at startup — lower every `.mf` over the
+// deployment, build+validate each revision — and FAILS FAST if any script is missing/unreadable/
+// invalid or any name duplicates (the §4.1 "compile the entire declared set; startup fails if any
+// fails" contract). A SUBMISSION names a script (`--script`); creation PINS its resolved immutable
+// identity (script name + plan version + content_hash + plan_length). A RESUME drives strictly by the
+// DURABLE pin — the script matching the pin's (name, version) — never the manifest's current active
+// version (no silent substitution). One deployment block for now (per-script routing is a later
+// refinement); atomic fleet/service activation is item 3b (the long-running service), not built here.
+//
+// Manifest shape:
+//   { "deployment": { …db, participants, operations… },
+//     "scripts": [ { "name": "checkout-v1", "version": "1.0.0", "path": "workflows/checkout.mf" }, … ] }
+struct ManifestScript {
+	pub name: String,
+	pub version: String,
+	pub cfg: json.JsonNode,          // lowered+merged runnable config (deployment ‖ plan/graph ‖ name/version)
+	pub content_hash_hex: String,
+	pub plan_length: Int
+}
+struct ManifestSet {
+	pub deployment: json.JsonNode,
+	pub scripts: Array<ManifestScript>
+}
+
+// The directory portion of a path (everything up to the last '/'), or "" if the path has no '/'.
+fn _dirname(path: &String) nothrow -> String {
+	val n = path.byte_length();
+	var last = -1;
+	var i = 0;
+	while i < n { if cast<Int>(path.byte_at(i)) == 47 { last = i; } i = i + 1; }   // '/'
+	if last <= 0 { if last == 0 { return "/"; } return ""; }
+	var buf = io.buffer(last);
+	var j = 0;
+	while j < last { io.buffer_write(&mut buf, j, path.byte_at(j)); j = j + 1; }
+	val ptr = io.buffer_ptr(&buf);
+	return core.string_from_utf8_bytes(ptr, last);
+}
+
+// Resolve a manifest script path: an ABSOLUTE path (leading '/') is used as-is; a RELATIVE path is
+// resolved against the MANIFEST FILE's directory (so a manifest is portable — not tied to the
+// runner's cwd). A manifest with no directory component (bare name in cwd) leaves the path relative.
+fn _resolve_script_path(manifest_path: &String, spath: &String) nothrow -> String {
+	if spath.byte_length() > 0 and cast<Int>(spath.byte_at(0)) == 47 { return _dup(spath); }   // absolute
+	val dir = _dirname(manifest_path);
+	if dir.byte_length() == 0 { return _dup(spath); }
+	return dir + "/" + _dup(spath);
+}
+
+// `base` with `script_name`/`plan_version` set to the manifest's declared identity, so the lowered
+// config carries it into the revision + the durable pin. (A parsed JsonNode is immutable — rebuild.)
+fn _deployment_for(base: &json.JsonNode, name: &String, version: &String) -> json.JsonNode {
+	var o = json.new_object();
+	var it = base.entries();
+	var done = false;
+	while !done {
+		match it.next() {
+			Optional::Some(entry) => {
+				if !_str_eq(entry.key, &"script_name") and !_str_eq(entry.key, &"plan_version") {
+					o.set(_dup(entry.key), entry.value.clone_deep());
+				}
+			},
+			Optional::None => { done = true; }
+		}
+	}
+	o.set("script_name", json.JsonNode::String(value = _dup(name)));
+	o.set("plan_version", json.JsonNode::String(value = _dup(version)));
+	return o.to_node();
+}
+
+// Load + COMPILE + VALIDATE the entire manifest. Fail-fast: a missing field, an unreadable/invalid
+// script, or a duplicate name throws RunnerError (the caller surfaces it as a clean outcome).
+fn _load_manifest(manifest_path: &String) throws -> ManifestSet {
+	val raw = _read_text(manifest_path);
+	var mjson = json.JsonNode::Null();
+	match json.parse_strict(&raw) {
+		core.Result::Ok(n) => { mjson = move n; },
+		core.Result::Err(_) => { throw RunnerError(message = "manifest is not valid JSON"); }
+	}
+	var deployment = json.JsonNode::Null();
+	match mjson.get(&"deployment") {
+		Optional::Some(d) => { deployment = d.clone_deep(); },
+		Optional::None => { throw RunnerError(message = "manifest missing 'deployment'"); }
+	}
+	var scripts: Array<ManifestScript> = [];
+	match mjson.get(&"scripts") {
+		Optional::Some(sn) => {
+			match sn.as_array() {
+				Optional::Some(arr) => {
+					var i = 0;
+					while i < arr.len {
+						val name = _req_str(&arr[i], &"name", "script.name");
+						val version = _req_str(&arr[i], &"version", "script.version");
+						val spath = _req_str(&arr[i], &"path", "script.path");
+						_validate_semver(&version);
+						var d = 0;
+						while d < scripts.len {
+							if _str_eq(&scripts[d].name, &name) { throw RunnerError(message = "duplicate script name in manifest: " + _dup(&name)); }
+							d = d + 1;
+						}
+						val rpath = _resolve_script_path(manifest_path, &spath);
+						val source = _read_text(&rpath);
+						val base2 = _deployment_for(&deployment, &name, &version);
+						var merged = json.JsonNode::Null();
+						match parser.lower(&source, &base2) {
+							core.Result::Ok(m) => { merged = move m; },
+							core.Result::Err(e) => { throw RunnerError(message = "script '" + _dup(&name) + "' failed to lower: " + _dup(&e.message)); }
+						}
+						_validate_registry(&merged);
+						val reg = _registry_build(&merged);
+						if reg.revisions.len == 0 { throw RunnerError(message = "script '" + _dup(&name) + "' produced no revision (empty plan/graph)"); }
+						val chx = _bytes_to_hex(&reg.revisions[0].content_hash);
+						val plen = reg.revisions[0].plan_length;
+						scripts.push(ManifestScript(name = move name, version = move version, cfg = move merged, content_hash_hex = move chx, plan_length = plen));
+						i = i + 1;
+					}
+				},
+				Optional::None => { throw RunnerError(message = "manifest 'scripts' must be an array"); }
+			}
+		},
+		Optional::None => { throw RunnerError(message = "manifest missing 'scripts'"); }
+	}
+	if scripts.len == 0 { throw RunnerError(message = "manifest declares no scripts"); }
+	return ManifestSet(deployment = move deployment, scripts = move scripts);
+}
+
+fn _find_script(scripts: &Array<ManifestScript>, name: &String) nothrow -> Int {
+	var i = 0;
+	while i < scripts.len { if _str_eq(&scripts[i].name, name) { return i; } i = i + 1; }
+	return -1;
+}
+fn _find_script_nv(scripts: &Array<ManifestScript>, name: &String, version: &String) nothrow -> Int {
+	var i = 0;
+	while i < scripts.len { if _str_eq(&scripts[i].name, name) and _str_eq(&scripts[i].version, version) { return i; } i = i + 1; }
+	return -1;
+}
+
+// Manifest mode: validate the whole set, then drive the ONE script this invocation needs — by
+// `--script` for a SUBMISSION, or by the durable pin's (name, version) for a RESUME — through the
+// same `_run_cfg` drive boundary. A bad manifest is a clean `invalid_manifest` outcome (exit 2).
+fn _run_manifest(manifest_path: &String, workflow_hex: &String, script_name: &String, has_script: Bool,
+                 operation_name: &String, input_json: &String, arguments_json: &String,
+                 has_arguments: Bool, admission: &AdmissionState) throws -> Outcome {
+	var ms_opt: Optional<ManifestSet> = Optional<ManifestSet>::None();
+	try {
+		ms_opt = Optional<ManifestSet>::Some(_load_manifest(manifest_path));
+	} catch RunnerError(e) {
+		console.eprintln("runner: invalid manifest: " + e.message);
+		return Outcome::Aborted(reason = "invalid_manifest", code = 2);
+	}
+	match move ms_opt {
+		Optional::Some(ms) => {
+			if has_arguments {
+				// SUBMISSION: name the script explicitly; creation pins its resolved identity.
+				if !has_script { return Outcome::Aborted(reason = "script_required_for_submission", code = 2); }
+				val sidx = _find_script(&ms.scripts, script_name);
+				if sidx < 0 { return Outcome::Aborted(reason = "unknown_script", code = 2); }
+				return _run_cfg(&ms.scripts[sidx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+			}
+			// RESUME: pick the script by the DURABLE pin (name, version) — never the active version.
+			val db_sub = _require_db(&ms.deployment);
+			val worker_id = _config_str(&ms.deployment, &"worker_id", "runner-1");
+			val identity = mf.identity_from_worker_name(&worker_id);
+			var b = mf.new_host_builder();
+			mf.with_json(&mut b, &db_sub);
+			mf.with_identity(&mut b, move identity);
+			val host = _build_host(move b);
+			val workflow_id = _hex_to_bytes(workflow_hex);
+			var pin_name = "";
+			var pin_version = "";
+			var pin_present = false;
+			match host.get().plan_get(&workflow_id) {
+				mf.PlanGetOutcome::Found(p) => { pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version); pin_present = true; },
+				mf.PlanGetOutcome::NotFound => {}
+			}
+			if !pin_present { return Outcome::Aborted(reason = "not_found", code = 2); }
+			val ridx = _find_script_nv(&ms.scripts, &pin_name, &pin_version);
+			if ridx < 0 {
+				// The pinned revision is NOT in the current manifest. Do NOT short-circuit: drive the
+				// proven STORAGE-FIRST planned path with the deployment-only config (no plan/graph),
+				// so the durable pin governs state-sensitively — TERMINAL REPLAY reports from durable
+				// state (registry-independent), and a CLAIMABLE workflow gets a DURABLE
+				// `revision_unavailable` defer (lease cleared, admission-aware via _defer_dispatch),
+				// exactly as an absent pinned plan does on the `--config` path. Never substitute.
+				return _run_cfg(&ms.deployment, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+			}
+			return _run_cfg(&ms.scripts[ridx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+		},
+		Optional::None => { return Outcome::Aborted(reason = "invalid_manifest", code = 2); }
+	}
 }
 
 // ===== manual-IR forward PLAN execution (multi-operation) =====

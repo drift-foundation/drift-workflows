@@ -23,7 +23,7 @@ fields/elements (`{ customer: arg c.id, amount: arg order.amount }`), pure, type
 fully-constant literals fold to a const (hash-stable). Full gate green — integration **138/138**, unit
 base + asan. As-built: `microflows_design.md` §12.9.
 
-### 2. Operational admission / draining / reload behavior — *in progress (first pass)*
+### 2. Operational admission / draining / reload behavior — ✅ LANDED (first pass, 2026-06-19)
 Required for any reasonable **prod update cycle**. **First pass (policy + shape, not full machinery):**
 admission state (`accepting` / `draining` / `stopped`) is an **input to the drive boundary** (`_run`,
 via `MICROFLOWS_ADMISSION`). While draining/stopped: a **fresh submission is refused** before
@@ -45,11 +45,25 @@ integration suite, **142/142**, was the oracle, run on each of the two verifiabl
 `_run`/drive boundary is now the coordinator-library entry the front-door (item 3 / the service) calls
 instead of shelling around the CLI.
 
-### 3. ScriptRegistry packaging / manifest activation
-Required so app teams deploy **named, pinned workflow revisions** rather than ad-hoc lowered configs.
-The runtime today loads a config-supplied revision (`--config` + `--lower-source`); this slice adds the
-manifest-driven `ScriptRegistry` (compile-on-startup + staged atomic SIGHUP/SIGUSR1 reload) sketched in
-`microflows_design.md` §4.1. **Discuss the exact package / manifest / update model before building.**
+### 3a. ScriptRegistry packaging / manifest (one-shot CLI) — ✅ LANDED (2026-06-19)
+App teams deploy **named, pinned, validated workflow revisions** instead of ad-hoc lowered configs. A
+deployment **manifest** (`{ "deployment": {db, participants, operations}, "scripts": [{name, version,
+path}] }`) declares named `.mf` scripts over a shared deployment. `microflows-runner --manifest <file>`
+**compiles+validates EVERY declared script at startup** (lower over the deployment → build → validate)
+and **fails fast** on any missing/unreadable/invalid script or duplicate name (`invalid_manifest`). A
+SUBMISSION names a script (`--script <name>`); creation **pins its resolved identity** (script name,
+plan version, content_hash, plan_length). A RESUME drives **strictly by the durable pin** (the script
+matching the pin's name+version) — never the manifest's active version (no silent substitution). One
+deployment block (per-script routing is a later refinement). The drive itself is unchanged — the
+manifest resolves the one script and calls the same `_run_cfg` boundary. Full gate green —
+integration **149/149** (C20: named submit + pin/hash parity, unknown-script refused, fail-fast
+invalid-manifest, resume-by-pin). As-built: `microflows_design.md` §14.
+
+### 3b. ScriptRegistry service shell — *next (the long-running front-door)*
+The thin long-running wrapper: a service that owns the registry, **atomic/staged reload** (SIGHUP/
+SIGUSR1, §4.1), the **admission gate** (item 2), and a submit/resume entry calling **`drive_workflow`
+→ Outcome** (item 2.5) — rendering admission/drain → HTTP 503 and outcomes → HTTP. Now a thin wrapper
+around three landed pieces (registry + admission + the Outcome boundary), not a redesign.
 
 ### 4. Business-team starter kit
 Examples and fixtures for **realistic workflows** so a new team is productive fast: charge / update /
