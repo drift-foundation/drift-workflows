@@ -463,24 +463,30 @@ fn _read_text(path: &String) throws -> String {
 	}
 }
 
+// Build a host (its own internally-pooled DB connections) from the config and drive once. The
+// one-shot CLI path: a fresh host per invocation. The long-running SERVICE instead builds ONE host
+// at startup and calls `_run_core` directly per request (sharing the pool across concurrent drives;
+// per-workflow leases/fencing keep them safe).
 fn _run_cfg(cfg: &json.JsonNode, workflow_hex: &String,
         operation_name: &String, input_json: &String,
         arguments_json: &String, has_arguments: Bool, admission: &AdmissionState) throws -> Outcome {
 	val db_sub = _require_db(cfg);
 	val worker_id = _config_str(cfg, &"worker_id", "runner-1");
-
-	// NOTE: the participant/operation registry is validated LAZILY — only on a path that
-	// actually needs it (fresh create, a claimed forward/reverse dispatch, or the legacy
-	// single-op path). It is deliberately NOT validated here so that TERMINAL REPLAY of a
-	// completed/planned workflow (which reports from durable state) stays registry- and
-	// config-independent.
-
 	val identity = mf.identity_from_worker_name(&worker_id);
 	var b = mf.new_host_builder();
 	mf.with_json(&mut b, &db_sub);
 	mf.with_identity(&mut b, move identity);
 	val host = _build_host(move b);
+	return _run_core(&host, cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+}
 
+// The drive core, given an already-built (shared) host. Reused by the CLI (`_run_cfg`) and the
+// long-running service. The participant/operation registry is validated LAZILY — only on a path that
+// actually needs it — so TERMINAL REPLAY of a completed/planned workflow (which reports from durable
+// state) stays registry- and config-independent.
+fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_hex: &String,
+        operation_name: &String, input_json: &String,
+        arguments_json: &String, has_arguments: Bool, admission: &AdmissionState) throws -> Outcome {
 	val workflow_id = _hex_to_bytes(workflow_hex);
 	// Derive the operation id from the CANONICAL lowercase hex of the decoded
 	// workflow bytes (not the supplied hex spelling), so upper/lower spellings
