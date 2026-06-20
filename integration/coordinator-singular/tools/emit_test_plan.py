@@ -40,6 +40,8 @@ APPS = [
      "lib_proj": "singular/drift", "local_lib": "singular"},
     {"out": "microflows-runner", "app_proj": "microflows/runner",
      "lib_proj": "microflows", "local_lib": "microflows"},
+    {"out": "microflows-service", "app_proj": "microflows/runner",
+     "lib_proj": "microflows", "local_lib": "microflows", "artifact": "microflows-service"},
 ]
 
 
@@ -94,7 +96,7 @@ def _external_deps(app, artifact_name):
 
 
 def _build_job(app):
-    app_art = _artifact(app["app_proj"])
+    app_art = _artifact(app["app_proj"], app.get("artifact"))
     lib_art = _artifact(app["lib_proj"], app["local_lib"])
     trust = str(ROOT / f"{app['app_proj']}/drift/trust.json")
     srcs = (_manifest_src_files(app["lib_proj"], lib_art)

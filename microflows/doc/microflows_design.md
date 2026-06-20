@@ -10,14 +10,15 @@ participant protocol, and the milestone-1 plan.
 > (`phase_drift_mile_design.md`) is preserved as the historical record; see
 > §10 (History & rationale) for why the direction changed and what it cost.
 
-> **As-built note (2026-06-19).** Milestone 1 is LANDED and proven. The
+> **As-built note (2026-06-20).** Milestone 1 is LANDED and proven. The
 > manual-IR runtime (durable dispatch, recovery, reversal) AND the `.mf`
 > language frontend (parser, type binding, lowering, diagnostics) are complete
-> on certified driftc **0.33.44** / ABI 17 (re-validated when the certified
-> toolchain advanced 0.33.42→0.33.44, a borrowed-place-inference bugfix; ABI 17
+> on certified driftc **0.33.45** / ABI 17 (re-validated when the certified
+> toolchain advanced 0.33.44→0.33.45, a MIR/LLVM temp-name-collision bugfix; ABI 17
 > unchanged, so content_hashes and seed fixtures are stable). Verified for the
-> latest slice (manifest-driven ScriptRegistry, §14): the `coordinator-singular`
-> integration gate (**149/149**, DB-backed, real HTTP); the unit gates
+> latest slice (ScriptRegistry service shell, §15 — long-running `web.rest`
+> front-door over the same drive boundary): the `coordinator-singular`
+> integration gate (**158/158**, DB-backed, real HTTP); the unit gates
 > (`ir_*`/`parser_test`, base + asan) and the other component gates
 > (stored-procedure, singular) were green at their slice's authoring and are
 > unchanged. §§1–11 below remain the
@@ -1145,7 +1146,7 @@ microflows/runner/src/runner.drift   registry build, content_hash, dispatch,
                                        recovery, reversal; --lower-source /
                                        --emit-content-hash CLIs
 microflows/runner/tests/unit/        ir_exec_test, ir_graph_test, parser_test
-integration/coordinator-singular/    test.py — the 149-check E2E gate
+integration/coordinator-singular/    test.py — the 158-check E2E gate
 singular/doc/singular-protocol.md    the participant-side protocol contract
 ```
 
@@ -1359,4 +1360,67 @@ admission + the `Outcome` boundary), not a redesign.
 Integration C20: a named submission pins+runs with **content_hash parity** vs direct lowering; an
 unknown `--script` is refused with no workflow row; a manifest with any invalid script fails at load
 (`invalid_manifest`, no workflow row); and a respond-pending workflow submitted via the manifest
-**resumes strictly by its durable pin** (no `--script`). Full gate green — integration **149/149**.
+**resumes strictly by its durable pin** (no `--script`). Full gate green — integration **158/158**.
+
+---
+
+## 15. ScriptRegistry service shell (roadmap item 3b — LANDED)
+
+A **second artifact** (`microflows-service`, entry `microflows.runner::service_main`) turns the
+proven one-shot CLI core into a long-running `web.rest` front-door. It adds **no workflow semantics** —
+it is a thin wrapper over the SAME drive boundary — but it is real service infrastructure.
+
+### 15.1 Shared state + the host
+
+`service_main` loads + validates the WHOLE manifest once (fail-fast, exactly as the CLI), builds ONE
+host (its own internally-pooled DB connections via `mf.with_json`), and holds an `arc`-shared
+`ServiceApp { host, registry: Mutex<Arc<ManifestSet>>, admission: AtomicInt, manifest_path }`. The host
+is built once and shared across all requests — the enabling refactor was extracting **`_run_core(host,
+cfg, …)`** from `_run_cfg` (the CLI builds a fresh host per invocation; the service reuses one). Per-
+workflow leases/fencing in the storage layer keep concurrent drives safe; a request takes a cheap
+snapshot of the registry `Arc` under the lock, releases it, then drives — so a concurrent reload never
+disturbs an in-flight request.
+
+### 15.2 Routes + Outcome → HTTP
+
+Internal API: `POST /v1/workflows/{id}/submit?script=NAME` (body = instance arguments),
+`POST /v1/workflows/{id}/resume` (driven strictly by the durable pin), `GET /healthz` (liveness),
+`GET /readyz` (ready ⇔ accepting). Each workflow request calls the same `_drive_manifest_request` →
+`_run_core` → **Outcome** the CLI uses. `_outcome_http_status` maps the Outcome arm to a semantic
+status (200 terminal · 202 pending/deferred · **503 refused/pending_restart** (drain back-pressure, §13)
+· 400 invalid/unknown-script/malformed-arguments · 404 not_found ·
+409 conflict/leased/blocked · 500 internal); the **body is the EXACT Outcome JSON** (`_oc_render`,
+unchanged), so a CLI consumer and an HTTP consumer read identical outcome documents.
+
+### 15.3 Runtime admission + staged reload (signals)
+
+Admission starts from `MICROFLOWS_ADMISSION` and is runtime-mutable. The main thread runs a signal
+loop while `web.rest` serves in the background:
+
+```text
+SIGTERM  -> admission := draining  (fresh submissions -> Refused -> HTTP 503; /readyz -> 503)
+            then graceful rest.shutdown (in-flight requests finish)  — the drain converges
+SIGUSR1  -> staged reload: load+validate a NEW manifest into a standby ScriptRegistry; on success
+            atomically SWAP the active Arc under the lock; on ANY failure keep serving the OLD one
+SIGINT   -> immediate graceful shutdown
+```
+
+The admission gate is the SAME one the drive already applies (§13) — the service only chooses the
+initial state and flips it on SIGTERM; the refusal/`pending_restart` behavior is unchanged.
+
+### 15.4 Security boundary
+
+**Internal API only.** Auth is roadmap item 5: the `/v1/workflows` route group is the seam where a
+`web.rest` auth middleware / a request security context attaches later — no auth logic is built here,
+and the drive still requires `auth_profile` to be null (§12.7). Deliberately not guessed now.
+
+### 15.5 Tests
+
+Integration C21 boots the service against the live stub and drives it over real HTTP: health/readiness;
+a submission completes (`200`, durable reservation); resume replays the terminal result by pin
+(`already_terminal`); an unknown script is `400`; a **malformed submit body** is a structured `400`
+with **no workflow row** (never silently `{}`); a **SIGUSR1 reload** makes a freshly-declared script
+runnable (was `400`, becomes `200` after the swap); and a service booted **draining** refuses fresh
+submissions with **`503`** *and* converges an existing pending workflow resumed under drain as
+**`pending_restart` → `503`** (the §13 back-pressure contract), reporting `/readyz` not-ready. Full gate
+green — integration **158/158**.

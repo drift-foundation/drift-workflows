@@ -16,7 +16,23 @@
       "modules": ["src/"],
       "package_deps": [
         { "name": "microflows", "version": "0.1" },
-        { "name": "web-client", "version": "0.4" }
+        { "name": "web-client", "version": "0.4" },
+        { "name": "web-rest", "version": "0.5" }
+      ]
+    },
+    {
+      "kind": "app",
+      "name": "microflows-service",
+      "module_namespace": "microflows.runner",
+      "version": "0.1.0",
+      "description": "Microflows coordinator service — long-running manifest-driven web.rest front-door (roadmap 3b)",
+      "entry_module": "src/runner.drift",
+      "entry_point": "microflows.runner::service_main",
+      "modules": ["src/"],
+      "package_deps": [
+        { "name": "microflows", "version": "0.1" },
+        { "name": "web-client", "version": "0.4" },
+        { "name": "web-rest", "version": "0.5" }
       ]
     }
   ]

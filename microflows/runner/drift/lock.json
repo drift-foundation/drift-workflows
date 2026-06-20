@@ -42,6 +42,82 @@
           "source_content_id": "sha256:b5174bf52bf3171590254c70f0c5ea1aac24b5b13815e93f9c38432380c96d92",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
+        },
+        "web-rest": {
+          "version": "0.5.4",
+          "sha256": "2c2b72983370ab17e8ea921e10289fcd803d1dceeb83dd941aeb1625f1b350d9",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:f7e7f7002a8658620151cbf1ac3f0f80954671abe4f2e5b736b45edd6a88bb60",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "direct"
+        },
+        "web-jwt": {
+          "version": "0.4.2",
+          "sha256": "3ef9ff9c38acc0d9cf7dab29c1cca52df22cc48ddde1760e6b171ced3889a6bd",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:5bb8aae9b06db58210ca035c0625ace02cdc6ea1345f248e896b6320ada70c99",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "transitive"
+        }
+      }
+    },
+    "microflows-service": {
+      "resolved": {
+        "mariadb-rpc": {
+          "version": "0.6.0",
+          "sha256": "c8e3359ea022c6ecd2baeb1052add4ca066bcb033c37790bb48e500b66c46f9d",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:1188223ff332c060852d751b2e432ecb0259278fae8d398e5e71b64c0c84b397",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "transitive"
+        },
+        "mariadb-wire-proto": {
+          "version": "0.4.0",
+          "sha256": "5c49fa540dd44c31e50a2e4c1b375c82b7202953a26af4f806840eb31495ca28",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:94b2231366549a7d0e108aed47b91db32a4b80b5900230d394b58edb214b3926",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "transitive"
+        },
+        "microflows": {
+          "version": "0.1.0",
+          "sha256": "9d0123bce50539376a067942c2fcafeabc2fa00a2475abbd7624e08c402814c9",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:a433ae840b10aa0f50c9f705788764950ad1b4b314f3b51e7ae422f31eba9caa",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "direct"
+        },
+        "net-tls": {
+          "version": "0.5.2",
+          "sha256": "05d6d945a62e9e42b2676dd0035b89e134bccbe5be88d75d715194425076b0bd",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:3f2fd3f603589b4369c19fc20e73020fdca92a75f972a0fc16ee82f4e3c036a7",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "transitive"
+        },
+        "web-client": {
+          "version": "0.4.2",
+          "sha256": "107beb5d88d232f933260668334f26efa2d639c957d2a1b0bbcd5502a20856a9",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:b5174bf52bf3171590254c70f0c5ea1aac24b5b13815e93f9c38432380c96d92",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "direct"
+        },
+        "web-rest": {
+          "version": "0.5.4",
+          "sha256": "2c2b72983370ab17e8ea921e10289fcd803d1dceeb83dd941aeb1625f1b350d9",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:f7e7f7002a8658620151cbf1ac3f0f80954671abe4f2e5b736b45edd6a88bb60",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "direct"
+        },
+        "web-jwt": {
+          "version": "0.4.2",
+          "sha256": "3ef9ff9c38acc0d9cf7dab29c1cca52df22cc48ddde1760e6b171ced3889a6bd",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:5bb8aae9b06db58210ca035c0625ace02cdc6ea1345f248e896b6320ada70c99",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "transitive"
         }
       }
     }

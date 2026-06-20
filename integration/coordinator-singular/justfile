@@ -76,7 +76,7 @@ _db-and-harness WORK:
 	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
 	  scenario --schema microflows --name coordinator-fixtures
 	echo "[integration] run coordinator<->singular harness"
-	STUB_BIN="{{WORK}}/participant-stub" RUNNER_BIN="{{WORK}}/microflows-runner" python3 test.py
+	STUB_BIN="{{WORK}}/participant-stub" RUNNER_BIN="{{WORK}}/microflows-runner" SERVICE_BIN="{{WORK}}/microflows-service" python3 test.py
 
 # No performance scenarios for this suite yet (explicit no-op, not a silent skip).
 perf:

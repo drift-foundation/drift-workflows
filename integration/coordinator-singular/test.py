@@ -30,11 +30,13 @@ Stdlib-only.
 """
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
@@ -48,6 +50,8 @@ STUB_BIN = Path(os.environ.get("STUB_BIN",
                 MF / "participant-stub" / "build" / "dist" / "bin" / "participant-stub"))
 RUNNER_BIN = Path(os.environ.get("RUNNER_BIN",
                   MF / "runner" / "build" / "dist" / "bin" / "microflows-runner"))
+SERVICE_BIN = Path(os.environ.get("SERVICE_BIN",
+                   MF / "runner" / "build" / "dist" / "bin" / "microflows-service"))
 
 MDB = {
     "host": os.environ.get("MDB_HOST", "127.0.0.1"),
@@ -136,6 +140,76 @@ def write_manifest(deployment, scripts):
     return mpath.name
 
 
+def write_manifest_at(path, deployment, scripts):
+    # Like write_manifest but to a SPECIFIC path (so a SIGUSR1 reload can overwrite the same file).
+    decl = []
+    for name, version, src in scripts:
+        mf = tempfile.NamedTemporaryFile("w", suffix=".mf", delete=False); mf.write(src); mf.close()
+        decl.append({"name": name, "version": version, "path": mf.name})
+    with open(path, "w") as f:
+        json.dump({"deployment": deployment, "scripts": decl}, f)
+    return path
+
+
+def _svc_get(base, path):
+    try:
+        with urllib.request.urlopen(f"{base}{path}", timeout=10) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+def _svc_post(base, path, body=None):
+    data = json.dumps(body).encode() if body is not None else b""
+    req = urllib.request.Request(f"{base}{path}", data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+def _svc_post_raw(base, path, raw):
+    # POST arbitrary (possibly malformed) bytes — for asserting body validation, which json.dumps can't produce.
+    req = urllib.request.Request(f"{base}{path}", data=raw, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+def boot_service(manifest_path, env_extra=None):
+    sport = _free_port()
+    sbase = f"http://127.0.0.1:{sport}"
+    senv = dict(os.environ)
+    if env_extra:
+        senv.update(env_extra)
+    proc = subprocess.Popen([str(SERVICE_BIN), "--manifest", manifest_path, "--port", str(sport)],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=senv)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            sys.exit(f"service exited early:\n{proc.stdout.read() if proc.stdout else ''}")
+        try:
+            urllib.request.urlopen(f"{sbase}/healthz", timeout=1); break
+        except Exception:
+            time.sleep(0.2)
+    else:
+        proc.terminate(); sys.exit("service not ready")
+    return proc, sbase
+
+
+def stop_service(proc):
+    proc.terminate()  # SIGTERM -> drain + graceful shutdown
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+
+
 def emit_content_hash(runner_cfg):
     """Print the active revision's content_hash for a config via the runner's own algorithm
     (--emit-content-hash; DB-free). Used to assert hash identity properties without
@@ -221,7 +295,7 @@ def _put_op(base, operation, op_id_hex, body_obj):
 
 
 def main():
-    for b in (STUB_BIN, RUNNER_BIN):
+    for b in (STUB_BIN, RUNNER_BIN, SERVICE_BIN):
         if not b.exists():
             sys.exit(f"error: missing binary {b} — build it first (`just test` here builds both)")
 
@@ -2691,6 +2765,93 @@ def main():
               and tr_c == 0 and tr_b.get("workflow") == "already_terminal" and tr_b.get("result") == {"reserved": "tm1"},
               (ts_c, ts_b, tr_c, tr_b))
 
+        # ===== item 3b: ScriptRegistry SERVICE shell (long-running web.rest front-door) =====
+        # The SAME drive boundary, now behind HTTP: boot the service against the live stub, exercise
+        # submit/resume/health over real HTTP, then staged reload (SIGUSR1 swaps the registry) and
+        # drain (admission -> HTTP 503). The body is the EXACT Outcome JSON; the status is semantic.
+        pend_src = ("args { code: string }\n"
+                    "steps { reserve { reservation: arg code, \"_fault\": { \"respond_pending\": true } } }\n")
+        svc_manifest = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False).name
+        write_manifest_at(svc_manifest, runner_cfg, [("svc", "1.0.0", mf_src), ("pend", "1.0.0", pend_src)])
+        sproc, sbase = boot_service(svc_manifest)
+        pend_wf = _wf_id()
+        try:
+            hc, hb = _svc_get(sbase, "/healthz")
+            rc, rb = _svc_get(sbase, "/readyz")
+            check("service_health_ready",
+                  hc == 200 and hb.get("status") == "ok" and rc == 200 and rb.get("status") == "ready",
+                  (hc, hb, rc, rb))
+
+            sv_wf = _wf_id()
+            subc, subb = _svc_post(sbase, f"/v1/workflows/{sv_wf}/submit?script=svc", {"code": "sv1"})
+            check("service_submit_completes",
+                  subc == 200 and subb.get("workflow") == "completed" and _ck_resv(sv_wf) == ["sv1"],
+                  (subc, subb, _ck_resv(sv_wf)))
+
+            # RESUME by the durable pin -> terminal replay (already_terminal) over HTTP.
+            rsc, rsb = _svc_post(sbase, f"/v1/workflows/{sv_wf}/resume")
+            check("service_resume_replays_terminal",
+                  rsc == 200 and rsb.get("workflow") == "already_terminal" and rsb.get("result") == {"reserved": "sv1"},
+                  (rsc, rsb))
+
+            # unknown script -> 400 aborted/unknown_script (body is the Outcome doc).
+            ukc, ukb = _svc_post(sbase, f"/v1/workflows/{_wf_id()}/submit?script=nope", {"code": "x"})
+            check("service_unknown_script_400",
+                  ukc == 400 and ukb.get("workflow") == "aborted" and ukb.get("reason") == "unknown_script",
+                  (ukc, ukb))
+
+            # MALFORMED submit body -> structured 400 BEFORE any drive; NO workflow row created (never
+            # silently coerced to {}).
+            m_wf = _wf_id()
+            mc, mb = _svc_post_raw(sbase, f"/v1/workflows/{m_wf}/submit?script=svc", b"{not valid json")
+            m_rows = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow WHERE workflow_id = UNHEX('{m_wf}')")
+            check("service_malformed_body_400_no_row",
+                  mc == 400 and mb.get("workflow") == "aborted" and mb.get("reason") == "malformed_arguments"
+                  and m_rows == [["0"]],
+                  (mc, mb, m_rows))
+
+            # An existing respond_pending workflow -> pending (op requested-not-settled). Resumed later
+            # while DRAINING it must converge as pending_restart -> HTTP 503 (set up here, asserted below).
+            psc, psb = _svc_post(sbase, f"/v1/workflows/{pend_wf}/submit?script=pend", {"code": "pr1"})
+            _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{pend_wf}')")
+            check("service_submit_pending_202",
+                  psc == 202 and psb.get("workflow") == "pending",
+                  (psc, psb))
+
+            # STAGED RELOAD: svc2 is unknown now; rewrite the SAME manifest to add it (keeping svc+pend),
+            # SIGUSR1, then it runs.
+            pre_c, pre_b = _svc_post(sbase, f"/v1/workflows/{_wf_id()}/submit?script=svc2", {"code": "y"})
+            write_manifest_at(svc_manifest, runner_cfg,
+                              [("svc", "1.0.0", mf_src), ("pend", "1.0.0", pend_src), ("svc2", "1.0.0", mf_src)])
+            sproc.send_signal(signal.SIGUSR1)
+            time.sleep(1.0)
+            r2_wf = _wf_id()
+            post_c, post_b = _svc_post(sbase, f"/v1/workflows/{r2_wf}/submit?script=svc2", {"code": "sv2"})
+            check("service_sigusr1_reload_swaps_registry",
+                  pre_c == 400 and post_c == 200 and post_b.get("workflow") == "completed" and _ck_resv(r2_wf) == ["sv2"],
+                  (pre_c, pre_b, post_c, post_b, _ck_resv(r2_wf)))
+        finally:
+            stop_service(sproc)
+
+        # A service booted DRAINING: fresh submissions are refused with HTTP 503 and /readyz is not-ready;
+        # an EXISTING in-flight workflow resumed while draining converges as pending_restart -> HTTP 503
+        # (refused and pending_restart share the 503 back-pressure contract, §13).
+        dproc, dbase = boot_service(svc_manifest, env_extra={"MICROFLOWS_ADMISSION": "draining"})
+        try:
+            drc, drb = _svc_get(dbase, "/readyz")
+            dsc, dsb = _svc_post(dbase, f"/v1/workflows/{_wf_id()}/submit?script=svc", {"code": "z"})
+            check("service_draining_refuses_503",
+                  drc == 503 and drb.get("status") == "draining"
+                  and dsc == 503 and dsb.get("workflow") == "refused" and dsb.get("reason") == "draining",
+                  (drc, drb, dsc, dsb))
+
+            prc, prb = _svc_post(dbase, f"/v1/workflows/{pend_wf}/resume")
+            check("service_draining_resume_pending_restart_503",
+                  prc == 503 and prb.get("workflow") == "pending_restart" and prb.get("reason") == "draining",
+                  (prc, prb))
+        finally:
+            stop_service(dproc)
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the LOCAL authoritative
         # result; no dependency on the participant. MUST be the LAST stub-using block — it terminates
         # the stub and never restarts it, so any check after this would hit a dead participant.
@@ -2738,7 +2899,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 149
+    EXPECTED_CHECKS = 158
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

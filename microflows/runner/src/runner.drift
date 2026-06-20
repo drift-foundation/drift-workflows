@@ -40,6 +40,7 @@ import microflows.host as mf;
 import microflows.runner.ir as ir;
 import microflows.runner.parser as parser;
 import web.client as client;
+import web.rest as rest;
 import std.env as env;
 import std.iter as iter;
 use trait iter.SinglePassIterator;
@@ -900,9 +901,46 @@ fn _find_script_nv(scripts: &Array<ManifestScript>, name: &String, version: &Str
 	return -1;
 }
 
-// Manifest mode: validate the whole set, then drive the ONE script this invocation needs — by
-// `--script` for a SUBMISSION, or by the durable pin's (name, version) for a RESUME — through the
-// same `_run_cfg` drive boundary. A bad manifest is a clean `invalid_manifest` outcome (exit 2).
+// Resolve the ONE script a manifest request needs and drive it through `_run_core` (the shared-host
+// boundary) — by `--script` for a SUBMISSION, or by the durable pin's (name, version) for a RESUME.
+// Takes an already-built host + an already-loaded ManifestSet, so BOTH the one-shot CLI (`_run_manifest`)
+// and the long-running service (which holds one shared host + an in-memory registry) reuse it.
+fn _drive_manifest_request(host: &arc.Arc<mf.MicroflowsHost>, ms: &ManifestSet, workflow_hex: &String,
+                           script_name: &String, has_script: Bool, operation_name: &String,
+                           input_json: &String, arguments_json: &String, has_arguments: Bool,
+                           admission: &AdmissionState) throws -> Outcome {
+	if has_arguments {
+		// SUBMISSION: name the script explicitly; creation pins its resolved identity.
+		if !has_script { return Outcome::Aborted(reason = "script_required_for_submission", code = 2); }
+		val sidx = _find_script(&ms.scripts, script_name);
+		if sidx < 0 { return Outcome::Aborted(reason = "unknown_script", code = 2); }
+		return _run_core(host, &ms.scripts[sidx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+	}
+	// RESUME: pick the script by the DURABLE pin (name, version) — never the active version.
+	val workflow_id = _hex_to_bytes(workflow_hex);
+	var pin_name = "";
+	var pin_version = "";
+	var pin_present = false;
+	match host.get().plan_get(&workflow_id) {
+		mf.PlanGetOutcome::Found(p) => { pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version); pin_present = true; },
+		mf.PlanGetOutcome::NotFound => {}
+	}
+	if !pin_present { return Outcome::Aborted(reason = "not_found", code = 2); }
+	val ridx = _find_script_nv(&ms.scripts, &pin_name, &pin_version);
+	if ridx < 0 {
+		// The pinned revision is NOT in the current manifest. Do NOT short-circuit: drive the proven
+		// STORAGE-FIRST planned path with the deployment-only config (no plan/graph), so the durable
+		// pin governs state-sensitively — TERMINAL REPLAY reports from durable state
+		// (registry-independent), and a CLAIMABLE workflow gets a DURABLE `revision_unavailable` defer
+		// (lease cleared, admission-aware via _defer_dispatch), exactly as an absent pinned plan does on
+		// the `--config` path. Never substitute.
+		return _run_core(host, &ms.deployment, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+	}
+	return _run_core(host, &ms.scripts[ridx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+}
+
+// Manifest mode (one-shot CLI): validate the whole set, build a host, then drive the one needed script.
+// A bad manifest is a clean `invalid_manifest` outcome (exit 2).
 fn _run_manifest(manifest_path: &String, workflow_hex: &String, script_name: &String, has_script: Bool,
                  operation_name: &String, input_json: &String, arguments_json: &String,
                  has_arguments: Bool, admission: &AdmissionState) throws -> Outcome {
@@ -915,14 +953,6 @@ fn _run_manifest(manifest_path: &String, workflow_hex: &String, script_name: &St
 	}
 	match move ms_opt {
 		Optional::Some(ms) => {
-			if has_arguments {
-				// SUBMISSION: name the script explicitly; creation pins its resolved identity.
-				if !has_script { return Outcome::Aborted(reason = "script_required_for_submission", code = 2); }
-				val sidx = _find_script(&ms.scripts, script_name);
-				if sidx < 0 { return Outcome::Aborted(reason = "unknown_script", code = 2); }
-				return _run_cfg(&ms.scripts[sidx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
-			}
-			// RESUME: pick the script by the DURABLE pin (name, version) — never the active version.
 			val db_sub = _require_db(&ms.deployment);
 			val worker_id = _config_str(&ms.deployment, &"worker_id", "runner-1");
 			val identity = mf.identity_from_worker_name(&worker_id);
@@ -930,26 +960,7 @@ fn _run_manifest(manifest_path: &String, workflow_hex: &String, script_name: &St
 			mf.with_json(&mut b, &db_sub);
 			mf.with_identity(&mut b, move identity);
 			val host = _build_host(move b);
-			val workflow_id = _hex_to_bytes(workflow_hex);
-			var pin_name = "";
-			var pin_version = "";
-			var pin_present = false;
-			match host.get().plan_get(&workflow_id) {
-				mf.PlanGetOutcome::Found(p) => { pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version); pin_present = true; },
-				mf.PlanGetOutcome::NotFound => {}
-			}
-			if !pin_present { return Outcome::Aborted(reason = "not_found", code = 2); }
-			val ridx = _find_script_nv(&ms.scripts, &pin_name, &pin_version);
-			if ridx < 0 {
-				// The pinned revision is NOT in the current manifest. Do NOT short-circuit: drive the
-				// proven STORAGE-FIRST planned path with the deployment-only config (no plan/graph),
-				// so the durable pin governs state-sensitively — TERMINAL REPLAY reports from durable
-				// state (registry-independent), and a CLAIMABLE workflow gets a DURABLE
-				// `revision_unavailable` defer (lease cleared, admission-aware via _defer_dispatch),
-				// exactly as an absent pinned plan does on the `--config` path. Never substitute.
-				return _run_cfg(&ms.deployment, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
-			}
-			return _run_cfg(&ms.scripts[ridx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+			return _drive_manifest_request(&host, &ms, workflow_hex, script_name, has_script, operation_name, input_json, arguments_json, has_arguments, admission);
 		},
 		Optional::None => { return Outcome::Aborted(reason = "invalid_manifest", code = 2); }
 	}
@@ -2832,4 +2843,226 @@ fn _dup(s: &String) nothrow -> String {
 	var i = 0;
 	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
 	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), n);
+}
+
+// ===== ScriptRegistry SERVICE shell (roadmap item 3b: long-running web.rest front-door) =====
+//
+// A THIN long-running wrapper over the SAME drive boundary the CLI uses (no new workflow semantics):
+//   - loads the manifest ONCE into an in-memory, swappable ScriptRegistry;
+//   - serves submit/resume/health over web.rest; each request calls `_drive_manifest_request` ->
+//     `_run_core` (drive_workflow) -> Outcome with the ONE shared, internally-pooled host;
+//   - owns runtime-mutable admission: SIGTERM -> draining (then graceful shutdown), enforced by the
+//     SAME admission rules the drive already applies (a fresh submission while draining -> Refused ->
+//     HTTP 503; in-flight resume converges via pending_restart);
+//   - staged reload on SIGUSR1: load+validate a NEW manifest into a standby, atomically swap on
+//     success, keep serving the OLD registry on failure;
+//   - maps Outcome -> a semantic HTTP status, the body being the EXACT Outcome JSON (contract
+//     unchanged), so a CLI consumer and an HTTP consumer read identical outcome documents.
+// INTERNAL API ONLY. Auth is roadmap item 5: the `/v1/workflows` route GROUP is the seam where
+// web.rest auth middleware / a security context plugs in later — no auth logic is built here.
+const ADM_ACCEPTING: Int = 0;
+const ADM_DRAINING: Int = 1;
+const ADM_STOPPED: Int = 2;
+
+fn _admission_of_int(n: Int) nothrow -> AdmissionState {
+	if n == ADM_DRAINING { return AdmissionState::Draining(); }
+	if n == ADM_STOPPED { return AdmissionState::Stopped(); }
+	return AdmissionState::Accepting();
+}
+
+fn _admission_to_int(a: &AdmissionState) nothrow -> Int {
+	match a {
+		AdmissionState::Draining() => { return ADM_DRAINING; },
+		AdmissionState::Stopped() => { return ADM_STOPPED; },
+		AdmissionState::Accepting() => { return ADM_ACCEPTING; }
+	}
+}
+
+struct ServiceApp {
+	host: arc.Arc<mf.MicroflowsHost>,
+	registry: conc.Mutex<arc.Arc<ManifestSet>>,   // swapped atomically on SIGUSR1 reload
+	admission: conc.AtomicInt,                     // ADM_ACCEPTING / ADM_DRAINING / ADM_STOPPED
+	manifest_path: String
+}
+
+// A consistent snapshot of the active registry: clone the inner Arc under the lock, release before the
+// drive — an in-flight request keeps its snapshot even if a concurrent reload swaps the active one.
+fn _registry_snapshot(m: &conc.Mutex<arc.Arc<ManifestSet>>) nothrow -> arc.Arc<ManifestSet> {
+	var g = conc.lock(m);
+	return conc.mutex_guard_get_mut(&mut g).clone();
+}
+
+// Staged reload: load+validate a NEW manifest into a standby, atomically swap on success; on an
+// EXPECTED (RunnerError) manifest failure keep serving the OLD registry. Returns true on swap.
+// `throws`: an UNEXPECTED defect is NOT a RunnerError, so it propagates (out through the signal loop ->
+// service_main's fatal catch) rather than being silently converted into a reload rejection.
+fn _service_reload(app: &ServiceApp) throws -> Bool {
+	var new_opt: Optional<ManifestSet> = Optional<ManifestSet>::None();
+	var ok = false;
+	// EXPECTED manifest failures (missing/unreadable/invalid script, bad semver, duplicate name) are
+	// RunnerError -> reject the reload, keep the active registry. A truly UNEXPECTED defect is NOT a
+	// RunnerError, so it is NOT caught here and fails loudly rather than masquerading as "bad manifest"
+	// (the same discipline applied to config-build errors in _run_planned).
+	try { new_opt = Optional<ManifestSet>::Some(_load_manifest(&app.manifest_path)); ok = true; } catch RunnerError(e) { console.eprintln("microflows-service: reload rejected (invalid manifest), keeping the active registry: " + e.message); ok = false; }
+	if !ok { return false; }
+	match move new_opt {
+		Optional::Some(ms) => {
+			var g = conc.lock(&app.registry);
+			val slot = conc.mutex_guard_get_mut(&mut g);
+			*slot = conc.arc(ms);
+			console.println("microflows-service: manifest reloaded");
+			return true;
+		},
+		Optional::None => { return false; }
+	}
+}
+
+// Outcome -> semantic HTTP status. The body is ALWAYS the exact Outcome JSON (contract unchanged), so
+// the status is advisory for load balancers / clients; the document is authoritative.
+fn _outcome_http_status(o: &Outcome) nothrow -> Int {
+	match o {
+		Outcome::Completed(a, b) => { return 200; },
+		Outcome::AlreadyTerminal(a, b) => { return 200; },
+		Outcome::Reversed() => { return 200; },
+		Outcome::ResolvedException() => { return 200; },
+		Outcome::TerminalState(s) => { return 200; },
+		Outcome::Pending(r, d) => { return 202; },
+		Outcome::PendingRestart(r) => { return 503; },   // drain back-pressure: same 503 contract as Refused (§13)
+		Outcome::Refused(r) => { return 503; },
+		Outcome::Deferred(r, d, c) => { if _str_eq(r, &"workflow_conflict") { return 409; } return 202; },
+		Outcome::Aborted(r, c) => { if _str_eq(r, &"not_found") { return 404; } return 400; },
+		Outcome::Active(r) => { return 409; },
+		Outcome::Blocked(r) => { return 409; },
+		Outcome::Failed(r) => { return 409; },
+		Outcome::DeferFailed(r, c) => { return 500; },
+		Outcome::ReverseAborted(r, c) => { return 500; },
+		Outcome::FailAborted(r, c) => { return 500; },
+		Outcome::Error(r) => { return 500; }
+	}
+}
+
+fn _outcome_response(o: &Outcome) nothrow -> rest.Response {
+	return rest.json_response(_outcome_http_status(o), _oc_render(o));
+}
+
+implement ServiceApp {
+	// Drive one request through the shared host + a registry snapshot, mapping Outcome -> HTTP.
+	fn drive(self: &ServiceApp, wf: &String, script: &String, has_script: Bool, args: &String, has_arguments: Bool) -> rest.Response {
+		if wf.byte_length() != 32 { return rest.json_response(400, "{\"workflow\":\"aborted\",\"reason\":\"bad_workflow_id\"}"); }
+		val adm = _admission_of_int(self.admission.load(conc.MemoryOrder::SeqCst()));
+		val snap = _registry_snapshot(&self.registry);
+		var resp: rest.Response = rest.json_response(500, "{\"workflow\":\"error\",\"reason\":\"runner-fatal\"}");
+		try {
+			val outcome = _drive_manifest_request(&self.host, snap.get(), wf, script, has_script, &"", &"{}", args, has_arguments, &adm);
+			resp = _outcome_response(&outcome);
+		} catch unexpected {
+			resp = rest.json_response(500, "{\"workflow\":\"error\",\"reason\":\"runner-fatal\"}");
+		}
+		return move resp;
+	}
+	// POST /v1/workflows/{id}/submit?script=NAME  — body = instance arguments (JSON object).
+	pub fn handle_submit(self: &ServiceApp, req: &rest.Request) throws -> rest.Response {
+		val wf = rest.path_param(req, "id").or_throw();
+		var script = "";
+		var has_script = false;
+		match rest.query_param(req, &"script") { Optional::Some(s) => { script = move s; has_script = true; }, Optional::None => {} }
+		// The submit body MUST be a valid JSON document (the instance arguments — `{}` if none). A
+		// malformed/empty body is a structured 400 BEFORE any drive — never silently coerced to `{}`
+		// (which could create a valid empty-argument workflow for a script that accepts no fields).
+		var args = "";
+		var have_args = false;
+		match rest.body_json(req) { core.Result::Ok(h) => { args = h.encode_compact(); have_args = true; }, core.Result::Err(_) => {} }
+		if !have_args { return rest.json_response(400, "{\"workflow\":\"aborted\",\"reason\":\"malformed_arguments\"}"); }
+		return self.drive(&wf, &script, has_script, &args, true);
+	}
+	// POST /v1/workflows/{id}/resume  — no script, no args; driven strictly by the durable pin.
+	pub fn handle_resume(self: &ServiceApp, req: &rest.Request) throws -> rest.Response {
+		val wf = rest.path_param(req, "id").or_throw();
+		return self.drive(&wf, &"", false, &"", false);
+	}
+	// GET /healthz — liveness (process up).
+	pub fn handle_healthz(self: &ServiceApp, req: &rest.Request) throws -> rest.Response {
+		return rest.json_response(200, "{\"status\":\"ok\"}");
+	}
+	// GET /readyz — readiness: registry loaded AND accepting; draining/stopped -> 503 (LB stops routing).
+	pub fn handle_readyz(self: &ServiceApp, req: &rest.Request) throws -> rest.Response {
+		if self.admission.load(conc.MemoryOrder::SeqCst()) == ADM_ACCEPTING { return rest.json_response(200, "{\"status\":\"ready\"}"); }
+		return rest.json_response(503, "{\"status\":\"draining\"}");
+	}
+}
+
+// The long-running service: `--manifest FILE` [`--port N`]. A second artifact (microflows-service).
+fn service_main(argv: Array<String>) nothrow -> Int {
+	var p = cli.parser("microflows-service", "0.1.0", "Microflows coordinator service (manifest-driven, long-running)");
+	val _ = p.option_string("manifest", "m", "FILE", "deployment manifest (named scripts + shared deployment routing)", true);
+	val _ = p.option_int("port", "p", "PORT", "listening port (default 8088)", false);
+	var manifest_path = "";
+	var port = 8088;
+	match p.parse(argv) {
+		core.Result::Ok(parsed) => {
+			match parsed.get_string("manifest", p) { Some(v) => { manifest_path = _dup(v); }, None => {} }
+			match parsed.get_int("port", p) { Some(v) => { port = v; }, None => {} }
+		},
+		core.Result::Err(_) => { console.eprintln("microflows-service: bad arguments"); return 2; }
+	}
+	return try _service_run(&manifest_path, port) catch unexpected { console.eprintln("microflows-service: fatal"); 1 };
+}
+
+fn _service_run(manifest_path: &String, port: Int) throws -> Int {
+	// Load + validate the WHOLE manifest at startup; refuse to start on any error (fail-fast).
+	var ms_opt: Optional<ManifestSet> = Optional<ManifestSet>::None();
+	try {
+		ms_opt = Optional<ManifestSet>::Some(_load_manifest(manifest_path));
+	} catch RunnerError(e) {
+		console.eprintln("microflows-service: invalid manifest: " + e.message);
+		return 2;
+	}
+	match move ms_opt {
+		Optional::Some(ms) => {
+			// ONE shared, internally-pooled host (from the manifest's deployment db) for all requests.
+			val db_sub = _require_db(&ms.deployment);
+			val worker_id = _config_str(&ms.deployment, &"worker_id", "runner-1");
+			val identity = mf.identity_from_worker_name(&worker_id);
+			var hb = mf.new_host_builder();
+			mf.with_json(&mut hb, &db_sub);
+			mf.with_identity(&mut hb, move identity);
+			val host = _build_host(move hb);
+			// Initial admission from MICROFLOWS_ADMISSION (accepting unless told otherwise); SIGTERM
+			// later flips it to draining at runtime. The drive applies the SAME admission rules.
+			val adm0 = _admission_from_env();
+			val app = conc.arc(ServiceApp(host = move host, registry = conc.mutex(conc.arc(ms)),
+			                              admission = conc.atomic_int(_admission_to_int(&adm0)), manifest_path = _dup(manifest_path)));
+
+			var ab = rest.new_app_builder();
+			rest.bind(ab, "0.0.0.0", port);
+			var web_app = rest.build_app(move ab);
+			// AUTH SEAM (roadmap item 5): the `/v1/workflows` route group is where web.rest auth
+			// middleware / a request security context attaches later. No auth logic now.
+			val wf_rg = rest.add_route_group(web_app, "/v1/workflows").or_throw();
+			rest.add_route_group_throws_route(web_app, wf_rg, "POST", "/{id}/submit",
+				|req, ctx| captures(share app) => { return app.get().handle_submit(req); }).or_throw();
+			rest.add_route_group_throws_route(web_app, wf_rg, "POST", "/{id}/resume",
+				|req, ctx| captures(share app) => { return app.get().handle_resume(req); }).or_throw();
+			rest.add_throws_route(web_app, "GET", "/healthz",
+				|req, ctx| captures(share app) => { return app.get().handle_healthz(req); }).or_throw();
+			rest.add_throws_route(web_app, "GET", "/readyz",
+				|req, ctx| captures(share app) => { return app.get().handle_readyz(req); }).or_throw();
+
+			console.println("microflows-service listening on " + fmt.format_int(port));
+			var running = rest.start(move web_app, conc.Duration(millis = 0));
+			// Signal loop: SIGUSR1 -> staged reload; SIGTERM -> drain (refuse new) + graceful shutdown.
+			var serving = true;
+			while serving {
+				match conc.await_signal() {
+					conc.ProcessSignal::User1 => { val _ = _service_reload(app.get()); },
+					conc.ProcessSignal::Terminate => { app.get().admission.store(ADM_DRAINING, conc.MemoryOrder::SeqCst()); serving = false; },
+					conc.ProcessSignal::Interrupt => { serving = false; }
+				}
+			}
+			console.println("microflows-service draining + shutting down");
+			val _ = rest.shutdown(running);
+			return 0;
+		},
+		Optional::None => { return 2; }
+	}
 }

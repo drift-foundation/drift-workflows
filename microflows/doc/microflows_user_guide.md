@@ -383,7 +383,7 @@ revision(s) your in-flight instances need.
 
 ## 7. Capability envelope & limits
 
-**Supported and proven (integration 149/149, real HTTP + Singular-backed participant):**
+**Supported and proven (integration 158/158, real HTTP + Singular-backed participant):**
 
 - Durable saga: call → settle → **checkpoint** → **compensate on failure** →
   resume after crash → effectively-once execution.

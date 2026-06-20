@@ -59,11 +59,20 @@ manifest resolves the one script and calls the same `_run_cfg` boundary. Full ga
 integration **149/149** (C20: named submit + pin/hash parity, unknown-script refused, fail-fast
 invalid-manifest, resume-by-pin). As-built: `microflows_design.md` §14.
 
-### 3b. ScriptRegistry service shell — *next (the long-running front-door)*
-The thin long-running wrapper: a service that owns the registry, **atomic/staged reload** (SIGHUP/
-SIGUSR1, §4.1), the **admission gate** (item 2), and a submit/resume entry calling **`drive_workflow`
-→ Outcome** (item 2.5) — rendering admission/drain → HTTP 503 and outcomes → HTTP. Now a thin wrapper
-around three landed pieces (registry + admission + the Outcome boundary), not a redesign.
+### 3b. ScriptRegistry service shell — ✅ LANDED (2026-06-20)
+The thin long-running front-door: a second artifact (`microflows-service`) on `web.rest` that owns the
+in-memory **swappable** registry and ONE shared, internally-pooled host, serving submit/resume/health
+over HTTP. Each request calls the SAME `_drive_manifest_request` → `_run_core` (drive_workflow) →
+Outcome the CLI uses — no new workflow semantics; `_run_core` was extracted so the host is built ONCE
+at startup and shared (per-workflow leases/fencing keep concurrent drives safe). Owns runtime-mutable
+admission: **SIGTERM → draining** (then graceful `rest.shutdown`), enforced by the same drive rules
+(fresh submission while draining → Refused → **HTTP 503**; `/readyz` → 503). **Staged reload on
+SIGUSR1**: load+validate a new manifest into a standby, atomically swap on success, keep the old on
+failure. Outcome → semantic HTTP status, body the EXACT Outcome JSON (contract unchanged), so CLI and
+HTTP consumers read identical documents. **Internal API only** — the `/v1/workflows` route group is the
+seam where item-5 auth middleware / a security context attaches (no auth logic built). Full gate green
+— integration **158/158** (C21: health/ready, submit→completed, resume→terminal replay, unknown-script
+400, SIGUSR1 reload swaps the registry, draining→503). As-built: `microflows_design.md` §15.
 
 ### 4. Business-team starter kit
 Examples and fixtures for **realistic workflows** so a new team is productive fast: charge / update /
