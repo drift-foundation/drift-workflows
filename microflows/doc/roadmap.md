@@ -32,15 +32,18 @@ resumes** but a would-be defer returns `{"workflow":"pending_restart",…}` (no 
 the drain converges. Same gate serves reload + graceful shutdown. The future front-door maps
 refused/pending_restart → **HTTP 503** (no `Retry-After` yet). See `microflows_design.md` §13.
 
-### 2.5. `drive_workflow(...) -> Outcome` library extraction — *after admission is proven*
-A **dedicated mechanical refactor**: extract the `_run` drive boundary into a coordinator-library
-`drive_workflow(...) -> Outcome` that **returns** a structured outcome instead of the ~57 inline
-`console.println("{…}")` sites + bare `Int` exit codes. The CLI renders `Outcome` → JSON + exit code;
-the future service renders admission/drain states → HTTP. Admission **already** crosses this boundary
-as a **parameter** (threaded through `_run` → the drive functions → the `_defer*` helpers; the library
-reads no environment), so 2.5 only changes how the OUTCOME is returned. The existing
-**integration suite pins JSON/exit-code compatibility**, making this low-risk but broad — its own slice,
-not bundled with new behavior.
+### 2.5. `drive_workflow(...) -> Outcome` library extraction — ✅ LANDED (2026-06-19)
+The drive now **returns a structured `Outcome`** instead of printing JSON inline. A typed `Outcome`
+variant (`Completed` / `Reversed` / `Deferred` / `Aborted` / `Refused` / `PendingRestart` / … — 17 arms)
+captures every machine-readable status; `_oc_render` is the single source of the JSON and `_oc_exit` the
+single source of the exit code. All ~61 inline `console.println("{…}")` + bare-`Int` sites across the 13
+drive functions (`_run`, `_run_planned`, `_run_forward`, `_run_reversal`, `_compensate` via `CompStep`,
+the `_defer*`/`_fail_operation`/`_reverse_block`/`_inspect_report`/`_report_terminal` helpers) were
+converted to `return Outcome::…`; the CLI adapter (`main`) renders **once** via `_emit`. A future service
+renders the same `Outcome` to HTTP. **Byte-compatible** — JSON shape and exit codes unchanged (the
+integration suite, **142/142**, was the oracle, run on each of the two verifiable passes). The
+`_run`/drive boundary is now the coordinator-library entry the front-door (item 3 / the service) calls
+instead of shelling around the CLI.
 
 ### 3. ScriptRegistry packaging / manifest activation
 Required so app teams deploy **named, pinned workflow revisions** rather than ad-hoc lowered configs.

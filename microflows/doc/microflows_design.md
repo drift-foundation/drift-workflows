@@ -1262,5 +1262,18 @@ converges to `pending_restart` (exit 11) instead of a new defer. Full gate green
 
 `accepting`↔`draining` is driven by an external `MICROFLOWS_ADMISSION` signal; a durable admission
 store, a health endpoint, `Retry-After`, and SIGHUP/SIGTERM handling arrive with the front-door
-service (roadmap items 2.5 / 3 / 5). The legacy single-op submission path is out of scope (deprecated;
+service (roadmap items 3 / 5). The legacy single-op submission path is out of scope (deprecated;
 the planned/graph path is the supported submission surface).
+
+### 13.6 The drive boundary returns a structured `Outcome` (roadmap item 2.5 — LANDED)
+
+The drive functions no longer print JSON inline. A typed **`Outcome`** variant captures every
+machine-readable status (`Completed` / `AlreadyTerminal` / `Reversed` / `ResolvedException` /
+`TerminalState` / `Active` / `Pending` / `PendingRestart` / `Refused` / `Error` / `Failed` / `Aborted` /
+`Deferred` / `DeferFailed` / `Blocked` / `ReverseAborted` / `FailAborted`). `_oc_render` is the **single**
+source of the JSON, `_oc_exit` the single source of the exit code; the CLI adapter (`main`) renders
+once via `_emit`. `_run` is now `throws -> Outcome` — the coordinator-library boundary the future
+front-door SERVICE calls directly (rendering the same `Outcome` to HTTP) instead of shelling around the
+CLI. The conversion was byte-compatible: identical JSON and exit codes, pinned by the integration suite
+(**142/142**) across two verifiable passes (introduce `Outcome` + centralized render; then return it +
+render at `main`). This is the seam item 3 builds the manifest-driven service on.

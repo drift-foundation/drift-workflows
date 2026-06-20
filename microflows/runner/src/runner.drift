@@ -111,23 +111,105 @@ fn _admission_label(a: &AdmissionState) nothrow -> String {
 	}
 }
 
+// ===== Outcome: the structured drive result (roadmap item 2.5) =====
+//
+// Every terminal status the drive can produce is a typed `Outcome`. `_oc_render` is the SINGLE source
+// of the machine-readable JSON; `_oc_exit` the single source of the process exit code. The drive
+// functions return an `Outcome` (no inline `console.println`); the CLI adapter (`main`) renders it
+// once. A future SERVICE renders the same `Outcome` to HTTP. Arms carry an explicit `code` where the
+// exit varies independently of the status (e.g. an `aborted` is 2 / 3 / 8 by cause). JSON shape and
+// exit codes are byte-compatible with the prior inline form (pinned by the integration suite).
+variant Outcome {
+	Completed(operation_id: String, result: String),       // exit 0
+	AlreadyTerminal(operation_id: String, result: String), // exit 0
+	Reversed,                                              // exit 0
+	ResolvedException,                                     // exit 0
+	TerminalState(state: Int),                             // exit 0
+	Active(reason: String),                                // exit 4
+	Pending(reason: String, defer_until: String),          // exit 9
+	PendingRestart(reason: String),                        // exit 11
+	Refused(reason: String),                               // exit 10
+	Error(reason: String),                                 // exit 10
+	Failed(reason: String),                                // exit 3 (disposition blocked_resolution)
+	Aborted(reason: String, code: Int),                    // exit 2 / 3 / 8
+	Deferred(reason: String, defer_until: String, code: Int), // defer_until "" -> omitted; exit 5 / 6 / 9
+	DeferFailed(reason: String, code: Int),                // exit 7 / 8
+	Blocked(reason: String),                               // direction reverse; reason "" -> omitted; exit 3
+	ReverseAborted(reason: String, code: Int),             // exit 7 / 8
+	FailAborted(reason: String, code: Int)                 // exit 7 / 8
+}
+
+fn _oc_render(o: &Outcome) nothrow -> String {
+	match o {
+		Outcome::Completed(operation_id, result) => { return "{\"workflow\":\"completed\",\"operation_id\":\"" + _dup(operation_id) + "\",\"result\":" + _dup(result) + "}"; },
+		Outcome::AlreadyTerminal(operation_id, result) => { return "{\"workflow\":\"already_terminal\",\"operation_id\":\"" + _dup(operation_id) + "\",\"result\":" + _dup(result) + "}"; },
+		Outcome::Reversed() => { return "{\"workflow\":\"reversed\"}"; },
+		Outcome::ResolvedException() => { return "{\"workflow\":\"resolved_exception\"}"; },
+		Outcome::TerminalState(state) => { return "{\"workflow\":\"terminal\",\"state\":" + fmt.format_int(state) + "}"; },
+		Outcome::Active(reason) => { return "{\"workflow\":\"active\",\"reason\":\"" + _dup(reason) + "\"}"; },
+		Outcome::Pending(reason, defer_until) => { return "{\"workflow\":\"pending\",\"reason\":\"" + _dup(reason) + "\",\"defer_until\":\"" + _dup(defer_until) + "\"}"; },
+		Outcome::PendingRestart(reason) => { return "{\"workflow\":\"pending_restart\",\"reason\":\"" + _dup(reason) + "\"}"; },
+		Outcome::Refused(reason) => { return "{\"workflow\":\"refused\",\"reason\":\"" + _dup(reason) + "\"}"; },
+		Outcome::Error(reason) => { return "{\"workflow\":\"error\",\"reason\":\"" + _dup(reason) + "\"}"; },
+		Outcome::Failed(reason) => { return "{\"workflow\":\"failed\",\"reason\":\"" + _dup(reason) + "\",\"disposition\":\"blocked_resolution\"}"; },
+		Outcome::Aborted(reason, code) => { return "{\"workflow\":\"aborted\",\"reason\":\"" + _dup(reason) + "\"}"; },
+		Outcome::Deferred(reason, defer_until, code) => {
+			if defer_until.byte_length() == 0 { return "{\"workflow\":\"deferred\",\"reason\":\"" + _dup(reason) + "\"}"; }
+			return "{\"workflow\":\"deferred\",\"reason\":\"" + _dup(reason) + "\",\"defer_until\":\"" + _dup(defer_until) + "\"}";
+		},
+		Outcome::DeferFailed(reason, code) => { return "{\"workflow\":\"defer_failed\",\"reason\":\"" + _dup(reason) + "\"}"; },
+		Outcome::Blocked(reason) => {
+			if reason.byte_length() == 0 { return "{\"workflow\":\"blocked\",\"direction\":\"reverse\"}"; }
+			return "{\"workflow\":\"blocked\",\"direction\":\"reverse\",\"reason\":\"" + _dup(reason) + "\"}";
+		},
+		Outcome::ReverseAborted(reason, code) => { return "{\"workflow\":\"reverse_aborted\",\"reason\":\"" + _dup(reason) + "\"}"; },
+		Outcome::FailAborted(reason, code) => { return "{\"workflow\":\"fail_aborted\",\"reason\":\"" + _dup(reason) + "\"}"; }
+	}
+}
+
+fn _oc_exit(o: &Outcome) nothrow -> Int {
+	match o {
+		Outcome::Completed(operation_id, result) => { return 0; },
+		Outcome::AlreadyTerminal(operation_id, result) => { return 0; },
+		Outcome::Reversed() => { return 0; },
+		Outcome::ResolvedException() => { return 0; },
+		Outcome::TerminalState(state) => { return 0; },
+		Outcome::Active(reason) => { return 4; },
+		Outcome::Pending(reason, defer_until) => { return 9; },
+		Outcome::PendingRestart(reason) => { return ADMISSION_PENDING_RESTART_EXIT; },
+		Outcome::Refused(reason) => { return ADMISSION_REFUSED_EXIT; },
+		Outcome::Error(reason) => { return 10; },
+		Outcome::Failed(reason) => { return 3; },
+		Outcome::Aborted(reason, code) => { return code; },
+		Outcome::Deferred(reason, defer_until, code) => { return code; },
+		Outcome::DeferFailed(reason, code) => { return code; },
+		Outcome::Blocked(reason) => { return 3; },
+		Outcome::ReverseAborted(reason, code) => { return code; },
+		Outcome::FailAborted(reason, code) => { return code; }
+	}
+}
+
+// PASS-A adapter: render the outcome and return its exit code, preserving the prior inline behavior
+// EXACTLY. (Pass B moves the render to `main` and lets the drive functions return `Outcome` directly.)
+fn _emit(o: Outcome) nothrow -> Int {
+	console.println(_oc_render(&o));
+	return _oc_exit(&o);
+}
+
 // While draining/stopped, a resume that cannot finish RELEASES the lease at `now` (no future retry
 // scheduled) and reports a clear `pending_restart` outcome — so the drain does not keep generating
 // retry work. The workflow stays in its durable state, resumable once admission returns to accepting.
-fn _drain_release(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, a: &AdmissionState) -> Int {
+fn _drain_release(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, a: &AdmissionState) -> Outcome {
 	val clock = host.clock_read(LEASE_SECONDS);
 	match host.release(workflow_id, fencing_token, &clock.now, &clock.now) {
 		mf.ReleaseOutcome::Released => {
-			console.println("{\"workflow\":\"pending_restart\",\"reason\":\"" + _admission_label(a) + "\"}");
-			return ADMISSION_PENDING_RESTART_EXIT;
+			return Outcome::PendingRestart(reason = _admission_label(a));
 		},
 		mf.ReleaseOutcome::FenceLost => {
-			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_fence_lost\"}");
-			return 7;
+			return Outcome::DeferFailed(reason = "release_fence_lost", code = 7);
 		},
 		default => {
-			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_not_found\"}");
-			return 7;
+			return Outcome::DeferFailed(reason = "release_not_found", code = 7);
 		}
 	}
 }
@@ -206,7 +288,7 @@ struct PinView {
 // Terminal with the process exit code (reversed / deferred / blocked / fenced).
 variant CompStep {
 	Continue,
-	Terminal(exit_code: Int)
+	Terminal(exit_code: Outcome)
 }
 
 fn main(argv: Array<String>) nothrow -> Int {
@@ -262,11 +344,17 @@ fn main(argv: Array<String>) nothrow -> Int {
 	// The CLI (front-door stand-in) reads the admission state from the environment and passes it to
 	// the drive boundary. A future service would translate admission into HTTP 503 and own reload/
 	// shutdown; it calls the same `_run`/drive_workflow boundary with admission as a parameter.
+	// `_run` RETURNS a structured `Outcome`; the CLI adapter renders it (machine-readable JSON to
+	// stdout + a process exit code) exactly once here. A service would render the same Outcome to HTTP.
 	val admission = _admission_from_env();
-	return try _run(&config_path, &workflow_hex, &operation_name, &input_json, &arguments_json, has_arguments, &admission) catch {
+	var outcome: Outcome = Outcome::Error(reason = "runner-fatal");
+	try {
+		outcome = _run(&config_path, &workflow_hex, &operation_name, &input_json, &arguments_json, has_arguments, &admission);
+	} catch unexpected {
 		console.eprintln("runner: fatal");
-		1
-	};
+		return 1;
+	}
+	return _emit(outcome);
 }
 
 // Build the registry from --config and print the active revision's content_hash (hex). DB-free
@@ -362,7 +450,7 @@ fn _read_text(path: &String) throws -> String {
 
 fn _run(config_path: &String, workflow_hex: &String,
         operation_name: &String, input_json: &String,
-        arguments_json: &String, has_arguments: Bool, admission: &AdmissionState) throws -> Int {
+        arguments_json: &String, has_arguments: Bool, admission: &AdmissionState) throws -> Outcome {
 	val cfg = _load_config_json(config_path);
 	val db_sub = _require_db(&cfg);
 	val worker_id = _config_str(&cfg, &"worker_id", "runner-1");
@@ -412,8 +500,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 	// 503. This is the boundary the future `drive_workflow` library exposes (see the AdmissionState
 	// note above).
 	if !_admission_accepting(admission) and is_submission and !pin.present {
-		console.println("{\"workflow\":\"refused\",\"reason\":\"" + _admission_label(admission) + "\"}");
-		return ADMISSION_REFUSED_EXIT;
+		return Outcome::Refused(reason = _admission_label(admission));
 	}
 	if pin.present {
 		// Existing planned workflow: resume, or REASSERT if this is a submission (so a reused
@@ -426,8 +513,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 		if _is_planned_config(&cfg) {
 			return _run_planned(host.get(), &cfg, &workflow_id, &workflow_canon_hex, &pin, true, arguments_json, admission);
 		}
-		console.println("{\"workflow\":\"aborted\",\"reason\":\"arguments_require_planned_config\"}");
-		return 2;
+		return Outcome::Aborted(reason = "arguments_require_planned_config", code = 2);
 	}
 	// No durable pin and no --arguments: a RESUME (or legacy). A planned config ("plan" or
 	// "graph") => a resume of a planned workflow (which, absent a pin, claim resolves to
@@ -486,8 +572,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 			console.eprintln(e.message);
 		}
 		if !ok {
-			console.println("{\"workflow\":\"aborted\",\"reason\":\"operation_unresolvable\"}");
-			return 2;
+			return Outcome::Aborted(reason = "operation_unresolvable", code = 2);
 		}
 	}
 
@@ -516,8 +601,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 			// Resume by id, but the workflow does not exist -> nothing to resume.
 			// Authoritative (a non-existent workflow has no in-flight request, so
 			// this is NOT the probe race). No lease was taken.
-			console.println("{\"workflow\":\"aborted\",\"reason\":\"operation_required\"}");
-			return 2;
+			return Outcome::Aborted(reason = "operation_required", code = 2);
 		},
 		mf.ClaimByIdOutcome::NotClaimable => {
 			// Not claimable: INSPECT to distinguish terminal / active / deferred.
@@ -591,12 +675,10 @@ fn _run(config_path: &String, workflow_hex: &String,
 		mf.OperationRequestOutcome::Exists(_) => {},
 		mf.OperationRequestOutcome::FenceLost => {
 			// Requirement 2: lost the fence -> STOP, do NOT dispatch.
-			console.println("{\"workflow\":\"aborted\",\"reason\":\"request_fence_lost\"}");
-			return 3;
+			return Outcome::Aborted(reason = "request_fence_lost", code = 3);
 		},
 		mf.OperationRequestOutcome::OperationConflict => {
-			console.println("{\"workflow\":\"aborted\",\"reason\":\"operation_conflict\"}");
-			return 3;
+			return Outcome::Aborted(reason = "operation_conflict", code = 3);
 		},
 		mf.OperationRequestOutcome::EventTimeSkew(defer_until) => {
 			// Non-increasing timestamp = clock skew: release/defer until the last
@@ -638,8 +720,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 			final_result = move r;
 		},
 		mf.OperationSettleOutcome::FenceLost => {
-			console.println("{\"workflow\":\"aborted\",\"reason\":\"settle_fence_lost\"}");
-			return 3;
+			return Outcome::Aborted(reason = "settle_fence_lost", code = 3);
 		},
 		mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
 			return _defer(host.get(), &workflow_id, fencing_token, &defer_until, "settle_event_time_skew", admission);
@@ -649,8 +730,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 		}
 	}
 
-	console.println("{\"workflow\":\"completed\",\"operation_id\":\"" + operation_id_hex + "\",\"result\":" + final_result + "}");
-	return 0;
+	return Outcome::Completed(operation_id = _dup(&operation_id_hex), result = _dup(&final_result));
 }
 
 // ===== manual-IR forward PLAN execution (multi-operation) =====
@@ -667,7 +747,7 @@ fn _run(config_path: &String, workflow_hex: &String,
 // a claimed REVERSING workflow unwinds instead.
 fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
                 workflow_canon_hex: &String, storage_pin: &PinView,
-                is_submission: Bool, args_json: &String, admission: &AdmissionState) -> Int {
+                is_submission: Bool, args_json: &String, admission: &AdmissionState) -> Outcome {
 	var pin_name: String = _dup(&storage_pin.name);
 	var pin_version: String = _dup(&storage_pin.version);
 	var pin_hash_hex: String = _dup(&storage_pin.hash_hex);
@@ -706,8 +786,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 			console.eprintln(e.message);
 		}
 		if !cfg_ok {
-			console.println("{\"workflow\":\"aborted\",\"reason\":\"invalid_config\"}");
-			return 2;
+			return Outcome::Aborted(reason = "invalid_config", code = 2);
 		}
 		reg_ready = true;
 		// Resolve the active generation by the CONFIGURED plan name (not a constant), so
@@ -717,8 +796,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		var aidx = 0;
 		match _registry_active(&reg, &active_name) { Optional::Some(i) => { aidx = i; has_active = true; }, Optional::None => {} }
 		if !has_active {
-			console.println("{\"workflow\":\"aborted\",\"reason\":\"no_active_revision\"}");
-			return 2;
+			return Outcome::Aborted(reason = "no_active_revision", code = 2);
 		}
 		// VALIDATE the submitted instance arguments against the script's DECLARED argument type
 		// BEFORE creating any durable state — but ONLY when creation may actually occur, i.e. a
@@ -737,8 +815,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 			}
 			match args_err {
 				Optional::Some(_) => {
-					console.println("{\"workflow\":\"aborted\",\"reason\":\"invalid_arguments\"}");
-					return 2;
+					return Outcome::Aborted(reason = "invalid_arguments", code = 2);
 				},
 				Optional::None => {}
 			}
@@ -757,14 +834,12 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// The workflow_id exists under a CONTRADICTORY identity — a legacy non-plan
 				// workflow, OR a DIFFERENT plan name (id collision across plans). No pin to
 				// adopt; no lease taken; report + stop.
-				console.println("{\"workflow\":\"deferred\",\"reason\":\"plan_conflict\"}");
-				return 9;
+				return Outcome::Deferred(reason = "plan_conflict", defer_until = "", code = 9);
 			},
 			mf.CreatePlannedOutcome::WorkflowConflict(_) => {
 				// Same plan name reused with DIFFERENT instance arguments — a different
 				// instance, not an adoptable winner. No lease taken; report + stop.
-				console.println("{\"workflow\":\"deferred\",\"reason\":\"workflow_conflict\"}");
-				return 9;
+				return Outcome::Deferred(reason = "workflow_conflict", defer_until = "", code = 9);
 			}
 		}
 	}
@@ -781,8 +856,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 			// fault. A RESUME (no --arguments) of a workflow that does not exist is simply
 			// not-found — report + stop, never create.
 			if is_submission { throw RunnerError(message = "workflow absent after create"); }
-			console.println("{\"workflow\":\"aborted\",\"reason\":\"not_found\"}");
-			return 2;
+			return Outcome::Aborted(reason = "not_found", code = 2);
 		},
 		mf.ClaimByIdOutcome::NotClaimable => { not_claimable = true; }
 	}
@@ -807,8 +881,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 					val rclk = host.clock_read(PENDING_RETRY_SECONDS);
 					match host.release(workflow_id, fencing_token, &rclk.now, &rclk.deadline) { default => {} }
 				}
-				console.println("{\"workflow\":\"aborted\",\"reason\":\"not_found\"}");
-				return 2;
+				return Outcome::Aborted(reason = "not_found", code = 2);
 			}
 		}
 	}
@@ -1268,7 +1341,7 @@ fn _lp(s: &String) nothrow -> String {
 // compensated, and with none (e.g. the FIRST operation rejected) it reaches `reversed`
 // immediately — never `blocked_resolution` for a definite forward rejection.
 fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
-                workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int, admission: &AdmissionState) -> Int {
+                workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int, admission: &AdmissionState) -> Outcome {
 	val n = plan_length;
 	var final_result: String = "{}";
 	var last_op_id_hex: String = "";
@@ -1304,8 +1377,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// All operations settled. Report completion per the existing final-op result
 				// rules (the LAST settled op's result + its operation_id), NOT the graph's unit
 				// return value.
-				console.println("{\"workflow\":\"completed\",\"operation_id\":\"" + last_op_id_hex + "\",\"result\":" + final_result + "}");
-				return 0;
+				return Outcome::Completed(operation_id = _dup(&last_op_id_hex), result = _dup(&final_result));
 			},
 			ir.StepOutcome::Fault(m) => {
 				// A validated graph should not Fault here. Treat defensively — never execute on a
@@ -1388,18 +1460,15 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 					mf.OperationRequestOutcome::Requested(_) => {},
 					mf.OperationRequestOutcome::Exists(_) => {},
 					mf.OperationRequestOutcome::FenceLost => {
-						console.println("{\"workflow\":\"aborted\",\"reason\":\"request_fence_lost\"}");
-						return 3;
+						return Outcome::Aborted(reason = "request_fence_lost", code = 3);
 					},
 					mf.OperationRequestOutcome::OperationConflict => {
-						console.println("{\"workflow\":\"aborted\",\"reason\":\"operation_conflict\"}");
-						return 3;
+						return Outcome::Aborted(reason = "operation_conflict", code = 3);
 					},
 					mf.OperationRequestOutcome::PlanViolation(reason) => {
 						// The request is out of the pinned plan (seq range / predecessor not
 						// settled). Stop BEFORE dispatch — never a remote side effect out of order.
-						console.println("{\"workflow\":\"aborted\",\"reason\":\"request_plan_violation:" + move reason + "\"}");
-						return 8;
+						return Outcome::Aborted(reason = "request_plan_violation:" + move reason, code = 8);
 					},
 					mf.OperationRequestOutcome::EventTimeSkew(defer_until) => {
 						return _defer(host, workflow_id, fencing_token, &defer_until, "request_event_time_skew", admission);
@@ -1431,14 +1500,12 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 								final_result = move res;
 							},
 							mf.OperationSettleOutcome::FenceLost => {
-								console.println("{\"workflow\":\"aborted\",\"reason\":\"settle_fence_lost\"}");
-								return 3;
+								return Outcome::Aborted(reason = "settle_fence_lost", code = 3);
 							},
 							mf.OperationSettleOutcome::PlanViolation(reason) => {
 								// The settle is outside the pinned plan (seq/checkpoint/finality): a
 								// runner/plan inconsistency, never silently settle. Stop and report.
-								console.println("{\"workflow\":\"aborted\",\"reason\":\"settle_plan_violation:" + move reason + "\"}");
-								return 8;
+								return Outcome::Aborted(reason = "settle_plan_violation:" + move reason, code = 8);
 							},
 							mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
 								return _defer(host, workflow_id, fencing_token, &defer_until, "settle_event_time_skew", admission);
@@ -1476,7 +1543,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 // begin_reversal requires.
 fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
                           workflow_canon_hex: &String, fencing_token: Int, operation_seq: Int,
-                          operation_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Int {
+                          operation_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Outcome {
 	val t = _now(host);
 	match host.begin_reversal(workflow_id, fencing_token, operation_seq, operation_id, &t, &reason) {
 		mf.BeginReversalOutcome::Reversing(_) => {
@@ -1484,8 +1551,7 @@ fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflo
 		},
 		mf.BeginReversalOutcome::Reversed => {
 			// No active checkpoints: a trivial unwind (nothing to compensate).
-			console.println("{\"workflow\":\"reversed\"}");
-			return 0;
+			return Outcome::Reversed();
 		},
 		mf.BeginReversalOutcome::AlreadyBegun(state) => {
 			// Idempotent replay of a committed begin: resume from the recorded state.
@@ -1493,15 +1559,12 @@ fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflo
 				return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 			}
 			if state == STATE_REVERSED {
-				console.println("{\"workflow\":\"reversed\"}");
-				return 0;
+				return Outcome::Reversed();
 			}
-			console.println("{\"workflow\":\"blocked\",\"direction\":\"reverse\"}");
-			return 3;
+			return Outcome::Blocked(reason = "");
 		},
 		mf.BeginReversalOutcome::FenceLost => {
-			console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"begin_reversal_fence_lost\"}");
-			return 7;
+			return Outcome::ReverseAborted(reason = "begin_reversal_fence_lost", code = 7);
 		},
 		mf.BeginReversalOutcome::EventTimeSkew(defer_until) => {
 			return _defer(host, workflow_id, fencing_token, &defer_until, "begin_reversal_skew", admission);
@@ -1510,8 +1573,7 @@ fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflo
 			// trigger_mismatch / operation_not_found / operation_conflict /
 			// operation_not_failed / not_found: a durable-state inconsistency, not a
 			// retryable condition. Report and stop.
-			console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"begin_reversal_precondition\"}");
-			return 8;
+			return Outcome::ReverseAborted(reason = "begin_reversal_precondition", code = 8);
 		}
 	}
 }
@@ -1654,7 +1716,7 @@ fn _reconcile_after_resubmit(base: &String, operation_name: &String, operation_i
 // Workflow not claimable: inspect to distinguish terminal / active / deferred,
 // and report. Terminal -> replay the LOCAL authoritative result (Microflows
 // already persisted it; no dependency on the participant being reachable).
-fn _inspect_report(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, operation_id_hex: &String, result_seq: Int) -> Int {
+fn _inspect_report(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, operation_id_hex: &String, result_seq: Int) -> Outcome {
 	val now = _now(host);
 	match host.inspect_workflow(workflow_id, &now) {
 		mf.WorkflowInspectOutcome::Found(snap) => {
@@ -1662,11 +1724,9 @@ fn _inspect_report(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, operatio
 				return _report_terminal(host, workflow_id, &snap, operation_id_hex, result_seq);
 			}
 			if snap.leased {
-				console.println("{\"workflow\":\"active\",\"reason\":\"leased_by_another\"}");
-				return 4;
+				return Outcome::Active(reason = "leased_by_another");
 			}
-			console.println("{\"workflow\":\"deferred\",\"reason\":\"not_yet_due_or_blocked\"}");
-			return 5;
+			return Outcome::Deferred(reason = "not_yet_due_or_blocked", defer_until = "", code = 5);
 		},
 		mf.WorkflowInspectOutcome::NotFound => {
 			throw RunnerError(message = "workflow vanished during inspect");
@@ -1678,46 +1738,40 @@ fn _inspect_report(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, operatio
 // result; `reversed` and `resolved_exception` are terminal WITHOUT a forward
 // success, so they must not assume one.
 fn _report_terminal(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>,
-                    snap: &mf.WorkflowSnapshot, operation_id_hex: &String, result_seq: Int) -> Int {
+                    snap: &mf.WorkflowSnapshot, operation_id_hex: &String, result_seq: Int) -> Outcome {
 	if snap.state_code == STATE_COMPLETED {
 		// The authoritative completed result is the LAST operation's (the plan may
 		// have run several); a single-op workflow's last seq is 1.
 		match host.operation_result(workflow_id, result_seq) {
 			mf.OperationResultOutcome::Succeeded(r) => {
-				console.println("{\"workflow\":\"already_terminal\",\"operation_id\":\"" + _dup(operation_id_hex) + "\",\"result\":" + r + "}");
-				return 0;
+				return Outcome::AlreadyTerminal(operation_id = _dup(operation_id_hex), result = move r);
 			},
 			mf.OperationResultOutcome::Requested => {
 				// COMPLETED but the operation has only a request, no settled result:
 				// inconsistent durable state. A completed workflow MUST carry its
 				// forward result — this is an error, not a success.
-				console.println("{\"workflow\":\"error\",\"reason\":\"completed_operation_unsettled\"}");
-				return 10;
+				return Outcome::Error(reason = "completed_operation_unsettled");
 			},
 			mf.OperationResultOutcome::NotFound => {
 				// COMPLETED but no operation row at all: corrupted durable state.
-				console.println("{\"workflow\":\"error\",\"reason\":\"completed_without_operation\"}");
-				return 10;
+				return Outcome::Error(reason = "completed_without_operation");
 			}
 		}
 	}
 	if snap.state_code == STATE_REVERSED {
-		console.println("{\"workflow\":\"reversed\"}");
-		return 0;
+		return Outcome::Reversed();
 	}
 	if snap.state_code == STATE_RESOLVED_EXCEPTION {
-		console.println("{\"workflow\":\"resolved_exception\"}");
-		return 0;
+		return Outcome::ResolvedException();
 	}
-	console.println("{\"workflow\":\"terminal\",\"state\":" + fmt.format_int(snap.state_code) + "}");
-	return 0;
+	return Outcome::TerminalState(state = snap.state_code);
 }
 
 // Operation pending (202/working) or participant unreachable: durably defer by
 // releasing the lease with a near-term next-attempt, so the workflow becomes
 // due again and re-polls. Reports only on a committed release (else a distinct
 // defer_failed outcome — never claim a transition that did not happen).
-fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, admission: &AdmissionState) -> Int {
+fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, admission: &AdmissionState) -> Outcome {
 	// Admission (slice 2): while draining/stopped, do NOT schedule new retry work — release at now
 	// and report pending_restart so the drain converges. Admission is THREADED from the drive
 	// boundary (`_run`), so a library caller passing Draining is honored without any env dependency.
@@ -1727,16 +1781,13 @@ fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 	val clock = host.clock_read(PENDING_RETRY_SECONDS);
 	match host.release(workflow_id, fencing_token, &clock.now, &clock.deadline) {
 		mf.ReleaseOutcome::Released => {
-			console.println("{\"workflow\":\"pending\",\"reason\":\"operation_pending\",\"defer_until\":\"" + _dup(&clock.deadline) + "\"}");
-			return 9;
+			return Outcome::Pending(reason = "operation_pending", defer_until = _dup(&clock.deadline));
 		},
 		mf.ReleaseOutcome::FenceLost => {
-			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_fence_lost\"}");
-			return 7;
+			return Outcome::DeferFailed(reason = "release_fence_lost", code = 7);
 		},
 		mf.ReleaseOutcome::NotFound => {
-			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_not_found\"}");
-			return 8;
+			return Outcome::DeferFailed(reason = "release_not_found", code = 8);
 		}
 	}
 }
@@ -1747,22 +1798,19 @@ fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 // release actually COMMITS; a failed release yields a distinct outcome (never
 // claim a durable transition that did not happen).
 fn _defer(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
-          defer_until: &String, reason: String, admission: &AdmissionState) -> Int {
+          defer_until: &String, reason: String, admission: &AdmissionState) -> Outcome {
 	// Admission (slice 2): suppress new defers while draining/stopped (see _defer_pending).
 	if !_admission_accepting(admission) { return _drain_release(host, workflow_id, fencing_token, admission); }
 	val clock = host.clock_read(LEASE_SECONDS);
 	match host.release(workflow_id, fencing_token, &clock.now, defer_until) {
 		mf.ReleaseOutcome::Released => {
-			console.println("{\"workflow\":\"deferred\",\"reason\":\"" + move reason + "\",\"defer_until\":\"" + _dup(defer_until) + "\"}");
-			return 6;
+			return Outcome::Deferred(reason = move reason, defer_until = _dup(defer_until), code = 6);
 		},
 		mf.ReleaseOutcome::FenceLost => {
-			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_fence_lost\"}");
-			return 7;
+			return Outcome::DeferFailed(reason = "release_fence_lost", code = 7);
 		},
 		mf.ReleaseOutcome::NotFound => {
-			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"release_not_found\"}");
-			return 8;
+			return Outcome::DeferFailed(reason = "release_not_found", code = 8);
 		}
 	}
 }
@@ -1773,22 +1821,19 @@ fn _defer(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: In
 // absolute future next_attempt, and appends an 'operation_dispatch_deferred'
 // audit event with the reason on ENTRY into the wait condition (deduped on
 // retry), so restoring config auto-recovers it — NOT a failure, NOT blocked.
-fn _defer_dispatch(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, reason: String, admission: &AdmissionState) -> Int {
+fn _defer_dispatch(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, reason: String, admission: &AdmissionState) -> Outcome {
 	// Admission (slice 2): suppress new dispatch defers while draining/stopped (see _defer_pending).
 	if !_admission_accepting(admission) { return _drain_release(host, workflow_id, fencing_token, admission); }
 	val clock = host.clock_read(DISPATCH_DEFER_SECONDS);
 	match host.defer_dispatch(workflow_id, fencing_token, &clock.now, &clock.deadline, &clock.now, &reason) {
 		mf.ReleaseOutcome::Released => {
-			console.println("{\"workflow\":\"deferred\",\"reason\":\"" + move reason + "\",\"defer_until\":\"" + _dup(&clock.deadline) + "\"}");
-			return 9;
+			return Outcome::Deferred(reason = move reason, defer_until = _dup(&clock.deadline), code = 9);
 		},
 		mf.ReleaseOutcome::FenceLost => {
-			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"defer_fence_lost\"}");
-			return 7;
+			return Outcome::DeferFailed(reason = "defer_fence_lost", code = 7);
 		},
 		mf.ReleaseOutcome::NotFound => {
-			console.println("{\"workflow\":\"defer_failed\",\"reason\":\"defer_not_found\"}");
-			return 8;
+			return Outcome::DeferFailed(reason = "defer_not_found", code = 8);
 		}
 	}
 }
@@ -1800,35 +1845,29 @@ fn _defer_dispatch(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_
 // forward(1) -> blocked_resolution(3) (disposition failed) and clears the lease,
 // so the workflow stops advancing forward. Idempotent (AlreadyBlocked).
 fn _fail_operation(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
-                   operation_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Int {
+                   operation_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Outcome {
 	val t = _now(host);
 	val cont = "{\"pos\":\"op:1:failed\"}";
 	val payload = "{\"reason\":\"" + _dup(&reason) + "\",\"kind\":\"non_retryable_failure\"}";
 	match host.operation_fail(workflow_id, fencing_token, OPERATION_SEQ, operation_id, &cont, &t, &payload) {
 		mf.OperationFailOutcome::Blocked => {
-			console.println("{\"workflow\":\"failed\",\"reason\":\"" + move reason + "\",\"disposition\":\"blocked_resolution\"}");
-			return 3;
+			return Outcome::Failed(reason = move reason);
 		},
 		mf.OperationFailOutcome::AlreadyBlocked => {
 			// Idempotent replay of the same non-retryable failure.
-			console.println("{\"workflow\":\"failed\",\"reason\":\"" + move reason + "\",\"disposition\":\"blocked_resolution\"}");
-			return 3;
+			return Outcome::Failed(reason = move reason);
 		},
 		mf.OperationFailOutcome::FenceLost => {
-			console.println("{\"workflow\":\"fail_aborted\",\"reason\":\"fail_fence_lost\"}");
-			return 7;
+			return Outcome::FailAborted(reason = "fail_fence_lost", code = 7);
 		},
 		mf.OperationFailOutcome::OperationConflict => {
-			console.println("{\"workflow\":\"fail_aborted\",\"reason\":\"fail_operation_conflict\"}");
-			return 7;
+			return Outcome::FailAborted(reason = "fail_operation_conflict", code = 7);
 		},
 		mf.OperationFailOutcome::NotFound => {
-			console.println("{\"workflow\":\"fail_aborted\",\"reason\":\"fail_workflow_not_found\"}");
-			return 8;
+			return Outcome::FailAborted(reason = "fail_workflow_not_found", code = 8);
 		},
 		mf.OperationFailOutcome::OperationNotFound => {
-			console.println("{\"workflow\":\"fail_aborted\",\"reason\":\"fail_operation_not_found\"}");
-			return 8;
+			return Outcome::FailAborted(reason = "fail_operation_not_found", code = 8);
 		},
 		mf.OperationFailOutcome::EventTimeSkew(defer_until) => {
 			return _defer(host, workflow_id, fencing_token, &defer_until, "fail_event_time_skew", admission);
@@ -1881,20 +1920,17 @@ fn _compensation_for(cfg: &json.JsonNode, fwd_op: &String) -> Optional<Compensat
 
 // Enter blocked_resolution (reverse direction) when a compensation cannot continue.
 fn _reverse_block(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
-                  seq: Int, rev_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Int {
+                  seq: Int, rev_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Outcome {
 	val ts = _now(host);
 	match host.reverse_block(workflow_id, fencing_token, seq, rev_id, 2, &reason, &ts) {
 		mf.ReverseBlockOutcome::Blocked => {
-			console.println("{\"workflow\":\"blocked\",\"direction\":\"reverse\",\"reason\":\"" + move reason + "\"}");
-			return 3;
+			return Outcome::Blocked(reason = move reason);
 		},
 		mf.ReverseBlockOutcome::AlreadyBlocked => {
-			console.println("{\"workflow\":\"blocked\",\"direction\":\"reverse\",\"reason\":\"" + move reason + "\"}");
-			return 3;
+			return Outcome::Blocked(reason = move reason);
 		},
 		mf.ReverseBlockOutcome::FenceLost => {
-			console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"block_fence_lost\"}");
-			return 7;
+			return Outcome::ReverseAborted(reason = "block_fence_lost", code = 7);
 		},
 		mf.ReverseBlockOutcome::EventTimeSkew(defer_until) => {
 			// Time-disciplined like every transition: defer to the supplied deadline
@@ -1902,8 +1938,7 @@ fn _reverse_block(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 			return _defer(host, workflow_id, fencing_token, &defer_until, "reverse_block_skew", admission);
 		},
 		default => {
-			console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"reverse_block_failed\"}");
-			return 8;
+			return Outcome::ReverseAborted(reason = "reverse_block_failed", code = 8);
 		}
 	}
 }
@@ -1931,21 +1966,18 @@ fn _compensate(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_toke
 			val ts = _now(host);
 			match host.reverse_settle(workflow_id, fencing_token, seq, rev_id, &result, &ts) {
 				mf.ReverseSettleOutcome::Reversed => {
-					console.println("{\"workflow\":\"reversed\"}");
-					return CompStep::Terminal(0);
+					return CompStep::Terminal(Outcome::Reversed());
 				},
 				mf.ReverseSettleOutcome::Reversing(_) => { return CompStep::Continue(); },
 				mf.ReverseSettleOutcome::AlreadyReversed => { return CompStep::Continue(); },
 				mf.ReverseSettleOutcome::FenceLost => {
-					console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"settle_fence_lost\"}");
-					return CompStep::Terminal(7);
+					return CompStep::Terminal(Outcome::ReverseAborted(reason = "settle_fence_lost", code = 7));
 				},
 				mf.ReverseSettleOutcome::EventTimeSkew(defer_until) => {
 					return CompStep::Terminal(_defer(host, workflow_id, fencing_token, &defer_until, "reverse_settle_skew", admission));
 				},
 				default => {
-					console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"reverse_settle_failed\"}");
-					return CompStep::Terminal(8);
+					return CompStep::Terminal(Outcome::ReverseAborted(reason = "reverse_settle_failed", code = 8));
 				}
 			}
 		},
@@ -1965,7 +1997,7 @@ fn _compensate(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_toke
 // dispatch via the generic dispatcher -> settle/descend, defer on pending, block on
 // definite rejection. Terminal reversed clears the lease.
 fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
-                 workflow_canon_hex: &String, fencing_token: Int, admission: &AdmissionState) -> Int {
+                 workflow_canon_hex: &String, fencing_token: Int, admission: &AdmissionState) -> Outcome {
 	while true {
 		match host.reverse_head(workflow_id) {
 			mf.ReverseHeadOutcome::NoneActive => {
@@ -2015,15 +2047,13 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 					mf.ReverseRequestOutcome::BindingConflict => {},   // persisted binding wins -> re-read head
 					mf.ReverseRequestOutcome::CheckpointInactive(_) => {},  // already advanced -> re-read head
 					mf.ReverseRequestOutcome::FenceLost => {
-						console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"reverse_request_fence_lost\"}");
-						return 7;
+						return Outcome::ReverseAborted(reason = "reverse_request_fence_lost", code = 7);
 					},
 					mf.ReverseRequestOutcome::EventTimeSkew(defer_until) => {
 						return _defer(host, workflow_id, fencing_token, &defer_until, "reverse_request_skew", admission);
 					},
 					default => {
-						console.println("{\"workflow\":\"reverse_aborted\",\"reason\":\"reverse_request_failed\"}");
-						return 8;
+						return Outcome::ReverseAborted(reason = "reverse_request_failed", code = 8);
 					}
 				}
 				if ready {
