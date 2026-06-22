@@ -58,10 +58,24 @@ _test-locked:
 	echo "[singular] test drift binding"
 	( cd drift && just _test-grouped "{{DB_HELD_GROUP}}" )
 
-# Foundation stress/perf gate stubs (populate as scenarios land).
+# Certification STRESS gate: lease-contention + idempotent-replay under concurrency. Acquires the
+# shared DB lock, loads schema, runs the scenario (it spawns its own worker fan-out internally).
 stress:
-	@echo "[singular] no stress scenarios defined yet (gate stub)"
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 -- just _stress-locked
 
+_stress-locked:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	echo "[singular] load schema"
+	just _db-load-schema
+	echo "[singular] stress drift binding"
+	( cd drift && just _stress-grouped "{{DB_HELD_GROUP}}" )
+
+# Foundation perf gate stub (populate as scenarios land).
 perf:
 	@echo "[singular] no perf scenarios defined yet (gate stub)"
 

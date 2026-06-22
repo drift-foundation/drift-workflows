@@ -50,6 +50,25 @@ _test-grouped DB_GROUP:
 	python3 tools/emit_test_plan.py test --db-group "{{DB_GROUP}}" --out "$WORK/plan.json"
 	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
 
+# Certification STRESS gate: lease-contention + idempotent-replay under concurrency. Same executor +
+# DB-serial discipline as `test`. Standalone-dev entry; the component justfile holds the schema/lock.
+stress:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	just _stress-grouped "mariadb-mdb114-a"
+
+_stress-grouped DB_GROUP:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	export DRIFT_PKG_ROOT="{{_pkg-root}}"
+	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
+	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	WORK="$(mktemp -d -t singular-stress-XXXXXX)"
+	trap 'rm -rf "$WORK"' EXIT
+	python3 tools/emit_test_plan.py stress --db-group "{{DB_GROUP}}" --out "$WORK/plan.json"
+	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
+
 # Raw-SQL / SP invariant regressions — focused DEV convenience. The certification path runs the SAME
 # script as a serialized DB_GROUP job inside `just test` (emit_test_plan LIVE jobs); this recipe just
 # runs it standalone for fast iteration. Asserts SQL NULL/edge inputs SIGNAL + leave table state

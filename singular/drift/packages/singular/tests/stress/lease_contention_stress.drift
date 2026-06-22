@@ -1,0 +1,143 @@
+// Singular STRESS gate (certification): lease contention + idempotent replay under concurrency.
+//
+// Bounded but REAL: ROUNDS rounds, each with WORKERS virtual threads RACING to start() the SAME key.
+// Singular's core guarantee is effectively-once — so a passing run MUST show, every round:
+//   - EXACTLY ONE worker wins the start() INSERT (Granted) and settles it (complete -> Settled), and
+//   - EVERY other worker (Exists) converges, by inspect(), to the SAME terminal result.
+// Any lost/duplicated winner, a stale-token settle, or a divergent/absent terminal is a FAIL (nonzero
+// exit). DB-serialized by the gate (mode:serial group:<DB>). Exit 0 = pass.
+
+module singular.tests.stress.lease_contention_stress;
+
+import std.core as core;
+import std.core.arc as arc;
+import std.console as con;
+import std.json as json;
+import std.concurrent as conc;
+import std.containers as containers;
+import std.format as fmt;
+import singular.uuid as uuid;
+import singular.gateway as gw;
+
+type VtInt = conc.VirtualThread<Int>;
+
+const TIMEOUT_S: Int = 30;
+const WORKERS: Int = 16;
+const ROUNDS: Int = 25;          // 16 x 25 = 400 racing start() attempts
+const POLL_TRIES: Int = 400;
+const POLL_SLEEP_MS: Int = 5;
+
+fn _config_json() -> json.JsonNode {
+	val text: String = "{\"backend\":\"mariadb\",\"host\":\"127.0.0.1\",\"port\":34114,\"user\":\"root\",\"password\":\"rootpw\",\"database\":\"singular\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
+	return json.parse(&text).or_throw();
+}
+
+fn _build_gw() -> arc.Arc<gw.SingularGateway> {
+	val cfg = _config_json();
+	val identity = gw.identity_from_worker_name("singular-stress", &"contender");
+	var b = gw.new_gateway_builder();
+	gw.with_json(&mut b, &cfg);
+	gw.with_identity(&mut b, move identity);
+	return gw.build_gateway(move b).or_throw();
+}
+
+fn _key(seed: &String) nothrow -> Array<Byte> {
+	return uuid.uuid_v3_from_string(seed);
+}
+
+// 1 = this worker WON (start->settle); 0 = observed the consistent terminal; negative = a violation.
+// nothrow: the gateway calls CAN throw (a genuine backend error) — absorbed as a violation (-50), which
+// fails the round, since a throw under stress is itself a defect.
+fn _worker(g: arc.Arc<gw.SingularGateway>, key: Array<Byte>, round_idx: Int) nothrow -> Int {
+	val expected = "{\"r\":\"v" + fmt.format_int(round_idx) + "\"}";
+	var rc = -99;
+	try {
+		val tok = gw.new_lease_token();
+		match g.get().start(&key, &"{\"t\":\"stress\"}", &"{}", TIMEOUT_S, &tok) {
+			gw.StartOutcome::Granted(lease) => {
+				match g.get().complete(&lease, &expected) {
+					gw.SettleOutcome::Settled(_) => { rc = 1; },
+					gw.SettleOutcome::TokenStale => { rc = -11; },
+					gw.SettleOutcome::NotFound => { rc = -12; }
+				}
+			},
+			gw.StartOutcome::Exists => {
+				var tries = 0;
+				var done = false;
+				while !done and tries < POLL_TRIES {
+					match g.get().inspect(&key) {
+						gw.InspectOutcome::Terminal(r, _) => {
+							match r {
+								gw.TerminalResult::Done(resp) => { if resp == expected { rc = 0; } else { rc = -21; } },
+								gw.TerminalResult::Failed(_) => { rc = -22; }
+							}
+							done = true;
+						},
+						gw.InspectOutcome::Working(_, _, _) => { val _ = conc.sleep(conc.Duration(millis = POLL_SLEEP_MS)); },
+						gw.InspectOutcome::NotFound => { val _ = conc.sleep(conc.Duration(millis = POLL_SLEEP_MS)); }
+					}
+					tries = tries + 1;
+				}
+				if !done { rc = -23; }
+			}
+		}
+	} catch unexpected { rc = -50; }
+	return rc;
+}
+
+// One contention round: spawn WORKERS racers on `key`; require exactly ONE winner + no violation.
+fn _round(g: arc.Arc<gw.SingularGateway>, round_idx: Int) nothrow -> Int {
+	val key = _key(&("singular-stress-" + fmt.format_int(round_idx)));
+	var dq = containers.deque<type VtInt>();
+	var i = 0;
+	while i < WORKERS {
+		val gc = g.clone();
+		val kc = key.clone();
+		val t = conc.spawn(| | captures(move gc, move kc, copy round_idx) => { return _worker(move gc, move kc, round_idx); });
+		dq.push_back(move t);
+		i = i + 1;
+	}
+	var winners = 0;
+	var violation = 0;
+	while dq.len() > 0 {
+		match dq.pop_front() {
+			Some(v) => {
+				var t = move v;
+				match t.join() {
+					core.Result::Ok(code) => {
+						if code == 1 { winners = winners + 1; }
+						else if code < 0 { violation = code; }
+					},
+					core.Result::Err(_) => { violation = -900; }
+				}
+			},
+			None => { return -901; }
+		}
+	}
+	if violation != 0 { return violation; }
+	if winners != 1 { return -800 - winners; }
+	return 0;
+}
+
+fn main(argv: Array<String>) nothrow -> Int {
+	var gopt: Optional<arc.Arc<gw.SingularGateway>> = Optional<arc.Arc<gw.SingularGateway>>::None();
+	try { gopt = Optional<arc.Arc<gw.SingularGateway>>::Some(_build_gw()); }
+	catch unexpected { con.eprintln("singular-stress: gateway build failed"); return 2; }
+	match move gopt {
+		Optional::Some(g) => {
+			var r = 0;
+			while r < ROUNDS {
+				val rc = _round(g.clone(), r);
+				if rc != 0 {
+					con.println("singular-stress: FAIL round " + fmt.format_int(r) + " rc=" + fmt.format_int(rc));
+					return 1;
+				}
+				r = r + 1;
+			}
+			con.println("singular-stress: " + fmt.format_int(ROUNDS) + " rounds x " + fmt.format_int(WORKERS)
+				+ " workers — effectively-once held under contention");
+			return 0;
+		},
+		Optional::None => { return 2; }
+	}
+}

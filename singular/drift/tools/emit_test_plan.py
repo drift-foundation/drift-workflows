@@ -225,10 +225,26 @@ def emit_compile(rel):
     return {"name": "compile", "phases": [{"name": "compile", "jobs": [{"id": "compile-check", "cmd": cmd}]}]}
 
 
+# --------------------------------------------------------------- gate: stress
+# Concurrency/contention gate: build the lease-contention scenario, run it ONCE,
+# serialized on the shared DB group (it spawns its own worker fan-out internally).
+STRESS_SRC = "packages/singular/tests/stress/lease_contention_stress.drift"
+
+
+def emit_stress():
+    srcs, dep_flags = src_files(), resolved_dep_flags()
+    entry = f"{module_of(STRESS_SRC)}::main"
+    build = [src_build("singular-stress", srcs, dep_flags, entry, STRESS_SRC)]
+    run = [{"id": "singular-stress#run", "cmd": [f"{{work}}/singular-stress"],
+            "needs": ["singular-stress"], "mode": "serial", "group": DB_GROUP, "order": 0}]
+    return {"name": "singular-stress",
+            "phases": [{"name": "build", "jobs": build}, {"name": "run", "jobs": run}]}
+
+
 def main():
     global DB_GROUP
     ap = argparse.ArgumentParser(description="Emit a drift_test_run.py plan for a Singular gate.")
-    ap.add_argument("gate", choices=["test", "one", "compile"])
+    ap.add_argument("gate", choices=["test", "stress", "one", "compile"])
     ap.add_argument("--file", help="test/source file (for one|compile)")
     ap.add_argument("--out", default="-", help="output path for the plan JSON (default: stdout)")
     ap.add_argument("--db-group", default=DB_GROUP,
@@ -240,6 +256,8 @@ def main():
         if not args.file:
             sys.exit("error: --file required for one|compile")
         plan = emit_one(args.file) if args.gate == "one" else emit_compile(args.file)
+    elif args.gate == "stress":
+        plan = emit_stress()
     else:
         plan = emit_test()
     text = json.dumps(plan, indent=2)
