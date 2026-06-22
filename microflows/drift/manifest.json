@@ -11,7 +11,7 @@
       "name": "microflows",
       "module_namespace": "microflows",
       "version": "0.1.0",
-      "description": "Microflows — typed durable workflow coordinator (control state over MariaDB)",
+      "description": "Microflows \u2014 typed durable workflow coordinator (control state over MariaDB)",
       "entry_module": "packages/microflows/src/lib.drift",
       "modules": [
         "packages/microflows/src/lib.drift",
@@ -21,7 +21,7 @@
       "package_deps": [
         {
           "name": "mariadb-rpc",
-          "version": "0.6"
+          "version": "0.7"
         }
       ],
       "assets": []

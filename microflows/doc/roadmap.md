@@ -74,10 +74,24 @@ seam where item-5 auth middleware / a security context attaches (no auth logic b
 — integration **158/158** (C21: health/ready, submit→completed, resume→terminal replay, unknown-script
 400, SIGUSR1 reload swaps the registry, draining→503). As-built: `microflows_design.md` §15.
 
-### 4. Business-team starter kit
-Examples and fixtures for **realistic workflows** so a new team is productive fast: charge / update /
-refund, inventory reservation, account mutation, **failure injection**, a local **runbook**, and
-**diagnostics expectations**. Builds on the authoring guide; turns it into runnable templates.
+### 4. Business-team starter kit — ✅ LANDED (2026-06-22)
+Runnable, production-shaped templates an app team copies for its first workflow (`microflows/examples/`):
+five `.mf` workflows — `payment_authorize_capture`, `payment_refund`, `inventory_reserve_release`,
+`account_adjustment_with_rollback`, and a mixed `checkout_branch_merge` (branch + merge + compensation) —
+over ONE shared deployment/routing registry + a service `manifest.json` (three logical participants
+payments/inventory/accounts, operation + compensation contracts, `auth_profile: null`), plus a
+`RUN_LOCAL.md` runbook (submit/resume/reload over HTTP) with an explicit **security-boundary** section
+listing the open questions for the business team. The reference participant stub gained the
+payment/inventory/account operations (realistic payloads, deterministic ids) + an out-of-band fault
+control, so the example payloads stay clean. Proven by integration C21 (`ex_*`): success,
+later-step→compensation, refund, pending→resume, branch+merge checkout, reload-preserves-pin, terminal
+replay with the participant down. Full gate green — integration **165/165** on driftc 0.33.53 / abi 18.
+As-built: `microflows/examples/README.md` + `RUN_LOCAL.md`.
+
+> **Surfaced + fixed a production bug.** The 4-op `checkout` exposed a `web.rest` keep-alive
+> epoll-readiness defect (~2.3s/dispatch, alternating connection failures; the long-running service
+> degraded). Reported to the web team with a minimal DB-free repro; fixed in **web-rest 0.5.6 /
+> driftc 0.33.53**. No Microflows change was needed — re-validating on the new toolchain unblocked it.
 
 ### 5. Participant auth / security context reference
 Important for prod, but **defer the design until the app team gives us real requirements** — we should

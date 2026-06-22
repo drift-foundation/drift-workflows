@@ -57,7 +57,33 @@ struct StubApp {
 	// PUT-only subset of request_count. Lets the harness distinguish a GET-first
 	// reconcile (put_count unchanged) from a PUT-first re-dispatch on recovery —
 	// request_count alone can't, since it counts GET and PUT alike.
-	put_count: conc.AtomicInt
+	put_count: conc.AtomicInt,
+	// OUT-OF-BAND fault control (test-only, NOT part of the operation contract): a single
+	// {operation: mode} object armed via `PUT /debug/arm/{operation}`. When a PUT arrives for the
+	// armed operation, the stub injects the mode ("reject" -> 400, "pending" -> 202) WITHOUT the
+	// business payload carrying any `_fault`. Lets the starter-kit examples stay pristine while the
+	// harness still drives compensation/pending paths. The test arms/disarms between scenarios.
+	armed: conc.Mutex<json.JsonNode>
+}
+
+// Arm (overwrite) the single out-of-band fault slot: { operation: mode }. mode "" disarms.
+fn _arm_fault(m: &conc.Mutex<json.JsonNode>, op: String, mode: String) nothrow -> Void {
+	var o = json.new_object();
+	o.set(move op, json.JsonNode::String(move mode));
+	var g = conc.lock(m);
+	val slot = conc.mutex_guard_get_mut(&mut g);
+	*slot = o.to_node();
+}
+
+// The armed mode for `op` ("reject" / "pending"), or "" if none.
+fn _armed_mode(m: &conc.Mutex<json.JsonNode>, op: &String) nothrow -> String {
+	var g = conc.lock(m);
+	val slot = conc.mutex_guard_get_mut(&mut g);
+	match slot.get(op) {
+		Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { return move v; }, Optional::None => {} } },
+		Optional::None => {}
+	}
+	return "";
 }
 
 // Two distinct operations, so the coordinator's GENERIC dispatch is exercised
@@ -139,7 +165,7 @@ fn _run(config_path: String, port_cli: Optional<Int>, service_group_default: Str
 
 	val app = conc.arc(StubApp(gateway = move gateway, service_group = move service_group,
 	                           exec_count = conc.atomic_int(0), request_count = conc.atomic_int(0),
-	                           put_count = conc.atomic_int(0)));
+	                           put_count = conc.atomic_int(0), armed = conc.mutex(json.new_object().to_node())));
 
 	var ab = rest.new_app_builder();
 	rest.bind(ab, "0.0.0.0", port);
@@ -161,6 +187,12 @@ fn _run(config_path: String, port_cli: Optional<Int>, service_group_default: Str
 
 	// Observable instrumentation for the harness: total operation-body executions.
 	val debug_rg = rest.add_route_group(web_app, "/debug").or_throw();
+	// Out-of-band fault control (test-only): PUT /debug/arm/{operation} body {"mode":"reject"|"pending"|""}.
+	rest.add_route_group_throws_route(web_app, debug_rg, "PUT", "/arm/{operation}",
+		|req, ctx| captures(share app) => {
+			val a = app.get();
+			return a.handle_arm(req, ctx);
+		}).or_throw();
 	rest.add_route_group_throws_route(web_app, debug_rg, "GET", "/exec-count",
 		|req, ctx| captures(share app) => {
 			val a = app.get();
@@ -236,11 +268,19 @@ implement StubApp {
 		if !_validate_input(op, input) {
 			return _json(400, _envelope_error("invalid-input"));
 		}
+		// Out-of-band armed fault for THIS operation name (test control; keeps business payloads clean).
+		val armed = _armed_mode(&self.armed, op);
 		// Fault injection: DEFINITE rejection (non-retryable 400) BEFORE Singular, so
 		// no operation is created and the body never runs. Exercises the runner's
 		// reverse-path block (and the forward block).
-		if _fault_reject(input) {
+		if _fault_reject(input) or armed == "reject" {
 			return _json(400, _envelope_error("fault-rejected"));
+		}
+		// Out-of-band SOFT pending: 202 BEFORE Singular, so NO operation is created and the coordinator
+		// re-dispatches on resume (disarm first) and completes — models "received, not yet durably
+		// accepted; retry." (Distinct from input `_fault.respond_pending`, which leaves a Working op.)
+		if armed == "pending" {
+			return _json(202, _envelope_pending());
 		}
 
 		val key = _op_key(op, op_id);
@@ -310,6 +350,21 @@ implement StubApp {
 		var o = json.new_object();
 		o.set("count", json.JsonNode::Number(fmt.format_int(n)));
 		return _json(200, json.encode(o.to_node()));
+	}
+
+	// PUT /debug/arm/{operation} body {"mode":"reject"|"pending"|""} -> arm/disarm the out-of-band
+	// fault for that operation name (test-only control; see the `armed` field).
+	pub fn handle_arm(self: &StubApp, req: &rest.Request, ctx: &mut rest.Context) throws -> rest.Response {
+		val op = rest.path_param(req, "operation").or_throw();
+		var mode = "";
+		match rest.body_json(req) {
+			core.Result::Ok(h) => {
+				match h.get(&"mode") { Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { mode = move v; }, Optional::None => {} } }, Optional::None => {} }
+			},
+			core.Result::Err(_) => {}
+		}
+		_arm_fault(&self.armed, move op, move mode);
+		return _json(200, "{\"armed\":true}");
 	}
 
 	// GET /debug/request-count -> { "count": N } : total inbound operation requests.
@@ -468,14 +523,64 @@ fn _validate_echo(input: &json.JsonNode) nothrow -> Bool {
 	}
 }
 
+// ===== Business starter-kit operations (roadmap item 4) =====
+//
+// Realistic payment / inventory / account operations, used by microflows/examples/. Each forward op
+// validates a realistic business input and returns a realistic, DETERMINISTIC reference id derived
+// from a STABLE input field — so a re-poll on recovery returns the SAME id (idempotent reconciliation),
+// exactly like `reserve` echoes its reservation. Each reverse (compensation) op likewise derives from
+// the durable checkpoint payload's id. These are TEST DOUBLES: they model the contract SHAPE (named
+// ops, typed-looking payloads, deterministic refs), not real payment/ledger logic. The `_fault` hooks
+// (respond_pending / reject / delay_after_commit_ms) remain test-only controls, outside the contract.
+//
+// spec = (operation, the stable INPUT field the id derives from, the RESULT id field, the id prefix).
+struct BizOp { src: String, id_field: String, prefix: String }
+fn _biz_spec(op: &String) nothrow -> Optional<BizOp> {
+	// Forward ops derive their result id from a forward-INPUT field. COMPENSATION (reverse) ops receive
+	// the forward CHECKPOINT PAYLOAD (the forward op's INPUT), so their `src` MUST be a field that
+	// existed in the forward input — e.g. reverse_adjustment sees adjust_balance's {account_id,…}.
+	if op == "authorize"          { return Optional<BizOp>::Some(BizOp(src = "order_id",   id_field = "auth_id",                prefix = "auth")); }
+	if op == "void_authorization" { return Optional<BizOp>::Some(BizOp(src = "order_id",   id_field = "void_id",                prefix = "void")); }  // <- authorize input
+	if op == "capture"            { return Optional<BizOp>::Some(BizOp(src = "auth_id",    id_field = "capture_id",             prefix = "cap")); }
+	if op == "refund_capture"     { return Optional<BizOp>::Some(BizOp(src = "auth_id",    id_field = "refund_id",              prefix = "rfnd")); }  // <- capture input
+	if op == "refund"             { return Optional<BizOp>::Some(BizOp(src = "capture_id", id_field = "refund_id",              prefix = "rfnd")); }
+	if op == "record_ledger"      { return Optional<BizOp>::Some(BizOp(src = "reference",  id_field = "ledger_entry_id",        prefix = "led")); }
+	if op == "notify_customer"    { return Optional<BizOp>::Some(BizOp(src = "customer_id",id_field = "notification_id",        prefix = "ntf")); }
+	if op == "reserve_inventory"  { return Optional<BizOp>::Some(BizOp(src = "order_id",   id_field = "reservation_id",         prefix = "rsv")); }
+	if op == "release_inventory"  { return Optional<BizOp>::Some(BizOp(src = "order_id",   id_field = "released_reservation_id", prefix = "rel")); }  // <- reserve_inventory input
+	if op == "commit_shipment"    { return Optional<BizOp>::Some(BizOp(src = "reservation_id", id_field = "shipment_id",        prefix = "shp")); }
+	if op == "adjust_balance"     { return Optional<BizOp>::Some(BizOp(src = "account_id", id_field = "adjustment_id",          prefix = "adj")); }
+	if op == "reverse_adjustment" { return Optional<BizOp>::Some(BizOp(src = "account_id", id_field = "rollback_id",            prefix = "rbk")); }  // <- adjust_balance input
+	if op == "post_journal"       { return Optional<BizOp>::Some(BizOp(src = "adjustment_id", id_field = "journal_id",         prefix = "jnl")); }
+	return Optional<BizOp>::None();
+}
+
+fn _has_str(input: &json.JsonNode, key: &String) nothrow -> Bool {
+	match input.get(key) {
+		Optional::Some(n) => { match n.as_string() { Optional::Some(_) => { return true; }, Optional::None => { return false; } } },
+		Optional::None => { return false; }
+	}
+}
+fn _str_field(input: &json.JsonNode, key: &String) nothrow -> String {
+	match input.get(key) { Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { return move v; }, Optional::None => {} } }, Optional::None => {} }
+	return "";
+}
+fn _id_result(id_field: String, prefix: String, src: String) nothrow -> String {
+	var o = json.new_object();
+	o.set(move id_field, json.JsonNode::String(prefix + "-" + src));
+	return json.encode(o.to_node());
+}
+
 // ===== Generic operation dispatch (by operation name) =====
 
 fn _supported_op(op: &String) nothrow -> Bool {
+	match _biz_spec(op) { Optional::Some(_) => { return true; }, Optional::None => {} }
 	return op == OP_ECHO_TRANSFORM or op == OP_STRING_JOIN or op == OP_RELEASE or op == OP_RESERVE
 	    or op == OP_CONFIRM or op == OP_UNCONFIRM;
 }
 
 fn _validate_input(op: &String, input: &json.JsonNode) nothrow -> Bool {
+	match _biz_spec(op) { Optional::Some(spec) => { return _has_str(input, &spec.src); }, Optional::None => {} }
 	if op == OP_ECHO_TRANSFORM { return _validate_echo(input); }
 	if op == OP_STRING_JOIN { return _validate_string_join(input); }
 	if op == OP_RELEASE { return _validate_release(input); }
@@ -486,6 +591,7 @@ fn _validate_input(op: &String, input: &json.JsonNode) nothrow -> Bool {
 }
 
 fn _execute_op(op: &String, input: &json.JsonNode) -> String {
+	match _biz_spec(op) { Optional::Some(spec) => { return _id_result(spec.id_field, spec.prefix, _str_field(input, &spec.src)); }, Optional::None => {} }
 	if op == OP_STRING_JOIN { return _string_join(input); }
 	if op == OP_RELEASE { return _release(input); }
 	if op == OP_RESERVE { return _reserve(input); }

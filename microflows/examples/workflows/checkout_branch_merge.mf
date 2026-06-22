@@ -1,0 +1,51 @@
+# checkout_branch_merge — pay, then reserve in a regional warehouse (BRANCH + MERGE), then ship.
+#
+# Business intent: a realistic checkout that authorizes + captures payment, then picks a fulfillment
+# warehouse by region, reserves stock there, and commits the shipment. It exercises every durable
+# control-flow feature in one flow:
+#   - BRANCH: `case region` picks the warehouse (the scrutinee is a DURABLE argument, decided once).
+#   - MERGE:  `merge reservation = …` joins the branch arms into ONE binding the shared tail reads,
+#             so the downstream step doesn't care which arm ran. The merge is consumed by the very next
+#             step (commit_shipment) — the idiomatic shape.
+#   - COMPENSATION: if `commit_shipment` fails, the completed steps unwind in reverse across the merge.
+#
+# Branches must be operation-balanced (each arm performs exactly one reservation), the §12.7 uniform-
+# op-depth rule. The merge value list is arm-order with the default LAST.
+#
+# Operation contracts:
+#   authorize          payments   {order_id,customer_id,amount}     -> {auth_id}         compensation: void_authorization
+#   capture            payments   {auth_id,amount}                  -> {capture_id}      compensation: refund_capture
+#   reserve_inventory  inventory  {order_id,sku,quantity,warehouse} -> {reservation_id}  compensation: release_inventory
+#   commit_shipment    inventory  {reservation_id}                  -> {shipment_id}      (terminal)
+#
+# Compensation behavior: if `commit_shipment` fails, Microflows unwinds release_inventory (the
+# reservation from whichever arm ran), refund_capture (capture), then void_authorization (authorize).
+
+args {
+  order_id:    string
+  customer_id: string
+  sku:         string
+  quantity:    int
+  region:      string
+  amount:      { value: int, currency: string }
+}
+
+op authorize         { input: { order_id: string, customer_id: string, amount: { value: int, currency: string } }  result: { auth_id: string } }
+op capture           { input: { auth_id: string, amount: { value: int, currency: string } }                        result: { capture_id: string } }
+op reserve_inventory { input: { order_id: string, sku: string, quantity: int, warehouse: string }                  result: { reservation_id: string } }
+op commit_shipment   { input: { reservation_id: string }                                                           result: { shipment_id: string } }
+
+steps {
+  let authorization = authorize { order_id: arg order_id, customer_id: arg customer_id, amount: arg amount }
+  let payment       = capture   { auth_id: result authorization.auth_id, amount: arg amount }
+
+  case region {
+    "us"    { let r_us = reserve_inventory { order_id: arg order_id, sku: arg sku, quantity: arg quantity, warehouse: const "us-east-1" } }
+    "eu"    { let r_eu = reserve_inventory { order_id: arg order_id, sku: arg sku, quantity: arg quantity, warehouse: const "eu-west-1" } }
+    default { let r_gl = reserve_inventory { order_id: arg order_id, sku: arg sku, quantity: arg quantity, warehouse: const "global-1" } }
+  }
+  merge reservation = result r_us | result r_eu | result r_gl
+  # The merged value IS a reserve_inventory result ({reservation_id}), which is exactly
+  # commit_shipment's input — so pass the whole merge binding (the idiomatic `<op> local <name>`).
+  commit_shipment local reservation
+}

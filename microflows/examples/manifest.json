@@ -1,0 +1,51 @@
+{
+  "_comment": "Microflows service manifest (roadmap item 4 starter kit). `microflows-service --manifest manifest.json` loads + validates EVERY script below at startup, over the shared `deployment` routing registry. This is a TEMPLATE: replace db.* and each participant endpoint with your environment. Script `path`s are resolved relative to THIS file's directory. SECURITY: auth_profile is null everywhere and the service is internal-only — see RUN_LOCAL.md 'Security boundary'.",
+
+  "deployment": {
+    "worker_id": "microflows-service-1",
+
+    "db": {
+      "backend": "mariadb",
+      "host": "REPLACE_WITH_YOUR_DB_HOST",
+      "port": 3306,
+      "user": "microflows",
+      "password": "REPLACE_WITH_YOUR_DB_PASSWORD",
+      "database": "microflows",
+      "connect_timeout_ms": 3000,
+      "io_timeout_ms": 3000,
+      "pool": { "keepalive_interval_ms": 30000 }
+    },
+
+    "participants": [
+      { "id": "payments",  "transport": { "kind": "http", "endpoints": ["https://payments.svc.internal:8443"],  "selection": "ordered_failover" }, "auth_profile": null },
+      { "id": "inventory", "transport": { "kind": "http", "endpoints": ["https://inventory.svc.internal:8443"], "selection": "ordered_failover" }, "auth_profile": null },
+      { "id": "accounts",  "transport": { "kind": "http", "endpoints": ["https://accounts.svc.internal:8443"],  "selection": "ordered_failover" }, "auth_profile": null }
+    ],
+
+    "operations": [
+      { "name": "authorize",          "participant": "payments",  "schema_version": 1, "compensation": { "operation": "void_authorization", "schema_version": 1 } },
+      { "name": "void_authorization", "participant": "payments",  "schema_version": 1 },
+      { "name": "capture",            "participant": "payments",  "schema_version": 1, "compensation": { "operation": "refund_capture", "schema_version": 1 } },
+      { "name": "refund_capture",     "participant": "payments",  "schema_version": 1 },
+      { "name": "refund",             "participant": "payments",  "schema_version": 1 },
+      { "name": "record_ledger",      "participant": "payments",  "schema_version": 1 },
+      { "name": "notify_customer",    "participant": "payments",  "schema_version": 1 },
+
+      { "name": "reserve_inventory",  "participant": "inventory", "schema_version": 1, "compensation": { "operation": "release_inventory", "schema_version": 1 } },
+      { "name": "release_inventory",  "participant": "inventory", "schema_version": 1 },
+      { "name": "commit_shipment",    "participant": "inventory", "schema_version": 1 },
+
+      { "name": "adjust_balance",     "participant": "accounts",  "schema_version": 1, "compensation": { "operation": "reverse_adjustment", "schema_version": 1 } },
+      { "name": "reverse_adjustment", "participant": "accounts",  "schema_version": 1 },
+      { "name": "post_journal",       "participant": "accounts",  "schema_version": 1 }
+    ]
+  },
+
+  "scripts": [
+    { "name": "payment_authorize_capture",        "version": "1.0.0", "path": "workflows/payment_authorize_capture.mf" },
+    { "name": "payment_refund",                   "version": "1.0.0", "path": "workflows/payment_refund.mf" },
+    { "name": "inventory_reserve_release",        "version": "1.0.0", "path": "workflows/inventory_reserve_release.mf" },
+    { "name": "account_adjustment_with_rollback", "version": "1.0.0", "path": "workflows/account_adjustment_with_rollback.mf" },
+    { "name": "checkout_branch_merge",            "version": "1.0.0", "path": "workflows/checkout_branch_merge.mf" }
+  ]
+}

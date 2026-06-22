@@ -701,6 +701,8 @@ fn _translate_pool_event(ev: &pool.PoolEvent) nothrow -> Optional<SingularEvent>
     return match ev {
         pool.PoolEvent::ConnOpened(opened_total) => { Optional<SingularEvent>::None() },
         pool.PoolEvent::ConnClosedByReap(closed_total) => { Optional<SingularEvent>::None() },
+        pool.PoolEvent::IdleConnRecycled(recycled_now) => { Optional<SingularEvent>::None() },   // mariadb-rpc 0.7: idle conn recycled by the poll fiber — internal mechanics, no domain event
+
         pool.PoolEvent::KeepalivePingOk => { Optional<SingularEvent>::None() },
         pool.PoolEvent::KeepalivePingFailed(ping_failed_tag) => { Optional<SingularEvent>::Some(SingularEvent::BackendDegraded(detail = _dup(&ping_failed_tag))) },
         pool.PoolEvent::ReconnectAttempt(attempt_attempt) => { Optional<SingularEvent>::Some(SingularEvent::BackendDegraded(detail = "reconnect-attempt")) },

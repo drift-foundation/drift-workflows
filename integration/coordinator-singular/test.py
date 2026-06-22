@@ -181,6 +181,15 @@ def _svc_post_raw(base, path, raw):
         return e.code, json.loads(e.read().decode() or "{}")
 
 
+def _arm_fault(stub_base, operation, mode):
+    # Out-of-band stub fault control (test-only): arm/disarm a reject/pending fault for an operation
+    # NAME, so the starter-kit example payloads stay free of any _fault field. mode "" disarms.
+    req = urllib.request.Request(f"{stub_base}/debug/arm/{operation}", data=json.dumps({"mode": mode}).encode(),
+                                 method="PUT", headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return r.status
+
+
 def boot_service(manifest_path, env_extra=None):
     sport = _free_port()
     sbase = f"http://127.0.0.1:{sport}"
@@ -2852,6 +2861,120 @@ def main():
         finally:
             stop_service(dproc)
 
+        # ===== C22: business starter-kit EXAMPLES over microflows-service (roadmap item 4) =====
+        # Drive the COMMITTED microflows/examples/workflows/*.mf through the service to prove the
+        # starter-kit templates run with prod-like qualities. The test builds its OWN deployment (test
+        # DB + the three LOGICAL participants payments/inventory/accounts, all routed to this stub) over
+        # the SAME operation/compensation contracts the committed manifest declares — the .mf files are
+        # the shared truth, exercised unchanged. Faults are injected OUT OF BAND (/debug/arm/{op}), so
+        # the example payloads carry no _fault.
+        EXW = MF / "examples" / "workflows"
+        ex_ops = [
+            {"name": "authorize", "participant": "payments", "schema_version": 1, "compensation": {"operation": "void_authorization", "schema_version": 1}},
+            {"name": "void_authorization", "participant": "payments", "schema_version": 1},
+            {"name": "capture", "participant": "payments", "schema_version": 1, "compensation": {"operation": "refund_capture", "schema_version": 1}},
+            {"name": "refund_capture", "participant": "payments", "schema_version": 1},
+            {"name": "refund", "participant": "payments", "schema_version": 1},
+            {"name": "record_ledger", "participant": "payments", "schema_version": 1},
+            {"name": "notify_customer", "participant": "payments", "schema_version": 1},
+            {"name": "reserve_inventory", "participant": "inventory", "schema_version": 1, "compensation": {"operation": "release_inventory", "schema_version": 1}},
+            {"name": "release_inventory", "participant": "inventory", "schema_version": 1},
+            {"name": "commit_shipment", "participant": "inventory", "schema_version": 1},
+            {"name": "adjust_balance", "participant": "accounts", "schema_version": 1, "compensation": {"operation": "reverse_adjustment", "schema_version": 1}},
+            {"name": "reverse_adjustment", "participant": "accounts", "schema_version": 1},
+            {"name": "post_journal", "participant": "accounts", "schema_version": 1},
+        ]
+        ex_dep = {
+            "worker_id": "examples-runner",
+            "db": runner_cfg["db"],
+            "participants": [
+                {"id": pid, "transport": {"kind": "http", "endpoints": [base], "selection": "ordered_failover"}, "auth_profile": None}
+                for pid in ("payments", "inventory", "accounts")
+            ],
+            "operations": ex_ops,
+        }
+        ex_scripts = [{"name": n, "version": "1.0.0", "path": str(EXW / f"{n}.mf")} for n in (
+            "payment_authorize_capture", "payment_refund", "inventory_reserve_release",
+            "account_adjustment_with_rollback", "checkout_branch_merge")]
+        ex_manifest = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False).name
+        with open(ex_manifest, "w") as f:
+            json.dump({"deployment": ex_dep, "scripts": ex_scripts}, f)
+
+        exproc, exbase = boot_service(ex_manifest)
+        try:
+            # (a) successful two-phase payment: authorize -> capture -> record_ledger (deterministic ids).
+            exwf_a = _wf_id()
+            ac, ab = _svc_post(exbase, f"/v1/workflows/{exwf_a}/submit?script=payment_authorize_capture",
+                               {"order_id": "ord-A1", "customer_id": "cust-9", "amount": {"value": 1299, "currency": "USD"}})
+            check("ex_payment_authorize_capture_completes",
+                  ac == 200 and ab.get("workflow") == "completed"
+                  and ab.get("result", {}).get("ledger_entry_id") == "led-cap-auth-ord-A1",
+                  (ac, ab))
+
+            # (b) later-step failure -> automatic compensation: post_journal rejected, so the prior
+            # adjust_balance is unwound by reverse_adjustment; the workflow ends REVERSED.
+            _arm_fault(base, "post_journal", "reject")
+            exwf_b = _wf_id()
+            bc, bb = _svc_post(exbase, f"/v1/workflows/{exwf_b}/submit?script=account_adjustment_with_rollback",
+                               {"account_id": "acct-7", "amount": {"value": 500, "currency": "USD"}, "memo": "promo-credit", "ledger": "GL-1"})
+            _arm_fault(base, "post_journal", "")  # disarm
+            check("ex_account_rollback_compensates",
+                  bc == 200 and bb.get("workflow") == "reversed",
+                  (bc, bb))
+
+            # (c) refund flow completes.
+            exwf_c = _wf_id()
+            cc, cb = _svc_post(exbase, f"/v1/workflows/{exwf_c}/submit?script=payment_refund",
+                               {"capture_id": "cap-xyz", "amount": {"value": 1299, "currency": "USD"}, "reason": "customer_request"})
+            check("ex_payment_refund_completes",
+                  cc == 200 and cb.get("workflow") == "completed"
+                  and cb.get("result", {}).get("refund_id") == "rfnd-cap-xyz",
+                  (cc, cb))
+
+            # (d) participant pending, then resume completes: reserve_inventory soft-pends (202), the
+            # workflow defers; after disarm + a due retry the resume re-dispatches and finishes.
+            _arm_fault(base, "reserve_inventory", "pending")
+            exwf_d = _wf_id()
+            dc, db_ = _svc_post(exbase, f"/v1/workflows/{exwf_d}/submit?script=inventory_reserve_release",
+                                {"order_id": "ord-D1", "sku": "SKU-42", "quantity": 3})
+            _arm_fault(base, "reserve_inventory", "")  # disarm so the resume can complete
+            _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{exwf_d}')")
+            rdc, rdb = _svc_post(exbase, f"/v1/workflows/{exwf_d}/resume")
+            check("ex_inventory_pending_then_resume_completes",
+                  dc == 202 and db_.get("workflow") == "pending"
+                  and rdc == 200 and rdb.get("workflow") == "completed"
+                  and rdb.get("result", {}).get("shipment_id") == "shp-rsv-ord-D1",
+                  (dc, db_, rdc, rdb))
+
+            # (e) the mixed branch+merge+compensation checkout runs end to end (region "eu" arm).
+            exwf_e = _wf_id()
+            ec, eb = _svc_post(exbase, f"/v1/workflows/{exwf_e}/submit?script=checkout_branch_merge",
+                               {"order_id": "ord-C1", "customer_id": "cust-3", "sku": "SKU-7", "quantity": 1,
+                                "region": "eu", "amount": {"value": 4200, "currency": "USD"}})
+            check("ex_checkout_branch_merge_completes",
+                  ec == 200 and eb.get("workflow") == "completed"
+                  and eb.get("result", {}).get("shipment_id") == "shp-rsv-ord-C1",
+                  (ec, eb))
+
+            # (f) manifest reload does NOT break a pinned older workflow: redeploy (SIGUSR1) the running
+            # service, then the already-completed wf from (a) still replays by its durable pin.
+            exproc.send_signal(signal.SIGUSR1)
+            time.sleep(1.0)
+            rlc, rlb = _svc_post(exbase, f"/v1/workflows/{exwf_a}/resume")
+            check("ex_reload_preserves_pinned_workflow",
+                  rlc == 200 and rlb.get("workflow") == "already_terminal",
+                  (rlc, rlb))
+
+            # (g) terminal replay is participant-INDEPENDENT: resuming a completed wf reads durable state
+            # and makes ZERO participant requests, so it succeeds even when the participant is down.
+            preq = _request_count(base)
+            tc, tb = _svc_post(exbase, f"/v1/workflows/{exwf_c}/resume")
+            check("ex_terminal_replay_no_participant_call",
+                  tc == 200 and tb.get("workflow") == "already_terminal" and _request_count(base) == preq,
+                  (tc, tb, preq, _request_count(base)))
+        finally:
+            stop_service(exproc)
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the LOCAL authoritative
         # result; no dependency on the participant. MUST be the LAST stub-using block — it terminates
         # the stub and never restarts it, so any check after this would hit a dead participant.
@@ -2899,7 +3022,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 158
+    EXPECTED_CHECKS = 165
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

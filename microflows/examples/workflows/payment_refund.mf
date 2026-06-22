@@ -1,0 +1,25 @@
+# payment_refund — refund a previously-captured payment.
+#
+# Business intent: the simplest possible workflow — a SINGLE idempotent participant operation. The
+# capture being refunded is identified by the durable instance arguments (capture_id), so re-submitting
+# the same workflow id reconciles to the SAME refund (the runner re-polls by the stable operation id) —
+# never a double refund. This is the template for "one durable, idempotent call to a participant."
+#
+# Operation contract:
+#   refund  payments  {capture_id, amount, reason} -> {refund_id}
+#
+# `refund` is the FINAL (and only) step, so it needs no compensation: there is no later step that could
+# fail and require unwinding it. (Microflows requires every NON-final operation to declare a reverse, so
+# a partially-completed workflow can always be unwound to a clean state — see the multi-step examples.)
+
+args {
+  capture_id: string
+  amount:     { value: int, currency: string }
+  reason:     string
+}
+
+op refund { input: { capture_id: string, amount: { value: int, currency: string }, reason: string }  result: { refund_id: string } }
+
+steps {
+  refund { capture_id: arg capture_id, amount: arg amount, reason: arg reason }
+}

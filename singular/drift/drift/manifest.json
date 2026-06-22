@@ -10,7 +10,7 @@
       "kind": "library",
       "name": "singular",
       "module_namespace": "singular",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "description": "Idempotency and lease coordination over MariaDB",
       "entry_module": "packages/singular/src/lib.drift",
       "modules": [
@@ -21,7 +21,7 @@
       "package_deps": [
         {
           "name": "mariadb-rpc",
-          "version": "0.6"
+          "version": "0.7"
         }
       ],
       "assets": []

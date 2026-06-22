@@ -4,42 +4,42 @@
     "microflows-participant-stub": {
       "resolved": {
         "mariadb-rpc": {
-          "version": "0.6.0",
-          "sha256": "c8e3359ea022c6ecd2baeb1052add4ca066bcb033c37790bb48e500b66c46f9d",
+          "version": "0.7.0",
+          "sha256": "d905d605842882a51207c1c707294079221bb5c5d1be6f6de9cd1c60c1d87a4e",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:1188223ff332c060852d751b2e432ecb0259278fae8d398e5e71b64c0c84b397",
+          "source_content_id": "sha256:74d4aa1fa143e5e1ccdc2fa210f9d9e9a8103b8331452f8736aa7842097892a5",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         },
         "mariadb-wire-proto": {
-          "version": "0.4.0",
-          "sha256": "5c49fa540dd44c31e50a2e4c1b375c82b7202953a26af4f806840eb31495ca28",
+          "version": "0.5.0",
+          "sha256": "455184d128f874ab8348944c1ce810076859a35a1ef22a9d01b432961f554444",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:94b2231366549a7d0e108aed47b91db32a4b80b5900230d394b58edb214b3926",
+          "source_content_id": "sha256:6f9952a60921c9908f425480a56582bf9937186deccb33832fc68a4979745c83",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         },
         "singular": {
-          "version": "0.4.0",
-          "sha256": "fc865633a30f652a2c4c706be471a52e83931d2f03a794126fa25e41ae000673",
+          "version": "0.4.1",
+          "sha256": "ffab6f61f95b4c82bc9d030ab88d3005256eb2cec9cf2008af9e8a4b82e6c131",
           "author_key": "ed25519:YvjbJdKVqMCnpiDHk8k+Fz53PplWaBPjXGZxWJ7JoVw=",
-          "source_content_id": "sha256:cf488f3bc4069c6660fa9de13ab88b8fb57a941cf30ef3cf81bf03daf4123b86",
+          "source_content_id": "sha256:0a5b81b3cb14de73dfdc8496bde6d00a9f1a9479bf0800b3ffb1cb64bcc88b1a",
           "source_attestation_key": "ed25519:YvjbJdKVqMCnpiDHk8k+Fz53PplWaBPjXGZxWJ7JoVw=",
           "dep_type": "direct"
         },
         "web-jwt": {
           "version": "0.4.2",
-          "sha256": "3ef9ff9c38acc0d9cf7dab29c1cca52df22cc48ddde1760e6b171ced3889a6bd",
+          "sha256": "8b338255362e5293c341cda476a0601b78a7e760893f50e5d10643e15b8b747e",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "source_content_id": "sha256:5bb8aae9b06db58210ca035c0625ace02cdc6ea1345f248e896b6320ada70c99",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         },
         "web-rest": {
-          "version": "0.5.4",
-          "sha256": "2c2b72983370ab17e8ea921e10289fcd803d1dceeb83dd941aeb1625f1b350d9",
+          "version": "0.5.6",
+          "sha256": "0e2c9e7f42f52a3f9f7626044b63a3baff0aee39b57c4582d3a53d0587b720ab",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:f7e7f7002a8658620151cbf1ac3f0f80954671abe4f2e5b736b45edd6a88bb60",
+          "source_content_id": "sha256:6632be795c91e7d95218425e36c44bab6019174e120036b917b930d7fa4ab6df",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         }

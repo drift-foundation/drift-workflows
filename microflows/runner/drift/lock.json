@@ -4,120 +4,120 @@
     "microflows-runner": {
       "resolved": {
         "mariadb-rpc": {
-          "version": "0.6.0",
-          "sha256": "c8e3359ea022c6ecd2baeb1052add4ca066bcb033c37790bb48e500b66c46f9d",
+          "version": "0.7.0",
+          "sha256": "d905d605842882a51207c1c707294079221bb5c5d1be6f6de9cd1c60c1d87a4e",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:1188223ff332c060852d751b2e432ecb0259278fae8d398e5e71b64c0c84b397",
+          "source_content_id": "sha256:74d4aa1fa143e5e1ccdc2fa210f9d9e9a8103b8331452f8736aa7842097892a5",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         },
         "mariadb-wire-proto": {
-          "version": "0.4.0",
-          "sha256": "5c49fa540dd44c31e50a2e4c1b375c82b7202953a26af4f806840eb31495ca28",
+          "version": "0.5.0",
+          "sha256": "455184d128f874ab8348944c1ce810076859a35a1ef22a9d01b432961f554444",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:94b2231366549a7d0e108aed47b91db32a4b80b5900230d394b58edb214b3926",
+          "source_content_id": "sha256:6f9952a60921c9908f425480a56582bf9937186deccb33832fc68a4979745c83",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         },
         "microflows": {
           "version": "0.1.0",
-          "sha256": "9d0123bce50539376a067942c2fcafeabc2fa00a2475abbd7624e08c402814c9",
+          "sha256": "2a4b5f21d0e49eaa277281b42926ee242dc62d007a68f00885229eee70bbd594",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:a433ae840b10aa0f50c9f705788764950ad1b4b314f3b51e7ae422f31eba9caa",
+          "source_content_id": "sha256:0cf01fc96e2ed69b513f0f7299d0d4f02a599c4285bc988be8a85072d1bd591a",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         },
         "net-tls": {
-          "version": "0.5.2",
-          "sha256": "05d6d945a62e9e42b2676dd0035b89e134bccbe5be88d75d715194425076b0bd",
+          "version": "0.5.3",
+          "sha256": "7b6833e441e4ffbaec38ff5b5425db6f911ad5b434fa6496ab98757389b0db70",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:3f2fd3f603589b4369c19fc20e73020fdca92a75f972a0fc16ee82f4e3c036a7",
+          "source_content_id": "sha256:8e748a4125aebd137ed3dce813a0350d88eaf86b807252097e3a7e49a01d2ef4",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         },
         "web-client": {
           "version": "0.4.2",
-          "sha256": "107beb5d88d232f933260668334f26efa2d639c957d2a1b0bbcd5502a20856a9",
+          "sha256": "aa7c0e08ae086644579f3a6a92a45812cf50b9dbaf7571ac76363d0808b00dab",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "source_content_id": "sha256:b5174bf52bf3171590254c70f0c5ea1aac24b5b13815e93f9c38432380c96d92",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         },
-        "web-rest": {
-          "version": "0.5.4",
-          "sha256": "2c2b72983370ab17e8ea921e10289fcd803d1dceeb83dd941aeb1625f1b350d9",
-          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:f7e7f7002a8658620151cbf1ac3f0f80954671abe4f2e5b736b45edd6a88bb60",
-          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "dep_type": "direct"
-        },
         "web-jwt": {
           "version": "0.4.2",
-          "sha256": "3ef9ff9c38acc0d9cf7dab29c1cca52df22cc48ddde1760e6b171ced3889a6bd",
+          "sha256": "8b338255362e5293c341cda476a0601b78a7e760893f50e5d10643e15b8b747e",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "source_content_id": "sha256:5bb8aae9b06db58210ca035c0625ace02cdc6ea1345f248e896b6320ada70c99",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
+        },
+        "web-rest": {
+          "version": "0.5.6",
+          "sha256": "0e2c9e7f42f52a3f9f7626044b63a3baff0aee39b57c4582d3a53d0587b720ab",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:6632be795c91e7d95218425e36c44bab6019174e120036b917b930d7fa4ab6df",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "direct"
         }
       }
     },
     "microflows-service": {
       "resolved": {
         "mariadb-rpc": {
-          "version": "0.6.0",
-          "sha256": "c8e3359ea022c6ecd2baeb1052add4ca066bcb033c37790bb48e500b66c46f9d",
+          "version": "0.7.0",
+          "sha256": "d905d605842882a51207c1c707294079221bb5c5d1be6f6de9cd1c60c1d87a4e",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:1188223ff332c060852d751b2e432ecb0259278fae8d398e5e71b64c0c84b397",
+          "source_content_id": "sha256:74d4aa1fa143e5e1ccdc2fa210f9d9e9a8103b8331452f8736aa7842097892a5",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         },
         "mariadb-wire-proto": {
-          "version": "0.4.0",
-          "sha256": "5c49fa540dd44c31e50a2e4c1b375c82b7202953a26af4f806840eb31495ca28",
+          "version": "0.5.0",
+          "sha256": "455184d128f874ab8348944c1ce810076859a35a1ef22a9d01b432961f554444",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:94b2231366549a7d0e108aed47b91db32a4b80b5900230d394b58edb214b3926",
+          "source_content_id": "sha256:6f9952a60921c9908f425480a56582bf9937186deccb33832fc68a4979745c83",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         },
         "microflows": {
           "version": "0.1.0",
-          "sha256": "9d0123bce50539376a067942c2fcafeabc2fa00a2475abbd7624e08c402814c9",
+          "sha256": "2a4b5f21d0e49eaa277281b42926ee242dc62d007a68f00885229eee70bbd594",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:a433ae840b10aa0f50c9f705788764950ad1b4b314f3b51e7ae422f31eba9caa",
+          "source_content_id": "sha256:0cf01fc96e2ed69b513f0f7299d0d4f02a599c4285bc988be8a85072d1bd591a",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         },
         "net-tls": {
-          "version": "0.5.2",
-          "sha256": "05d6d945a62e9e42b2676dd0035b89e134bccbe5be88d75d715194425076b0bd",
+          "version": "0.5.3",
+          "sha256": "7b6833e441e4ffbaec38ff5b5425db6f911ad5b434fa6496ab98757389b0db70",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:3f2fd3f603589b4369c19fc20e73020fdca92a75f972a0fc16ee82f4e3c036a7",
+          "source_content_id": "sha256:8e748a4125aebd137ed3dce813a0350d88eaf86b807252097e3a7e49a01d2ef4",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         },
         "web-client": {
           "version": "0.4.2",
-          "sha256": "107beb5d88d232f933260668334f26efa2d639c957d2a1b0bbcd5502a20856a9",
+          "sha256": "aa7c0e08ae086644579f3a6a92a45812cf50b9dbaf7571ac76363d0808b00dab",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "source_content_id": "sha256:b5174bf52bf3171590254c70f0c5ea1aac24b5b13815e93f9c38432380c96d92",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         },
-        "web-rest": {
-          "version": "0.5.4",
-          "sha256": "2c2b72983370ab17e8ea921e10289fcd803d1dceeb83dd941aeb1625f1b350d9",
-          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:f7e7f7002a8658620151cbf1ac3f0f80954671abe4f2e5b736b45edd6a88bb60",
-          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "dep_type": "direct"
-        },
         "web-jwt": {
           "version": "0.4.2",
-          "sha256": "3ef9ff9c38acc0d9cf7dab29c1cca52df22cc48ddde1760e6b171ced3889a6bd",
+          "sha256": "8b338255362e5293c341cda476a0601b78a7e760893f50e5d10643e15b8b747e",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "source_content_id": "sha256:5bb8aae9b06db58210ca035c0625ace02cdc6ea1345f248e896b6320ada70c99",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
+        },
+        "web-rest": {
+          "version": "0.5.6",
+          "sha256": "0e2c9e7f42f52a3f9f7626044b63a3baff0aee39b57c4582d3a53d0587b720ab",
+          "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "source_content_id": "sha256:6632be795c91e7d95218425e36c44bab6019174e120036b917b930d7fa4ab6df",
+          "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
+          "dep_type": "direct"
         }
       }
     }

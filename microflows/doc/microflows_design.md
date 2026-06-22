@@ -10,15 +10,19 @@ participant protocol, and the milestone-1 plan.
 > (`phase_drift_mile_design.md`) is preserved as the historical record; see
 > §10 (History & rationale) for why the direction changed and what it cost.
 
-> **As-built note (2026-06-20).** Milestone 1 is LANDED and proven. The
+> **As-built note (2026-06-22).** Milestone 1 is LANDED and proven. The
 > manual-IR runtime (durable dispatch, recovery, reversal) AND the `.mf`
 > language frontend (parser, type binding, lowering, diagnostics) are complete
-> on certified driftc **0.33.45** / ABI 17 (re-validated when the certified
-> toolchain advanced 0.33.44→0.33.45, a MIR/LLVM temp-name-collision bugfix; ABI 17
-> unchanged, so content_hashes and seed fixtures are stable). Verified for the
-> latest slice (ScriptRegistry service shell, §15 — long-running `web.rest`
-> front-door over the same drive boundary): the `coordinator-singular`
-> integration gate (**158/158**, DB-backed, real HTTP); the unit gates
+> on certified driftc **0.33.53** / ABI **18** (re-validated when the certified
+> toolchain advanced 0.33.45→0.33.53; ABI 17→18 brought the wait-set I/O
+> readiness path + mariadb-rpc 0.7 (whose new `PoolEvent::IdleConnRecycled` is
+> handled in the singular gateway) + **web-rest 0.5.6**, which fixed a keep-alive
+> epoll-readiness defect that had added ~2.3s/dispatch and blocked workflows of
+> 4+ remote operations. content_hashes are graph-authoritative and unchanged
+> across the ABI bump; seed fixtures stable). Verified for the latest slice
+> (business-team starter kit, `microflows/examples/` — runnable payment/inventory/
+> account templates over the §15 service): the `coordinator-singular`
+> integration gate (**165/165**, DB-backed, real HTTP); the unit gates
 > (`ir_*`/`parser_test`, base + asan) and the other component gates
 > (stored-procedure, singular) were green at their slice's authoring and are
 > unchanged. §§1–11 below remain the
@@ -1146,7 +1150,7 @@ microflows/runner/src/runner.drift   registry build, content_hash, dispatch,
                                        recovery, reversal; --lower-source /
                                        --emit-content-hash CLIs
 microflows/runner/tests/unit/        ir_exec_test, ir_graph_test, parser_test
-integration/coordinator-singular/    test.py — the 158-check E2E gate
+integration/coordinator-singular/    test.py — the 165-check E2E gate
 singular/doc/singular-protocol.md    the participant-side protocol contract
 ```
 
@@ -1360,7 +1364,7 @@ admission + the `Outcome` boundary), not a redesign.
 Integration C20: a named submission pins+runs with **content_hash parity** vs direct lowering; an
 unknown `--script` is refused with no workflow row; a manifest with any invalid script fails at load
 (`invalid_manifest`, no workflow row); and a respond-pending workflow submitted via the manifest
-**resumes strictly by its durable pin** (no `--script`). Full gate green — integration **158/158**.
+**resumes strictly by its durable pin** (no `--script`). Full gate green — integration **165/165**.
 
 ---
 
@@ -1423,4 +1427,4 @@ with **no workflow row** (never silently `{}`); a **SIGUSR1 reload** makes a fre
 runnable (was `400`, becomes `200` after the swap); and a service booted **draining** refuses fresh
 submissions with **`503`** *and* converges an existing pending workflow resumed under drain as
 **`pending_restart` → `503`** (the §13 back-pressure contract), reporting `/readyz` not-ready. Full gate
-green — integration **158/158**.
+green — integration **165/165**.
