@@ -15,11 +15,12 @@ CREATE PROCEDURE `sp_singular_start`(
 	IN arg_item_meta mediumtext,
 	IN arg_lease_owner varbinary(16),       -- descriptive (SingularIdentity); varbinary so short values are NOT padded
 	IN arg_lease_meta mediumtext,
-	IN arg_lease_timeout_seconds int,
+	IN arg_event_ts datetime(6),            -- 0.5: caller-supplied logical claim time (NOT the DB clock)
+	IN arg_lease_expires_at datetime(6),    -- 0.5: caller-supplied ABSOLUTE lease deadline
 	IN arg_lease_token varbinary(16)        -- app-minted capability token; the authority
 )
 proc:BEGIN
-	DECLARE v_now datetime(6);
+	DECLARE v_now datetime(6);              -- DB wall clock: AUDIT columns ONLY (created_at/updated_at)
 	DECLARE v_lease_expires datetime(6);
 	DECLARE v_exists tinyint(1) DEFAULT 0;
 
@@ -49,15 +50,22 @@ proc:BEGIN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'SingularLeaseMetaInvalid';
 	END IF;
 
-	-- A live lease MUST be bounded: a NULL/non-positive timeout would create an
-	-- unbounded WORKING lease that can never be reclaimed. Reject it (the gateway also
-	-- validates client-side via InvalidLeaseTimeout; this is the backend-side guarantee).
-	IF arg_lease_timeout_seconds IS NULL OR arg_lease_timeout_seconds <= 0 THEN
-		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'SingularLeaseTimeoutInvalid';
+	-- 0.5 absolute-time contract: the caller supplies BOTH the event time and the lease deadline.
+	-- A live lease MUST be bounded and the deadline MUST be strictly after the event that creates it.
+	-- lease_expires_at <= event_ts -> InvalidLeaseExpiry (errno 30003; the gateway also guards this
+	-- client-side, this is the backend-side guarantee). start() is the item's FIRST event, so there is
+	-- no prior event_ts to order against (no EventTimeConflict possible here).
+	IF arg_event_ts IS NULL THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'SingularEventTimeInvalid';
+	END IF;
+	IF arg_lease_expires_at IS NULL OR arg_lease_expires_at <= arg_event_ts THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'SingularInvalidLeaseExpiry', MYSQL_ERRNO = 30003;
 	END IF;
 
+	-- Event time + lease deadline are caller-owned (never DB-clock); v_now is the DB wall clock used
+	-- ONLY for the created_at/updated_at audit columns.
 	SET v_now = UTC_TIMESTAMP(6);
-	SET v_lease_expires = DATE_ADD(v_now, INTERVAL arg_lease_timeout_seconds SECOND);
+	SET v_lease_expires = arg_lease_expires_at;
 
 	-- The PK serializes concurrent first-submits: exactly one INSERT succeeds. A PK
 	-- conflict (ER_DUP_ENTRY = 1062) flips v_exists and continues; any OTHER error
@@ -77,12 +85,12 @@ proc:BEGIN
 		) VALUES (
 			arg_service_group,
 			arg_idempotency_key,
-			v_now,
+			arg_event_ts,            -- current_event_ts: caller's logical claim time
 			'{}',                    -- checkpoint_payload: empty document (never SQL NULL)
 			arg_lease_token,
 			NULL,
-			v_now,
-			v_now
+			v_now,                   -- created_at: DB audit clock
+			v_now                    -- updated_at: DB audit clock
 		);
 	END;
 
@@ -108,7 +116,7 @@ proc:BEGIN
 	) VALUES (
 		arg_service_group,
 		arg_idempotency_key,
-		v_now,
+		arg_event_ts,            -- event_ts: caller's logical claim time
 		arg_item_meta,
 		arg_lease_owner,
 		arg_lease_meta,

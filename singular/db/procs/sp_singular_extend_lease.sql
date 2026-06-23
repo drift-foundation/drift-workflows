@@ -14,10 +14,11 @@ CREATE PROCEDURE `sp_singular_extend_lease`(
 	IN arg_idempotency_key varbinary(32),
 	IN arg_lease_owner varbinary(16),       -- descriptive/audit only; varbinary so short values are NOT padded
 	IN arg_lease_token varbinary(16),       -- the authority
-	IN arg_lease_timeout_seconds int
+	IN arg_event_ts datetime(6),            -- 0.5: caller-supplied event time (strictly monotonic)
+	IN arg_lease_expires_at datetime(6)     -- 0.5: caller-supplied ABSOLUTE new lease deadline
 )
 proc:BEGIN
-	DECLARE v_now datetime(6);
+	DECLARE v_now datetime(6);              -- DB wall clock: updated_at AUDIT column only
 	DECLARE v_current_event_ts datetime(6);
 	DECLARE v_current_lease_token varbinary(16);
 	DECLARE v_terminal_lease_token varbinary(16);
@@ -54,10 +55,11 @@ proc:BEGIN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'SingularLeaseOwnerInvalid';
 	END IF;
 
-	-- A live lease MUST stay bounded: a NULL/non-positive timeout is rejected (extend never
-	-- produces an unbounded lease). Gateway validates client-side too (InvalidLeaseTimeout).
-	IF arg_lease_timeout_seconds IS NULL OR arg_lease_timeout_seconds <= 0 THEN
-		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'SingularLeaseTimeoutInvalid';
+	-- 0.5 absolute-time contract: caller supplies the event time + the new ABSOLUTE deadline. The
+	-- monotonicity + deadline checks are deferred to the WORKING write path below (after the
+	-- token/terminal fencing) so a stale/terminal token still gets its own outcome, not a time error.
+	IF arg_event_ts IS NULL THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'SingularEventTimeInvalid';
 	END IF;
 
 	SET v_current_event_ts = NULL;
@@ -125,16 +127,19 @@ proc:BEGIN
 	END IF;
 
 	IF v_result_code = 0 THEN
-		SET v_new_event_ts = v_now;
-		IF v_new_event_ts <= v_current_event_ts THEN
-			SET v_new_event_ts = DATE_ADD(v_current_event_ts, INTERVAL 1 MICROSECOND);
+		-- 0.5 strict monotonicity + absolute deadline, enforced on the WORKING extend write:
+		--   event_ts <= last recorded event   -> EventTimeConflict   (errno 30002)
+		--   lease_expires_at <= event_ts       -> InvalidLeaseExpiry  (errno 30003)
+		-- The caller's times are authoritative and used verbatim — the deadline is NOT floored to the
+		-- old one (the caller owns absolute time in 0.5; "never shorten" is a caller-side policy now).
+		IF arg_event_ts <= v_current_event_ts THEN
+			SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'SingularEventTimeConflict', MYSQL_ERRNO = 30002;
 		END IF;
-
-		-- Extend-only: never SHORTEN the live lease. Floor the new expiry at the current
-		-- one (a shorter requested timeout, or clock skew, must not pull the deadline in).
-		-- The existing WORKING expiry is non-null by the schema CHECK, and the timeout is
-		-- a validated positive, so the result is always a bounded, non-decreasing deadline.
-		SET v_desired_lease_expires = GREATEST(v_existing_lease_expires, DATE_ADD(v_now, INTERVAL arg_lease_timeout_seconds SECOND));
+		IF arg_lease_expires_at IS NULL OR arg_lease_expires_at <= arg_event_ts THEN
+			SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'SingularInvalidLeaseExpiry', MYSQL_ERRNO = 30003;
+		END IF;
+		SET v_new_event_ts = arg_event_ts;
+		SET v_desired_lease_expires = arg_lease_expires_at;
 
 		INSERT INTO `tb_singular_work_item_history` (
 			`service_group`,
@@ -175,7 +180,8 @@ proc:BEGIN
 	END IF;
 
 	IF v_result_code = CONST_RESULT_EXTENDED THEN
-		SELECT JSON_OBJECT('outcome', 'extended') AS result;
+		-- 0.5: return the new ABSOLUTE deadline so the gateway threads an updated WorkLease.
+		SELECT JSON_OBJECT('outcome', 'extended', 'lease_expires_at', v_desired_lease_expires) AS result;
 	ELSEIF v_result_code = CONST_RESULT_TOKEN_STALE THEN
 		SELECT JSON_OBJECT('outcome', 'token_stale') AS result;
 	ELSEIF v_result_code = CONST_RESULT_NOT_FOUND THEN

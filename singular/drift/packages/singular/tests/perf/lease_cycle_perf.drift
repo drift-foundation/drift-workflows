@@ -1,0 +1,88 @@
+// Singular PERF gate scenario (certification): a fixed, sequential acquire->settle->inspect workload.
+//
+// Runs CYCLES full operations (distinct keys), each: start() -> Granted, complete() -> Settled,
+// inspect() -> Terminal — the hot path Bookkeeper drives. Times only the MEASURED batch (warmup first,
+// to amortize connect/pool). Emits ONE JSON metric line on stdout for the perf harness to gate:
+//   {"scenario":"lease_cycle","cycles":<n>,"elapsed_ms":<ms>,"per_cycle_us":<us>}
+// Exit 0 iff all CYCLES completed (a logical failure -> nonzero, independent of timing). The harness
+// (tools/perf_gate.py) gates per_cycle_us against a committed, machine-keyed baseline.
+
+module singular.tests.perf.lease_cycle_perf;
+
+import std.core as core;
+import std.core.arc as arc;
+import std.console as con;
+import std.json as json;
+import std.time as time;
+import std.format as fmt;
+import singular.uuid as uuid;
+import singular.gateway as gw;
+
+const TIMEOUT_S: Int = 30;
+const WARMUP: Int = 20;
+const CYCLES: Int = 300;
+
+fn _config_json() -> json.JsonNode {
+	val text: String = "{\"backend\":\"mariadb\",\"host\":\"127.0.0.1\",\"port\":34114,\"user\":\"root\",\"password\":\"rootpw\",\"database\":\"singular\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
+	return json.parse(&text).or_throw();
+}
+
+fn _build_gw() -> arc.Arc<gw.SingularGateway> {
+	val cfg = _config_json();
+	val identity = gw.identity_from_worker_name("singular-perf", &"driver");
+	var b = gw.new_gateway_builder();
+	gw.with_json(&mut b, &cfg);
+	gw.with_identity(&mut b, move identity);
+	return gw.build_gateway(move b).or_throw();
+}
+
+// One full operation on a distinct key. true on the expected start->settle->terminal path.
+fn _cycle(g: arc.Arc<gw.SingularGateway>, seed: Int) nothrow -> Bool {
+	var ok = false;
+	try {
+		val key = uuid.uuid_v3_from_string(&("singular-perf-" + fmt.format_int(seed)));
+		val tok = gw.new_lease_token();
+		val claim_time = time.now_utc();
+		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(&claim_time) + TIMEOUT_S * 1000000);
+		match g.get().start(&key, &"{\"t\":\"perf\"}", &"{}", &claim_time, &lease_expires, &tok) {
+			gw.StartOutcome::Granted(lease) => {
+				val settle_time = time.now_utc();
+				match g.get().complete(&lease, &settle_time, &"{\"r\":\"ok\"}") {
+					gw.SettleOutcome::Settled(_) => {
+						match g.get().inspect(&key) {
+							gw.InspectOutcome::Terminal(_, _) => { ok = true; },
+							default => {}
+						}
+					},
+					default => {}
+				}
+			},
+			gw.StartOutcome::Exists => {}
+		}
+	} catch unexpected { ok = false; }
+	return ok;
+}
+
+fn main(argv: Array<String>) nothrow -> Int {
+	var gopt: Optional<arc.Arc<gw.SingularGateway>> = Optional<arc.Arc<gw.SingularGateway>>::None();
+	try { gopt = Optional<arc.Arc<gw.SingularGateway>>::Some(_build_gw()); }
+	catch unexpected { con.eprintln("singular-perf: gateway build failed"); return 2; }
+	match move gopt {
+		Optional::Some(g) => {
+			var w = 0;
+			while w < WARMUP { val _ = _cycle(g.clone(), 0 - 1 - w); w = w + 1; }
+			val t0 = time.now_monotonic();
+			var ok = 0;
+			var i = 0;
+			while i < CYCLES { if _cycle(g.clone(), i) { ok = ok + 1; } i = i + 1; }
+			val ms = time.elapsed_ms(&t0);
+			val us_per = time.elapsed_micros(&t0) / CYCLES;
+			con.println("{\"scenario\":\"lease_cycle\",\"cycles\":" + fmt.format_int(ok)
+				+ ",\"elapsed_ms\":" + fmt.format_int(ms)
+				+ ",\"per_cycle_us\":" + fmt.format_int(us_per) + "}");
+			if ok != CYCLES { con.eprintln("singular-perf: only " + fmt.format_int(ok) + "/" + fmt.format_int(CYCLES) + " cycles completed"); return 1; }
+			return 0;
+		},
+		Optional::None => { return 2; }
+	}
+}

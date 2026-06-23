@@ -5,13 +5,13 @@
 #   DRIFT_TOOLCHAIN_ROOT — required toolchain
 #   DRIFT_PKG_ROOT       — foundation package root
 #                          (default: $HOME/opt/drift/certified/current/libs)
-#   PUSHCOIN_LIB_ROOT    — PushCoin-published lib root for `singular`
-#                          (default: ../../pushcoin/singular/build/dist/lib)
+#   SINGULAR_LIB_ROOT    — locally-published lib root for `singular` (Foundation-owned, this repo)
+#                          (default: ../../singular/drift/build/dist/lib)
 #   MDB_ROOT_PWD         — MariaDB root password (Singular schema load)
 
 MANIFEST := "drift/manifest.json"
 _pkg-root := env("DRIFT_PKG_ROOT", env("HOME") + "/opt/drift/certified/current/libs")
-_pkg-local := env("PUSHCOIN_LIB_ROOT", "../../singular/drift/build/dist/lib")
+_pkg-local := env("SINGULAR_LIB_ROOT", "../../singular/drift/build/dist/lib")
 BIN_DIR := "build/dist/bin"
 
 # Resolve dependencies and write drift/lock.json.

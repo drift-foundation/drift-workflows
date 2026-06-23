@@ -241,10 +241,24 @@ def emit_stress():
             "phases": [{"name": "build", "jobs": build}, {"name": "run", "jobs": run}]}
 
 
+# ----------------------------------------------------------------- gate: perf
+# BUILD-ONLY plan: compile the perf scenario to {work}/singular-perf. The serial DB-backed RUN +
+# baseline gate happens in the harness (tools/perf_gate.py), bracketing the executor (the
+# drift-mariadb-client convention: parallel compile here, exclusive measurement outside).
+PERF_SRC = "packages/singular/tests/perf/lease_cycle_perf.drift"
+
+
+def emit_perf():
+    srcs, dep_flags = src_files(), resolved_dep_flags()
+    entry = f"{module_of(PERF_SRC)}::main"
+    build = [src_build("singular-perf", srcs, dep_flags, entry, PERF_SRC)]
+    return {"name": "singular-perf", "phases": [{"name": "build", "jobs": build}]}
+
+
 def main():
     global DB_GROUP
     ap = argparse.ArgumentParser(description="Emit a drift_test_run.py plan for a Singular gate.")
-    ap.add_argument("gate", choices=["test", "stress", "one", "compile"])
+    ap.add_argument("gate", choices=["test", "stress", "perf", "one", "compile"])
     ap.add_argument("--file", help="test/source file (for one|compile)")
     ap.add_argument("--out", default="-", help="output path for the plan JSON (default: stdout)")
     ap.add_argument("--db-group", default=DB_GROUP,
@@ -258,6 +272,8 @@ def main():
         plan = emit_one(args.file) if args.gate == "one" else emit_compile(args.file)
     elif args.gate == "stress":
         plan = emit_stress()
+    elif args.gate == "perf":
+        plan = emit_perf()
     else:
         plan = emit_test()
     text = json.dumps(plan, indent=2)

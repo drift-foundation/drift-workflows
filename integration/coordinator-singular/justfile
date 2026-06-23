@@ -78,10 +78,81 @@ _db-and-harness WORK:
 	echo "[integration] run coordinator<->singular harness"
 	STUB_BIN="{{WORK}}/participant-stub" RUNNER_BIN="{{WORK}}/microflows-runner" SERVICE_BIN="{{WORK}}/microflows-service" python3 test.py
 
-# No performance scenarios for this suite yet (explicit no-op, not a silent skip).
-perf:
-	@echo "[integration:coordinator-singular] no perf scenarios defined yet (gate stub)"
+# Coordinator PERF gate: service drive throughput (timing) vs a committed baseline. Same compile +
+# DB-lock + schema-reset discipline as `test`. Pass --update-baseline ARGS to (re)record the baseline.
+perf *ARGS:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../../../mariachi && just setup'" >&2; exit 1; }
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
+	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	WORK="$(mktemp -d -t coord-singular-perf-XXXXXX)"
+	trap 'rm -rf "$WORK"' EXIT
+	echo "[integration:perf] compile participant-stub + microflows-service from source"
+	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
+	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	"{{FLOCKER}}" --key {{DB_LOCK}} -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _db-and-perf "$WORK" {{ARGS}}
 
-# No stress/soak/recovery scenarios for this suite yet (explicit no-op).
+# Internal: DB-touching perf phase (reset both schemas, then measure + gate). Under the shared DB lock.
+_db-and-perf WORK *ARGS:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	echo "[integration:perf] reset singular schema (clean participant store)"
+	"{{MARIACHI}}" \
+	  --schema-template "{{SG}}/db" \
+	  --host {{DB_HOST}} --port {{DB_PORT}} \
+	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  apply --schema singular --env=development --allow-destructive --destroy-database
+	echo "[integration:perf] reset + seed microflows schema (coordinator-fixtures)"
+	"{{MARIACHI}}" \
+	  --schema-template "{{MF}}/db" \
+	  --host {{DB_HOST}} --port {{DB_PORT}} \
+	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  scenario --schema microflows --name coordinator-fixtures
+	echo "[integration:perf] measure coordinator drive throughput + gate"
+	STUB_BIN="{{WORK}}/participant-stub" SERVICE_BIN="{{WORK}}/microflows-service" python3 perf.py {{ARGS}}
+
+# Coordinator STRESS gate: concurrent-submit recovery race — WORKERS racing one workflow id must collapse
+# to exactly-once participant execution. Same compile + DB-lock + schema-reset discipline as `test`.
 stress:
-	@echo "[integration:coordinator-singular] no stress scenarios defined yet (gate stub)"
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../../../mariachi && just setup'" >&2; exit 1; }
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
+	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	WORK="$(mktemp -d -t coord-singular-stress-XXXXXX)"
+	trap 'rm -rf "$WORK"' EXIT
+	echo "[integration:stress] compile participant-stub + microflows-runner from source"
+	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
+	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	"{{FLOCKER}}" --key {{DB_LOCK}} -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _db-and-stress "$WORK"
+
+# Internal: DB-touching stress phase (reset both schemas, then run the concurrent-drive harness).
+# Always under the shared DB lock held by `stress`.
+_db-and-stress WORK:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	echo "[integration:stress] reset singular schema (clean participant store)"
+	"{{MARIACHI}}" \
+	  --schema-template "{{SG}}/db" \
+	  --host {{DB_HOST}} --port {{DB_PORT}} \
+	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  apply --schema singular --env=development --allow-destructive --destroy-database
+	echo "[integration:stress] reset + seed microflows schema (coordinator-fixtures)"
+	"{{MARIACHI}}" \
+	  --schema-template "{{MF}}/db" \
+	  --host {{DB_HOST}} --port {{DB_PORT}} \
+	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  scenario --schema microflows --name coordinator-fixtures
+	echo "[integration:stress] run coordinator concurrent-drive stress"
+	STUB_BIN="{{WORK}}/participant-stub" RUNNER_BIN="{{WORK}}/microflows-runner" python3 stress.py

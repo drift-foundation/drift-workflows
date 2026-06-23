@@ -1,0 +1,8 @@
+{
+  "machine_id": "f6fa5233bd0ddece63a0694084f62f80",
+  "scenarios": {
+    "lease_cycle": {
+      "per_cycle_us": 633
+    }
+  }
+}

@@ -36,6 +36,7 @@ import std.cli as cli;
 import std.env as env;
 import web.rest as rest;
 import singular as singular;
+import std.time as time;
 
 const DEFAULT_PORT: Int = 8080;
 const LEASE_TIMEOUT_SECONDS: Int = 30;
@@ -288,7 +289,12 @@ implement StubApp {
 		val input_hash = _input_hash(input);
 		val item_meta = _hash_meta(&input_hash);
 
-		match self.gateway.get().start(&key, &item_meta, &"{}", LEASE_TIMEOUT_SECONDS, &token) {
+		// 0.5: caller-supplied absolute times. claim_time = wall clock now; the lease deadline is
+		// claim_time + LEASE_TIMEOUT_SECONDS. The settle event_time (taken after the body runs + the
+		// start round-trip) is strictly later, satisfying Singular's monotonicity.
+		val claim_time = time.now_utc();
+		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(&claim_time) + LEASE_TIMEOUT_SECONDS * 1000000);
+		match self.gateway.get().start(&key, &item_meta, &"{}", &claim_time, &lease_expires, &token) {
 			singular.StartOutcome::Granted(lease) => {
 				// Fault injection: RESPOND-PENDING. Simulate accepted-but-not-terminal
 				// by returning 202 without completing. The lease drops, leaving the op
@@ -302,7 +308,8 @@ implement StubApp {
 				// First submit: run the operation body EXACTLY ONCE.
 				val _prev = self.exec_count.fetch_add(1, conc.MemoryOrder::SeqCst());
 				val result_json = _execute_op(op, input);
-				match self.gateway.get().complete(&lease, &result_json) {
+				val settle_time = time.now_utc();
+				match self.gateway.get().complete(&lease, &settle_time, &result_json) {
 					singular.SettleOutcome::Settled(tr) => {
 						// Fault injection: DROP-AFTER-COMMIT. The result is already
 						// durably committed above; sleeping past the client's PUT

@@ -94,15 +94,13 @@ individually pinnable by Bookkeeper), just staged from one repo entry — exactl
 
 We proceed with the single-entry shape (option 1 above) under the current constraint.
 
-### Sequencing vs the singular 0.5.0 reshape
+### Singular 0.5.0 reshape — DONE; certify 0.5.0 only
 
-The single entry certifies whatever the top-level manifest declares. To avoid certifying singular 0.4.x
-as a Bookkeeper target, the recommended sequencing: get the repo **cert-ready now** (gates green,
-top-level manifest, deploy works) but have the cert team **add drift-workflows to `run-all-latest` once
-singular's 0.5.0 reshape lands**, so the certified `singular` is the reshaped surface. microflows is ready
-in parallel and ships in the same first cert. (Open: whether to land microflows + singular-0.4.x first
-and bump singular to 0.5.0 in a follow-on cert — faster microflows unblock, but stages a non-target
-singular. Flagged for the team.)
+The reshape is **implemented and green** (caller-supplied `UtcTimestamp` event times on all transitions;
+thrown `EventTimeConflict` / `InvalidLeaseExpiry`; `WorkLease` threading). The top-level manifest stages
+**`singular 0.5.0`** (NOT 0.4.x — that version is never submitted). Both artifacts certify together in the
+first cert: `singular 0.5.0` + `microflows 0.1.0`. No sequencing question remains — there is no scenario
+that stages a pre-reshape singular.
 
 ## Command surface this repo will expose (from the repo ROOT — the checkout root)
 
@@ -136,15 +134,22 @@ singular. Flagged for the team.)
 
 Bounded/smoke in SIZE, not in meaning. A green **stress** run must mean *concurrency is correct under
 contention*; a green **perf** run must mean *throughput has not regressed* — caught against a
-**persisted, committed baseline** so a cascading slowdown is a HARD FAILURE (the drift-mariadb-client
-convention: a `perf_baseline.py`-style harness + committed `perf/results/`, gated on **op / SP-call /
-round-trip / byte counts**, not wall-clock, so a busy host doesn't false-fail).
+**persisted, committed baseline** so a slowdown is a HARD FAILURE. Our packages measure at the
+**library/API level** with the **real DB round trips in the workload** (production behavior), and gate
+**elapsed time / throughput** vs a committed, machine-keyed baseline — with a **missing baseline as a
+hard failure** (never auto-minted in a gate; only `--update-baseline` records, then it's committed).
+Per-SP-call timing / wire-byte accounting is **drift-mariadb-client**'s domain, not ours. (A tolerance
+absorbs host variance while catching cascading slowdowns; logical counts like exactly-once dispatch are
+asserted as **correctness** in stress/test, not as the perf metric.)
 
 - **singular.stress** — N concurrent workers contend on the SAME lease key + replay the SAME idempotent
   operation; assert effectively-once + no lost/duplicated settle under contention. Serialized on the DB
   group, bounded iterations.
-- **singular.perf** — fixed acquire→settle→inspect cycle; **pin** protocol round-trips / SP calls / bytes
-  as a committed baseline; gate every future run against it.
+- **singular.perf** — fixed acquire→settle→inspect cycle measured at the **library/API level** (the real
+  gateway → mariadb-rpc → SP → MariaDB round trips ARE in the workload — production behavior). Gate
+  **elapsed time / throughput** (`per_cycle_us`) against a committed, machine-keyed baseline; a **missing
+  baseline HARD-FAILS** (only `--update-baseline` records — never auto-minted during a gate). Singular
+  does NOT measure per-SP-call timing or wire-byte accounting — that is **drift-mariadb-client**'s domain.
 - **microflows.stress** — concurrent drives of one workflow id (recovery race) + respond-pending→resume
   under contention; assert exactly-once dispatch + clean terminal state.
 - **microflows.perf** — drive a fixed workflow to completion; **pin** participant-dispatch count + event
@@ -178,34 +183,29 @@ All four: DB-backed, serialized on the shared flocker DB key, deterministic, wit
 ## Version / package names Bookkeeper pins
 
 - `microflows` → **0.1.0**.
-- `singular` → **the reshaped API as a NEW version (≥ 0.5.0)** — **NOT 0.4.1**.
+- `singular` → **the reshaped API at 0.5.0** — **NOT 0.4.x** (never submitted).
 
-**DECISION (made):** do **not** certify 0.4.1 as the Bookkeeper target. The parked determinism reshape
-changes singular's public caller contract enough that 0.4.1 would be a churn release; the app team wants
-to adapt §5 **once** against the stable surface. So the **official, Bookkeeper-consumable `singular`
-package is the reshaped surface**, published as a new version (a material API change → bump the version,
-not a re-tag of 0.4.1). The reshape is the **next singular-specific sub-step**, BLOCKING official
-cert-pool submission of singular. See "Singular reshape sub-step" below.
+**DECISION (done):** certify **`singular 0.5.0` only** as the Bookkeeper target. The determinism reshape
+changed singular's public caller contract (a material API change → a new version, not a re-tag), so 0.4.x
+is never submitted. The reshape is **implemented and green** (see below); both artifacts certify together.
 
-> Sequencing: the repo-side, **API-agnostic** cert alignment (this lane's bulk — command contract,
-> deploy/stage_packages, real stress/perf, DB env, layout/claims/locks) proceeds NOW and is valid
-> regardless of the API. `microflows` can be submitted to the pool once aligned. `singular` aligns now
-> but its official submission waits on the reshape version.
+## Singular 0.5.0 reshape — IMPLEMENTED + GREEN
 
-## Singular reshape sub-step (blocks official singular submission)
+The reshape landed (owner gave the spec + directed implementation). The 0.5.0 public surface:
 
-A separate singular-specific change, scoped here but implemented as its own step (needs the design/spec
-from the singular owners — this lane does not guess the API):
+- caller-supplied `std.time.UtcTimestamp` event time on **every** mutating transition
+  (`start`/`complete`/`fail`/`extend_lease`) + absolute `lease_expires_at` on start/extend (the public
+  `lease_timeout_seconds` knob is removed); the gateway + SPs never substitute DB time for a caller time;
+- strict monotonicity → thrown **`EventTimeConflict`** (errno 30002); `lease_expires_at > event_time`
+  → thrown **`InvalidLeaseExpiry`** (errno 30003); enforced client-side AND in the SPs;
+- `WorkLease.lease_expires_at` typed as `UtcTimestamp`; `start`/`extend_lease` return the threaded lease;
+- behavior change: extend is caller-authoritative (proposed absolute deadline applied verbatim,
+  validated `> event_time`); the pre-0.5 "never shorten" flooring is gone.
 
-- caller-supplied `std.time.UtcTimestamp` (deterministic time in, no hidden clock reads);
-- `WorkLease` threading through the gateway API;
-- thrown `EventTimeConflict`;
-- thrown `InvalidLeaseExpiry`.
-
-Deliverable of that sub-step: the reshaped singular API at a new version, its tests/stress/perf updated,
-re-signed + lock-regenerated, then submitted as the Bookkeeper-pinned package. Microflows consumes
-singular only in its test apps (stub), so it tracks whatever singular version is current; the published
-microflows **library** is unaffected by the singular API (no singular dep).
+Verified: singular 16/16 (e2e + raw-SQL SP-invariants for both throws + complete/fail/extend
+monotonicity), stress, perf; integration 165/165 (stub on the 0.5 API); top-level deploy stages
+`singular 0.5.0`, Foundation-signed. Microflows consumes singular only in its test stub (compiled from
+source); the published microflows **library** has no singular dep, so it is unaffected by the singular API.
 
 ## Implementation order (repo-side first, then the message)
 

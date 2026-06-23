@@ -75,9 +75,22 @@ _stress-locked:
 	echo "[singular] stress drift binding"
 	( cd drift && just _stress-grouped "{{DB_HELD_GROUP}}" )
 
-# Foundation perf gate stub (populate as scenarios land).
-perf:
-	@echo "[singular] no perf scenarios defined yet (gate stub)"
+# Certification PERF gate: fixed acquire->settle->inspect workload, gated vs a committed baseline.
+# Acquires the shared DB lock, loads schema, runs the binding's perf gate (compile + measure).
+perf *ARGS:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 -- just _perf-locked {{ARGS}}
+
+_perf-locked *ARGS:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	echo "[singular] load schema"
+	just _db-load-schema
+	echo "[singular] perf drift binding"
+	( cd drift && just perf {{ARGS}} )
 
 # Apply the shared backend schema (db/) via Mariachi, AND load the isolated
 # malformed-backend fixture schema the binding's malformed_backend_test depends

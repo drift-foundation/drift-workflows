@@ -5,7 +5,7 @@ Microflows's PLAN EMITTER — the small per-project POLICY piece; the shared
 toolchain executor (`$DRIFT_TOOLCHAIN_ROOT/lib/tools/drift_test_run.py`) owns
 the mechanism (parallel compile under the flocker pool, run scheduling, dedup,
 valgrind wrap, heartbeat, host concurrency budget). Mirrors the Singular
-emitter's structure (see ../pushcoin/singular/tools/emit_test_plan.py).
+emitter's structure (see ../../singular/drift/tools/emit_test_plan.py).
 
 Gates:
   test  — unit + e2e, each built {base, asan}. Unit runs base/memcheck/asan in

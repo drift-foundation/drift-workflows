@@ -5,7 +5,7 @@
 // database-clock sourcing. Remote-operation dispatch + result persistence
 // arrive in step 4.
 //
-// Modeled on Singular's gateway (../pushcoin/singular gateway.drift): a
+// Modeled on Singular's gateway (../../singular gateway.drift): a
 // connection pool wrapped behind an interface, every operation calling one
 // stored procedure that returns ONE result row with ONE column `result` — a
 // discriminated JSON DOCUMENT keyed by `outcome`.

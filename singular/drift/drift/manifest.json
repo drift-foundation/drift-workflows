@@ -3,14 +3,14 @@
   "project": {
     "name": "singular",
     "license": "MIT",
-    "author_profile": "pushcoin.author-profile"
+    "author_profile": "the-drift-foundation.author-profile"
   },
   "artifacts": [
     {
       "kind": "library",
       "name": "singular",
       "module_namespace": "singular",
-      "version": "0.4.1",
+      "version": "0.5.0",
       "description": "Idempotency and lease coordination over MariaDB",
       "entry_module": "packages/singular/src/lib.drift",
       "modules": [

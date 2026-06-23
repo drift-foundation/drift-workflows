@@ -15,10 +15,11 @@ CREATE PROCEDURE `sp_singular_complete`(
 	IN arg_idempotency_key varbinary(32),
 	IN arg_lease_owner varbinary(16),       -- descriptive/audit only; varbinary so short values are NOT padded
 	IN arg_lease_token varbinary(16),       -- the authority
+	IN arg_event_ts datetime(6),            -- 0.5: caller-supplied settle time (strictly monotonic)
 	IN arg_response mediumtext
 )
 proc:BEGIN
-	DECLARE v_now datetime(6);
+	DECLARE v_now datetime(6);              -- DB wall clock: updated_at AUDIT column only
 	DECLARE v_current_event_ts datetime(6);
 	DECLARE v_current_lease_token varbinary(16);
 	DECLARE v_terminal_lease_token varbinary(16);
@@ -112,10 +113,13 @@ proc:BEGIN
 		IF NOT (arg_lease_token <=> v_current_lease_token) THEN
 			SET v_result_code = CONST_RESULT_TOKEN_STALE;
 		ELSE
-			SET v_new_event_ts = v_now;
-			IF v_new_event_ts <= v_current_event_ts THEN
-				SET v_new_event_ts = DATE_ADD(v_current_event_ts, INTERVAL 1 MICROSECOND);
+			-- 0.5 strict monotonicity: the caller's settle time MUST be strictly after the item's last
+			-- recorded event (equal disallowed). Violation -> EventTimeConflict (errno 30002). The
+			-- caller's time is used verbatim — never silently replaced or bumped to the DB clock.
+			IF arg_event_ts IS NULL OR arg_event_ts <= v_current_event_ts THEN
+				SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'SingularEventTimeConflict', MYSQL_ERRNO = 30002;
 			END IF;
+			SET v_new_event_ts = arg_event_ts;
 
 			INSERT INTO `tb_singular_work_item_history` (
 				`service_group`, `idempotency_key`, `event_ts`, `item_meta`,

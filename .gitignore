@@ -19,3 +19,4 @@ microflows/perf/results/
 **/tmp_db_instances/
 microflows/runner/build
 __pycache__
+build

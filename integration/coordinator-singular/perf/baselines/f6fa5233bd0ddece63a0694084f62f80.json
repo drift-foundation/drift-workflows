@@ -1,0 +1,8 @@
+{
+  "machine_id": "f6fa5233bd0ddece63a0694084f62f80",
+  "scenarios": {
+    "service_reserve_drive": {
+      "per_wf_ms": 3.12
+    }
+  }
+}

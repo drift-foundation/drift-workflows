@@ -6,8 +6,8 @@
 #   DRIFT_TOOLCHAIN_ROOT — required for test gates (just test). Toolchain >= 0.33.17.
 #   DRIFT_PKG_ROOT       — foundation-libs root for resolving external deps
 #                          (default: $HOME/opt/drift/certified/current/libs).
-#   PUSHCOIN_SIGN_KEY_FILE — Ed25519 signing key file (PushCoin publisher identity)
-#                          (default: $HOME/.config/drift/keys/pushcoin.seed).
+#   DRIFT_SIGN_KEY_FILE  — Ed25519 author-claim signer (The Drift Foundation identity)
+#                          (default: $HOME/.config/drift/keys/default.seed).
 #   DRIFT_DIST_ROOT      — deploy destination (default: build/dist/lib)
 #   MDB_ROOT_PWD         — MariaDB root password for db-* recipes.
 
@@ -144,17 +144,22 @@ author-claim:
 # --- Stress / perf gates (Foundation standard) ---
 # Empty scaffolds so certification has the recipes; populate as scenarios land.
 
-# Stress gate — no scenarios yet.
+# Stress gate. The coordinator's stress scenario is inherently CROSS-COMPONENT (it needs a live
+# Singular-backed participant + the coordinator's MariaDB control state), so it lives in the integration
+# suite — `integration/coordinator-singular` `just stress` (concurrent-submit recovery race), run by the
+# root aggregate gate via `_integration-gate stress`. No microflows-ONLY (participant-less) stress exists.
 stress:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	echo "[stress] no stress scenarios defined yet (Foundation gate stub)"
+	echo "[stress] coordinator stress is the integration gate: integration/coordinator-singular (just stress)"
 
-# Perf gate — no scenarios yet.
+# Perf gate. Same rationale: the coordinator drive-throughput perf is cross-component and lives in
+# `integration/coordinator-singular` `just perf` (service drive throughput vs a committed baseline), run
+# by the root aggregate via `_integration-gate perf`. No microflows-ONLY perf scenario exists.
 perf:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	echo "[perf] no perf scenarios defined yet (Foundation gate stub)"
+	echo "[perf] coordinator perf is the integration gate: integration/coordinator-singular (just perf)"
 
 # Wipe all generated artifacts under build/.
 clean:

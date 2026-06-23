@@ -16,6 +16,7 @@ import std.json as json;
 import std.concurrent as conc;
 import std.containers as containers;
 import std.format as fmt;
+import std.time as time;
 import singular.uuid as uuid;
 import singular.gateway as gw;
 
@@ -53,9 +54,12 @@ fn _worker(g: arc.Arc<gw.SingularGateway>, key: Array<Byte>, round_idx: Int) not
 	var rc = -99;
 	try {
 		val tok = gw.new_lease_token();
-		match g.get().start(&key, &"{\"t\":\"stress\"}", &"{}", TIMEOUT_S, &tok) {
+		val claim_time = time.now_utc();
+		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(&claim_time) + TIMEOUT_S * 1000000);
+		match g.get().start(&key, &"{\"t\":\"stress\"}", &"{}", &claim_time, &lease_expires, &tok) {
 			gw.StartOutcome::Granted(lease) => {
-				match g.get().complete(&lease, &expected) {
+				val settle_time = time.now_utc();
+				match g.get().complete(&lease, &settle_time, &expected) {
 					gw.SettleOutcome::Settled(_) => { rc = 1; },
 					gw.SettleOutcome::TokenStale => { rc = -11; },
 					gw.SettleOutcome::NotFound => { rc = -12; }

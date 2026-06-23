@@ -12,7 +12,7 @@
 // Prerequisites:
 //   - MariaDB on 127.0.0.1:34114 with root/rootpw (container mdb114-a)
 //   - singular database with schema + stored procedures loaded
-//     (`just db-load-schema` in pushcoin root)
+//     (`just db-load-schema` in singular/)
 //
 // No test-data cleanup needed: each run uses a unique service_group
 // (SINGULAR_E2E_SVCGROUP, set by the check-e2e recipe), so repeated runs are
@@ -28,10 +28,26 @@ import std.concurrent as conc;
 import std.containers as containers;
 import std.format as fmt;
 import std.env as env;
+import std.time as time;
 import singular.uuid as uuid;
 import singular.gateway as gw;
 
 const TIMEOUT_MS: Int = 3000;
+
+// 0.5 time contract: every mutating call carries a caller-supplied event_time, and Singular
+// enforces strict monotonicity per key (each transition's event_time must be > the item's last
+// recorded event_ts). For start/extend, lease_expires_at must be strictly > event_time.
+//
+// _ts(seq): a distinct, strictly-increasing event_time per seq (base 2023-11, +1s per seq).
+// _exp(seq): a lease deadline 30s after _ts(seq) (always > _ts(seq)).
+// Within one key's lifecycle we pick strictly-increasing seqs along the transition order; across
+// distinct keys/scenarios the same seq may repeat.
+fn _ts(seq: Int) nothrow -> time.UtcTimestamp {
+    return time.utc_from_unix_micros(1700000000000000 + seq * 1000000);
+}
+fn _exp(seq: Int) nothrow -> time.UtcTimestamp {
+    return time.utc_from_unix_micros(1700000000000000 + seq * 1000000 + 30000000);
+}
 
 fn _config_json() -> json.JsonNode {
     val text: String = "{\"backend\":\"mariadb\",\"host\":\"127.0.0.1\",\"port\":34114,\"user\":\"root\",\"password\":\"rootpw\",\"database\":\"singular\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
@@ -75,7 +91,7 @@ fn _lease_for(key: &Array<Byte>, tok: Array<Byte>) nothrow -> gw.WorkLease {
     return gw.WorkLease(
         key = key.clone(),
         lease_token = move tok,
-        lease_expires_at = ""
+        lease_expires_at = _exp(1)
     );
 }
 
@@ -89,7 +105,7 @@ fn _must_start(g: &arc.Arc<gw.SingularGateway>, key: &Array<Byte>, tok: &Array<B
     // codegen ICE — E-AUTO-56dbd38a, missing CallInfo — is fixed; inline form restored.)
     var out = _lease_for(key, tok.clone());
     var ok = false;
-    match g.get().start(key, &"{\"t\":\"start\"}", &"{}", 30, tok) {
+    match g.get().start(key, &"{\"t\":\"start\"}", &"{}", &_ts(1), &_exp(1), tok) {
         gw.StartOutcome::Granted(l) => { out = move l; ok = true; },
         gw.StartOutcome::Exists => {}
     }
@@ -145,12 +161,12 @@ fn scenario_start_complete_resume() -> Int {
 
     var lease = _must_start(&g, &key, &t1);
 
-    val cr = g.get().complete(&lease, &"{\"r\":\"ok\"}");
+    val cr = g.get().complete(&lease, &_ts(2), &"{\"r\":\"ok\"}");
     val ok2 = match cr { gw.SettleOutcome::Settled(_) => { true }, default => { false } };
     if !ok2 { return 102; }
 
     // A resubmit drives start→Exists then resume→Terminal(Done) with the payload.
-    match g.get().start(&key, &"{\"t\":\"1\"}", &"{\"w\":\"w1\"}", 30, &t1) {
+    match g.get().start(&key, &"{\"t\":\"1\"}", &"{\"w\":\"w1\"}", &_ts(1), &_exp(1), &t1) {
         gw.StartOutcome::Granted(_) => { return 103; },
         gw.StartOutcome::Exists => {}
     }
@@ -176,7 +192,7 @@ fn scenario_start_fail_resume() -> Int {
 
     var lease = _must_start(&g, &key, &t1);
 
-    val fr = g.get().fail(&lease, &"{\"error\":\"boom\"}");
+    val fr = g.get().fail(&lease, &_ts(2), &"{\"error\":\"boom\"}");
     val ok2 = match fr { gw.SettleOutcome::Settled(_) => { true }, default => { false } };
     if !ok2 { return 202; }
 
@@ -205,7 +221,7 @@ fn scenario_start_exists_resume_active() -> Int {
     val _ = _must_start(&ga, &key, &t1);
 
     // Second start (same key) → Exists.
-    match ga.get().start(&key, &"{\"t\":\"3\"}", &"{}", 30, &t1) {
+    match ga.get().start(&key, &"{\"t\":\"3\"}", &"{}", &_ts(1), &_exp(1), &t1) {
         gw.StartOutcome::Granted(_) => { return 302; },
         gw.StartOutcome::Exists => {}
     }
@@ -239,22 +255,22 @@ fn scenario_token_stale_fence() -> Int {
 
     val bogus = _lease_for(&key, _tok(&"pr1-t5-bogus"));
 
-    val cr = g.get().complete(&bogus, &"{\"r\":\"stale\"}");
+    val cr = g.get().complete(&bogus, &_ts(2), &"{\"r\":\"stale\"}");
     if !(match cr { gw.SettleOutcome::TokenStale => { true }, default => { false } }) { return 502; }
 
-    val fr = g.get().fail(&bogus, &"{\"e\":\"stale\"}");
+    val fr = g.get().fail(&bogus, &_ts(2), &"{\"e\":\"stale\"}");
     if !(match fr { gw.SettleOutcome::TokenStale => { true }, default => { false } }) { return 503; }
 
-    val er = g.get().extend_lease(&bogus, 60);
+    val er = g.get().extend_lease(&bogus, &_ts(2), &_exp(2));
     if !(match er { gw.ExtendLeaseOutcome::TokenStale => { true }, default => { false } }) { return 504; }
 
     // The real token still holds the lease.
-    val cr2 = g.get().complete(&real_lease, &"{\"r\":\"ok\"}");
+    val cr2 = g.get().complete(&real_lease, &_ts(2), &"{\"r\":\"ok\"}");
     if !(match cr2 { gw.SettleOutcome::Settled(_) => { true }, default => { false } }) { return 505; }
 
     // Now the item is terminal. A stale token's extend_lease must be fenced as
     // TokenStale (#1) — NOT handed the authoritative Terminal result.
-    val er2 = g.get().extend_lease(&bogus, 60);
+    val er2 = g.get().extend_lease(&bogus, &_ts(3), &_exp(3));
     if !(match er2 { gw.ExtendLeaseOutcome::TokenStale => { true }, default => { false } }) { return 506; }
     return 0;
 }
@@ -271,7 +287,7 @@ fn scenario_terminal_replay_vs_stale() -> Int {
 
     var lease = _must_start(&g, &key, &t1);
 
-    val c1 = g.get().complete(&lease, &"{\"r\":\"first\"}");
+    val c1 = g.get().complete(&lease, &_ts(2), &"{\"r\":\"first\"}");
     match c1 {
         gw.SettleOutcome::Settled(tr) => {
             match tr { gw.TerminalResult::Done(_) => {}, default => { return 602; } }
@@ -282,7 +298,7 @@ fn scenario_terminal_replay_vs_stale() -> Int {
     // Same-token replay on the terminal item → Terminal, carrying the AUTHORITATIVE
     // result ("first"), never the resubmitted "second" payload. This is the caller's
     // redeliver path: effect not repeated, but the stored outcome is handed back.
-    val c2 = g.get().complete(&lease, &"{\"r\":\"second\"}");
+    val c2 = g.get().complete(&lease, &_ts(3), &"{\"r\":\"second\"}");
     match c2 {
         gw.SettleOutcome::Settled(tr) => {
             match tr { gw.TerminalResult::Done(p) => { if p != "{\"r\":\"first\"}" { return 605; } }, default => { return 604; } }
@@ -292,7 +308,7 @@ fn scenario_terminal_replay_vs_stale() -> Int {
 
     // Different token on the terminal item → TokenStale (suppress; not the delivery owner).
     val bogus = _lease_for(&key, _tok(&"pr1-t6-other"));
-    val c3 = g.get().complete(&bogus, &"{\"r\":\"third\"}");
+    val c3 = g.get().complete(&bogus, &_ts(4), &"{\"r\":\"third\"}");
     if !(match c3 { gw.SettleOutcome::TokenStale => { true }, default => { false } }) { return 607; }
 
     // The cached response stays "first" (terminal record immutable).
@@ -311,22 +327,24 @@ fn scenario_extend_lease() -> Int {
 
     var lease = _must_start(&g, &key, &t1);
 
-    // Extend to a long horizon; capture the expiry.
-    val er = g.get().extend_lease(&lease, 60);
-    if !(match er { gw.ExtendLeaseOutcome::Extended => { true }, default => { false } }) { return 702; }
+    // Extend to a long horizon (lease_expires_at = base+2s+30s); capture the expiry.
+    val er = g.get().extend_lease(&lease, &_ts(2), &_exp(2));
+    if !(match er { gw.ExtendLeaseOutcome::Extended(_) => { true }, default => { false } }) { return 702; }
     val exp1 = _inspect_working_expires(&g, &key);
     if exp1.byte_length() == 0 { return 703; }
 
-    // A SHORTER subsequent extension must NOT pull the deadline in (#2): the expiry
-    // is floored at the existing (longer) value, so it stays exactly exp1.
-    val er_short = g.get().extend_lease(&lease, 1);
-    if !(match er_short { gw.ExtendLeaseOutcome::Extended => { true }, default => { false } }) { return 704; }
+    // 0.5 caller-authoritative time: extend uses the proposed lease_expires_at VERBATIM (no flooring),
+    // as long as it is strictly after event_time. A shorter-but-still-future deadline (base+3s+1s) is
+    // therefore APPLIED, so the stored expiry CHANGES away from exp1 (the pre-0.5 "never shorten" floor
+    // is gone — the caller owns the absolute deadline). event_time still advances (base+3s > base+2s).
+    val er_short = g.get().extend_lease(&lease, &_ts(3), &time.utc_from_unix_micros(1700000000000000 + 3 * 1000000 + 1000000));
+    if !(match er_short { gw.ExtendLeaseOutcome::Extended(_) => { true }, default => { false } }) { return 704; }
     val exp2 = _inspect_working_expires(&g, &key);
-    if exp2 != exp1 { return 705; }
+    if exp2 == exp1 { return 705; }
 
     // After completion, the writer's extend → Terminal(Done) (no live lease to extend).
-    val _ = g.get().complete(&lease, &"{\"r\":\"done\"}");
-    val er2 = g.get().extend_lease(&lease, 60);
+    val _ = g.get().complete(&lease, &_ts(4), &"{\"r\":\"done\"}");
+    val er2 = g.get().extend_lease(&lease, &_ts(5), &_exp(5));
     match er2 {
         gw.ExtendLeaseOutcome::Terminal(tr) => {
             match tr { gw.TerminalResult::Done(_) => {}, default => { return 706; } }
@@ -344,13 +362,13 @@ fn scenario_missing_key_notfound() -> Int {
     val key = _key(&"pr1-missing-key");          // never start()ed
     val lease = _lease_for(&key, _tok(&"pr1-t8"));
 
-    val cr = g.get().complete(&lease, &"{\"r\":\"x\"}");
+    val cr = g.get().complete(&lease, &_ts(1), &"{\"r\":\"x\"}");
     if !(match cr { gw.SettleOutcome::NotFound => { true }, default => { false } }) { return 801; }
 
-    val fr = g.get().fail(&lease, &"{\"e\":\"x\"}");
+    val fr = g.get().fail(&lease, &_ts(1), &"{\"e\":\"x\"}");
     if !(match fr { gw.SettleOutcome::NotFound => { true }, default => { false } }) { return 802; }
 
-    val er = g.get().extend_lease(&lease, 30);
+    val er = g.get().extend_lease(&lease, &_ts(1), &_exp(1));
     if !(match er { gw.ExtendLeaseOutcome::NotFound => { true }, default => { false } }) { return 803; }
 
     // resume on a missing key → NotFound.
@@ -382,7 +400,7 @@ fn scenario_token_validation() -> Int {
     // E_TYPED_CATCH_FIELD_UNSUPPORTED_TYPE.)
     var ok_start = false;
     try {
-        val _ = g.get().start(&key, &"{\"t\":\"9\"}", &"{}", 30, &bad);
+        val _ = g.get().start(&key, &"{\"t\":\"9\"}", &"{}", &_ts(1), &_exp(1), &bad);
     } catch gw:SingularException(_) {
         ok_start = true;
     }
@@ -393,7 +411,7 @@ fn scenario_token_validation() -> Int {
 
     var ok_complete = false;
     try {
-        val _ = g.get().complete(&bad_lease, &"{\"r\":\"x\"}");
+        val _ = g.get().complete(&bad_lease, &_ts(1), &"{\"r\":\"x\"}");
     } catch gw:SingularException(_) {
         ok_complete = true;
     }
@@ -401,7 +419,7 @@ fn scenario_token_validation() -> Int {
 
     var ok_fail = false;
     try {
-        val _ = g.get().fail(&bad_lease, &"{\"e\":\"x\"}");
+        val _ = g.get().fail(&bad_lease, &_ts(1), &"{\"e\":\"x\"}");
     } catch gw:SingularException(_) {
         ok_fail = true;
     }
@@ -409,7 +427,7 @@ fn scenario_token_validation() -> Int {
 
     var ok_extend = false;
     try {
-        val _ = g.get().extend_lease(&bad_lease, 30);
+        val _ = g.get().extend_lease(&bad_lease, &_ts(1), &_exp(1));
     } catch gw:SingularException(_) {
         ok_extend = true;
     }
@@ -421,7 +439,7 @@ fn scenario_token_validation() -> Int {
     val json_lease = _lease_for(&key, _tok(&"pr1-json"));
     var ok_complete_json = false;
     try {
-        val _ = g.get().complete(&json_lease, &"not json");
+        val _ = g.get().complete(&json_lease, &_ts(1), &"not json");
     } catch gw:SingularException(_) {
         ok_complete_json = true;
     }
@@ -429,7 +447,7 @@ fn scenario_token_validation() -> Int {
 
     var ok_fail_json = false;
     try {
-        val _ = g.get().fail(&json_lease, &"");
+        val _ = g.get().fail(&json_lease, &_ts(1), &"");
     } catch gw:SingularException(_) {
         ok_fail_json = true;
     }
@@ -457,11 +475,11 @@ fn scenario_token_gt_owner() -> Int {
 
     // gb shares the owner but carries a different token → TokenStale.
     val bogus = _lease_for(&key, _tok(&"pr1-t10-other"));
-    val cr_b = gb.get().complete(&bogus, &"{\"r\":\"stolen\"}");
+    val cr_b = gb.get().complete(&bogus, &_ts(2), &"{\"r\":\"stolen\"}");
     if !(match cr_b { gw.SettleOutcome::TokenStale => { true }, default => { false } }) { return 1002; }
 
     // The real token completes.
-    val cr_a = ga.get().complete(&lease, &"{\"r\":\"ok\"}");
+    val cr_a = ga.get().complete(&lease, &_ts(2), &"{\"r\":\"ok\"}");
     if !(match cr_a { gw.SettleOutcome::Settled(_) => { true }, default => { false } }) { return 1003; }
     return 0;
 }
@@ -487,7 +505,7 @@ fn scenario_concurrent_start_race() -> Int {
             // inside a nothrow lambda (was the constraint-#3 workaround).
             var code = 0;
             try {
-                match g.get().start(&k, &"{\"t\":\"csr\"}", &"{}", 30, &tok) {
+                match g.get().start(&k, &"{\"t\":\"csr\"}", &"{}", &_ts(1), &_exp(1), &tok) {
                     gw.StartOutcome::Granted(_) => { code = 1; },
                     gw.StartOutcome::Exists => { code = 2; }
                 }
@@ -547,7 +565,7 @@ fn scenario_concurrent_complete_race() -> Int {
     var t_owner = conc.spawn(| | captures(move g_owner, move lease_owner) nothrow => {
         var code = 0;
         try {
-            val cr = g_owner.get().complete(&lease_owner, &"{\"r\":\"owner\"}");
+            val cr = g_owner.get().complete(&lease_owner, &_ts(2), &"{\"r\":\"owner\"}");
             match cr {
                 gw.SettleOutcome::Settled(_) => { code = 1; },
                 gw.SettleOutcome::TokenStale => { code = 3; },
@@ -569,7 +587,7 @@ fn scenario_concurrent_complete_race() -> Int {
         var t = conc.spawn(| | captures(move g, move bogus) nothrow => {
             var code = 0;
             try {
-                val cr = g.get().complete(&bogus, &"{\"r\":\"other\"}");
+                val cr = g.get().complete(&bogus, &_ts(2), &"{\"r\":\"other\"}");
                 match cr {
                     gw.SettleOutcome::Settled(_) => { code = 1; },
                     gw.SettleOutcome::TokenStale => { code = 3; },
@@ -631,8 +649,8 @@ fn scenario_inspect_and_history() -> Int {
         default => { return 1303; }
     }
 
-    val _ = g.get().extend_lease(&lease, 60);
-    val _ = g.get().complete(&lease, &"{\"r\":\"done\"}");
+    val _ = g.get().extend_lease(&lease, &_ts(2), &_exp(2));
+    val _ = g.get().complete(&lease, &_ts(3), &"{\"r\":\"done\"}");
 
     if _inspect_terminal_kind(&g, &key) != 2 { return 1306; }
     if _inspect_terminal_payload(&g, &key).byte_length() == 0 { return 1307; }
@@ -661,10 +679,10 @@ fn scenario_cross_terminal() -> Int {
     val ta = _tok(&"pr1-t14a");
     val la = _must_start(&ga, &ka, &ta);
 
-    val fa = ga.get().fail(&la, &"{\"e\":\"declined\"}");
+    val fa = ga.get().fail(&la, &_ts(2), &"{\"e\":\"declined\"}");
     if !(match fa { gw.SettleOutcome::Settled(_) => { true }, default => { false } }) { return 1402; }
 
-    val ca = ga.get().complete(&la, &"{\"r\":\"oops-success\"}");
+    val ca = ga.get().complete(&la, &_ts(3), &"{\"r\":\"oops-success\"}");
     match ca {
         gw.SettleOutcome::Settled(tr) => {
             match tr { gw.TerminalResult::Failed(e) => { if e != "{\"e\":\"declined\"}" { return 1404; } }, default => { return 1403; } }
@@ -679,10 +697,10 @@ fn scenario_cross_terminal() -> Int {
     val tb = _tok(&"pr1-t14b");
     val lb = _must_start(&gb, &kb, &tb);
 
-    val cb = gb.get().complete(&lb, &"{\"r\":\"charged\"}");
+    val cb = gb.get().complete(&lb, &_ts(2), &"{\"r\":\"charged\"}");
     if !(match cb { gw.SettleOutcome::Settled(_) => { true }, default => { false } }) { return 1407; }
 
-    val fb = gb.get().fail(&lb, &"{\"e\":\"oops-failure\"}");
+    val fb = gb.get().fail(&lb, &_ts(3), &"{\"e\":\"oops-failure\"}");
     match fb {
         gw.SettleOutcome::Settled(tr) => {
             match tr { gw.TerminalResult::Done(p) => { if p != "{\"r\":\"charged\"}" { return 1409; } }, default => { return 1408; } }
@@ -694,43 +712,46 @@ fn scenario_cross_terminal() -> Int {
 }
 
 // ============================================================
-// 15. lease-timeout validation: a live lease must be bounded. start/extend_lease reject a
-//     non-positive timeout (InvalidLeaseTimeout) client-side with NO row/history mutation;
-//     a valid positive extend still works (never-shorten preserved). (NULL timeout is not
-//     representable through the Int gateway; the SPs SIGNAL SingularLeaseTimeoutInvalid as
-//     a backend-side defense.)
+// 15. lease-expiry validation (0.5): a live lease must be bounded — lease_expires_at MUST be
+//     strictly AFTER event_time. start/extend_lease reject lease_expires_at <= event_time
+//     (InvalidLeaseExpiry) client-side with NO row/history mutation; a valid (expiry > event_time)
+//     extend still works (never-shorten preserved).
+//
+//     NOTE (0.5 adaptation): the old non-positive-Int-timeout path (InvalidLeaseTimeout) is gone —
+//     the Int timeout argument no longer exists. This scenario now exercises the nearest 0.5
+//     equivalent: lease_expires_at == event_time and lease_expires_at < event_time both reject.
 // ============================================================
 fn scenario_lease_timeout_validation() -> Int {
     val g = _build_gw(&"w15");
     val key = _key(&"pr1-lease-timeout");
     val t1 = _tok(&"pr1-t15");
 
-    // start with zero / negative timeout → throws, creates no row.
-    var threw_zero = false;
-    try { val _ = g.get().start(&key, &"{\"t\":\"x\"}", &"{}", 0, &t1); } catch gw:SingularException(_) { threw_zero = true; }
-    if !threw_zero { return 1502; }
-    var threw_neg = false;
-    try { val _ = g.get().start(&key, &"{\"t\":\"x\"}", &"{}", -5, &t1); } catch gw:SingularException(_) { threw_neg = true; }
-    if !threw_neg { return 1503; }
+    // start with lease_expires_at == event_time / < event_time → throws, creates no row.
+    var threw_eq = false;
+    try { val _ = g.get().start(&key, &"{\"t\":\"x\"}", &"{}", &_ts(1), &_ts(1), &t1); } catch gw:SingularException(_) { threw_eq = true; }
+    if !threw_eq { return 1502; }
+    var threw_before = false;
+    try { val _ = g.get().start(&key, &"{\"t\":\"x\"}", &"{}", &_ts(5), &_ts(1), &t1); } catch gw:SingularException(_) { threw_before = true; }
+    if !threw_before { return 1503; }
     match g.get().inspect(&key) {
         gw.InspectOutcome::NotFound => {},
         default => { return 1504; }   // a rejected start must not have created a row
     }
 
-    // real start, then extend with zero / negative → throws, lease expiry unchanged.
+    // real start, then extend with expiry == / < event_time → throws, lease expiry unchanged.
     val lease = _must_start(&g, &key, &t1);
     val exp_before = _inspect_working_expires(&g, &key);
-    var threw_e0 = false;
-    try { val _ = g.get().extend_lease(&lease, 0); } catch gw:SingularException(_) { threw_e0 = true; }
-    if !threw_e0 { return 1505; }
-    var threw_en = false;
-    try { val _ = g.get().extend_lease(&lease, -1); } catch gw:SingularException(_) { threw_en = true; }
-    if !threw_en { return 1506; }
+    var threw_e_eq = false;
+    try { val _ = g.get().extend_lease(&lease, &_ts(2), &_ts(2)); } catch gw:SingularException(_) { threw_e_eq = true; }
+    if !threw_e_eq { return 1505; }
+    var threw_e_before = false;
+    try { val _ = g.get().extend_lease(&lease, &_ts(5), &_ts(2)); } catch gw:SingularException(_) { threw_e_before = true; }
+    if !threw_e_before { return 1506; }
     if _inspect_working_expires(&g, &key) != exp_before { return 1507; }   // rejected extends mutated nothing
 
-    // a valid positive extend still works.
-    match g.get().extend_lease(&lease, 60) {
-        gw.ExtendLeaseOutcome::Extended => {},
+    // a valid extend (lease_expires_at strictly after event_time) still works.
+    match g.get().extend_lease(&lease, &_ts(2), &_exp(2)) {
+        gw.ExtendLeaseOutcome::Extended(_) => {},
         default => { return 1508; }
     }
     return 0;
@@ -740,7 +761,7 @@ fn scenario_lease_timeout_validation() -> Int {
 // firing as InvalidJson). Returns true iff it threw.
 fn _complete_rejects(g: &arc.Arc<gw.SingularGateway>, lease: &gw.WorkLease, payload: &String) nothrow -> Bool {
     var threw = false;
-    try { val _ = g.get().complete(lease, payload); } catch gw:SingularException(_) { threw = true; } catch unexpected { threw = false; }
+    try { val _ = g.get().complete(lease, &_ts(2), payload); } catch gw:SingularException(_) { threw = true; } catch unexpected { threw = false; }
     return threw;
 }
 
@@ -771,7 +792,7 @@ fn scenario_json_object_contract() -> Int {
     }
 
     // ACCEPT: a populated object with a NESTED array (only the TOP level must be an object).
-    val cr = g.get().complete(&lease, &"{\"items\":[1,2]}");
+    val cr = g.get().complete(&lease, &_ts(2), &"{\"items\":[1,2]}");
     match cr {
         gw.SettleOutcome::Settled(tr) => {
             match tr { gw.TerminalResult::Done(p) => { if p != "{\"items\":[1,2]}" { return 1610; } }, default => { return 1609; } }
@@ -782,15 +803,66 @@ fn scenario_json_object_contract() -> Int {
     // start REJECTS a non-object item_meta client-side (no row); ACCEPTS {} (the empty document).
     val key2 = _key(&"pr1-json-object-contract-2");
     var threw_meta = false;
-    try { val _ = g.get().start(&key2, &"[1,2]", &"{}", 30, &t1); } catch gw:SingularException(_) { threw_meta = true; }
+    try { val _ = g.get().start(&key2, &"[1,2]", &"{}", &_ts(1), &_exp(1), &t1); } catch gw:SingularException(_) { threw_meta = true; }
     if !threw_meta { return 1612; }
     match g.get().inspect(&key2) {
         gw.InspectOutcome::NotFound => {},
         default => { return 1613; }   // a rejected start must not have created a row
     }
-    match g.get().start(&key2, &"{}", &"{}", 30, &t1) {
+    match g.get().start(&key2, &"{}", &"{}", &_ts(1), &_exp(1), &t1) {
         gw.StartOutcome::Granted(_) => {},
         default => { return 1614; }
+    }
+    return 0;
+}
+
+// ============================================================
+// 17. event-time monotonicity (0.5): complete() and fail() each require event_time STRICTLY AFTER the
+//     item's last recorded event. A start claims at _ts(1); a settle at _ts(1) (==) or _ts(0) (<) MUST
+//     throw our SingularException (the SP raises SingularEventTimeConflict / errno 30002, which the
+//     gateway maps to RuntimeErrorKind::EventTimeConflict). The contrast is decisive: the SAME call
+//     with a strictly-later event_time (_ts(2)) settles — so the ONLY thing rejected is the ordering.
+//     (The exact kind→errno mapping is pinned at the SP boundary by sp_invariants_test.py.)
+// ============================================================
+fn scenario_event_time_conflict() -> Int {
+    val g = _build_gw(&"w17");
+
+    // --- complete: non-monotonic event_time rejected; monotonic accepted ---
+    val keyc = _key(&"pr1-evtconflict-complete");
+    val tc = _tok(&"pr1-t17c");
+    val leasec = _must_start(&g, &keyc, &tc);              // claim at _ts(1)
+    var c_eq = false;
+    try { val _ = g.get().complete(&leasec, &_ts(1), &"{\"r\":\"x\"}"); } catch gw:SingularException(_) { c_eq = true; }
+    if !c_eq { return 1702; }                              // event_time == last → conflict
+    var c_before = false;
+    try { val _ = g.get().complete(&leasec, &_ts(0), &"{\"r\":\"x\"}"); } catch gw:SingularException(_) { c_before = true; }
+    if !c_before { return 1703; }                          // event_time < last → conflict
+    match g.get().inspect(&keyc) {
+        gw.InspectOutcome::Working(_, _, _) => {},          // rejected completes settled nothing
+        default => { return 1704; }
+    }
+    match g.get().complete(&leasec, &_ts(2), &"{\"r\":\"ok\"}") {
+        gw.SettleOutcome::Settled(_) => {},                 // strictly-later event_time → settles
+        default => { return 1705; }
+    }
+
+    // --- fail: same monotonicity contract ---
+    val keyf = _key(&"pr1-evtconflict-fail");
+    val tf = _tok(&"pr1-t17f");
+    val leasef = _must_start(&g, &keyf, &tf);              // claim at _ts(1)
+    var f_eq = false;
+    try { val _ = g.get().fail(&leasef, &_ts(1), &"{\"e\":\"x\"}"); } catch gw:SingularException(_) { f_eq = true; }
+    if !f_eq { return 1706; }
+    var f_before = false;
+    try { val _ = g.get().fail(&leasef, &_ts(0), &"{\"e\":\"x\"}"); } catch gw:SingularException(_) { f_before = true; }
+    if !f_before { return 1707; }
+    match g.get().inspect(&keyf) {
+        gw.InspectOutcome::Working(_, _, _) => {},
+        default => { return 1708; }
+    }
+    match g.get().fail(&leasef, &_ts(2), &"{\"e\":\"boom\"}") {
+        gw.SettleOutcome::Settled(_) => {},                 // strictly-later event_time → settles (Failed)
+        default => { return 1709; }
     }
     return 0;
 }
@@ -841,6 +913,9 @@ fn main() nothrow -> Int {
     con.println("16 json_object_contract");
     val r16 = try scenario_json_object_contract() catch { 1699 };
     if r16 != 0 { return r16; }
+    con.println("17 event_time_conflict");
+    val r17 = try scenario_event_time_conflict() catch { 1799 };
+    if r17 != 0 { return r17; }
     con.println("all pass");
     return 0;
 }

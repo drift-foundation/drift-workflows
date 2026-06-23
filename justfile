@@ -70,3 +70,66 @@ _integration-gate GATE:
 		( cd "$d" && just {{GATE}} )
 	done
 	if [[ "$found" -eq 0 ]]; then echo "[root] no integration suites found under integration/"; fi
+
+# --- Certification author/deploy surface (the drift-web / drift-mariadb-client convention) ---
+# The repo ROOT owns the multi-artifact author-claim + lock + deploy over the top-level
+# drift/manifest.json (singular + microflows), signed with the Foundation key (The Drift
+# Foundation owns this repo). The orchestrator's stage_packages runs the bare
+# `drift deploy --dest <libs_root>` and binds real cert-suite evidence; the local recipes
+# here are the dev fallback (`--cert-suite-id drift-workflows/dev --cert-suite-no-evidence`).
+# No bespoke evidence ceremony — same as the other Foundation cert-pool repos.
+
+# Re-mint drift/{singular,microflows}.author-claim under the Foundation author key.
+#   DRIFT_LANG_ROOT (default ~/src/drift-lang); DRIFT_SIGN_KEY_FILE (default seed).
+author-claim:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DRIFT_LANG_ROOT="${DRIFT_LANG_ROOT:-${HOME}/src/drift-lang}"
+	KEY_FILE="${DRIFT_SIGN_KEY_FILE:-${HOME}/.config/drift/keys/default.seed}"
+	[[ -d "${DRIFT_LANG_ROOT}/tools/drift_author" ]] || { echo "error: tools.drift_author not found at ${DRIFT_LANG_ROOT}" >&2; exit 1; }
+	[[ -f "${KEY_FILE}" ]] || { echo "error: signing key not found: ${KEY_FILE}" >&2; exit 1; }
+	for ART in singular microflows; do
+	  echo "[author-claim] minting drift/${ART}.author-claim"
+	  PYTHONPATH="${DRIFT_LANG_ROOT}" python3 -m tools.drift_author publish \
+	    --manifest "$(pwd)/drift/manifest.json" \
+	    --artifact "${ART}" \
+	    --key-file "${KEY_FILE}" \
+	    --overwrite
+	done
+
+# Resolve deps + write drift/lock.json against the package root.
+prepare:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
+	"$DRIFT" prepare --package-root "${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+
+# Read-only trust preflight (author-claims, SCI equality, trust grants).
+trust-check:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
+	"$DRIFT" trust check
+
+# Re-mint author-claims + re-resolve lock + trust-check; run before committing a version bump.
+# (Does NOT test — run `just test` first.)
+reseal:
+	@just author-claim
+	@just prepare
+	@just trust-check
+	@echo "[reseal] done — review & commit: drift/manifest.json, drift/lock.json, drift/*.author-claim"
+
+# Build, sign, and publish singular + microflows. Dev fallback cert-suite; the orchestrator
+# overrides --cert-suite-id and binds real evidence (deps resolved from DRIFT_PKG_ROOT).
+deploy *ARGS:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
+	LIBS="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	DEST="${DRIFT_DEPLOY_DEST:-build/deploy}"
+	mkdir -p "$DEST"
+	EXTRA=""
+	if [[ "{{ARGS}}" != *--cert-suite* ]]; then
+	  EXTRA="--cert-suite-id drift-workflows/dev --cert-suite-no-evidence"
+	fi
+	"$DRIFT" deploy --dest "$DEST" --package-root "$LIBS" ${EXTRA} {{ARGS}}

@@ -10,8 +10,10 @@ ONLY this run's exact service_groups — so parallel certification runs against 
 never collide with or delete each other's fixtures.
 
 Covered:
-  - Lease-timeout defense-in-depth: start/extend_lease with SQL NULL, 0, and negative timeout
-    SIGNAL 'SingularLeaseTimeoutInvalid' and leave projection + history COUNT unchanged.
+  - 0.5 caller-time contract: start/extend_lease with lease_expires_at <= event_time SIGNAL
+    'SingularInvalidLeaseExpiry' (errno 30003); extend with a non-monotonic event_time (<= the item's
+    last) SIGNALs 'SingularEventTimeConflict' (errno 30002); a NULL event_time SIGNALs
+    'SingularEventTimeInvalid'. All leave projection + history COUNT and the stored expiry unchanged.
   - Dangling head-history (corruption): a projection row whose current_event_ts has no matching
     history row makes inspect/resume/complete/fail/extend_lease SIGNAL 'SingularHeadHistoryMissing'
     with MYSQL_ERRNO 30001 (the structured code the gateway maps to BackendResponseInvalid).
@@ -49,9 +51,16 @@ OWNER = bytes(16)                 # 16-byte lease_owner (binary(16))
 TOKEN = bytes(range(16))          # valid 16-byte capability token
 KEY = b"\x01"                     # 1-byte idempotency key (valid: 1..32 bytes)
 
+EXPIRY_ERRNO = 30003              # MYSQL_ERRNO on SingularInvalidLeaseExpiry
+CONFLICT_ERRNO = 30002            # MYSQL_ERRNO on SingularEventTimeConflict
+# 0.5: caller-supplied absolute times (datetime(6) SP args). EV < EV2, and EXP is 30s after EV (> EV).
+EV = "2026-01-01 00:00:00.000000"   # a caller event time
+EXP = "2026-01-01 00:00:30.000000"  # a lease deadline strictly after EV
+EV2 = "2026-01-01 00:00:01.000000"  # a strictly-later event time (settle/extend after a start at EV)
+
 NONCE = uuid.uuid4().hex[:12]     # per-run isolation
 SG = {name: f"sptest-{NONCE}-{name}"
-      for name in ("start", "extend", "dangling", "meta", "resp", "owner", "ckpair")}
+      for name in ("start", "extend", "settle", "dangling", "meta", "resp", "owner", "ckpair")}
 
 _failures = []
 
@@ -109,35 +118,73 @@ def cleanup(cur):
     cur.execute(f"DELETE FROM tb_singular_work_item WHERE service_group IN ({placeholders})", sgs)
 
 
-def test_start_timeout(cur):
+def test_start_expiry(cur):
+    # 0.5: start takes caller event_time + absolute lease_expires_at. lease_expires_at <= event_time ->
+    # SingularInvalidLeaseExpiry (errno 30003); a NULL event_time -> SingularEventTimeInvalid. No row.
     sg = SG["start"]
     before = counts(cur, sg)
-    for label, timeout in (("NULL", None), ("zero", 0), ("negative", -5)):
-        expect_signal(cur, f"start timeout={label}", "sp_singular_start",
-                      (sg, KEY, "{}", OWNER, "{}", timeout, TOKEN), "SingularLeaseTimeoutInvalid")
+    bad_exp = [("equal", EV, EV), ("earlier", EV, "2025-12-31 23:59:59.000000"), ("expiry-NULL", EV, None)]
+    for label, ev, exp in bad_exp:
+        expect_signal(cur, f"start expiry={label}", "sp_singular_start",
+                      (sg, KEY, "{}", OWNER, "{}", ev, exp, TOKEN), "SingularInvalidLeaseExpiry", EXPIRY_ERRNO)
+    expect_signal(cur, "start event_ts=NULL", "sp_singular_start",
+                  (sg, KEY, "{}", OWNER, "{}", None, EXP, TOKEN), "SingularEventTimeInvalid")
     after = counts(cur, sg)
     if after == before == (0, 0):
-        _ok("start: rejected timeouts created no projection/history row")
+        _ok("start: rejected invalid expiry / NULL event_ts created no projection/history row")
     else:
         _fail(f"start: row counts changed {before} -> {after} (expected (0,0))")
 
 
-def test_extend_timeout(cur):
+def test_extend_expiry_and_monotonicity(cur):
+    # 0.5: extend takes caller event_time + absolute lease_expires_at. A non-monotonic event_time
+    # (<= the item's last) -> SingularEventTimeConflict (30002); lease_expires_at <= event_time ->
+    # SingularInvalidLeaseExpiry (30003). Neither mutates history nor changes the stored expiry.
     sg = SG["extend"]
-    call(cur, "sp_singular_start", (sg, KEY, "{}", OWNER, "{}", 30, TOKEN))   # valid live lease
+    call(cur, "sp_singular_start", (sg, KEY, "{}", OWNER, "{}", EV, EXP, TOKEN))   # live lease at EV
     before = counts(cur, sg)
     cur.execute("SELECT lease_expires_at FROM tb_singular_work_item_history WHERE service_group=%s", (sg,))
     exp_before = cur.fetchone()[0]
-    for label, timeout in (("NULL", None), ("zero", 0), ("negative", -1)):
-        expect_signal(cur, f"extend timeout={label}", "sp_singular_extend_lease",
-                      (sg, KEY, OWNER, TOKEN, timeout), "SingularLeaseTimeoutInvalid")
+    # bad expiry on a monotonic event (EV2 > EV): lease_expires_at <= event_time
+    for label, exp in (("equal", EV2), ("earlier", EV)):
+        expect_signal(cur, f"extend expiry={label}", "sp_singular_extend_lease",
+                      (sg, KEY, OWNER, TOKEN, EV2, exp), "SingularInvalidLeaseExpiry", EXPIRY_ERRNO)
+    # non-monotonic event_time (== current EV): EventTimeConflict regardless of the expiry arg
+    expect_signal(cur, "extend event<=last", "sp_singular_extend_lease",
+                  (sg, KEY, OWNER, TOKEN, EV, EXP), "SingularEventTimeConflict", CONFLICT_ERRNO)
     after = counts(cur, sg)
     cur.execute("SELECT lease_expires_at FROM tb_singular_work_item_history WHERE service_group=%s", (sg,))
     exp_after = cur.fetchone()[0]
     if after == before == (1, 1) and exp_after == exp_before:
-        _ok("extend: rejected timeouts mutated no history row and left expiry unchanged")
+        _ok("extend: rejected expiry/monotonicity violations mutated no history and left expiry unchanged")
     else:
         _fail(f"extend: state changed counts {before}->{after}, expiry {exp_before}->{exp_after}")
+
+
+def test_settle_monotonicity(cur):
+    # 0.5: complete AND fail require event_time strictly after the item's last event (the claim at EV).
+    # event_time <= current -> SingularEventTimeConflict (30002), no settle. A strictly-later complete
+    # then settles. Pins the conflict at the SP boundary for the terminal transitions (not just extend).
+    sg = SG["settle"]
+    call(cur, "sp_singular_start", (sg, KEY, "{}", OWNER, "{}", EV, EXP, TOKEN))   # claim at EV
+    earlier = "2025-12-31 23:59:59.000000"
+    for label, ev in (("equal", EV), ("earlier", earlier)):
+        expect_signal(cur, f"complete event={label}", "sp_singular_complete",
+                      (sg, KEY, OWNER, TOKEN, ev, "{}"), "SingularEventTimeConflict", CONFLICT_ERRNO)
+        expect_signal(cur, f"fail event={label}", "sp_singular_fail",
+                      (sg, KEY, OWNER, TOKEN, ev, "{}"), "SingularEventTimeConflict", CONFLICT_ERRNO)
+    # the rejected settles left it WORKING; a strictly-later complete settles it DONE.
+    try:
+        call(cur, "sp_singular_complete", (sg, KEY, OWNER, TOKEN, EV2, '{"r":"ok"}'))
+    except pymysql.MySQLError as e:
+        _fail(f"settle monotonicity: monotonic complete unexpectedly raised {e!r}"); return
+    cur.execute("SELECT status FROM tb_singular_work_item_history "
+                "WHERE service_group=%s AND event_type=20", (sg,))   # COMPLETED event
+    row = cur.fetchone()
+    if row is not None and row[0] == 2:   # DONE
+        _ok("settle monotonicity: complete/fail reject event<=last (30002); a monotonic complete settles")
+    else:
+        _fail(f"settle monotonicity: expected a DONE terminal after the monotonic complete, got {row!r}")
 
 
 def test_dangling_head(cur):
@@ -152,9 +199,9 @@ def test_dangling_head(cur):
     # All five SPs must surface the dangling head as corruption (errno 30001), not NotFound/NULL.
     expect_signal(cur, "inspect dangling-head", "sp_singular_inspect", (sg, KEY), want, errno)
     expect_signal(cur, "resume dangling-head", "sp_singular_resume", (sg, KEY), want, errno)
-    expect_signal(cur, "complete dangling-head", "sp_singular_complete", (sg, KEY, OWNER, TOKEN, "{}"), want, errno)
-    expect_signal(cur, "fail dangling-head", "sp_singular_fail", (sg, KEY, OWNER, TOKEN, "{}"), want, errno)
-    expect_signal(cur, "extend dangling-head", "sp_singular_extend_lease", (sg, KEY, OWNER, TOKEN, 30), want, errno)
+    expect_signal(cur, "complete dangling-head", "sp_singular_complete", (sg, KEY, OWNER, TOKEN, EV2, "{}"), want, errno)
+    expect_signal(cur, "fail dangling-head", "sp_singular_fail", (sg, KEY, OWNER, TOKEN, EV2, "{}"), want, errno)
+    expect_signal(cur, "extend dangling-head", "sp_singular_extend_lease", (sg, KEY, OWNER, TOKEN, EV2, EXP), want, errno)
 
 
 def test_missing_projection_is_notfound(cur):
@@ -183,7 +230,7 @@ def test_start_item_meta_contract(cur):
     rejects = [("NULL", None), ("malformed", "{"), ("json-null", "null"), ("array", "[1,2]"), ("scalar", "5")]
     for label, meta in rejects:
         expect_signal(cur, f"start item_meta={label}", "sp_singular_start",
-                      (sg, KEY, meta, OWNER, "{}", 30, TOKEN), "SingularItemMetaInvalid")
+                      (sg, KEY, meta, OWNER, "{}", EV, EXP, TOKEN), "SingularItemMetaInvalid")
     mid = counts(cur, sg)
     if mid == before == (0, 0):
         _ok("start item_meta: rejected NULL/malformed/json-null/array/scalar created no row")
@@ -194,7 +241,7 @@ def test_start_item_meta_contract(cur):
     ok = True
     for k, meta in accepts:
         try:
-            call(cur, "sp_singular_start", (sg, k, meta, OWNER, "{}", 30, TOKEN))
+            call(cur, "sp_singular_start", (sg, k, meta, OWNER, "{}", EV, EXP, TOKEN))
         except pymysql.MySQLError as e:
             ok = False
             _fail(f"start item_meta accept {meta!r}: unexpected SIGNAL {e!r}")
@@ -209,14 +256,14 @@ def test_complete_response_contract(cur):
     # JSON object contract on the terminal payload SP input: arg_response must be a JSON OBJECT.
     sg = SG["resp"]
     k = b"\x01"
-    call(cur, "sp_singular_start", (sg, k, "{}", OWNER, "{}", 30, TOKEN))   # live lease
+    call(cur, "sp_singular_start", (sg, k, "{}", OWNER, "{}", EV, EXP, TOKEN))   # live lease at EV
     rejects = [("NULL", None), ("malformed", "{"), ("json-null", "null"), ("array", "[1,2]"), ("scalar", "5")]
     for label, resp in rejects:
         expect_signal(cur, f"complete response={label}", "sp_singular_complete",
-                      (sg, k, OWNER, TOKEN, resp), "SingularResponseInvalid")
-    # Still WORKING (rejected completes never settled it), then a nested-array object settles it.
+                      (sg, k, OWNER, TOKEN, EV2, resp), "SingularResponseInvalid")
+    # Still WORKING (rejected completes never settled it), then a nested-array object settles it at EV2.
     try:
-        call(cur, "sp_singular_complete", (sg, k, OWNER, TOKEN, '{"items":[1,2]}'))
+        call(cur, "sp_singular_complete", (sg, k, OWNER, TOKEN, EV2, '{"items":[1,2]}'))
         _ok("complete response: rejected non-objects, accepted nested-array object")
     except pymysql.MySQLError as e:
         _fail(f"complete response accept: unexpected SIGNAL {e!r}")
@@ -229,10 +276,10 @@ def test_owner_input_contract(cur):
     sg = SG["owner"]
     before = counts(cur, sg)
     cases = [
-        ("start",        "sp_singular_start",        lambda o: (sg, KEY, "{}", o, "{}", 30, TOKEN)),
-        ("complete",     "sp_singular_complete",     lambda o: (sg, KEY, o, TOKEN, "{}")),
-        ("fail",         "sp_singular_fail",         lambda o: (sg, KEY, o, TOKEN, "{}")),
-        ("extend_lease", "sp_singular_extend_lease", lambda o: (sg, KEY, o, TOKEN, 30)),
+        ("start",        "sp_singular_start",        lambda o: (sg, KEY, "{}", o, "{}", EV, EXP, TOKEN)),
+        ("complete",     "sp_singular_complete",     lambda o: (sg, KEY, o, TOKEN, EV2, "{}")),
+        ("fail",         "sp_singular_fail",         lambda o: (sg, KEY, o, TOKEN, EV2, "{}")),
+        ("extend_lease", "sp_singular_extend_lease", lambda o: (sg, KEY, o, TOKEN, EV2, EXP)),
     ]
     for name, sp, mk in cases:
         for label, owner in (("NULL", None), ("short", bytes(8))):
@@ -275,10 +322,12 @@ def main():
     cur = conn.cursor()
     try:
         cleanup(cur)
-        print(f"sp-invariants (nonce {NONCE}): lease-timeout (start)")
-        test_start_timeout(cur)
-        print("sp-invariants: lease-timeout (extend)")
-        test_extend_timeout(cur)
+        print(f"sp-invariants (nonce {NONCE}): lease-expiry contract (start)")
+        test_start_expiry(cur)
+        print("sp-invariants: lease-expiry + event monotonicity (extend)")
+        test_extend_expiry_and_monotonicity(cur)
+        print("sp-invariants: event monotonicity (complete + fail)")
+        test_settle_monotonicity(cur)
         print("sp-invariants: dangling head-history (corruption, errno 30001)")
         test_dangling_head(cur)
         print("sp-invariants: missing projection -> NotFound (control)")
