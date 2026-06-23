@@ -52,7 +52,7 @@ from one `drift/manifest.json` + one `deploy`):
 "drift-workflows": {
   "path": "../drift-workflows",
   "kind": "package_repo",
-  "depends_on": ["drift-lang","drift-mariadb-client","drift-net-tls","drift-web"],
+  "depends_on": ["drift-lang","drift-mariadb-client","drift-web"],
   "commands": {
     "test":  ["just","test"], "stress": ["just","stress"], "perf": ["just","perf"],
     "stage_packages": ["{staged_drift}","deploy","--dest","{libs_root}"]
@@ -77,8 +77,12 @@ individually pinnable by Bookkeeper), just staged from one repo entry — exactl
   the certified **`singular` 0.5.0** + **`microflows` 0.1.0** artifacts the drift-workflows entry stages.
 - **microflows has no `singular` package edge:** the coordinator never calls singular; only the
   participant-stub *test double* uses it, compiled **from source** in the integration. So the repo's
-  external deps are just drift-mariadb-client (mariadb-rpc, used by both libs + singular-from-source) +
-  drift-net-tls + drift-web (web-rest/web-client, for the runner/service/stub HTTP apps in the gate).
+  **direct** external deps are just drift-mariadb-client (mariadb-rpc, used by both libs + singular-from-
+  source) + drift-web (web-rest/web-client, for the runner/service/stub HTTP apps in the gate). We do NOT
+  consume `net-tls` directly (it sits below drift-web — transitive, not declared). Upstream retest needs
+  the cert team to add `drift-workflows` to `drift-mariadb-client.affects` + `drift-web.affects` (the
+  orchestrator computes downstream invalidation from `affects`, not `depends_on`); TLS flows via the
+  existing `drift-net-tls → drift-web → drift-workflows` chain.
 
 > The participant-stub / microflows-runner / microflows-service are **apps**, built+booted *inside* the
 > test/stress gates (HTTP, ephemeral ports). They are NOT cert-pool packages and are NOT in the manifest.

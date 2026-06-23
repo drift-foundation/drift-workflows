@@ -17,7 +17,7 @@ below is implemented and green locally on `0.33.53 / abi18`.
 {
   "path": "../drift-workflows",
   "kind": "package_repo",
-  "depends_on": ["drift-lang", "drift-mariadb-client", "drift-net-tls", "drift-web"],
+  "depends_on": ["drift-lang", "drift-mariadb-client", "drift-web"],
   "affects":    ["bookkeeper"],
   "commands": {
     "test":           ["just", "test"],
@@ -42,9 +42,21 @@ separate author-claims.
   `drift deploy --dest <libs_root>` from the checkout root stages **both** `singular/<v>` and
   `microflows/<v>` (verified locally with the empty-evidence sentinel). A deploy with NO evidence at all
   correctly refuses — as expected; we do not synthesize one.
-- `depends_on`: the libraries depend on `mariadb-rpc`; the integration apps (runner/service/stub) also
-  link `web` + `net-tls`. Edges set so a bump in any of those re-tests us.
-- `affects`: Bookkeeper consumes both packages.
+- `depends_on`: our **direct** runtime foundations — the libraries depend on `mariadb-rpc`; the
+  integration apps (runner/service/stub) link `web` (`web.rest`/`web.client`). We do **not** import
+  `net-tls` directly (verified: no `net_tls` imports) — TLS sits *below* drift-web, so it's transitive via
+  web, not a dependency we declare. This pulls the right providers when we're already being tested, but it
+  does **not**, by itself, retest us on an upstream bump (downstream invalidation is computed from
+  `affects`, not `depends_on`).
+- **Config edits we need on the UPSTREAM side (please add):** so a bump in a **direct** foundation retests
+  drift-workflows, add `drift-workflows` to these two repos' `affects` —
+  - `drift-mariadb-client` → `affects: [… , drift-workflows]` (we link `mariadb-rpc`)
+  - `drift-web` → `affects: [… , drift-workflows]` (the apps link `web`)
+  We are **not** requesting a direct `drift-net-tls → drift-workflows` edge — we don't consume TLS
+  directly. If TLS changes should retest us, let that flow through the existing
+  `drift-net-tls → drift-web → drift-workflows` chain (owned by the web/TLS graph; assumes your invalidation
+  is transitive through `affects`). Our own `depends_on` edges above stay.
+- `affects: [bookkeeper]`: Bookkeeper consumes both packages, so a drift-workflows change retests it.
 
 **Alternatives we did NOT take (your call if you prefer them):** (a) teach the orchestrator monorepo
 / sub-path package roots; (b) split into two Git repos. Both touch your config or our repo structure, so

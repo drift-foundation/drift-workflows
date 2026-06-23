@@ -254,7 +254,11 @@ _test-sp:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
-	../../mariachi/.venv/bin/python db/tests/sp_operation_test.py
+	# Honor the MARIACHI_BIN env contract: the SP regression needs the mariachi venv's PYTHON
+	# (pymysql), which lives beside the `mariachi` binary — derive it instead of hardcoding a path.
+	MARIACHI_PY="$(dirname "{{MARIACHI}}")/python"
+	[[ -x "$MARIACHI_PY" ]] || { echo "error: mariachi venv python not found at $MARIACHI_PY (set MARIACHI_BIN to the venv's mariachi binary)" >&2; exit 1; }
+	"$MARIACHI_PY" db/tests/sp_operation_test.py
 
 # NOTE: the cross-component coordinator<->Singular E2E moved to the repository
 # level: integration/coordinator-singular/ (run via root `just test-integration`
