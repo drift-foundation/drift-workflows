@@ -1,0 +1,7 @@
+{
+  "canonical": "G{2:n0;|I2:n0;a[4:flag;]2:n1;2:n2;;P2:n1;4:ping;k2:{};2:n3;;P2:n2;4:ping;k2:{};2:n3;;P2:n3;5:merge;k7:{\"x\":1};2:n4;;R2:n4;k4:null;;}",
+  "is_graph": true,
+  "status": "ok",
+  "type_check": "ok",
+  "validate": "ok"
+}

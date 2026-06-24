@@ -1,0 +1,9 @@
+{
+  "byte_offset": 72,
+  "code": "duplicate-default",
+  "column": 54,
+  "expected": "",
+  "found": "",
+  "line": 2,
+  "status": "parse-error"
+}

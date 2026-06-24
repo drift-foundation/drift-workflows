@@ -1,0 +1,4 @@
+args { req: { reservation: string } }
+op reserve { input: { reservation: string } }
+steps { let r = arg req.reservation
+ reserve { "reservation": "x" } }

@@ -1,0 +1,3 @@
+args { xs: [int] }
+steps { let ys = map arg xs local e
+ reserve {} }

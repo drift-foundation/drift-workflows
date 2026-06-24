@@ -13,6 +13,7 @@ import std.core as core;
 import std.core.arc as arc;
 import std.console as con;
 import std.json as json;
+import std.env as env;
 import std.time as time;
 import std.format as fmt;
 import singular.uuid as uuid;
@@ -22,8 +23,46 @@ const TIMEOUT_S: Int = 30;
 const WARMUP: Int = 20;
 const CYCLES: Int = 300;
 
+// DB host/port come from the cert-env-resolved environment (DB_HOST/DB_PORT), set by the
+// justfile recipe that runs this scenario; local-dev fallbacks match the historical defaults.
+fn _db_host() nothrow -> String {
+	match env.get("DB_HOST") {
+		Optional::Some(v) => { if v.byte_length() > 0 { return move v; } },
+		Optional::None => {}
+	}
+	return "127.0.0.1";
+}
+
+fn _db_port() nothrow -> String {
+	match env.get("DB_PORT") {
+		Optional::Some(v) => { if v.byte_length() > 0 { return move v; } },
+		Optional::None => {}
+	}
+	return "34214";
+}
+
+fn _db_user() nothrow -> String {
+	match env.get("DB_USER") {
+		Optional::Some(v) => { if v.byte_length() > 0 { return move v; } },
+		Optional::None => {}
+	}
+	return "root";
+}
+
+fn _db_pwd() nothrow -> String {
+	match env.get("MDB_ROOT_PWD") {
+		Optional::Some(v) => { if v.byte_length() > 0 { return move v; } },
+		Optional::None => {}
+	}
+	return "rootpw";
+}
+
 fn _config_json() -> json.JsonNode {
-	val text: String = "{\"backend\":\"mariadb\",\"host\":\"127.0.0.1\",\"port\":34114,\"user\":\"root\",\"password\":\"rootpw\",\"database\":\"singular\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
+	val host = _db_host();
+	val port = _db_port();
+	val user = _db_user();
+	val pwd = _db_pwd();
+	val text: String = "{\"backend\":\"mariadb\",\"host\":\"" + host + "\",\"port\":" + port + ",\"user\":\"" + user + "\",\"password\":\"" + pwd + "\",\"database\":\"singular\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
 	return json.parse(&text).or_throw();
 }
 

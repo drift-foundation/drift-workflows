@@ -1,7 +1,7 @@
 // Malformed-backend regression — decode-side JSON object-contract (part of the e2e gate).
 //
 // Runs the gateway against the `singular_malformed` fixture schema (loaded by `just db-load-schema`
-// from malformed_backend.sql), whose inspect/history SPs return hand-built `result` documents per
+// via the Mariachi template db/tests/malformed), whose inspect/history SPs return hand-built `result` documents per
 // idempotency key. The gateway requires every SP result to be ONE non-null JSON OBJECT discriminated
 // by `outcome` (or, for history, by `event`), with payload/checkpoint being NESTED JSON objects and
 // lease_owner being lowercase hex of exactly 16 bytes; history rows also carry a `status` the gateway
@@ -19,10 +19,26 @@ import std.core as core;
 import std.core.arc as arc;
 import std.console as con;
 import std.json as json;
+import std.env as env;
 import singular.gateway as gw;
 
+// DB endpoint/credentials come from the cert-env-resolved environment (DB_HOST/DB_PORT/
+// DB_USER/MDB_ROOT_PWD); local-dev fallbacks match the historical defaults. The database
+// stays `singular_malformed` (the fixture schema), which is NOT an env value.
+fn _env_or(key: String, dflt: String) nothrow -> String {
+    match env.get(key) {
+        Optional::Some(v) => { if v.byte_length() > 0 { return move v; } },
+        Optional::None => {}
+    }
+    return dflt;
+}
+
 fn _gw() -> arc.Arc<gw.SingularGateway> {
-    val text: String = "{\"backend\":\"mariadb\",\"host\":\"127.0.0.1\",\"port\":34114,\"user\":\"root\",\"password\":\"rootpw\",\"database\":\"singular_malformed\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
+    val host = _env_or("DB_HOST", "127.0.0.1");
+    val port = _env_or("DB_PORT", "34214");
+    val user = _env_or("DB_USER", "root");
+    val pwd = _env_or("MDB_ROOT_PWD", "rootpw");
+    val text: String = "{\"backend\":\"mariadb\",\"host\":\"" + host + "\",\"port\":" + port + ",\"user\":\"" + user + "\",\"password\":\"" + pwd + "\",\"database\":\"singular_malformed\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
     val cfg = json.parse(&text).or_throw();
     var b = gw.new_gateway_builder();
     gw.with_json(&mut b, &cfg);

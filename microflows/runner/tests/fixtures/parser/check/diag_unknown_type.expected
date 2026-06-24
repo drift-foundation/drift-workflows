@@ -1,0 +1,9 @@
+{
+  "byte_offset": 10,
+  "code": "unknown-type",
+  "column": 11,
+  "expected": "int/float/bool/string/null/{…}/[…]",
+  "found": "blob",
+  "line": 1,
+  "status": "parse-error"
+}

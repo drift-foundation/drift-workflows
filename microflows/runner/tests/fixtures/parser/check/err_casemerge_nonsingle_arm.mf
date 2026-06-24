@@ -1,0 +1,4 @@
+args { kind: int, g: bool }
+op reserve { input: { reservation: string } }
+steps { case kind { 1 { if g { reserve {} } else { reserve {} } } 2 { let b = reserve { "reservation": "B" } } default { let d = reserve { "reservation": "D" } } } merge picked = result a | result b | result d
+ reserve local picked }

@@ -1,0 +1,4 @@
+op reserve { input: { reservation: string } result: { reserved: string } }
+op confirm { input: { reserved: string } }
+steps { let r = reserve { "reservation": "A" }
+ confirm result r }

@@ -1,0 +1,2 @@
+op confirm { input: { reserved: string } }
+steps { confirm result ghost }

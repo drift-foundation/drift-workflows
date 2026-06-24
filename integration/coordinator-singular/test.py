@@ -54,9 +54,9 @@ SERVICE_BIN = Path(os.environ.get("SERVICE_BIN",
                    MF / "runner" / "build" / "dist" / "bin" / "microflows-service"))
 
 MDB = {
-    "host": os.environ.get("MDB_HOST", "127.0.0.1"),
-    "port": int(os.environ.get("MDB_PORT", "34114")),
-    "user": os.environ.get("MDB_USER", "root"),
+    "host": os.environ.get("DB_HOST", "127.0.0.1"),
+    "port": int(os.environ.get("DB_PORT", "34214")),
+    "user": os.environ.get("DB_USER", "root"),
     "password": os.environ.get("MDB_ROOT_PWD", "rootpw"),
 }
 failures = []

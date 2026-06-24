@@ -39,9 +39,9 @@ import uuid
 
 import pymysql
 
-HOST = "127.0.0.1"
-PORT = 34114
-USER = "root"
+HOST = os.environ.get("DB_HOST", "127.0.0.1")
+PORT = int(os.environ.get("DB_PORT", "34214"))
+USER = os.environ.get("DB_USER", "root")
 PWD = os.environ.get("MDB_ROOT_PWD", "rootpw")
 DB = "singular"
 

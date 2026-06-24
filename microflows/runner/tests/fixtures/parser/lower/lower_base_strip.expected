@@ -1,0 +1,39 @@
+{
+  "config": {
+    "operations": [
+      {
+        "name": "reserve",
+        "participant": "ref",
+        "schema_version": 1
+      },
+      {
+        "name": "release",
+        "participant": "ref",
+        "schema_version": 1
+      }
+    ],
+    "participants": [
+      {
+        "auth_profile": null,
+        "id": "ref",
+        "transport": {
+          "endpoints": [
+            "http://ref.invalid:8443"
+          ],
+          "kind": "http",
+          "selection": "ordered_failover"
+        }
+      }
+    ],
+    "plan": [
+      {
+        "input": {
+          "reservation": "p1"
+        },
+        "operation": "reserve"
+      }
+    ],
+    "worker_id": "w"
+  },
+  "outcome": "ok"
+}

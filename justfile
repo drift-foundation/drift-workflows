@@ -20,12 +20,31 @@
 
 # All gates: component unit + stored-procedure + component E2E, then every
 # cross-component integration suite. Ordered, fail-fast (set -e).
-test: test-singular test-microflows test-integration
+test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	source tools/cert-env.sh
+	# Gate RESTORES ENTRY STATE exactly: bring up our private DB, then on exit (success OR failure) put it
+	# back as found — created->removed, was-stopped->stopped, was-running->left. Sub-gates see it RUNNING.
+	_dbstate="$("$DB_INSTANCE_SH" up)"
+	case "$_dbstate" in   # restore EXACTLY: created(was absent)->remove; started(was stopped)->stop; running->leave
+	  CREATED) trap '"$DB_INSTANCE_SH" down >/dev/null 2>&1 || true' EXIT ;;
+	  STARTED) trap '"$DB_INSTANCE_SH" stop >/dev/null 2>&1 || true' EXIT ;;
+	esac
+	just test-singular
+	just test-microflows
+	just test-integration
 
 # All performance suites, in the same order.
 perf:
 	#!/usr/bin/env bash
 	set -euo pipefail
+	source tools/cert-env.sh
+	_dbstate="$("$DB_INSTANCE_SH" up)"   # restore entry state (see `test`): tear down on exit iff we started it
+	case "$_dbstate" in   # restore EXACTLY: created(was absent)->remove; started(was stopped)->stop; running->leave
+	  CREATED) trap '"$DB_INSTANCE_SH" down >/dev/null 2>&1 || true' EXIT ;;
+	  STARTED) trap '"$DB_INSTANCE_SH" stop >/dev/null 2>&1 || true' EXIT ;;
+	esac
 	echo "=== [root] perf: singular ==="    ; ( cd singular   && just perf )
 	echo "=== [root] perf: microflows ==="  ; ( cd microflows && just perf )
 	just _integration-gate perf
@@ -34,9 +53,33 @@ perf:
 stress:
 	#!/usr/bin/env bash
 	set -euo pipefail
+	source tools/cert-env.sh
+	_dbstate="$("$DB_INSTANCE_SH" up)"   # restore entry state (see `test`): tear down on exit iff we started it
+	case "$_dbstate" in   # restore EXACTLY: created(was absent)->remove; started(was stopped)->stop; running->leave
+	  CREATED) trap '"$DB_INSTANCE_SH" down >/dev/null 2>&1 || true' EXIT ;;
+	  STARTED) trap '"$DB_INSTANCE_SH" stop >/dev/null 2>&1 || true' EXIT ;;
+	esac
 	echo "=== [root] stress: singular ==="   ; ( cd singular   && just stress )
 	echo "=== [root] stress: microflows ===" ; ( cd microflows && just stress )
 	just _integration-gate stress
+
+# --- Repo-private MariaDB fixture (Docker) ---
+# drift-workflows owns its DB: a private mariadb:11.4 container (tools/db_instance.sh) on port 34214 —
+# NOT a platform `service:mariadb`, NOT shared with any other repo. The gates AUTO-PROVISION + tear it
+# down; the container runtime is the declared `tool:docker` capability, so the cert surface is exactly
+# `tool:mariachi` + `tool:docker`. These recipes are for explicit lifecycle control / fast iteration.
+
+# Bring up the private MariaDB fixture (idempotent; ~3s cold, ~8ms if already running).
+db-up:
+	tools/db_instance.sh up
+
+# Stop + remove the private MariaDB fixture.
+db-down:
+	tools/db_instance.sh down
+
+# Report the private MariaDB fixture status.
+db-status:
+	tools/db_instance.sh status
 
 # --- Component-focused gates (independently runnable) ---
 

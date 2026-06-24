@@ -1,0 +1,9 @@
+{
+  "byte_offset": 56,
+  "code": "case-arm-after-default",
+  "column": 38,
+  "expected": "",
+  "found": "",
+  "line": 2,
+  "status": "parse-error"
+}

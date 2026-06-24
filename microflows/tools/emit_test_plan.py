@@ -42,7 +42,7 @@ ARTIFACT = "microflows"
 PKG_ROOT = os.path.abspath(os.environ.get(
     "DRIFT_PKG_ROOT", os.path.expanduser("~/opt/drift/certified/current/libs")))
 
-# Host-global mutex key naming the shared MariaDB *instance* (mdb114-a @ :34114).
+# Host-global mutex key naming the shared MariaDB *instance* (mdb114-a @ :34214).
 # Must match other consumers' string (singular, mariadb-client) to serialize
 # across suites on the one physical box. This DEFAULT serializes a direct executor
 # run on the shared resource. An orchestrator that already holds the shared lock

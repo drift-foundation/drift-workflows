@@ -1,0 +1,3 @@
+args { cands: [ { reservation: string } ] }
+steps { let ys = fold arg cands each c local c
+ reserve local ys }

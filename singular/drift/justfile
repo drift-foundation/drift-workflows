@@ -92,7 +92,9 @@ perf *ARGS:
 test-sql:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	../../../mariachi/.venv/bin/python packages/singular/tests/sql/sp_invariants_test.py
+	# Honor MARIACHI_BIN (the pymysql venv python lives beside the `mariachi` binary); relative = dev fallback.
+	if [[ -n "${MARIACHI_BIN:-}" ]]; then MARIACHI_PY="$(dirname "${MARIACHI_BIN}")/python"; else MARIACHI_PY="../../../mariachi/.venv/bin/python"; fi
+	"$MARIACHI_PY" packages/singular/tests/sql/sp_invariants_test.py
 
 # --- Dev workflows (generic, via the same emitter) ---
 
@@ -118,10 +120,13 @@ check-one FILE:
 test-malformed-fixture:
 	#!/usr/bin/env bash
 	set -euo pipefail
+	source "../../tools/cert-env.sh"
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
-	mariadb -h 127.0.0.1 -P 34114 -u root -p"${MDB_ROOT_PWD}" \
-	  < packages/singular/tests/fixtures/malformed_backend.sql
+	"$MARIACHI_BIN" \
+	  --schema-template ../db/tests/malformed \
+	  --host "$DB_HOST" --port "$DB_PORT" \
+	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
+	  apply --schema singular_malformed --env development --allow-destructive --destroy-database
 	just check-one packages/singular/tests/fixtures/malformed_backend_test.drift
 
 # Type-check one file against singular's sources (no entry, no run).
@@ -178,7 +183,7 @@ clean:
 clean-data GROUP="":
 	#!/usr/bin/env bash
 	set -euo pipefail
-	DB_INSTANCE="${SINGULAR_DB_INSTANCE:-mdb114-a}"
+	source "../../tools/cert-env.sh"
 	if [[ -z "{{GROUP}}" ]]; then
 	  echo "[clean-data] removing ALL singular work-item data"
 	  WHERE=""
@@ -186,7 +191,7 @@ clean-data GROUP="":
 	  echo "[clean-data] removing service_group={{GROUP}}"
 	  WHERE=" WHERE service_group='{{GROUP}}'"
 	fi
-	tools/db_instance.sh sql "$DB_INSTANCE" \
+	"$DB_INSTANCE_SH" sql \
 	  "USE singular; DELETE FROM tb_singular_work_item_history${WHERE}; DELETE FROM tb_singular_work_item${WHERE};"
 
 # Build, sign, and publish singular to DEPLOY_DEST (default: build/dist/lib). Dev fallback

@@ -1,0 +1,2 @@
+args { flag: bool }
+steps { if flag { ping {} } else { ping {} } merge { "x": 1 } }

@@ -1,0 +1,4 @@
+args { kind: int }
+op reserve { input: { reservation: string } }
+steps { case kind { 1 { } 2 { let b = reserve { "reservation": "B" } } default { let d = reserve { "reservation": "D" } } } merge picked = result a | result b | result d
+ reserve local picked }

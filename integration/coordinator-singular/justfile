@@ -11,27 +11,26 @@
 # set (the shared executor + driftc). NO signing keys and NO deployed packages
 # are needed: this suite COMPILES both apps from current library source.
 
-DB_HOST := "127.0.0.1"
-DB_PORT := "34114"
-DB_USER := "root"
 HEARTBEAT_SECS := "30"
-MARIACHI := env("MARIACHI_BIN", "../../../mariachi/.venv/bin/mariachi")
 MF := "../../microflows"
 SG := "../../singular"
-# Host-global DB serialization: the same flocker key the shared executor uses for
-# its serial DB jobs (group `mariadb-mdb114-a`). Holding it across the reset +
-# harness keeps a destructive schema reset from ever overlapping another gate's
-# DB-backed execution on the one shared MariaDB instance.
+# External-capability env (Mariachi path; MariaDB host/port/user/password; DB lock key) is resolved by the
+# repo-root shim `tools/cert-env.sh`, sourced at the top of every DB-backed recipe: from
+# DRIFT_CERT_CAPABILITIES in cert mode (authoritative, fail-early), or local-dev defaults otherwise. It
+# sets MARIACHI_BIN / DB_HOST / DB_PORT / DB_USER / DB_LOCK / DB_HELD_GROUP + ensures MDB_ROOT_PWD. The
+# shared host-global DB lock ($DB_LOCK) is the same flocker key the shared executor uses for its serial DB
+# jobs, so holding it across the reset + harness keeps a destructive schema reset from ever overlapping
+# another gate's DB-backed execution on the one shared MariaDB instance.
+# flocker is toolchain-provided (not a declared capability).
 FLOCKER := env("DRIFT_TOOLCHAIN_ROOT", env("HOME") + "/opt/drift/certified/current/toolchain") + "/bin/flocker"
-DB_LOCK := "serial-mariadb-mdb114-a"
 
 # Cross-component E2E with destructive, isolated setup (dev-only schemas).
 test:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	source "../../tools/cert-env.sh"
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
-	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../../../mariachi && just setup'" >&2; exit 1; }
+	[[ -x "$MARIACHI_BIN" ]] || { echo "error: mariachi not found at '$MARIACHI_BIN' (set MARIACHI_BIN or DRIFT_CERT_CAPABILITIES.tool:mariachi)" >&2; exit 1; }
 	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
@@ -54,7 +53,7 @@ test:
 	# flocker is REQUIRED (ships with the toolchain); missing => hard error, never
 	# run destructive resets unserialized.
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
-	"{{FLOCKER}}" --key {{DB_LOCK}} -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _db-and-harness "$WORK"
+	"{{FLOCKER}}" --key "$DB_LOCK" -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _db-and-harness "$WORK"
 
 # Internal: the DB-touching phase (reset both schemas, then run the harness).
 # Always invoked under the shared DB lock by `test` — never run it standalone
@@ -62,18 +61,19 @@ test:
 _db-and-harness WORK:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	source "../../tools/cert-env.sh"
+	"$DB_INSTANCE_SH" up >/dev/null   # ensure our repo-private MariaDB fixture is running (idempotent)
 	echo "[integration] reset singular schema (clean participant store)"
-	"{{MARIACHI}}" \
+	"$MARIACHI_BIN" \
 	  --schema-template "{{SG}}/db" \
-	  --host {{DB_HOST}} --port {{DB_PORT}} \
-	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  --host "$DB_HOST" --port "$DB_PORT" \
+	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  apply --schema singular --env=development --allow-destructive --destroy-database
 	echo "[integration] reset + seed microflows schema (coordinator-fixtures)"
-	"{{MARIACHI}}" \
+	"$MARIACHI_BIN" \
 	  --schema-template "{{MF}}/db" \
-	  --host {{DB_HOST}} --port {{DB_PORT}} \
-	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  --host "$DB_HOST" --port "$DB_PORT" \
+	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  scenario --schema microflows --name coordinator-fixtures
 	echo "[integration] run coordinator<->singular harness"
 	STUB_BIN="{{WORK}}/participant-stub" RUNNER_BIN="{{WORK}}/microflows-runner" SERVICE_BIN="{{WORK}}/microflows-service" python3 test.py
@@ -83,9 +83,9 @@ _db-and-harness WORK:
 perf *ARGS:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	source "../../tools/cert-env.sh"
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
-	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../../../mariachi && just setup'" >&2; exit 1; }
+	[[ -x "$MARIACHI_BIN" ]] || { echo "error: mariachi not found at '$MARIACHI_BIN' (set MARIACHI_BIN or DRIFT_CERT_CAPABILITIES.tool:mariachi)" >&2; exit 1; }
 	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
@@ -95,24 +95,25 @@ perf *ARGS:
 	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
 	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
-	"{{FLOCKER}}" --key {{DB_LOCK}} -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _db-and-perf "$WORK" {{ARGS}}
+	"{{FLOCKER}}" --key "$DB_LOCK" -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _db-and-perf "$WORK" {{ARGS}}
 
 # Internal: DB-touching perf phase (reset both schemas, then measure + gate). Under the shared DB lock.
 _db-and-perf WORK *ARGS:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	source "../../tools/cert-env.sh"
+	"$DB_INSTANCE_SH" up >/dev/null   # ensure our repo-private MariaDB fixture is running (idempotent)
 	echo "[integration:perf] reset singular schema (clean participant store)"
-	"{{MARIACHI}}" \
+	"$MARIACHI_BIN" \
 	  --schema-template "{{SG}}/db" \
-	  --host {{DB_HOST}} --port {{DB_PORT}} \
-	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  --host "$DB_HOST" --port "$DB_PORT" \
+	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  apply --schema singular --env=development --allow-destructive --destroy-database
 	echo "[integration:perf] reset + seed microflows schema (coordinator-fixtures)"
-	"{{MARIACHI}}" \
+	"$MARIACHI_BIN" \
 	  --schema-template "{{MF}}/db" \
-	  --host {{DB_HOST}} --port {{DB_PORT}} \
-	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  --host "$DB_HOST" --port "$DB_PORT" \
+	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  scenario --schema microflows --name coordinator-fixtures
 	echo "[integration:perf] measure coordinator drive throughput + gate"
 	STUB_BIN="{{WORK}}/participant-stub" SERVICE_BIN="{{WORK}}/microflows-service" python3 perf.py {{ARGS}}
@@ -122,9 +123,9 @@ _db-and-perf WORK *ARGS:
 stress:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	source "../../tools/cert-env.sh"
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
-	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../../../mariachi && just setup'" >&2; exit 1; }
+	[[ -x "$MARIACHI_BIN" ]] || { echo "error: mariachi not found at '$MARIACHI_BIN' (set MARIACHI_BIN or DRIFT_CERT_CAPABILITIES.tool:mariachi)" >&2; exit 1; }
 	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
@@ -134,25 +135,26 @@ stress:
 	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
 	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
-	"{{FLOCKER}}" --key {{DB_LOCK}} -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _db-and-stress "$WORK"
+	"{{FLOCKER}}" --key "$DB_LOCK" -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _db-and-stress "$WORK"
 
 # Internal: DB-touching stress phase (reset both schemas, then run the concurrent-drive harness).
 # Always under the shared DB lock held by `stress`.
 _db-and-stress WORK:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	source "../../tools/cert-env.sh"
+	"$DB_INSTANCE_SH" up >/dev/null   # ensure our repo-private MariaDB fixture is running (idempotent)
 	echo "[integration:stress] reset singular schema (clean participant store)"
-	"{{MARIACHI}}" \
+	"$MARIACHI_BIN" \
 	  --schema-template "{{SG}}/db" \
-	  --host {{DB_HOST}} --port {{DB_PORT}} \
-	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  --host "$DB_HOST" --port "$DB_PORT" \
+	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  apply --schema singular --env=development --allow-destructive --destroy-database
 	echo "[integration:stress] reset + seed microflows schema (coordinator-fixtures)"
-	"{{MARIACHI}}" \
+	"$MARIACHI_BIN" \
 	  --schema-template "{{MF}}/db" \
-	  --host {{DB_HOST}} --port {{DB_PORT}} \
-	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  --host "$DB_HOST" --port "$DB_PORT" \
+	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  scenario --schema microflows --name coordinator-fixtures
 	echo "[integration:stress] run coordinator concurrent-drive stress"
 	STUB_BIN="{{WORK}}/participant-stub" RUNNER_BIN="{{WORK}}/microflows-runner" python3 stress.py

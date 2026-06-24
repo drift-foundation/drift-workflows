@@ -1,0 +1,2 @@
+op x { bogus: int }
+steps { x {} }

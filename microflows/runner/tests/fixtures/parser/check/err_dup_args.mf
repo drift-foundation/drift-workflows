@@ -1,0 +1,3 @@
+args { a: int }
+args { b: int }
+steps { x {} }

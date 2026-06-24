@@ -1,0 +1,2 @@
+op reserve { input: { reservation: string } }
+steps { reserve local nope }

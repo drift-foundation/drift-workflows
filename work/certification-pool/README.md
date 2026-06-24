@@ -3,8 +3,10 @@
 ## Objective
 
 Get `drift-workflows` into the build-orchestrator cert pool so **`singular`** and **`microflows`** are
-published as **certified client-packages** (built + certified against the current certified toolchain,
-driftc 0.33.53 / abi 18), consumed exactly like `mariadb-rpc` / `web-rest`. This unblocks **Bookkeeper**,
+published as **certified client-packages** (built + certified against the certified toolchain — gates
+green on driftc **0.33.54 / abi 18**; 0.33.53 has a codegen OOM the now-data-driven parser gate sidesteps,
+cert-team's toolchain choice — see ORCH_MESSAGE §0), consumed exactly like `mariadb-rpc` / `web-rest`.
+This unblocks **Bookkeeper**,
 which is gated on a certified `singular` (its dist left the monorepo with the repo move and is not in
 the pool; the only pool `singular` is a stale 0.3.1 pre-move snapshot).
 
@@ -33,9 +35,11 @@ the exact proposed entries for them to add. Locally-published `build/dist/lib` a
 - The orchestrator sets `DRIFT_TOOLCHAIN_ROOT` (staged toolchain) and `DRIFT_PKG_ROOT` (staged
   `libs_root`, populated by upstream `stage_packages`). Recipes must rely only on these, not on ambient
   local dist.
-- **DB-backed gates are supported**: the certified `drift-mariadb-client` runs its test/stress/perf
-  against MariaDB at `127.0.0.1:34114`, serialized on a shared flocker DB-group key
-  (`mariadb-mdb114-a`), password via `MDB_ROOT_PWD`. We use the identical contract.
+- **DB-backed gates are self-provisioned**: like `drift-mariadb-client`, MariaDB is a **repo-private**
+  test fixture, not a platform service. Our gate brings up (and tears down) its own `mariadb:11.4`
+  container (`tools/db_instance.sh`, `127.0.0.1:34214`) and serializes on its own flocker key
+  (`drift-workflows-mdb`). The container runtime is the declared `tool:docker` capability, so the
+  external surface is `requires: ["tool:mariachi", "tool:docker"]`.
 
 ## Proposed orchestrator entry — ONE `drift-workflows` `package_repo` (multi-artifact)
 
@@ -127,10 +131,12 @@ that stages a pre-reshape singular.
    baselines (not placeholders, per directive).
 4. **Verify the bare `drift deploy --dest <tmp>` contract** from the repo root (top-level manifest +
    author-claims resolve; no `--cert-suite` hardcoded; deps from `{libs_root}` + toolchain).
-5. **Make the DB/environment contract explicit + deterministic** (MariaDB `127.0.0.1:34114`,
-   `MDB_ROOT_PWD`, flocker `mariadb-mdb114-a`; microflows needs BOTH the microflows control schema (via
-   **Mariachi** — resolve its availability) AND the singular schema for the stub), matching
-   drift-mariadb-client. Document for the orchestrator.
+5. **Make the DB/environment contract explicit + deterministic**: MariaDB is a **repo-private** Docker
+   fixture the gate provisions itself (`tools/db_instance.sh`, `127.0.0.1:34214`, flocker
+   `drift-workflows-mdb`); schema population is via **Mariachi** (microflows needs BOTH the microflows
+   control schema AND the singular schema for the stub). External surface is
+   `requires: ["tool:mariachi", "tool:docker"]` — the schema tool + the container runtime; MariaDB
+   itself is the repo-private fixture, not `service:mariadb`. Document for the orchestrator.
 6. Per-component lockfiles already **regenerated via `drift prepare`** (this session); author-claims
    committed; deploy works from committed source. Keep it that way; add the top-level lock the same way.
 
@@ -176,11 +182,15 @@ All four: DB-backed, serialized on the shared flocker DB key, deterministic, wit
 
 ## DB / service dependencies (explicit for the orchestrator)
 
-- **MariaDB** at `127.0.0.1:34114`, root password via `MDB_ROOT_PWD`, schema applied by the gate (singular
-  via its `db-load-schema`; microflows via Mariachi). Identical environment to the certified
-  drift-mariadb-client gate → already orchestrator-supported.
-- **flocker** DB-group serialization on `mariadb-mdb114-a` so concurrent cert lanes never collide on the
-  one DB (the established convention).
+- **MariaDB is repo-PRIVATE — NOT a platform `service:mariadb`.** The gate brings up (and tears down) its
+  own `mariadb:11.4` container (`tools/db_instance.sh` → `drift-workflows-mdb` on `127.0.0.1:34214`, image
+  pinned by digest, repo-owned root password) and populates it via Mariachi. Auto-provisioned (idempotent)
+  at each schema-setup step and torn down on gate exit (restoring entry state); `just db-up`/`db-down`/
+  `db-status` give explicit control. No injected DB endpoint, no injected secret. The container runtime is
+  the **declared `tool:docker` capability** — so the external surface is
+  `requires: ["tool:mariachi", "tool:docker"]`.
+- **flocker** serialization on our own key `drift-workflows-mdb` so our concurrent gate runs never collide
+  on the private instance.
 - **No external services**: microflows's integration/stress boot the participant-stub + microflows-service
   themselves on ephemeral ports; nothing outside the repo is required.
 

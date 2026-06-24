@@ -1,0 +1,3 @@
+args { cands: [ { keep: bool } ] }
+steps { let ys = filter arg cands each c local c.keep
+ reserve local ys }

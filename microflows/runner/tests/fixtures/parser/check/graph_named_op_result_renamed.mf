@@ -1,0 +1,7 @@
+# reformatted
+op reserve { input: { reservation: string }  result: { reserved: string } }
+op confirm { input: { reserved: string } }
+steps {
+  let   myRes  =  reserve  {  "reservation":  "A"  }
+  confirm   result   myRes
+}

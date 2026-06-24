@@ -27,7 +27,9 @@ BASELINE_DIR = ROOT / "perf" / "baselines"
 RESULTS_DIR = ROOT / "perf" / "results"
 STUB_BIN = os.environ["STUB_BIN"]
 SERVICE_BIN = os.environ["SERVICE_BIN"]
-MDB = {"host": "127.0.0.1", "port": 34114, "user": "root",
+MDB = {"host": os.environ.get("DB_HOST", "127.0.0.1"),
+       "port": int(os.environ.get("DB_PORT", "34214")),
+       "user": os.environ.get("DB_USER", "root"),
        "password": os.environ.get("MDB_ROOT_PWD", "rootpw")}
 WARMUP = int(os.environ.get("MF_PERF_WARMUP", "15"))
 CYCLES = int(os.environ.get("MF_PERF_CYCLES", "200"))

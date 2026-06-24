@@ -1,0 +1,7 @@
+{
+  "canonical": "G{2:n0;|C2:n0;a[4:mode;][3:\"a\";2:n1;3:\"b\";2:n2;]2:n3;;P2:n1;7:reserve;k19:{\"reservation\":\"A\"};2:n4;;P2:n2;7:reserve;k19:{\"reservation\":\"B\"};2:n4;;P2:n3;7:reserve;k19:{\"reservation\":\"D\"};2:n4;;P2:n4;7:reserve;k21:{\"reservation\":\"fin\"};2:n5;;R2:n5;k4:null;;}",
+  "is_graph": true,
+  "status": "ok",
+  "type_check": "ok",
+  "validate": "ok"
+}

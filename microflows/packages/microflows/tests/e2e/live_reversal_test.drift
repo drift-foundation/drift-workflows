@@ -12,7 +12,7 @@
 // / reverse_block.
 //
 // TIME IS FABRICATED (§24.4): synthetic datetimes, no sleeps.
-// Prereqs: MariaDB 127.0.0.1:34114 root/rootpw, schema + test fixtures loaded.
+// Prereqs: MariaDB 127.0.0.1:34214 root/rootpw, schema + test fixtures loaded.
 
 module microflows.tests.e2e.live_reversal_test;
 
@@ -21,12 +21,27 @@ import std.core.arc as arc;
 import std.io as io;
 import std.json as json;
 import std.env as env;
+import std.parse as parse;
 import std.uuid as uuid;
 import mariadb.rpc as rpc;
 import microflows.host as host;
 
+// DB endpoint/credentials come from the cert-env-resolved environment (DB_HOST/DB_PORT/
+// DB_USER/MDB_ROOT_PWD); local-dev fallbacks match the historical defaults.
+fn _env_or(key: String, dflt: String) nothrow -> String {
+	match env.get(key) {
+		Optional::Some(v) => { if v.byte_length() > 0 { return move v; } },
+		Optional::None => {}
+	}
+	return dflt;
+}
+
 fn _config_json() -> json.JsonNode {
-	val text: String = "{\"backend\":\"mariadb\",\"host\":\"127.0.0.1\",\"port\":34114,\"user\":\"root\",\"password\":\"rootpw\",\"database\":\"microflows\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
+	val db_host = _env_or("DB_HOST", "127.0.0.1");
+	val port = _env_or("DB_PORT", "34214");
+	val user = _env_or("DB_USER", "root");
+	val pwd = _env_or("MDB_ROOT_PWD", "rootpw");
+	val text: String = "{\"backend\":\"mariadb\",\"host\":\"" + db_host + "\",\"port\":" + port + ",\"user\":\"" + user + "\",\"password\":\"" + pwd + "\",\"database\":\"microflows\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
 	return json.parse(&text).or_throw();
 }
 
@@ -79,11 +94,11 @@ fn _wf_id(seed: &String) nothrow -> Array<Byte> {
 fn _seed_reversing(wf: &Array<Byte>, cp_op: &Array<Byte>, trig: &Array<Byte>,
                    script: &String, ts: &String) -> Void {
 	var builder = rpc.new_connection_config_builder();
-	builder.with_host("127.0.0.1");
-	builder.with_port(34114);
-	builder.with_user("root");
-	builder.with_password("rootpw");
-	builder.with_database("microflows");
+	builder.with_host(_env_or("DB_HOST", "127.0.0.1"));
+	builder.with_port(parse.parse_int(_env_or("DB_PORT", "34214")).or_throw());
+	builder.with_user(_env_or("DB_USER", "root"));
+	builder.with_password(_env_or("MDB_ROOT_PWD", "rootpw"));
+	builder.with_database("microflows_test");   // seed proc lives here; it writes into `microflows`.* (qualified)
 	builder.with_connect_timeout_ms(3000);
 	builder.with_read_timeout_ms(3000);
 	builder.with_write_timeout_ms(3000);

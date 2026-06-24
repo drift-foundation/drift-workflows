@@ -10,7 +10,7 @@
 //     (a result, not an error).
 //
 // Prerequisites:
-//   - MariaDB on 127.0.0.1:34114 with root/rootpw (container mdb114-a)
+//   - MariaDB on 127.0.0.1:34214 with root/rootpw (container mdb114-a)
 //   - singular database with schema + stored procedures loaded
 //     (`just db-load-schema` in singular/)
 //
@@ -49,8 +49,22 @@ fn _exp(seq: Int) nothrow -> time.UtcTimestamp {
     return time.utc_from_unix_micros(1700000000000000 + seq * 1000000 + 30000000);
 }
 
+// DB endpoint/credentials come from the cert-env-resolved environment (DB_HOST/DB_PORT/
+// DB_USER/MDB_ROOT_PWD); local-dev fallbacks match the historical defaults.
+fn _env_or(key: String, dflt: String) nothrow -> String {
+    match env.get(key) {
+        Optional::Some(v) => { if v.byte_length() > 0 { return move v; } },
+        Optional::None => {}
+    }
+    return dflt;
+}
+
 fn _config_json() -> json.JsonNode {
-    val text: String = "{\"backend\":\"mariadb\",\"host\":\"127.0.0.1\",\"port\":34114,\"user\":\"root\",\"password\":\"rootpw\",\"database\":\"singular\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
+    val host = _env_or("DB_HOST", "127.0.0.1");
+    val port = _env_or("DB_PORT", "34214");
+    val user = _env_or("DB_USER", "root");
+    val pwd = _env_or("MDB_ROOT_PWD", "rootpw");
+    val text: String = "{\"backend\":\"mariadb\",\"host\":\"" + host + "\",\"port\":" + port + ",\"user\":\"" + user + "\",\"password\":\"" + pwd + "\",\"database\":\"singular\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
     return json.parse(&text).or_throw();
 }
 

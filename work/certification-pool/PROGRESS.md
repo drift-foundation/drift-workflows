@@ -12,7 +12,8 @@ yet. The plan's orchestrator-entry/package-root model was CORRECTED (see below);
 - Wrote + revised the plan (`README.md`).
 - Per-component lockfiles (singular/drift, microflows, runner, participant-stub) already regenerated via
   `drift prepare` (truthful sha, abi18 family); singular re-signed, microflows author-claim re-minted.
-  Gate green at 165/165 on 0.33.53/abi18.
+  Gate re-verified green at 165/165 on **0.33.54/abi18** (test + stress + perf). 0.33.53 has a driftc
+  codegen OOM now sidestepped by the data-driven parser gate — see the round at the end + ORCH_MESSAGE §0.
 
 ## CORRECTION — orchestrator entry/package-root model (cert-team review)
 
@@ -100,9 +101,12 @@ team — both touch their config / repo structure, so not assumed.
       dep/affects, single-entry/package-root rationale, Foundation-key signing, the three gates + their
       meaning, env+Mariachi contract, committed machine-keyed perf baselines + the cert-host baseline
       ask, version pins + 0.5.0 sequencing, monorepo/split alternatives).
-- [ ] **Final validation:** full root dry-run (`just test` → `just stress` → `just perf`) in one sweep
-      under the staged toolchain/libs. Each gate is individually GREEN; this confirms the aggregation
-      order end-to-end. (~15 min; not yet run as a single sweep.)
+- [x] **Final validation — full root sweep GREEN.** `just test → just stress → just perf` run as one
+      sweep under the staged toolchain/libs (all exit 0): **test** = singular 16/16 + microflows component
+      (sp_operation 110/110 via the MARIACHI_BIN-derived python + runner IR 3/3) + integration 165/165;
+      **stress** = singular + microflows (exactly-once dispatch held); **perf** = singular 646µs vs 633
+      baseline + microflows 3.04ms vs 3.12 baseline (both PASS). Confirms the re-key, re-mint, the Mariachi
+      fix, and scenario 17 end-to-end through the orchestrator's root entry.
 - [x] **Foundation re-key — repo-wide (owner: "Foundation owns this repo").** Swept `pushcoin`/
       `ed25519:YvjbJdKV…` out of singular entirely → the Foundation key (`ed25519:6DSIXZVQ…` /
       `default.seed`): component `singular/drift` trust.json, author-claim (re-minted), manifest
@@ -131,9 +135,62 @@ team — both touch their config / repo structure, so not assumed.
 
 ## Next action
 
-Cert-pool alignment is **functionally complete**: 4 gates green, top-level manifest stages both under the
-Foundation key, orch message drafted. Remaining = the optional full root dry-run sweep (each piece already
-green individually) + the non-blocking component-singular re-key follow-up.
+Cert-pool alignment is **complete**: singular 0.5.0 reshape green; Foundation re-key (trust-check passes);
+drift-web/mariadb-client convention (root author/deploy recipes); top-level manifest stages both under the
+Foundation key; **full root sweep test→stress→perf GREEN end-to-end**; orch message corrected.
+
+**Orch-team review round (all addressed):** (1) stale microflows claim — re-minted, SCI now matches the
+orchestrator's recompute (`0a584…`), trust-check ✓; (2) upstream retest — **SUPERSEDED by the final round
+below: `affects` was removed from the orchestrator config model entirely; invalidation is reversed
+`depends_on`, so NO `affects` edges / upstream edits are needed (the earlier "request `*.affects`" ask is
+obsolete).** net-tls correctly stayed out of our `depends_on` (zero `net_tls` imports; transitive via web);
+(3) MARIACHI_BIN bypass — `_test-sp` now derives the venv python from the resolved env;
+(4) readiness vs evidence — the full root sweep is now run + green, so "ready" is evidence-backed.
+
+**Cert attempt #1 (`[singular] load schema → mariachi venv missing`):** part env, part repo. The
+schema-load itself correctly honors `MARIACHI_BIN` (singular/justfile:18) — the orch just hadn't set it
+(the relative dev default can't resolve under a fresh checkout). BUT a repo-side sweep found **more
+hardcoded mariachi-python paths** the round-3 fix missed: `singular/drift/tools/emit_test_plan.py`
+(the cert plan's SP-invariants job) + `singular/drift/justfile` `test-sql`. Both now derive the venv
+python from `MARIACHI_BIN` (relative = dev fallback); a comment in `microflows/db/tests/sp_operation_test.py`
+updated too. Verified: `emit_test_plan` emits `<MARIACHI_BIN-dir>/python` when set, the relative fallback
+when unset; **`singular test` 16/16 with `MARIACHI_BIN` exported to an absolute path**. ORCH_MESSAGE §4
+now states `MARIACHI_BIN` is REQUIRED under cert + that nothing in the repo hardcodes a Mariachi path.
+
+## Capabilities-contract adoption (`DRIFT_CERT_CAPABILITIES`) — supersedes the per-tool env approach
+
+> **HISTORICAL — capability surface SUPERSEDED.** This round adopted `requires:["tool:mariachi",
+> "service:mariadb"]`. Both later rounds changed that: `service:mariadb` was **removed** (MariaDB is a
+> repo-private Docker fixture), then **`tool:docker` was added**. The CURRENT contract is
+> `requires:["tool:mariachi","tool:docker"]` — see the two "## Round:" entries at the end of this file.
+
+The orchestrator moved to a formal external-capabilities contract (build-orchestrator
+docs/certification-onboarding.md §5-7 + work/cert-capabilities/WORKFLOWS_ADOPTION.md): it injects ONLY
+`DRIFT_CERT_CAPABILITIES` → a `capabilities.json`; it no longer sets `MARIACHI_BIN`/`DB_*`. We declared
+`requires:["tool:mariachi","service:mariadb"]` (orch confirmed it's wired in `orchestration.json`) and
+adopted it:
+
+- **`tools/cert-env.sh`** — one root shim, sourced at the top of every DB-backed recipe (singular +
+  microflows + integration justfiles). Two-mode: cert (doc authoritative, **fail-early** on a missing
+  `tool:mariachi.bin` / `service:mariadb.{host,port,credential_env}`; password normalized into
+  `MDB_ROOT_PWD` via env-name indirection, secret never serialized) / local (repo defaults +
+  `MARIACHI_BIN`/`MDB_ROOT_PWD` overrides). Parsed with **python3, no `jq`** (per directive). The doc
+  carries NO `lock_key`/`user` (confirmed against the updated onboarding §6); the corrected shim does not
+  require them.
+- **`mariadb` CLI dependency removed** — **SUPERSEDED by the final round below: `tools/load_sql.py` was an
+  interim step and is now DELETED; ALL DB population (incl. both test fixtures) goes through Mariachi
+  (separate `singular_malformed` / `microflows_test` schemas).** Cert surface is exactly `tool:mariachi` +
+  `service:mariadb` (+ toolchain-provided flocker).
+- **DB lock is repo-owned + project-scoped** (`drift-workflows-mdb114-a`, not the shared-instance key) per
+  adoption-doc §3 — avoids over-serializing other repos on the shared MariaDB box.
+- Harnesses (`test.py`/`stress.py`/`perf.py`/`sp_operation_test.py`/`sp_invariants_test.py`) + the two
+  Drift stress/perf scenarios read `DB_HOST`/`DB_PORT` from the resolved env.
+- **Verified BOTH modes, all three gates** (onboarding §4 hand-written `capabilities.json`):
+  - **cert mode** (`DRIFT_CERT_CAPABILITIES` set): `test` **165/165**, `stress` exactly-once held,
+    `perf` singular 676µs/633 + microflows 2.942ms/3.12 (both PASS) — Mariachi + DB sourced from the doc,
+    no `MARIACHI_BIN`/`DB_*` from ambient env;
+  - **local mode** (unset): `test` green (component 20/20 + 110/110 + 3/3, integration 165/165), stress +
+    perf green.
 
 ## Notes
 
@@ -141,3 +198,74 @@ green individually) + the non-blocking component-singular re-key follow-up.
 - Do NOT treat local `build/dist/lib` as cert output; do NOT hand-edit locks/claims.
 - DB tests need MariaDB 127.0.0.1:34114 + MDB_ROOT_PWD + flocker `mariadb-mdb114-a` (same as
   drift-mariadb-client — orchestrator-supported).
+
+## Round: cert-compliance reviews (two teams) + Mariachi-for-everything + affects removal
+
+- **Findings 1+2 (hardcoded DB endpoint in cert-gate tests):** the 6 test files (3 microflows e2e,
+  singular live_gateway / malformed_backend_test, sp_invariants_test.py) now read host/port/user/password
+  from env (defaults preserved for local). Fixed a `host` binding vs `import microflows.host` collision
+  (`host`→`db_host`).
+- **mariadb CLI removed from the gate path → Mariachi (owner directive: use Mariachi, not load_sql.py).**
+  Both raw-SQL fixtures migrated to **separate Mariachi-managed test schemas**: `singular_malformed`
+  (procs-only, `singular/db/tests/malformed`) and `microflows_test` (`microflows/db/tests/seed`, whose seed
+  proc writes into `microflows.*` with qualified names). Confirmed Mariachi loads procs-only/malformed
+  templates (the DELIMITER wrapper is required, like the real procs). `tools/load_sql.py` + both raw `.sql`
+  DELETED; `test-malformed-fixture` dev recipe re-routed through Mariachi. Note: mariadb-rpc `conn.call`
+  rejects a dotted proc name, so the seed connection targets `microflows_test` and calls the proc
+  unqualified. Only remaining mariadb-CLI use is the dev-only `db-sql` (NOT on any gate path; marked so).
+- **Orch review — `affects` removed from the config model:** deleted `affects:["bookkeeper"]` from the §1
+  entry (a lingering `affects` is now a hard load error); reversed the stale "invalidation from affects"
+  text — the orchestrator reverses `depends_on`, so our `depends_on:[drift-lang,drift-mariadb-client,
+  drift-web]` already auto-retests us on an upstream bump (net-tls→web→workflows transitively); NO upstream
+  edits needed. Entry is now exactly path/kind/depends_on/requires/commands.
+- **§3 lock key reconciled** to the project-scoped `drift-workflows-mdb114-a` (matches §4 + cert-env.sh);
+  dropped the "same shared group as drift-mariadb-client" framing.
+- **Shim:** secret check tightened to reject empty-but-set (`in (None, "")`).
+- **Verified BOTH modes, all three gates:** local + cert (hand-written capabilities.json) — test 165/165 +
+  110/110 + 3/3, stress exactly-once, perf within baseline. All exit 0.
+
+## Round: tool:docker capability + gate teardown (orch follow-up)
+
+Orch declined "Docker kept to ourselves" — sandboxing may block spawning a container, so it must go
+through the capability model (onboarding doc updated with a Docker-capability section + "gates restore
+entry state"). Addressed:
+- **Declared `tool:docker`** → `requires: ["tool:mariachi", "tool:docker"]`. `tools/cert-env.sh` resolves
+  BOTH tool bins in cert mode (`MARIACHI_BIN` + `DOCKER_BIN`), fails early if either capability/bin is
+  missing; local mode defaults `DOCKER_BIN=docker`. `db_instance.sh` uses the resolved client + checks
+  daemon liveness (preflight verifies the client; daemon is ours).
+- **Image pinned by digest** — `mariadb@sha256:2f45480c…` (determinism; no run-time tag pull).
+- **Teardown = restore entry state (REQUIRED).** Root `test`/`stress`/`perf` capture whether they STARTED
+  the container (`db_instance.sh up` now reports STARTED/RUNNING) and trap-`down` on exit (success OR
+  failure) ONLY if they started it; a pre-existing container (dev box) is left. Nesting-safe (sub-gates
+  see RUNNING). Inner schema-setup `up` is idempotent.
+- **`db_instance.sh sql` subcommand** added; the stale `clean-data` dev recipe (mdb114-a / two-arg call)
+  rewired to it via the shim.
+- **VERIFIED both modes + teardown:** local & cert test/stress/perf all exit 0 with the container ABSENT
+  after each gate that started it (165/165 integration, 110/110 SP, perf within baseline); and a
+  pre-existing container is correctly LEFT running. Capability surface is honestly `tool:mariachi` +
+  `tool:docker` — MariaDB is a repo-private, self-torn-down Docker fixture.
+
+## Round: parser unit test made data-driven (drop the 5 GB compile) + re-validate on 0.33.54
+
+The microflows parser unit test was a single ~520-line `scenario()` in
+`runner/tests/unit/parser_test.drift` that inlined ~60 `.mf` scenarios + hand-authored expected graphs
+into ONE driftc translation unit — **~5.4 GB / ~4 min PER VARIANT to compile** (and it tripped the
+0.33.53 codegen OOM, fixed in 0.33.54). Testing a parser must not cost 5 GB. Reworked to the standard
+compiler-test pattern (owner: "produce the mf-compiler; the binary reads these tests"):
+- **New `microflows-runner --parse-check FILE` mode** (`runner/src/runner.drift`): parse a `.mf` source,
+  emit a canonical JSON outcome (`status`/`is_graph`/`canonical`/`validate`/`type_check`, or
+  `code`+byte/line/column for a parse error) to stdout; DB-free, registry-free. Reuses the existing
+  `--lower-source` for the 3 lower-overlay/strip/unknown-op cases.
+- **Fixture corpus** `runner/tests/fixtures/parser/{check,lower}/*.mf` (74 + 3) + committed goldens,
+  blessed from the currently-passing parser and **cross-checked against the old test's exact assertions**
+  (diagnostic codes + byte/line/column incl. the multibyte `café` case, is_graph, validate/type rejects,
+  rename→identical-canonical parity, lower overlay/strip/unknown-operation).
+- **Harness** `runner/tests/run_parser_fixtures.py` (run + `--update`). The runner `just test` now builds
+  the binary once + golden-diffs the corpus: **77/77 in 0.082 s** (KB RAM). The heavy compile is preserved
+  OFF the gate path as `just test-compiler-stress` (a deliberate driftc-codegen regression canary — it
+  caught the 0.33.53 OOM). Fixed `runner` `just build` to select the `microflows-runner` artifact.
+- The certified `microflows` LIBRARY artifact is untouched (the change is in the runner app, compiled from
+  source by the integration gate). No re-mint / lock change; abi18 unchanged.
+- **Re-validated all three gates on 0.33.54/abi18:** `test` (integration 165/165 + runner fixtures 77/77),
+  `stress` (20×8 exactly-once held), `perf` (microflows 3.312 ms vs 3.12 baseline → PASS). DB container
+  self-torn-down. See `work/parser-fixture-tests/` for the PLAN/PROGRESS of this sub-effort.

@@ -8,8 +8,8 @@ Covers the hardening invariants:
   - status/result table invariant
   - happy-path lifecycle ends with workflow completed + checkpoint
 
-Run via the mariachi venv python (has PyMySQL):
-  ../../../mariachi/.venv/bin/python db/tests/sp_operation_test.py
+Run via the mariachi venv python (has PyMySQL) — the gate derives it from MARIACHI_BIN
+(`"$(dirname "$MARIACHI_BIN")/python" db/tests/sp_operation_test.py`); see microflows/justfile `_test-sp`.
 Requires the `microflows` schema loaded (`just db-load-schema`) and MDB_ROOT_PWD.
 """
 import datetime
@@ -21,9 +21,9 @@ import uuid
 
 import pymysql
 
-HOST = os.environ.get("MDB_HOST", "127.0.0.1")
-PORT = int(os.environ.get("MDB_PORT", "34114"))
-USER = os.environ.get("MDB_USER", "root")
+HOST = os.environ.get("DB_HOST", "127.0.0.1")
+PORT = int(os.environ.get("DB_PORT", "34214"))
+USER = os.environ.get("DB_USER", "root")
 PWD = os.environ.get("MDB_ROOT_PWD", "rootpw")
 
 # Random per-run workflow id so concurrent gate runs never collide.

@@ -1,0 +1,9 @@
+{
+  "byte_offset": 264,
+  "code": "case-merge-arity",
+  "column": 2,
+  "expected": "",
+  "found": "",
+  "line": 4,
+  "status": "parse-error"
+}

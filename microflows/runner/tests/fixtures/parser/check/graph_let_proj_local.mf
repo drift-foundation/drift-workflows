@@ -1,0 +1,3 @@
+args { req: { reservation: string } }
+steps { let p = arg req
+ reserve local p.reservation }

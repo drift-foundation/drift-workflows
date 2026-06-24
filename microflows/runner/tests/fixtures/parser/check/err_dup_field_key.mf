@@ -1,0 +1,3 @@
+args { y: int }
+op op1 { }
+steps { op1 { a: arg y, a: const 1 } }

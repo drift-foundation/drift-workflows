@@ -16,19 +16,23 @@ build:
 	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
 	PKG_LOCAL="$(realpath -m "{{_pkg-local}}")"
 	mkdir -p "{{BIN_DIR}}"
-	"$DRIFT" build --package-root "$PKG_LOCAL" --package-root "{{_pkg-root}}" -o "{{BIN_DIR}}/microflows-runner"
+	"$DRIFT" build --package-root "$PKG_LOCAL" --package-root "{{_pkg-root}}" microflows-runner -o "{{BIN_DIR}}/microflows-runner"
 
-# Unit tests for runner-owned modules — the V1 control-flow graph IR (types + canonical hashing +
-# flat-plan builder + validation + interpreter) in src/ir.drift, and the textual frontend in
-# src/parser.drift (which lowers source to the SAME config the IR consumes). DB-free and
-# dependency-light: both modules import only std.*, so each test is compiled standalone with the
-# runner-owned source it exercises. base + asan.
+# Unit tests for runner-owned modules.
+#  - The V1 control-flow graph IR (types + canonical hashing + flat-plan builder + validation +
+#    interpreter) in src/ir.drift: compiled standalone (ir.drift imports only std.*), base + asan.
+#  - The textual frontend (src/parser.drift): DATA-DRIVEN. The parser is exercised by building the
+#    runner binary ONCE and driving ~77 `.mf` fixtures through it (`--parse-check` / `--lower-source`)
+#    against committed goldens — kilobytes of RAM, <0.1s. This REPLACES the old compiled-in
+#    parser_test.drift, which baked ~60 scenarios into ONE driftc translation unit and cost ~5 GB /
+#    ~4 min PER VARIANT just to BUILD (and tripped a driftc codegen OOM). Testing a parser must not
+#    cost 5 GB. The heavy compile is preserved OFF the gate path as `just test-compiler-stress`.
 test:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	DC="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/driftc"
 	OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
-	# ir-only tests compile standalone with src/ir.drift.
+	# ir-only tests (graph IR construction/hashing + interpreter execution) compile standalone.
 	for t in ir_graph_test ir_exec_test; do
 		for variant in base asan; do
 			san=""; [[ "$variant" == asan ]] && san="--sanitize=address"
@@ -39,14 +43,27 @@ test:
 			echo "[runner] ${t}#$variant ok"
 		done
 	done
-	# parser_test exercises src/parser.drift, which imports src/ir.drift — compile both.
+	# parser/IR frontend: build the runner binary once, then golden-diff the .mf fixture corpus.
+	just build
+	python3 tests/run_parser_fixtures.py --bin "{{BIN_DIR}}/microflows-runner"
+	echo "[runner] parser fixtures ok"
+
+# Compiler-regression canary — NOT on the daily/cert gate (`just test` data-drives the same coverage).
+# Compiles the legacy all-in-one parser_test.drift (a ~520-line scenario() with ~60 inlined .mf
+# scenarios + hand-authored expected graphs) — a deliberately heavy driftc workout that caught the
+# 0.33.53 codegen OOM 0.33.54 fixes. Run occasionally / in CI when vetting a new toolchain.
+test-compiler-stress:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	DC="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/driftc"
+	OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 	for variant in base asan; do
 		san=""; [[ "$variant" == asan ]] && san="--sanitize=address"
 		"$DC" --target-word-bits 64 $san \
 			--entry "microflows.runner.tests.parser_test::main" \
 			src/ir.drift src/parser.drift "tests/unit/parser_test.drift" -o "$OUT/parser_test.$variant"
 		"$OUT/parser_test.$variant"
-		echo "[runner] parser_test#$variant ok"
+		echo "[runner] parser_test#$variant ok (compiler-stress canary)"
 	done
 
 clean:

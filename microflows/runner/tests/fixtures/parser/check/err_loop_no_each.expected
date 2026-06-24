@@ -1,0 +1,9 @@
+{
+  "byte_offset": 75,
+  "code": "expected-each",
+  "column": 32,
+  "expected": "",
+  "found": "",
+  "line": 2,
+  "status": "parse-error"
+}

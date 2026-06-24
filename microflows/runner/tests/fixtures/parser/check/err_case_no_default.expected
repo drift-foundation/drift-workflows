@@ -1,0 +1,9 @@
+{
+  "byte_offset": 53,
+  "code": "case-missing-default",
+  "column": 35,
+  "expected": "",
+  "found": "",
+  "line": 2,
+  "status": "parse-error"
+}

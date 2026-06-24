@@ -1,0 +1,9 @@
+{
+  "byte_offset": 6,
+  "code": "expected-token",
+  "column": 7,
+  "expected": "'{'",
+  "found": "",
+  "line": 1,
+  "status": "parse-error"
+}

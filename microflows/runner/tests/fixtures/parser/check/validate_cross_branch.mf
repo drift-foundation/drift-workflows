@@ -1,0 +1,4 @@
+args { flag: bool }
+op reserve { input: { reservation: string } result: { reserved: string } }
+op confirm { input: { reserved: string } }
+steps { if flag { let r = reserve { "reservation": "A" } } else { reserve { "reservation": "B" } } confirm result r }

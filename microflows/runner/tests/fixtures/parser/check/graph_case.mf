@@ -1,0 +1,3 @@
+args { mode: string }
+op reserve { input: { reservation: string } }
+steps { case mode { "a" { reserve { "reservation": "A" } } "b" { reserve { "reservation": "B" } } default { reserve { "reservation": "D" } } } reserve { "reservation": "fin" } }

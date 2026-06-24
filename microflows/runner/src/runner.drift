@@ -303,6 +303,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 	val _ = p.option_string("arguments", "a", "JSON", "instance arguments (JSON object) for a PLANNED workflow SUBMISSION; supplying it creates/reasserts (and conflicts on changed args), omitting it RESUMES", false);
 	val _ = p.flag("emit-content-hash", "", "build the registry from --config and print the active revision's content_hash (hex), then exit; no DB or --workflow-id needed (used to (re)compute fixtures)");
 	val _ = p.option_string("lower-source", "", "FILE", "lower a .mf source file into a runnable config: use --config as the base routing registry, print the merged config JSON to stdout, then exit (no DB/dispatch; the textual frontend)", false);
+	val _ = p.option_string("parse-check", "", "FILE", "parse a .mf source and print a CANONICAL JSON outcome (status/is_graph/canonical/validate/type_check, or status/code/position for a parse error) to stdout, then exit 0; DB-free, no routing registry — the parser/IR test driver (golden-fixture tooling)", false);
 	val _ = p.option_string("manifest", "m", "FILE", "deployment manifest (named scripts + shared deployment routing). Compiles+validates EVERY declared script at startup; a SUBMISSION names a script via --script, a RESUME drives by the durable pin. Alternative to --config", false);
 	val _ = p.option_string("script", "s", "NAME", "the manifest script to SUBMIT (manifest mode, fresh submission only; a resume uses the durable pin)", false);
 
@@ -314,6 +315,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 	var has_arguments: Bool = false;
 	var emit_hash: Bool = false;
 	var lower_source_path: String = "";
+	var parse_check_path: String = "";
 	var manifest_path: String = "";
 	var script_name: String = "";
 	var has_script: Bool = false;
@@ -326,6 +328,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 			match parsed.get_string("input", p) { Some(v) => { input_json = _dup(v); }, None => {} }
 			match parsed.get_string("arguments", p) { Some(v) => { arguments_json = _dup(v); has_arguments = true; }, None => {} }
 			match parsed.get_string("lower-source", p) { Some(v) => { lower_source_path = _dup(v); }, None => {} }
+				match parsed.get_string("parse-check", p) { Some(v) => { parse_check_path = _dup(v); }, None => {} }
 			match parsed.get_string("manifest", p) { Some(v) => { manifest_path = _dup(v); }, None => {} }
 			match parsed.get_string("script", p) { Some(v) => { script_name = _dup(v); has_script = true; }, None => {} }
 			emit_hash = parsed.has_flag("emit-content-hash", p);
@@ -334,6 +337,11 @@ fn main(argv: Array<String>) nothrow -> Int {
 			console.eprintln("runner: bad arguments");
 			return 2;
 		}
+	}
+	// Parser/IR test-driver mode: parse a .mf source and print a canonical JSON outcome, then exit.
+	// DB-free and registry-free — the golden-fixture driver for the parser unit suite.
+	if parse_check_path.byte_length() != 0 {
+		return try _parse_check(&parse_check_path) catch { console.eprintln("runner: parse-check failed"); 1 };
 	}
 	// Frontend mode: lower a .mf source file into a runnable config (base routing from --config),
 	// print the merged config JSON, then exit. Pure front end — no DB, no claim, no dispatch.
@@ -386,6 +394,114 @@ fn _emit_content_hash(config_path: &String) throws -> Int {
 	}
 	console.println(_bytes_to_hex(&reg.revisions[0].content_hash));
 	return 0;
+}
+
+// Parser/IR test-driver: parse a `.mf` source and emit a CANONICAL JSON outcome to stdout (exit 0;
+// the outcome — success or failure — is in the JSON, so golden comparison is a plain stdout diff).
+// DB-free, registry-free: this is the legitimate replacement for the old compiled-in parser_test
+// (which baked ~60 scenarios into one driftc translation unit and cost multiple GB to build). The
+// scenarios are now data files; this built binary reads them. Emits, on a parse error,
+// {status:"parse-error", code, byte_offset, line, column, expected, found}; otherwise
+// {status:"ok", is_graph, canonical, validate, type_check} where `canonical` is the IR graph_canonical
+// identity (the exact thing the old parity checks compared), `validate` reflects validate_graph, and
+// `type_check` reflects type_check_graph over the source-declared contracts + argument_type.
+fn _parse_check(source_path: &String) -> Int {
+	val source = _read_text(source_path);
+	match parser.parse_source(&source) {
+		core.Result::Err(e) => {
+			var o = json.new_object();
+			o.set("status", json.JsonNode::String(value = "parse-error"));
+			o.set("code", json.JsonNode::String(value = _dup(&e.code)));
+			o.set("byte_offset", json.JsonNode::Number(raw = fmt.format_int(e.byte_offset)));
+			o.set("line", json.JsonNode::Number(raw = fmt.format_int(e.line)));
+			o.set("column", json.JsonNode::Number(raw = fmt.format_int(e.column)));
+			o.set("expected", json.JsonNode::String(value = _dup(&e.expected)));
+			o.set("found", json.JsonNode::String(value = _dup(&e.found)));
+			val node = o.to_node();
+			console.println(json.encode_compact(&node));
+			return 0;
+		},
+		core.Result::Ok(pw) => {
+			var o = json.new_object();
+			o.set("status", json.JsonNode::String(value = "ok"));
+			o.set("is_graph", json.JsonNode::Bool(value = pw.is_graph));
+			o.set("canonical", json.JsonNode::String(value = _pc_canon(&pw.body, pw.is_graph)));
+			o.set("validate", json.JsonNode::String(value = _pc_validate(&pw.body, pw.is_graph)));
+			o.set("type_check", json.JsonNode::String(value = _pc_typecheck(&pw)));
+			val node = o.to_node();
+			console.println(json.encode_compact(&node));
+			return 0;
+		}
+	}
+}
+
+// Canonical IR identity of a parsed body — a "graph" via parse_graph, a flat "plan" lifted through
+// flat_to_graph (the degenerate-graph identity the runner pins). Mirrors the old test helpers.
+fn _pc_canon(body: &json.JsonNode, is_graph: Bool) -> String {
+	if is_graph {
+		match ir.parse_graph(body) {
+			core.Result::Ok(g) => { return ir.graph_canonical(&g); },
+			core.Result::Err(_) => { return "<bad-graph>"; }
+		}
+	}
+	var steps: Array<ir.FlatStep> = [];
+	match body.as_array() {
+		Optional::Some(items) => {
+			var i = 0;
+			while i < items.len {
+				var op: String = "";
+				match items[i].get(&"operation") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { op = move s; }, Optional::None => {} } }, Optional::None => {} }
+				var inp: String = "{}";
+				match items[i].get(&"input") { Optional::Some(n) => { inp = json.encode_compact(n); }, Optional::None => {} }
+				steps.push(ir.FlatStep(operation = move op, input_json = move inp));
+				i = i + 1;
+			}
+		},
+		Optional::None => {}
+	}
+	match ir.flat_to_graph(&steps) {
+		core.Result::Ok(g) => { return ir.graph_canonical(&g); },
+		core.Result::Err(_) => { return "<err>"; }
+	}
+}
+
+// "ok" / "reject" (validate_graph) / "bad-graph" — plans are structurally trivial ("ok").
+fn _pc_validate(body: &json.JsonNode, is_graph: Bool) -> String {
+	if !is_graph { return "ok"; }
+	match ir.parse_graph(body) {
+		core.Result::Ok(g) => {
+			match ir.validate_graph(&g) { Optional::Some(_) => { return "reject"; }, Optional::None => { return "ok"; } }
+		},
+		core.Result::Err(_) => { return "bad-graph"; }
+	}
+}
+
+// "ok" / "reject" (type_check_graph) / "n/a" (no graph, or not structurally valid). Builds the
+// argument_type + per-op contracts from the SOURCE's own declarations (what `lower` would overlay).
+fn _pc_typecheck(pw: &parser.ParsedWorkflow) -> String {
+	if !pw.is_graph { return "n/a"; }
+	match ir.parse_graph(&pw.body) {
+		core.Result::Ok(g) => {
+			match ir.validate_graph(&g) { Optional::Some(_) => { return "n/a"; }, Optional::None => {} }
+			var at = ir.empty_object_type();
+			match &pw.arg_type {
+				Optional::Some(n) => { match ir.parse_object_type(n) { core.Result::Ok(t) => { at = move t; }, core.Result::Err(_) => { return "n/a"; } } },
+				Optional::None => {}
+			}
+			var ocs: Array<ir.OpContract> = [];
+			var i = 0;
+			while i < pw.contracts.len {
+				var inty: Optional<ir.IrType> = Optional<ir.IrType>::None();
+				match &pw.contracts[i].input_type { Optional::Some(n) => { inty = Optional<ir.IrType>::Some(ir.parse_type(n)); }, Optional::None => {} }
+				var outy: Optional<ir.IrType> = Optional<ir.IrType>::None();
+				match &pw.contracts[i].result_type { Optional::Some(n) => { outy = Optional<ir.IrType>::Some(ir.parse_type(n)); }, Optional::None => {} }
+				ocs.push(ir.OpContract(name = _dup(&pw.contracts[i].name), input_type = move inty, result_type = move outy));
+				i = i + 1;
+			}
+			match ir.type_check_graph(&g, &at, &ocs) { Optional::Some(_) => { return "reject"; }, Optional::None => { return "ok"; } }
+		},
+		core.Result::Err(_) => { return "n/a"; }
+	}
 }
 
 // Frontend mode: lower a `.mf` source file into a COMPLETE runnable config. The `--config` file is

@@ -1,0 +1,7 @@
+{
+  "canonical": "G{2:n0;|C2:n0;a[1:m;][3:\"a\";2:n1;]2:n4;;I2:n1;a[1:f;]2:n2;2:n3;;P2:n2;4:ping;k2:{};2:n5;;P2:n3;4:ping;k2:{};2:n5;;P2:n4;4:ping;k2:{};2:n5;;R2:n5;k4:null;;}",
+  "is_graph": true,
+  "status": "ok",
+  "type_check": "ok",
+  "validate": "ok"
+}

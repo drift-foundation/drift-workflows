@@ -1,0 +1,4 @@
+args { flag: bool }
+op reserve { input: { reservation: string } }
+steps { if flag { let a = reserve { "reservation": "A" } } else { let b = reserve { "reservation": "B" } } merge p = result ghost | result b
+ reserve local p }

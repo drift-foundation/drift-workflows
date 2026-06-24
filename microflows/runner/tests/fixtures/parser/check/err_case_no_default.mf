@@ -1,0 +1,2 @@
+args { m: string }
+steps { case m { "a" { ping {} } } }

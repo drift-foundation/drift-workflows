@@ -1,0 +1,8 @@
+# straight-line refund (slice 1)
+args { amount: int, currency: string }
+op reserve { input: { reservation: string } result: { reserved: string } }
+op release { input: { reservation: string } }
+steps {
+  reserve { "reservation": "p1" }
+  reserve { "reservation": "p2" }
+}

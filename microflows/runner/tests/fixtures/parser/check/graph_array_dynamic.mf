@@ -1,0 +1,3 @@
+args { a: int }
+op pack { }
+steps { pack [ arg a, const 1 ] }

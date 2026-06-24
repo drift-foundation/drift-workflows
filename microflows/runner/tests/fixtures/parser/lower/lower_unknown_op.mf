@@ -1,0 +1,2 @@
+op ghost { input: { x: int } }
+steps { reserve { "reservation": "p1" } }

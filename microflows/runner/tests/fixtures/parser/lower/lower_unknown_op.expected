@@ -1,0 +1,10 @@
+{
+  "byte_offset": -1,
+  "code": "unknown-operation",
+  "column": 0,
+  "expected": "",
+  "found": "",
+  "kind": "parse",
+  "line": 0,
+  "outcome": "error"
+}

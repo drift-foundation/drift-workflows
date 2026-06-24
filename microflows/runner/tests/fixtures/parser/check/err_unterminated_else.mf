@@ -1,0 +1,2 @@
+args { f: bool }
+steps { if f { ping {} } else { ping {} 

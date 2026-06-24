@@ -1,0 +1,9 @@
+{
+  "byte_offset": 0,
+  "code": "unknown-keyword",
+  "column": 1,
+  "expected": "args/op/steps",
+  "found": "frob",
+  "line": 1,
+  "status": "parse-error"
+}

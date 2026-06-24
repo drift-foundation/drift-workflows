@@ -1,0 +1,2 @@
+args { x: blob }
+steps { ping {} }

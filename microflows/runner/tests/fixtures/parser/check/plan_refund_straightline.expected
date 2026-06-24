@@ -1,0 +1,7 @@
+{
+  "canonical": "G{2:n0;|P2:n0;7:reserve;k20:{\"reservation\":\"p1\"};2:n1;;P2:n1;7:reserve;k20:{\"reservation\":\"p2\"};2:n2;;R2:n2;k4:null;;}",
+  "is_graph": false,
+  "status": "ok",
+  "type_check": "n/a",
+  "validate": "ok"
+}

@@ -16,20 +16,16 @@ DEPLOY_DEST := env("DRIFT_DIST_ROOT", "build/dist/lib")
 _pkg-root := env("DRIFT_PKG_ROOT", env("HOME") + "/opt/drift/certified/current/libs")
 HEARTBEAT_SECS := "30"
 
-DB_HOST := "127.0.0.1"
-DB_PORT := "34114"
-DB_USER := "root"
 DB_SCHEMA := "microflows"
-# Shared host-global DB lock — same flocker key the test executor uses for its
-# serial DB jobs (group `mariadb-mdb114-a`), so a destructive reset / DB
-# regression here can't overlap another gate's DB-backed execution.
+# External-capability env (Mariachi path; MariaDB host/port/user/password; DB lock key + held group) is
+# resolved by the repo-root shim `tools/cert-env.sh`, sourced at the top of every DB-backed recipe: from
+# DRIFT_CERT_CAPABILITIES in cert mode (authoritative, fail-early), or local-dev defaults otherwise. It
+# sets MARIACHI_BIN / DB_HOST / DB_PORT / DB_USER / DB_LOCK / DB_HELD_GROUP + ensures MDB_ROOT_PWD. The
+# shared host-global DB lock ($DB_LOCK) is the same flocker key the test executor uses for its serial DB
+# jobs, so a destructive reset / DB regression here can't overlap another gate's DB-backed execution; the
+# executor's per-job key ($DB_HELD_GROUP) is distinct so its lock can't deadlock against the outer hold.
+# flocker is toolchain-provided (not a declared capability).
 FLOCKER := env("DRIFT_TOOLCHAIN_ROOT", env("HOME") + "/opt/drift/certified/current/toolchain") + "/bin/flocker"
-DB_LOCK := "serial-mariadb-mdb114-a"
-# Executor serial DB key used WHILE this gate holds the shared lock across its
-# whole phase. Distinct from `mariadb-mdb114-a` so the executor's per-job lock
-# can't deadlock against the outer hold (flocker is not re-entrant); only ever
-# active under the held lock, so a fixed non-shared key is safe.
-DB_HELD_GROUP := "mariadb-mdb114-a-held"
 
 # --- Certification gates (shared executor) ---
 # Gates run on the toolchain's shared `drift_test_run` executor (mechanism),
@@ -48,20 +44,22 @@ DB_HELD_GROUP := "mariadb-mdb114-a-held"
 test:
 	#!/usr/bin/env bash
 	set -euo pipefail
+	source "../tools/cert-env.sh"
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
 	# Runner-owned unit tests (the V1 control-flow graph IR in runner/src/ir.drift) are
 	# DB-free — run them as part of THIS component gate, before taking the DB lock. (ir.drift
 	# is Microflows code; this is its component home.)
 	( cd runner && just test )
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
-	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _test-locked
+	exec "{{FLOCKER}}" --key "$DB_LOCK" -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _test-locked
 
 # PRIVATE: the complete setup+DB-test phase. Runs ONLY under the shared lock held
-# by `test`. The executor's DB jobs take a non-shared serial key ({{DB_HELD_GROUP}}
+# by `test`. The executor's DB jobs take a non-shared serial key ($DB_HELD_GROUP
 # via --db-group) so their per-job lock can't deadlock against the outer hold.
 _test-locked:
 	#!/usr/bin/env bash
 	set -euo pipefail
+	source "../tools/cert-env.sh"
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
 	export DRIFT_PKG_ROOT="{{_pkg-root}}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
@@ -73,7 +71,7 @@ _test-locked:
 	just _db-load-test-fixtures
 	WORK="$(mktemp -d -t microflows-test-XXXXXX)"
 	trap 'rm -rf "$WORK"' EXIT
-	python3 tools/emit_test_plan.py test --db-group "{{DB_HELD_GROUP}}" --out "$WORK/plan.json"
+	python3 tools/emit_test_plan.py test --db-group "$DB_HELD_GROUP" --out "$WORK/plan.json"
 	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
 	# Stored-procedure regression reuses the freshly-loaded schema (unique ids per run).
 	just _test-sp
@@ -170,9 +168,8 @@ clean:
 # db/{schema,procs,constants,grants} in Mariachi-compatible form and are
 # deployed via Mariachi (the Foundation schema orchestrator), not ad-hoc
 # loaders. Mariachi handles ordering (FK parents before children) and
-# idempotent apply. One-time bootstrap: `cd ../mariachi && just setup`.
-
-MARIACHI := env("MARIACHI_BIN", "../../mariachi/.venv/bin/mariachi")
+# idempotent apply. One-time bootstrap: `cd ../mariachi && just setup`. The Mariachi
+# binary path ($MARIACHI_BIN) is resolved by the cert-env shim, sourced per recipe.
 
 # (Re-)create the microflows schema from the db/ template via Mariachi
 # (dev recreation; --destroy-database is refused on production-marked DBs).
@@ -182,61 +179,73 @@ MARIACHI := env("MARIACHI_BIN", "../../mariachi/.venv/bin/mariachi")
 db-load-schema:
 	#!/usr/bin/env bash
 	set -euo pipefail
+	source "../tools/cert-env.sh"
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
-	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 -- just _db-load-schema
+	exec "{{FLOCKER}}" --key "$DB_LOCK" -j 1 -- just _db-load-schema
 
 # PRIVATE: the actual destructive reset. Runs ONLY under the shared lock (held by
 # `db-load-schema` or `_test-locked`) — not a standalone entry point.
 _db-load-schema:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../mariachi && just setup'" >&2; exit 1; }
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
-	"{{MARIACHI}}" \
+	source "../tools/cert-env.sh"
+	"$DB_INSTANCE_SH" up >/dev/null   # ensure our repo-private MariaDB fixture is running (idempotent; ~8ms if up)
+	[[ -x "$MARIACHI_BIN" ]] || { echo "error: mariachi not found at '$MARIACHI_BIN' (set MARIACHI_BIN or DRIFT_CERT_CAPABILITIES.tool:mariachi)" >&2; exit 1; }
+	"$MARIACHI_BIN" \
 	  --schema-template db \
-	  --host {{DB_HOST}} --port {{DB_PORT}} \
-	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  --host "$DB_HOST" --port "$DB_PORT" \
+	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  apply --schema {{DB_SCHEMA}} --env=development --allow-destructive --destroy-database
 
-# Load TEST-ONLY fixture procedures (db/tests/*.sql) into the test database. NOT
-# part of the production schema apply — only the test gate (and dev e2e runs) load
-# these. Run AFTER db-load-schema (which destroys+recreates).
+# Load TEST-ONLY fixture procedures into a SEPARATE `microflows_test` schema (Mariachi template
+# db/tests/seed) — they write into the product `microflows` schema with qualified names. NOT part of
+# the production schema apply — only the test gate (and dev e2e runs) load these. Run AFTER
+# db-load-schema (which destroys+recreates the product schema).
 # PUBLIC entry: acquire the shared DB lock, then run the private load. flocker is
 # REQUIRED so a direct invocation can never overlap another checkout's tests.
 db-load-test-fixtures:
 	#!/usr/bin/env bash
 	set -euo pipefail
+	source "../tools/cert-env.sh"
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
-	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 -- just _db-load-test-fixtures
+	exec "{{FLOCKER}}" --key "$DB_LOCK" -j 1 -- just _db-load-test-fixtures
 
 # PRIVATE: the actual fixture load. Runs ONLY under the shared lock (held by the
-# public wrapper or by _test-locked).
+# public wrapper or by _test-locked). Test-only seed procs live in a SEPARATE Mariachi-managed
+# schema `microflows_test` (db/tests/seed) that writes into the product `microflows` schema with
+# qualified names — loaded the same way as everything else, via Mariachi (the one declared DB tool).
+# No mariadb client binary; not in the product schema (the app/prod role is never granted EXECUTE here).
 _db-load-test-fixtures:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
-	for f in db/tests/*.sql; do
-	  mariadb -h {{DB_HOST}} -P {{DB_PORT}} -u {{DB_USER}} -p"${MDB_ROOT_PWD}" {{DB_SCHEMA}} < "$f"
-	done
+	source "../tools/cert-env.sh"
+	"$MARIACHI_BIN" \
+	  --schema-template db/tests/seed \
+	  --host "$DB_HOST" --port "$DB_PORT" \
+	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
+	  apply --schema microflows_test --env development --allow-destructive --destroy-database
 
 # Plan a schema diff (no mutation) via Mariachi.
 db-plan:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	[[ -x "{{MARIACHI}}" ]] || { echo "error: mariachi venv missing — run 'cd ../mariachi && just setup'" >&2; exit 1; }
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
-	"{{MARIACHI}}" \
+	source "../tools/cert-env.sh"
+	[[ -x "$MARIACHI_BIN" ]] || { echo "error: mariachi not found at '$MARIACHI_BIN' (set MARIACHI_BIN or DRIFT_CERT_CAPABILITIES.tool:mariachi)" >&2; exit 1; }
+	"$MARIACHI_BIN" \
 	  --schema-template db \
-	  --host {{DB_HOST}} --port {{DB_PORT}} \
-	  --user {{DB_USER}} --password-env MDB_ROOT_PWD \
+	  --host "$DB_HOST" --port "$DB_PORT" \
+	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  plan --schema {{DB_SCHEMA}}
 
-# Run a SQL statement against the microflows database.
+# DEV-ONLY ad-hoc SQL convenience — NOT on any cert gate path (test/stress/perf never reach it). This
+# one recipe uses the `mariadb` client for interactive output; it is the ONLY remaining mariadb-CLI use
+# and is intentionally not part of the cert capability surface (which is exactly tool:mariachi +
+# tool:docker). Cert-gate DB work all goes through Mariachi against the repo-private Docker fixture.
 db-sql SQL:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
-	mariadb -h {{DB_HOST}} -P {{DB_PORT}} -u {{DB_USER}} -p"${MDB_ROOT_PWD}" {{DB_SCHEMA}} -e "{{SQL}}"
+	source "../tools/cert-env.sh"
+	mariadb -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"${MDB_ROOT_PWD}" {{DB_SCHEMA}} -e "{{SQL}}"
 
 # Focused SQL regression for the operation lifecycle stored procedures
 # (NULL fencing, command-identity conflict, idempotent settle, invariants).
@@ -245,18 +254,19 @@ db-sql SQL:
 test-sp:
 	#!/usr/bin/env bash
 	set -euo pipefail
+	source "../tools/cert-env.sh"
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
-	exec "{{FLOCKER}}" --key {{DB_LOCK}} -j 1 -- just _test-sp
+	exec "{{FLOCKER}}" --key "$DB_LOCK" -j 1 -- just _test-sp
 
 # PRIVATE: the DB-backed regression. Runs ONLY under the shared lock (held by
 # `test-sp` or `_test-locked`).
 _test-sp:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
+	source "../tools/cert-env.sh"
 	# Honor the MARIACHI_BIN env contract: the SP regression needs the mariachi venv's PYTHON
 	# (pymysql), which lives beside the `mariachi` binary — derive it instead of hardcoding a path.
-	MARIACHI_PY="$(dirname "{{MARIACHI}}")/python"
+	MARIACHI_PY="$(dirname "$MARIACHI_BIN")/python"
 	[[ -x "$MARIACHI_PY" ]] || { echo "error: mariachi venv python not found at $MARIACHI_PY (set MARIACHI_BIN to the venv's mariachi binary)" >&2; exit 1; }
 	"$MARIACHI_PY" db/tests/sp_operation_test.py
 

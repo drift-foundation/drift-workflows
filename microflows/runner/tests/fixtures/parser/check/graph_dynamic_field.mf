@@ -1,0 +1,3 @@
+args { x: string }
+op reserve { input: { reservation: string } }
+steps { reserve { reservation: arg x } }

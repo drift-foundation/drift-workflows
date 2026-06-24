@@ -1,0 +1,2 @@
+steps { let y = const 5
+ reserve { "reservation": "z" } }

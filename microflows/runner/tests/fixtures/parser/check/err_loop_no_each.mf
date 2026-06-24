@@ -1,0 +1,3 @@
+args { cands: [ { reservation: string } ] }
+steps { let ys = map arg cands local e
+ reserve local ys }

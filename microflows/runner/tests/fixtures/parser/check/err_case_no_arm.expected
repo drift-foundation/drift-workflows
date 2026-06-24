@@ -1,0 +1,9 @@
+{
+  "byte_offset": 57,
+  "code": "case-missing-arm",
+  "column": 39,
+  "expected": "",
+  "found": "",
+  "line": 2,
+  "status": "parse-error"
+}

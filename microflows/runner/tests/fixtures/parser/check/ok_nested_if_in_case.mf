@@ -1,0 +1,2 @@
+args { m: string, f: bool }
+steps { case m { "a" { if f { ping {} } else { ping {} } } default { ping {} } } }

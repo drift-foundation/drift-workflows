@@ -1,0 +1,32 @@
+{
+  "worker_id": "w",
+  "participants": [
+    {
+      "id": "ref",
+      "transport": {
+        "kind": "http",
+        "endpoints": [
+          "http://ref.invalid:8443"
+        ],
+        "selection": "ordered_failover"
+      },
+      "auth_profile": null
+    }
+  ],
+  "operations": [
+    {
+      "name": "reserve",
+      "participant": "ref",
+      "schema_version": 1,
+      "compensation": {
+        "operation": "release",
+        "schema_version": 1
+      }
+    },
+    {
+      "name": "release",
+      "participant": "ref",
+      "schema_version": 1
+    }
+  ]
+}

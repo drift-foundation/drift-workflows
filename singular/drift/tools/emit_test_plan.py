@@ -53,7 +53,7 @@ ARTIFACT = "singular"
 PKG_ROOT = os.path.abspath(os.environ.get(
     "DRIFT_PKG_ROOT", os.path.expanduser("~/opt/drift/certified/current/libs")))
 
-# Host-global mutex key naming the shared MariaDB *instance* (mdb114-a @ :34114).
+# Host-global mutex key naming the shared MariaDB *instance* (mdb114-a @ :34214).
 # Must match other consumers' string (mariadb-client) to serialize across suites
 # on the one physical box — resource contention, not state (A1 isolates state).
 # This DEFAULT serializes a direct executor run on the shared resource. An
@@ -188,7 +188,14 @@ def emit_test():
     # SQL NULL args, deliberate backend corruption, table-count assertions). Same runner + DB_GROUP
     # serialization + isolation policy as the other DB tests (per-run nonce service_group inside the
     # script). No build dependency. The mariachi venv provides pymysql.
-    sp_python = str(ROOT.parent.parent.parent / "mariachi" / ".venv" / "bin" / "python")
+    # Honor the MARIACHI_BIN env contract: the venv python lives beside the `mariachi` binary. Deriving
+    # it (not hardcoding a sibling path) is what makes this resolve under a fresh orchestrator checkout
+    # where ../../../mariachi does not exist. The relative path is a dev-only fallback.
+    _mariachi_bin = os.environ.get("MARIACHI_BIN")
+    if _mariachi_bin:
+        sp_python = str(Path(_mariachi_bin).parent / "python")
+    else:
+        sp_python = str(ROOT.parent.parent.parent / "mariachi" / ".venv" / "bin" / "python")
     sp_script = str(ROOT / "packages" / "singular" / "tests" / "sql" / "sp_invariants_test.py")
     run_live.append({"id": f"{ARTIFACT}-sp-invariants", "cmd": [sp_python, sp_script],
                      "needs": [], "mode": "serial", "group": DB_GROUP, "order": order})

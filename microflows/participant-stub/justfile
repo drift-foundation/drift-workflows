@@ -45,7 +45,6 @@ run CONFIG: build
 test-http: build
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${MDB_ROOT_PWD:?set MDB_ROOT_PWD to the MariaDB root password}"
 	python3 tests/http/conformance.py
 
 # Wipe build artifacts.

@@ -1,0 +1,3 @@
+args { flag: bool }
+op reserve { input: { reservation: string } }
+steps { if flag { reserve { reservation: "A" } } else { reserve { reservation: "B" } } }

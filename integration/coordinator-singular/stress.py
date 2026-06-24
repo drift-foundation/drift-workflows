@@ -23,7 +23,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 STUB_BIN = os.environ["STUB_BIN"]
 RUNNER_BIN = os.environ["RUNNER_BIN"]
-MDB = {"host": "127.0.0.1", "port": 34114, "user": "root",
+MDB = {"host": os.environ.get("DB_HOST", "127.0.0.1"),
+       "port": int(os.environ.get("DB_PORT", "34214")),
+       "user": os.environ.get("DB_USER", "root"),
        "password": os.environ.get("MDB_ROOT_PWD", "rootpw")}
 ROUNDS = int(os.environ.get("MF_STRESS_ROUNDS", "20"))
 WORKERS = int(os.environ.get("MF_STRESS_WORKERS", "8"))

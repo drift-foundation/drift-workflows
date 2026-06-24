@@ -7,7 +7,7 @@ asserts observable behavior. Stdlib-only (no pytest/requests dependency).
 
 Prereqs:
   - `just build` in participant-stub (binary at build/dist/bin/participant-stub)
-  - MariaDB up on 127.0.0.1:34114 with the `singular` schema loaded
+  - MariaDB up on 127.0.0.1:34214 with the `singular` schema loaded
     (`cd ../../singular && just db-load-schema`)
   - MDB_ROOT_PWD (default: rootpw)
 
@@ -82,7 +82,7 @@ def spawn_stub():
         "singular": {
             "backend": "mariadb",
             "host": os.environ.get("MDB_HOST", "127.0.0.1"),
-            "port": int(os.environ.get("MDB_PORT", "34114")),
+            "port": int(os.environ.get("MDB_PORT", "34214")),
             "user": os.environ.get("MDB_USER", "root"),
             "password": os.environ.get("MDB_ROOT_PWD", "rootpw"),
             "database": "singular",
