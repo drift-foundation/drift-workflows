@@ -229,7 +229,7 @@ def emit_content_hash(runner_cfg):
 
 
 # Fixed-id fixtures seeded by the `coordinator-fixtures` Mariachi scenario
-# (microflows/db/scenarios/coordinator-fixtures/). Each represents a durable DB
+# (microflows/db-tests/coordinator/scenarios/coordinator-fixtures/). Each represents a durable DB
 # state the normal slice cannot reach by running the coordinator forward, so we
 # seed it declaratively (clean reset + overlay) instead of mutating live rows.
 WF_RECOVERY = "a0000000000000000000000000000001"   # forward/requested, due; request persisted with a _fault input

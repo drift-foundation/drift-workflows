@@ -15,7 +15,7 @@
       "entry_point": "microflows.runner::main",
       "modules": ["src/"],
       "package_deps": [
-        { "name": "microflows", "version": "0.1" },
+        { "name": "mariadb-rpc", "version": "0.7" },
         { "name": "web-client", "version": "0.4" },
         { "name": "web-rest", "version": "0.5" }
       ]
@@ -30,7 +30,7 @@
       "entry_point": "microflows.runner::service_main",
       "modules": ["src/"],
       "package_deps": [
-        { "name": "microflows", "version": "0.1" },
+        { "name": "mariadb-rpc", "version": "0.7" },
         { "name": "web-client", "version": "0.4" },
         { "name": "web-rest", "version": "0.5" }
       ]

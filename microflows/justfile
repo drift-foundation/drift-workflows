@@ -115,22 +115,13 @@ prepare:
 	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
 	"$DRIFT" prepare --package-root "{{_pkg-root}}"
 
-# Re-mint drift/microflows.author-claim under the Drift Foundation author key
-# (Foundation convention: tools.drift_author + DRIFT_SIGN_KEY_FILE). Run after
-# any source change that affects SCI (modules, assets, deps, version).
-author-claim:
-	#!/usr/bin/env bash
-	set -euo pipefail
-	DRIFT_LANG_ROOT="${DRIFT_LANG_ROOT:-${HOME}/src/drift-lang}"
-	KEY_FILE="${DRIFT_SIGN_KEY_FILE:-${HOME}/.config/drift/keys/default.seed}"
-	[[ -d "${DRIFT_LANG_ROOT}/tools/drift_author" ]] || { echo "error: tools.drift_author not found at ${DRIFT_LANG_ROOT}" >&2; exit 1; }
-	[[ -f "${KEY_FILE}" ]] || { echo "error: signing key not found: ${KEY_FILE}" >&2; exit 1; }
-	echo "[author-claim] minting drift/microflows.author-claim"
-	PYTHONPATH="${DRIFT_LANG_ROOT}" python3 -m tools.drift_author publish \
-	  --manifest "$(pwd)/drift/manifest.json" \
-	  --artifact microflows \
-	  --key-file "${KEY_FILE}" \
-	  --overwrite
+# NON-RELEASE component manifest: this `microflows` project is for local dev / source compilation +
+# component tests only. It is intentionally NOT signed or deployed as a release here (no per-component
+# `author-claim` / `deploy`). The certified, DB-asset-bearing `microflows` package (code + microflows/db)
+# is published ONLY from the repo-root `drift/manifest.json` via the root `just deploy` — exactly one
+# signed meaning per public version (microflows 0.2.0 = code + microflows/db). Apps that import microflows
+# (the runner/service) compile it FROM SOURCE; a second same-version no-asset signed identity must never
+# be created (do not run `drift author`/`drift deploy` from this component tree).
 
 # NOTE: there is intentionally no test-time `deploy` recipe. The cross-component
 # integration suite COMPILES the runner directly against these library sources
@@ -198,7 +189,7 @@ _db-load-schema:
 	  apply --schema {{DB_SCHEMA}} --env=development --allow-destructive --destroy-database
 
 # Load TEST-ONLY fixture procedures into a SEPARATE `microflows_test` schema (Mariachi template
-# db/tests/seed) — they write into the product `microflows` schema with qualified names. NOT part of
+# db-tests/seed) — they write into the product `microflows` schema with qualified names. NOT part of
 # the production schema apply — only the test gate (and dev e2e runs) load these. Run AFTER
 # db-load-schema (which destroys+recreates the product schema).
 # PUBLIC entry: acquire the shared DB lock, then run the private load. flocker is
@@ -212,7 +203,7 @@ db-load-test-fixtures:
 
 # PRIVATE: the actual fixture load. Runs ONLY under the shared lock (held by the
 # public wrapper or by _test-locked). Test-only seed procs live in a SEPARATE Mariachi-managed
-# schema `microflows_test` (db/tests/seed) that writes into the product `microflows` schema with
+# schema `microflows_test` (db-tests/seed) that writes into the product `microflows` schema with
 # qualified names — loaded the same way as everything else, via Mariachi (the one declared DB tool).
 # No mariadb client binary; not in the product schema (the app/prod role is never granted EXECUTE here).
 _db-load-test-fixtures:
@@ -220,7 +211,7 @@ _db-load-test-fixtures:
 	set -euo pipefail
 	source "../tools/cert-env.sh"
 	"$MARIACHI_BIN" \
-	  --schema-template db/tests/seed \
+	  --schema-template db-tests/seed \
 	  --host "$DB_HOST" --port "$DB_PORT" \
 	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  apply --schema microflows_test --env development --allow-destructive --destroy-database
@@ -268,9 +259,9 @@ _test-sp:
 	# (pymysql), which lives beside the `mariachi` binary — derive it instead of hardcoding a path.
 	MARIACHI_PY="$(dirname "$MARIACHI_BIN")/python"
 	[[ -x "$MARIACHI_PY" ]] || { echo "error: mariachi venv python not found at $MARIACHI_PY (set MARIACHI_BIN to the venv's mariachi binary)" >&2; exit 1; }
-	"$MARIACHI_PY" db/tests/sp_operation_test.py
+	"$MARIACHI_PY" db-tests/sp_operation_test.py
 
 # NOTE: the cross-component coordinator<->Singular E2E moved to the repository
 # level: integration/coordinator-singular/ (run via root `just test-integration`
 # or `just test`). The fixtures it seeds remain a microflows schema asset at
-# db/scenarios/coordinator-fixtures/.
+# db-tests/coordinator/scenarios/coordinator-fixtures/.

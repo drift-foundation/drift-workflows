@@ -22,10 +22,6 @@
           "version": "0.5"
         },
         {
-          "name": "singular",
-          "version": "0.5"
-        },
-        {
           "name": "mariadb-rpc",
           "version": "0.7"
         }

@@ -3,33 +3,40 @@
 #
 # Environment:
 #   DRIFT_TOOLCHAIN_ROOT — required toolchain
-#   DRIFT_PKG_ROOT       — foundation package root
+#   DRIFT_PKG_ROOT       — foundation package root for EXTERNAL deps
 #                          (default: $HOME/opt/drift/certified/current/libs)
-#   SINGULAR_LIB_ROOT    — locally-published lib root for `singular` (Foundation-owned, this repo)
-#                          (default: ../../singular/drift/build/dist/lib)
 #   MDB_ROOT_PWD         — MariaDB root password (Singular schema load)
+#
+# Singular is compiled FROM SOURCE with the stub (it is a Foundation-owned sibling in this monorepo and
+# the package under certification — never consumed as a pre-deployed package). Same approach as the
+# integration planner (integration/coordinator-singular/tools/emit_test_plan.py) and the runner build.
 
 MANIFEST := "drift/manifest.json"
 _pkg-root := env("DRIFT_PKG_ROOT", env("HOME") + "/opt/drift/certified/current/libs")
-_pkg-local := env("SINGULAR_LIB_ROOT", "../../singular/drift/build/dist/lib")
 BIN_DIR := "build/dist/bin"
 
-# Resolve dependencies and write drift/lock.json.
+# Resolve EXTERNAL dependencies and write drift/lock.json (singular is a source dep, not locked).
 prepare:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
-	PKG_LOCAL="$(realpath -m "{{_pkg-local}}")"
-	"$DRIFT" prepare --package-root "$PKG_LOCAL" --package-root "{{_pkg-root}}"
+	"$DRIFT" prepare --package-root "{{_pkg-root}}"
 
-# Build the participant-stub binary.
+# Build the participant-stub binary FROM SOURCE: compile the Singular LIBRARY source together with the
+# stub app source, resolving only EXTERNAL deps from the package root (mirrors the integration planner +
+# the runner build). Singular is NOT consumed as a package, so this works on a fresh checkout / cert host
+# where no local or certified singular package exists. External --dep flags come from this app's lock.
 build:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
-	PKG_LOCAL="$(realpath -m "{{_pkg-local}}")"
+	DC="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/driftc"
 	mkdir -p "{{BIN_DIR}}"
-	"$DRIFT" build --timing --package-root "$PKG_LOCAL" --package-root "{{_pkg-root}}" -o "{{BIN_DIR}}/participant-stub"
+	DEPS="$(python3 -c "import json; r=json.load(open('drift/lock.json'))['artifacts']['microflows-participant-stub']['resolved']; print(' '.join('--dep %s@%s'%(n, r[n]['version']) for n in sorted(r) if n != 'singular'))")"
+	[[ -n "$DEPS" ]] || { echo "error: no external deps resolved in drift/lock.json (run 'just prepare')" >&2; exit 1; }
+	"$DC" --target-word-bits 64 --trust-store drift/trust.json --package-root "{{_pkg-root}}" \
+	  $DEPS --entry "microflows.participant_stub::main" \
+	  ../../singular/drift/packages/singular/src/*.drift src/*.drift \
+	  -o "{{BIN_DIR}}/participant-stub"
 
 # Run the stub. Pass a JSON config file via --config.
 #   just run config/local.json

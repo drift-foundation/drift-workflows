@@ -16,7 +16,7 @@ instead of letting a Microflows-local test reach into `../singular/db`.
 Component-owned assets stay with their component:
 - Microflows stored-procedure tests → `microflows/` (`just test-sp`).
 - Singular tests → `singular/`.
-- Microflows schema fixtures → `microflows/db/scenarios/coordinator-fixtures/`
+- Microflows schema fixtures → `microflows/db-tests/coordinator/scenarios/coordinator-fixtures/`
   (a Microflows schema asset; this suite *applies* them, doesn't own them).
 
 This directory owns only cross-component **orchestration + assertions**

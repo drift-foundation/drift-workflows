@@ -5,7 +5,7 @@
       "resolved": {
         "mariadb-rpc": {
           "version": "0.7.0",
-          "sha256": "d905d605842882a51207c1c707294079221bb5c5d1be6f6de9cd1c60c1d87a4e",
+          "sha256": "435f33c65ef75208f54bb1e835dcf2758702582358acb7101a448decf03513df",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "source_content_id": "sha256:74d4aa1fa143e5e1ccdc2fa210f9d9e9a8103b8331452f8736aa7842097892a5",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
@@ -13,7 +13,7 @@
         },
         "mariadb-wire-proto": {
           "version": "0.5.0",
-          "sha256": "455184d128f874ab8348944c1ce810076859a35a1ef22a9d01b432961f554444",
+          "sha256": "c9cd34199b02e57f6843a0527f8a89a4a209f2137dcbd1598b8db7213624a459",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "source_content_id": "sha256:6f9952a60921c9908f425480a56582bf9937186deccb33832fc68a4979745c83",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
@@ -25,7 +25,7 @@
       "resolved": {
         "mariadb-rpc": {
           "version": "0.7.0",
-          "sha256": "d905d605842882a51207c1c707294079221bb5c5d1be6f6de9cd1c60c1d87a4e",
+          "sha256": "435f33c65ef75208f54bb1e835dcf2758702582358acb7101a448decf03513df",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "source_content_id": "sha256:74d4aa1fa143e5e1ccdc2fa210f9d9e9a8103b8331452f8736aa7842097892a5",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
@@ -33,7 +33,7 @@
         },
         "mariadb-wire-proto": {
           "version": "0.5.0",
-          "sha256": "455184d128f874ab8348944c1ce810076859a35a1ef22a9d01b432961f554444",
+          "sha256": "c9cd34199b02e57f6843a0527f8a89a4a209f2137dcbd1598b8db7213624a459",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "source_content_id": "sha256:6f9952a60921c9908f425480a56582bf9937186deccb33832fc68a4979745c83",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",

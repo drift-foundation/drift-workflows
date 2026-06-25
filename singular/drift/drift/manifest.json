@@ -10,7 +10,7 @@
       "kind": "library",
       "name": "singular",
       "module_namespace": "singular",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "description": "Idempotency and lease coordination over MariaDB",
       "entry_module": "packages/singular/src/lib.drift",
       "modules": [

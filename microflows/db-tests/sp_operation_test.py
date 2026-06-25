@@ -9,7 +9,7 @@ Covers the hardening invariants:
   - happy-path lifecycle ends with workflow completed + checkpoint
 
 Run via the mariachi venv python (has PyMySQL) — the gate derives it from MARIACHI_BIN
-(`"$(dirname "$MARIACHI_BIN")/python" db/tests/sp_operation_test.py`); see microflows/justfile `_test-sp`.
+(`"$(dirname "$MARIACHI_BIN")/python" db-tests/sp_operation_test.py`); see microflows/justfile `_test-sp`.
 Requires the `microflows` schema loaded (`just db-load-schema`) and MDB_ROOT_PWD.
 """
 import datetime

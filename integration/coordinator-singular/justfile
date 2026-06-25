@@ -71,7 +71,7 @@ _db-and-harness WORK:
 	  apply --schema singular --env=development --allow-destructive --destroy-database
 	echo "[integration] reset + seed microflows schema (coordinator-fixtures)"
 	"$MARIACHI_BIN" \
-	  --schema-template "{{MF}}/db" \
+	  --schema-template "{{MF}}/db-tests/coordinator" \
 	  --host "$DB_HOST" --port "$DB_PORT" \
 	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  scenario --schema microflows --name coordinator-fixtures
@@ -111,7 +111,7 @@ _db-and-perf WORK *ARGS:
 	  apply --schema singular --env=development --allow-destructive --destroy-database
 	echo "[integration:perf] reset + seed microflows schema (coordinator-fixtures)"
 	"$MARIACHI_BIN" \
-	  --schema-template "{{MF}}/db" \
+	  --schema-template "{{MF}}/db-tests/coordinator" \
 	  --host "$DB_HOST" --port "$DB_PORT" \
 	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  scenario --schema microflows --name coordinator-fixtures
@@ -152,7 +152,7 @@ _db-and-stress WORK:
 	  apply --schema singular --env=development --allow-destructive --destroy-database
 	echo "[integration:stress] reset + seed microflows schema (coordinator-fixtures)"
 	"$MARIACHI_BIN" \
-	  --schema-template "{{MF}}/db" \
+	  --schema-template "{{MF}}/db-tests/coordinator" \
 	  --host "$DB_HOST" --port "$DB_PORT" \
 	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  scenario --schema microflows --name coordinator-fixtures

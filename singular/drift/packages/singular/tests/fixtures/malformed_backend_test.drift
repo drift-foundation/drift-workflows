@@ -1,7 +1,7 @@
 // Malformed-backend regression — decode-side JSON object-contract (part of the e2e gate).
 //
 // Runs the gateway against the `singular_malformed` fixture schema (loaded by `just db-load-schema`
-// via the Mariachi template db/tests/malformed), whose inspect/history SPs return hand-built `result` documents per
+// via the Mariachi template db-tests/malformed), whose inspect/history SPs return hand-built `result` documents per
 // idempotency key. The gateway requires every SP result to be ONE non-null JSON OBJECT discriminated
 // by `outcome` (or, for history, by `event`), with payload/checkpoint being NESTED JSON objects and
 // lease_owner being lowercase hex of exactly 16 bytes; history rows also carry a `status` the gateway

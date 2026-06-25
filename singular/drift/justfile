@@ -4,14 +4,12 @@
 #   DRIFT_TOOLCHAIN_ROOT — required for cert gates (just test). Toolchain >= 0.33.17.
 #   DRIFT_PKG_ROOT       — foundation-libs root for resolving external deps
 #                          (default: $HOME/opt/drift/certified/current/libs).
-#   DRIFT_SIGN_KEY_FILE  — Ed25519 signing key file (The Drift Foundation publisher identity):
-#                          cert-claim signer for `just deploy`, author-claim signer for
-#                          `just author-claim`. The Foundation owns this repo
-#                          (default: $HOME/.config/drift/keys/default.seed).
-#   DRIFT_DIST_ROOT      — deploy destination (default: build/dist/lib)
+#
+# NON-RELEASE component manifest: this `singular/drift` project is for local dev / source compilation
+# + component tests only. It is NOT signed or deployed as a release here — the certified, asset-bearing
+# `singular` package is published ONLY from the repo-root `drift/manifest.json`. No signing key needed.
 
 MANIFEST := "drift/manifest.json"
-DEPLOY_DEST := env("DRIFT_DIST_ROOT", "build/dist/lib")
 _pkg-root := env("DRIFT_PKG_ROOT", env("HOME") + "/opt/drift/certified/current/libs")
 HEARTBEAT_SECS := "30"
 
@@ -123,7 +121,7 @@ test-malformed-fixture:
 	source "../../tools/cert-env.sh"
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
 	"$MARIACHI_BIN" \
-	  --schema-template ../db/tests/malformed \
+	  --schema-template ../db-tests/malformed \
 	  --host "$DB_HOST" --port "$DB_PORT" \
 	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  apply --schema singular_malformed --env development --allow-destructive --destroy-database
@@ -152,24 +150,15 @@ prepare:
 	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
 	"$DRIFT" prepare --package-root "{{_pkg-root}}"
 
-# Re-mint drift/singular.author-claim under the Drift Foundation author key. Run after
-# any source change that affects SCI (modules, assets, deps, version).
-# The author-claim is then committed; the cert-claim is emitted by `just deploy`.
-author-claim:
-	#!/usr/bin/env bash
-	set -euo pipefail
-	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
-	KEY_FILE="${DRIFT_SIGN_KEY_FILE:-${HOME}/.config/drift/keys/default.seed}"
-	[[ -f "${KEY_FILE}" ]] || { echo "error: signing key not found: ${KEY_FILE}" >&2; exit 1; }
-	echo "[author-claim] minting drift/singular.author-claim"
-	"$DRIFT" author \
-	  --artifact singular \
-	  --key-file "${KEY_FILE}" \
-	  --overwrite
-
-# Produce singular's release dist (signed .zdmp + sidecars) at build/dist/lib/.
-# Alias for `deploy` (which re-mints the author-claim, then stages + signs).
-build: deploy
+# NON-RELEASE COMPONENT MANIFEST. This `singular/drift` manifest exists ONLY for local dev / source
+# compilation + the component's own tests. It is intentionally NOT signed and NOT deployable as a
+# release. The canonical, CERTIFIED, DB-asset-bearing `singular` package (code + `singular/db`) is
+# published ONLY from the repo-root `drift/manifest.json` via the root `just deploy`. Invariant: exactly
+# ONE signed meaning per public version (singular 0.6.0 = code + singular/db). Apps that import singular
+# (e.g. the participant-stub) compile it FROM SOURCE — they never consume a per-component package — so
+# there is deliberately no component-local `author-claim` / `deploy` here (a second, same-version,
+# no-asset signed identity must never be created; a direct `drift deploy`/`author` from this tree would
+# violate the invariant and must not be run).
 
 # Wipe all generated artifacts under build/.
 clean:
@@ -194,22 +183,12 @@ clean-data GROUP="":
 	"$DB_INSTANCE_SH" sql \
 	  "USE singular; DELETE FROM tb_singular_work_item_history${WHERE}; DELETE FROM tb_singular_work_item${WHERE};"
 
-# Build, sign, and publish singular to DEPLOY_DEST (default: build/dist/lib). Dev fallback
-# cert-suite (the drift-web / drift-mariadb-client convention: `--cert-suite-id <repo>/dev
-# --cert-suite-no-evidence`); the orchestrator overrides --cert-suite-id and binds real
-# evidence. No bespoke evidence ceremony. The repo root's `just deploy` is the canonical
-# multi-artifact entry; this per-component deploy stages just singular (e.g. for the stub's
-# local lib root) and for the eventual standalone-repo split.
-deploy *ARGS: author-claim
-	#!/usr/bin/env bash
-	set -euo pipefail
-	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
-	mkdir -p "{{DEPLOY_DEST}}"
-	EXTRA=""
-	if [[ "{{ARGS}}" != *--cert-suite* ]]; then
-	  EXTRA="--cert-suite-id drift-workflows/dev --cert-suite-no-evidence"
-	fi
-	"$DRIFT" deploy --dest "{{DEPLOY_DEST}}" --package-root "{{_pkg-root}}" ${EXTRA} {{ARGS}}
+# (No per-component `deploy`/`author-claim`: singular is a NON-RELEASE component manifest here — see the
+# note above. The certified, DB-asset-bearing release is the repo-root `just deploy` only.)
+
+# `build` = a from-source compile smoke-test of the library (NOT a deploy/sign). The umbrella
+# `singular/justfile build` delegates here.
+build: compile-check
 
 # NOTE: no test-time lib deploy. Consumers that need this library for a test
 # (e.g. the cross-component integration suite) COMPILE against these sources
