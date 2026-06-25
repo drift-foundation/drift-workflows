@@ -118,3 +118,27 @@ Literal next action: relocate `<pkg>/db/tests/` + `microflows/db/scenarios/` out
 
 - Out of scope: toolchain/Mariachi/orchestrator changes; consumer-repo (bookkeeper) wiring.
 - Don't answer pushcoin until our side is implemented + re-cert lands (owner sequencing).
+
+## Cert runs (orchestrator) — two rejections fixed
+
+**Run 1 (commit d9794b3) — REJECTED at author-claim preflight.** Committed claims were stale
+(singular claim c8d9 ≠ source e320; microflows 10c8 ≠ af95). Cause: I minted the claims during the
+reseal, then made further ASSET edits (`db/README.md` fixes — link removal + path correction) which
+change `<pkg>/db` content → SCI, and never re-minted. **Fix:** re-sealed against the final source →
+claims now bind e320/af95, `drift author verify` in-sync, trust-check ✓ (only the 2 `.author-claim`
+files changed; lock unchanged). **Lesson: re-seal must be the LAST step before commit — any source OR
+asset change invalidates the claim.**
+
+**Run 2 (commit 36a26fe) — author-claims OK; staged microflows@0.2.0 + singular@0.6.0; all NORMAL gates
++ test(debug) passed; REJECTED at stress(debug).** Not a code defect — a MariaDB readiness race:
+`(2013, Lost connection to MySQL server during query)` during the singular schema load, in the MySQL
+handshake (before any stress workload). The same `db/` template loaded fine in every normal gate +
+test(debug). **Root cause:** `tools/db_instance.sh _wait_ready` marked the DB ready via the in-container
+`mariadb-admin ping`, but all gates/Mariachi connect through the published host port 127.0.0.1:34214; a
+fresh MariaDB answers the local ping during init then RESTARTS the server (init sequence) → the host
+port drops the handshake during that window. **Fix:** strengthened `_wait_ready` — phase 1 in-container
+liveness, phase 2 loop on a real `SELECT 1` over 127.0.0.1:HOST_PORT (throwaway client container on the
+host network; tool:docker only, no host mariadb client / pymysql dep) until it truly succeeds; `cmd_up`
+also probes when already RUNNING. Verified locally: up waits for host-port readiness; independent probe
+confirms accepting; teardown clean. `tools/db_instance.sh` is not in any artifact SCI, so claims stay
+in-sync. **Next: commit `tools/db_instance.sh` + re-run cert.**

@@ -30,15 +30,30 @@ _have_docker() { command -v "$DOCKER" >/dev/null 2>&1 || { echo "error: docker c
 _exists()  { "$DOCKER" inspect "$CONTAINER" >/dev/null 2>&1; }
 _running() { [[ "$("$DOCKER" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == "true" ]]; }
 
+# Readiness must verify the SAME path the gates use: a real SQL connection over the PUBLISHED HOST PORT
+# (127.0.0.1:HOST_PORT). The in-container `mariadb-admin ping` is NOT sufficient — a fresh MariaDB image
+# answers the local ping during initialization, then RESTARTS the server (its init sequence); during that
+# window the host port forward is up but drops the TCP handshake. That exact race rejected a cert run
+# (debug stress: "Lost connection to MySQL server during query" at Mariachi's first connect). So:
+#   phase 1 — cheap in-container liveness (process is up);
+#   phase 2 — loop on `SELECT 1` over 127.0.0.1:HOST_PORT until it actually succeeds.
+# Phase 2 uses ONLY tool:docker (a throwaway client container on the host network) — no host mariadb
+# client or pymysql dependency. This connects exactly like Mariachi/the tests do, so "ready" means ready.
 _wait_ready() {
 	local deadline=$(( SECONDS + READY_TIMEOUT_SECS ))
+	# phase 1: in-container liveness (server process answering locally)
 	while (( SECONDS < deadline )); do
-		if "$DOCKER" exec "$CONTAINER" mariadb-admin ping -uroot -p"$ROOT_PASSWORD" --silent >/dev/null 2>&1; then
-			return 0
-		fi
+		"$DOCKER" exec "$CONTAINER" mariadb-admin ping -uroot -p"$ROOT_PASSWORD" --silent >/dev/null 2>&1 && break
 		sleep 1
 	done
-	echo "error: $CONTAINER did not become ready within ${READY_TIMEOUT_SECS}s" >&2
+	# phase 2: REAL readiness over the published host port (the path every gate/Mariachi uses)
+	while (( SECONDS < deadline )); do
+		"$DOCKER" run --rm --network host --entrypoint mariadb "$IMAGE" \
+			-h 127.0.0.1 -P "$HOST_PORT" -uroot -p"$ROOT_PASSWORD" --skip-ssl \
+			--connect-timeout=3 -e "SELECT 1" >/dev/null 2>&1 && return 0
+		sleep 1
+	done
+	echo "error: $CONTAINER not ready on host port 127.0.0.1:${HOST_PORT} (SELECT 1) within ${READY_TIMEOUT_SECS}s" >&2
 	"$DOCKER" logs --tail 30 "$CONTAINER" >&2 2>/dev/null || true
 	return 1
 }
@@ -49,7 +64,9 @@ _wait_ready() {
 #   CREATED — absent          -> we created it; restore = `down` (stop + remove, back to absent)
 cmd_up() {
 	_have_docker
-	if _running; then echo "RUNNING"; return 0; fi
+	# Even an already-RUNNING container may still be mid-init (nested gate / a just-started instance) —
+	# verify host-port readiness before reporting it usable.
+	if _running; then _wait_ready; echo "RUNNING"; return 0; fi
 	local state
 	if _exists; then
 		"$DOCKER" start "$CONTAINER" >/dev/null
