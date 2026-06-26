@@ -1,0 +1,85 @@
+// VT-scoped request logging context for the uflowsd daemon.
+//
+// Mirrors PushCoin Bookkeeper's logging shape (pushcoin/bookkeeper/src/logging.drift) so uflowsd's
+// operational logs read the same:
+//   - the logger is long-lived shared app state (ServiceApp.logger);
+//   - request context is short-lived VT-scoped state via rt.thread_registry();
+//   - AppLogResolver implements log.ContextResolver so bare logger calls pick up the ambient request
+//     context (req / workflow_id / script) automatically — including the global middleware's terminal
+//     `req-out` audit line, which fires after the handler returns.
+
+module microflows.runner.logging;
+
+import std.log as log;
+import std.runtime as rt;
+
+export {
+	AppLogResolver,
+	ensure_request_context,
+	push_request_context,
+	set_workflow_fields
+};
+
+pub struct AppLogResolver {}
+
+implement log.ContextResolver for AppLogResolver {
+	pub fn resolve(self: &AppLogResolver) nothrow -> Optional<&log.LogContext> {
+		val _ = self;
+		val reg = rt.thread_registry();
+		match rt.get<type RequestContextState>(reg) {
+			Some(st) => { return st.ctx.peek(); },
+			None => { return Optional<&log.LogContext>::None(); }
+		}
+	}
+}
+
+struct RequestContextState {
+	ctx: rt.ScopedStack<log.LogContext>
+}
+
+// Ensure the per-VT context state exists. Idempotent — safe on every request.
+pub fn ensure_request_context() nothrow -> Bool {
+	val reg = rt.thread_registry();
+	if rt.contains<type RequestContextState>(reg) {
+		return true;
+	}
+	return reg.set<type RequestContextState>(RequestContextState(ctx = rt.scoped_stack<type log.LogContext>()));
+}
+
+// Push request-scoped context with the `req` label ("<METHOD> <PATH>"). Workflow routes extend it with
+// workflow_id/script via set_workflow_fields; non-workflow routes (/healthz, …) leave them absent.
+// Returns None if VT context state is missing, so callers degrade to context-less logging.
+pub fn push_request_context(req: String) nothrow -> Optional<rt.ScopeGuard<log.LogContext>> {
+	val reg = rt.thread_registry();
+	match rt.get_mut<type RequestContextState>(reg) {
+		Some(st) => {
+			var ctx = log.log_context();
+			ctx.put("req", req);
+			var guard = st.ctx.push(ctx);
+			return Optional::Some(guard);
+		},
+		None => {
+			return Optional<type rt.ScopeGuard<log.LogContext>>::None();
+		}
+	}
+}
+
+// Mutate the top of the request-context stack to set workflow-scoped fields (workflow_id / script).
+// Used by route handlers so the fields are visible to EVERY log line for the request — including the
+// global middleware's terminal `req-out` line, which fires after the handler returns. Silent no-op if
+// no scope is on the stack. (Analogous to Bookkeeper's set_task_fields.)
+pub fn set_workflow_fields(workflow_id: String, script: String) nothrow -> Void {
+	val reg = rt.thread_registry();
+	match rt.get_mut<type RequestContextState>(reg) {
+		Some(st) => {
+			match st.ctx.peek_mut() {
+				Some(ctx) => {
+					ctx.put("workflow_id", workflow_id);
+					if script.byte_length() != 0 { ctx.put("script", script); }
+				},
+				None => {}
+			}
+		},
+		None => {}
+	}
+}

@@ -24,6 +24,38 @@
         "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
       ]
     },
+    "net_tls.*": {
+      "authors": [
+        "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
+      ],
+      "certifiers": [
+        "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
+      ]
+    },
+    "web.client.*": {
+      "authors": [
+        "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
+      ],
+      "certifiers": [
+        "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
+      ]
+    },
+    "web.jwt.*": {
+      "authors": [
+        "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
+      ],
+      "certifiers": [
+        "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
+      ]
+    },
+    "web.rest.*": {
+      "authors": [
+        "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
+      ],
+      "certifiers": [
+        "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
+      ]
+    },
     "singular.*": {
       "authors": [
         "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
@@ -33,6 +65,14 @@
       ]
     },
     "microflows.*": {
+      "authors": [
+        "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
+      ],
+      "certifiers": [
+        "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
+      ]
+    },
+    "microflows.runner.*": {
       "authors": [
         "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0="
       ],

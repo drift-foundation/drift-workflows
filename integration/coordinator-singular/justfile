@@ -76,7 +76,7 @@ _db-and-harness WORK:
 	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  scenario --schema microflows --name coordinator-fixtures
 	echo "[integration] run coordinator<->singular harness"
-	STUB_BIN="{{WORK}}/participant-stub" RUNNER_BIN="{{WORK}}/microflows-runner" SERVICE_BIN="{{WORK}}/microflows-service" python3 test.py
+	STUB_BIN="{{WORK}}/participant-stub" RUNNER_BIN="{{WORK}}/microflows-runner" SERVICE_BIN="{{WORK}}/uflowsd" python3 test.py
 
 # Coordinator PERF gate: service drive throughput (timing) vs a committed baseline. Same compile +
 # DB-lock + schema-reset discipline as `test`. Pass --update-baseline ARGS to (re)record the baseline.
@@ -91,7 +91,7 @@ perf *ARGS:
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
 	WORK="$(mktemp -d -t coord-singular-perf-XXXXXX)"
 	trap 'rm -rf "$WORK"' EXIT
-	echo "[integration:perf] compile participant-stub + microflows-service from source"
+	echo "[integration:perf] compile participant-stub + uflowsd from source"
 	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
 	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
@@ -116,7 +116,7 @@ _db-and-perf WORK *ARGS:
 	  --user "$DB_USER" --password-env MDB_ROOT_PWD \
 	  scenario --schema microflows --name coordinator-fixtures
 	echo "[integration:perf] measure coordinator drive throughput + gate"
-	STUB_BIN="{{WORK}}/participant-stub" SERVICE_BIN="{{WORK}}/microflows-service" python3 perf.py {{ARGS}}
+	STUB_BIN="{{WORK}}/participant-stub" SERVICE_BIN="{{WORK}}/uflowsd" python3 perf.py {{ARGS}}
 
 # Coordinator STRESS gate: concurrent-submit recovery race — WORKERS racing one workflow id must collapse
 # to exactly-once participant execution. Same compile + DB-lock + schema-reset discipline as `test`.

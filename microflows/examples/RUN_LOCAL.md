@@ -1,12 +1,12 @@
 # Run the starter kit locally
 
-Drive the example workflows through `microflows-service` over HTTP. This is the same path your
+Drive the example workflows through `uflowsd` over HTTP. This is the same path your
 application will use: submit a named script, resume pending work, inspect outcomes, redeploy by reload.
 
 ## 0. Prerequisites
 
-- The certified toolchain (driftc 0.33.53 / abi 18) and a built `microflows-service` binary
-  (`microflows/runner` builds artifacts `microflows-runner` and `microflows-service`).
+- The certified toolchain (driftc 0.33.53 / abi 18) and a built `uflowsd` binary
+  (`microflows/runner` builds artifacts `microflows-runner` and `uflowsd`).
 - A MariaDB with the Microflows schema loaded, and your participant services reachable.
 - Edit `manifest.json`: set `deployment.db.*` to your database and each participant's
   `transport.endpoints` to your services. (For a pure local smoke test, point all three logical
@@ -16,7 +16,7 @@ application will use: submit a named script, resume pending work, inspect outcom
 ## 1. Start the service
 
 ```bash
-microflows-service --manifest /path/to/microflows/examples/manifest.json --port 8088
+uflowsd --manifest /path/to/microflows/examples/manifest.json --port 8088
 ```
 
 At startup the service **loads and validates every script** in the manifest over the shared

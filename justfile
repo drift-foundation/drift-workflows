@@ -131,7 +131,7 @@ author-claim:
 	KEY_FILE="${DRIFT_SIGN_KEY_FILE:-${HOME}/.config/drift/keys/default.seed}"
 	[[ -d "${DRIFT_LANG_ROOT}/tools/drift_author" ]] || { echo "error: tools.drift_author not found at ${DRIFT_LANG_ROOT}" >&2; exit 1; }
 	[[ -f "${KEY_FILE}" ]] || { echo "error: signing key not found: ${KEY_FILE}" >&2; exit 1; }
-	for ART in singular microflows; do
+	for ART in singular microflows uflowsd; do
 	  echo "[author-claim] minting drift/${ART}.author-claim"
 	  PYTHONPATH="${DRIFT_LANG_ROOT}" python3 -m tools.drift_author publish \
 	    --manifest "$(pwd)/drift/manifest.json" \

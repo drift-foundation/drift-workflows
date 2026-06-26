@@ -4,18 +4,18 @@
     "microflows": {
       "resolved": {
         "mariadb-rpc": {
-          "version": "0.7.0",
-          "sha256": "435f33c65ef75208f54bb1e835dcf2758702582358acb7101a448decf03513df",
+          "version": "0.8.0",
+          "sha256": "68fc291791a414e95d828158c2ba4ddde6274270cc3450a9536f2898601d165b",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:74d4aa1fa143e5e1ccdc2fa210f9d9e9a8103b8331452f8736aa7842097892a5",
+          "source_content_id": "sha256:06a346cd34b2b2eda9d39d4c0e3cbc26955f9eee24139c50eccb441a0577885e",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         },
         "mariadb-wire-proto": {
-          "version": "0.5.0",
-          "sha256": "c9cd34199b02e57f6843a0527f8a89a4a209f2137dcbd1598b8db7213624a459",
+          "version": "0.6.0",
+          "sha256": "314882c7b2fc485ad34f7a73448934015ac27f2ebc8825c35dacf676909ece63",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:6f9952a60921c9908f425480a56582bf9937186deccb33832fc68a4979745c83",
+          "source_content_id": "sha256:c5b7c104a63c0e3a689710003595bc89bee6718f2b55ef0ec09dd35336b02e1a",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         }

@@ -1370,7 +1370,7 @@ unknown `--script` is refused with no workflow row; a manifest with any invalid 
 
 ## 15. ScriptRegistry service shell (roadmap item 3b — LANDED)
 
-A **second artifact** (`microflows-service`, entry `microflows.runner::service_main`) turns the
+A **second artifact** (`uflowsd`, entry `microflows.runner::service_main`) turns the
 proven one-shot CLI core into a long-running `web.rest` front-door. It adds **no workflow semantics** —
 it is a thin wrapper over the SAME drive boundary — but it is real service infrastructure.
 

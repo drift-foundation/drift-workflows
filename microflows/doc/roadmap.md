@@ -60,7 +60,7 @@ integration **149/149** (C20: named submit + pin/hash parity, unknown-script ref
 invalid-manifest, resume-by-pin). As-built: `microflows_design.md` §14.
 
 ### 3b. ScriptRegistry service shell — ✅ LANDED (2026-06-20)
-The thin long-running front-door: a second artifact (`microflows-service`) on `web.rest` that owns the
+The thin long-running front-door: a second artifact (`uflowsd`) on `web.rest` that owns the
 in-memory **swappable** registry and ONE shared, internally-pooled host, serving submit/resume/health
 over HTTP. Each request calls the SAME `_drive_manifest_request` → `_run_core` (drive_workflow) →
 Outcome the CLI uses — no new workflow semantics; `_run_core` was extracted so the host is built ONCE

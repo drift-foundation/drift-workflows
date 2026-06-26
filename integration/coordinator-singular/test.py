@@ -51,7 +51,7 @@ STUB_BIN = Path(os.environ.get("STUB_BIN",
 RUNNER_BIN = Path(os.environ.get("RUNNER_BIN",
                   MF / "runner" / "build" / "dist" / "bin" / "microflows-runner"))
 SERVICE_BIN = Path(os.environ.get("SERVICE_BIN",
-                   MF / "runner" / "build" / "dist" / "bin" / "microflows-service"))
+                   MF / "runner" / "build" / "dist" / "bin" / "uflowsd"))
 
 MDB = {
     "host": os.environ.get("DB_HOST", "127.0.0.1"),
@@ -2861,7 +2861,7 @@ def main():
         finally:
             stop_service(dproc)
 
-        # ===== C22: business starter-kit EXAMPLES over microflows-service (roadmap item 4) =====
+        # ===== C22: business starter-kit EXAMPLES over uflowsd (roadmap item 4) =====
         # Drive the COMMITTED microflows/examples/workflows/*.mf through the service to prove the
         # starter-kit templates run with prod-like qualities. The test builds its OWN deployment (test
         # DB + the three LOGICAL participants payments/inventory/accounts, all routed to this stub) over

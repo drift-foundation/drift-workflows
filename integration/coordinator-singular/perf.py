@@ -2,7 +2,7 @@
 """Microflows coordinator PERF gate (certification): service drive throughput vs a committed baseline.
 
 Measures at the COORDINATOR / service API level with the real participant round trips in the workload
-(production behavior): boot the long-running microflows-service over a one-reserve-op manifest, then
+(production behavior): boot the long-running uflowsd over a one-reserve-op manifest, then
 time CYCLES sequential workflow submissions (each a full drive -> participant -> terminal). Gate
 per-workflow latency (`per_wf_ms`) against a committed, machine-keyed baseline (a 3x tolerance catches
 cascading slowdowns while absorbing host variance). A MISSING baseline HARD-FAILS — only

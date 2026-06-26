@@ -7,10 +7,10 @@
   },
   "artifacts": [
     {
-      "kind": "library",
+      "kind": "package",
       "name": "singular",
       "module_namespace": "singular",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "description": "Idempotency and lease coordination over MariaDB",
       "entry_module": "singular/drift/packages/singular/src/lib.drift",
       "modules": [
@@ -21,7 +21,7 @@
       "package_deps": [
         {
           "name": "mariadb-rpc",
-          "version": "0.7"
+          "version": "0.8"
         }
       ],
       "assets": [
@@ -29,10 +29,10 @@
       ]
     },
     {
-      "kind": "library",
+      "kind": "package",
       "name": "microflows",
       "module_namespace": "microflows",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "description": "Microflows \u2014 typed durable workflow coordinator (control state over MariaDB)",
       "entry_module": "microflows/packages/microflows/src/lib.drift",
       "modules": [
@@ -43,11 +43,44 @@
       "package_deps": [
         {
           "name": "mariadb-rpc",
-          "version": "0.7"
+          "version": "0.8"
         }
       ],
       "assets": [
         "microflows/db"
+      ]
+    },
+    {
+      "kind": "app",
+      "name": "uflowsd",
+      "module_namespace": "microflows.runner",
+      "version": "0.1.0",
+      "description": "Microflows coordinator daemon — manifest-driven HTTP front-door driving .mf plans + dispatching operations over MariaDB",
+      "entry_module": "microflows/runner/src/runner.drift",
+      "entry_point": "microflows.runner::service_main",
+      "modules": [
+        "microflows/runner/src/runner.drift",
+        "microflows/runner/src/ir.drift",
+        "microflows/runner/src/parser.drift",
+        "microflows/runner/src/logging.drift"
+      ],
+      "package_deps": [
+        {
+          "name": "microflows",
+          "version": "0.3"
+        },
+        {
+          "name": "mariadb-rpc",
+          "version": "0.8"
+        },
+        {
+          "name": "web-client",
+          "version": "0.5"
+        },
+        {
+          "name": "web-rest",
+          "version": "0.6"
+        }
       ]
     }
   ]

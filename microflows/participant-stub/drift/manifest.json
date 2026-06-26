@@ -19,11 +19,11 @@
       "package_deps": [
         {
           "name": "web-rest",
-          "version": "0.5"
+          "version": "0.6"
         },
         {
           "name": "mariadb-rpc",
-          "version": "0.7"
+          "version": "0.8"
         }
       ],
       "assets": []

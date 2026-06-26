@@ -15,14 +15,14 @@
       "entry_point": "microflows.runner::main",
       "modules": ["src/"],
       "package_deps": [
-        { "name": "mariadb-rpc", "version": "0.7" },
-        { "name": "web-client", "version": "0.4" },
-        { "name": "web-rest", "version": "0.5" }
+        { "name": "mariadb-rpc", "version": "0.8" },
+        { "name": "web-client", "version": "0.5" },
+        { "name": "web-rest", "version": "0.6" }
       ]
     },
     {
       "kind": "app",
-      "name": "microflows-service",
+      "name": "uflowsd",
       "module_namespace": "microflows.runner",
       "version": "0.1.0",
       "description": "Microflows coordinator service — long-running manifest-driven web.rest front-door (roadmap 3b)",
@@ -30,9 +30,9 @@
       "entry_point": "microflows.runner::service_main",
       "modules": ["src/"],
       "package_deps": [
-        { "name": "mariadb-rpc", "version": "0.7" },
-        { "name": "web-client", "version": "0.4" },
-        { "name": "web-rest", "version": "0.5" }
+        { "name": "mariadb-rpc", "version": "0.8" },
+        { "name": "web-client", "version": "0.5" },
+        { "name": "web-rest", "version": "0.6" }
       ]
     }
   ]

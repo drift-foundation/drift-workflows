@@ -1,8 +1,8 @@
 {
-  "_comment": "Microflows service manifest (roadmap item 4 starter kit). `microflows-service --manifest manifest.json` loads + validates EVERY script below at startup, over the shared `deployment` routing registry. This is a TEMPLATE: replace db.* and each participant endpoint with your environment. Script `path`s are resolved relative to THIS file's directory. SECURITY: auth_profile is null everywhere and the service is internal-only — see RUN_LOCAL.md 'Security boundary'.",
+  "_comment": "Microflows service manifest (roadmap item 4 starter kit). `uflowsd --manifest manifest.json` loads + validates EVERY script below at startup, over the shared `deployment` routing registry. This is a TEMPLATE: replace db.* and each participant endpoint with your environment. Script `path`s are resolved relative to THIS file's directory. SECURITY: auth_profile is null everywhere and the service is internal-only — see RUN_LOCAL.md 'Security boundary'.",
 
   "deployment": {
-    "worker_id": "microflows-service-1",
+    "worker_id": "uflowsd-1",
 
     "db": {
       "backend": "mariadb",

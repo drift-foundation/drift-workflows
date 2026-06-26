@@ -40,8 +40,8 @@ APPS = [
      "lib_proj": "singular/drift", "local_lib": "singular"},
     {"out": "microflows-runner", "app_proj": "microflows/runner",
      "lib_proj": "microflows", "local_lib": "microflows"},
-    {"out": "microflows-service", "app_proj": "microflows/runner",
-     "lib_proj": "microflows", "local_lib": "microflows", "artifact": "microflows-service"},
+    {"out": "uflowsd", "app_proj": "microflows/runner",
+     "lib_proj": "microflows", "local_lib": "microflows", "artifact": "uflowsd"},
 ]
 
 

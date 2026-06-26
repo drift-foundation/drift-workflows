@@ -36,6 +36,9 @@ import std.codec as codec;
 import std.uuid as uuid;
 import std.crypto as crypto;
 import std.log as log;
+import std.time as time;
+import std.text as txt;
+import microflows.runner.logging as logging;
 import microflows.host as mf;
 import microflows.runner.ir as ir;
 import microflows.runner.parser as parser;
@@ -2998,7 +3001,8 @@ struct ServiceApp {
 	host: arc.Arc<mf.MicroflowsHost>,
 	registry: conc.Mutex<arc.Arc<ManifestSet>>,   // swapped atomically on SIGUSR1 reload
 	admission: conc.AtomicInt,                     // ADM_ACCEPTING / ADM_DRAINING / ADM_STOPPED
-	manifest_path: String
+	manifest_path: String,
+	logger: log.Logger                             // shared, long-lived; bare calls auto-carry VT request context
 }
 
 // A consistent snapshot of the active registry: clone the inner Arc under the lock, release before the
@@ -3019,14 +3023,14 @@ fn _service_reload(app: &ServiceApp) throws -> Bool {
 	// RunnerError -> reject the reload, keep the active registry. A truly UNEXPECTED defect is NOT a
 	// RunnerError, so it is NOT caught here and fails loudly rather than masquerading as "bad manifest"
 	// (the same discipline applied to config-build errors in _run_planned).
-	try { new_opt = Optional<ManifestSet>::Some(_load_manifest(&app.manifest_path)); ok = true; } catch RunnerError(e) { console.eprintln("microflows-service: reload rejected (invalid manifest), keeping the active registry: " + e.message); ok = false; }
+	try { new_opt = Optional<ManifestSet>::Some(_load_manifest(&app.manifest_path)); ok = true; } catch RunnerError(e) { app.logger.error("manifest-reload-rejected", {"reason": "invalid_manifest", "message": e.message}); ok = false; }
 	if !ok { return false; }
 	match move new_opt {
 		Optional::Some(ms) => {
 			var g = conc.lock(&app.registry);
 			val slot = conc.mutex_guard_get_mut(&mut g);
 			*slot = conc.arc(ms);
-			console.println("microflows-service: manifest reloaded");
+			app.logger.info("manifest-reloaded", {"manifest": _dup(&app.manifest_path)});
 			return true;
 		},
 		Optional::None => { return false; }
@@ -3072,6 +3076,7 @@ implement ServiceApp {
 			val outcome = _drive_manifest_request(&self.host, snap.get(), wf, script, has_script, &"", &"{}", args, has_arguments, &adm);
 			resp = _outcome_response(&outcome);
 		} catch unexpected {
+			self.logger.error("workflow-handler-failed", {"reason": "runner_fatal"});
 			resp = rest.json_response(500, "{\"workflow\":\"error\",\"reason\":\"runner-fatal\"}");
 		}
 		return move resp;
@@ -3082,19 +3087,30 @@ implement ServiceApp {
 		var script = "";
 		var has_script = false;
 		match rest.query_param(req, &"script") { Optional::Some(s) => { script = move s; has_script = true; }, Optional::None => {} }
+		logging.set_workflow_fields(_dup(&wf), _dup(&script));
+		self.logger.info("workflow-submit-received", {"script": _dup(&script)});
 		// The submit body MUST be a valid JSON document (the instance arguments — `{}` if none). A
 		// malformed/empty body is a structured 400 BEFORE any drive — never silently coerced to `{}`
 		// (which could create a valid empty-argument workflow for a script that accepts no fields).
 		var args = "";
 		var have_args = false;
 		match rest.body_json(req) { core.Result::Ok(h) => { args = h.encode_compact(); have_args = true; }, core.Result::Err(_) => {} }
-		if !have_args { return rest.json_response(400, "{\"workflow\":\"aborted\",\"reason\":\"malformed_arguments\"}"); }
-		return self.drive(&wf, &script, has_script, &args, true);
+		if !have_args {
+			self.logger.error("workflow-submit-rejected", {"reason": "malformed_arguments"});
+			return rest.json_response(400, "{\"workflow\":\"aborted\",\"reason\":\"malformed_arguments\"}");
+		}
+		val resp = self.drive(&wf, &script, has_script, &args, true);
+		self.logger.info("workflow-submit-completed", {"status": fmt.format_int(resp.status)});
+		return move resp;
 	}
 	// POST /v1/workflows/{id}/resume  — no script, no args; driven strictly by the durable pin.
 	pub fn handle_resume(self: &ServiceApp, req: &rest.Request) throws -> rest.Response {
 		val wf = rest.path_param(req, "id").or_throw();
-		return self.drive(&wf, &"", false, &"", false);
+		logging.set_workflow_fields(_dup(&wf), "");
+		self.logger.info("workflow-resume-received", {"workflow_id": _dup(&wf)});
+		val resp = self.drive(&wf, &"", false, &"", false);
+		self.logger.info("workflow-resume-completed", {"status": fmt.format_int(resp.status)});
+		return move resp;
 	}
 	// GET /healthz — liveness (process up).
 	pub fn handle_healthz(self: &ServiceApp, req: &rest.Request) throws -> rest.Response {
@@ -3107,34 +3123,56 @@ implement ServiceApp {
 	}
 }
 
-// The long-running service: `--manifest FILE` [`--port N`]. A second artifact (microflows-service).
+// The long-running service: `--manifest FILE` [`--port N`]. A second artifact (uflowsd).
 fn service_main(argv: Array<String>) nothrow -> Int {
-	var p = cli.parser("microflows-service", "0.1.0", "Microflows coordinator service (manifest-driven, long-running)");
+	var p = cli.parser("uflowsd", "0.1.0", "Microflows coordinator service (manifest-driven, long-running)");
 	val _ = p.option_string("manifest", "m", "FILE", "deployment manifest (named scripts + shared deployment routing)", true);
 	val _ = p.option_int("port", "p", "PORT", "listening port (default 8088)", false);
+	val _ = p.option_string("log-level", "l", "LEVEL", "log level: debug | info | error (default: info)", false);
 	var manifest_path = "";
 	var port = 8088;
+	var log_level = log.Level::Info();
 	match p.parse(argv) {
 		core.Result::Ok(parsed) => {
 			match parsed.get_string("manifest", p) { Some(v) => { manifest_path = _dup(v); }, None => {} }
 			match parsed.get_int("port", p) { Some(v) => { port = v; }, None => {} }
+			match parsed.get_string("log-level", p) {
+				Some(v) => {
+					if *v == "debug" { log_level = log.Level::Debug(); }
+					else if *v == "info" { log_level = log.Level::Info(); }
+					else if *v == "error" { log_level = log.Level::Error(); }
+					else { console.eprintln("uflowsd: unknown --log-level (expected debug|info|error)"); return 2; }
+				},
+				None => {}
+			}
 		},
-		core.Result::Err(_) => { console.eprintln("microflows-service: bad arguments"); return 2; }
+		core.Result::Err(_) => { console.eprintln("uflowsd: bad arguments"); return 2; }
 	}
-	return try _service_run(&manifest_path, port) catch unexpected { console.eprintln("microflows-service: fatal"); 1 };
+	return try _service_run(&manifest_path, port, log_level) catch unexpected { console.eprintln("uflowsd: fatal"); 1 };
 }
 
-fn _service_run(manifest_path: &String, port: Int) throws -> Int {
+fn _service_run(manifest_path: &String, port: Int, log_level: log.Level) throws -> Int {
+	// Operational logger (Bookkeeper-style): JSON ISO-8601 to stderr; a VT request-context resolver so
+	// bare logger calls carry req/workflow_id/script automatically. Shared via ServiceApp.logger.
+	var cfgb = log.config_builder();
+	cfgb.sink(log.stderr_sink());
+	cfgb.min_level(log_level);
+	cfgb.formatter(log.FormatterKind::JsonIso8601());
+	cfgb.context_resolver(conc.arc(logging.AppLogResolver()).as_interface<type log.ContextResolver>());
+	val logger = log.create_logger("uflowsd", cfgb.build());
+	logger.info("uflowsd-startup-begin", {"port": fmt.format_int(port)});
 	// Load + validate the WHOLE manifest at startup; refuse to start on any error (fail-fast).
+	logger.info("manifest-load-begin", {"manifest": _dup(manifest_path)});
 	var ms_opt: Optional<ManifestSet> = Optional<ManifestSet>::None();
 	try {
 		ms_opt = Optional<ManifestSet>::Some(_load_manifest(manifest_path));
 	} catch RunnerError(e) {
-		console.eprintln("microflows-service: invalid manifest: " + e.message);
+		logger.error("manifest-load-rejected", {"reason": "invalid_manifest", "message": e.message});
 		return 2;
 	}
 	match move ms_opt {
 		Optional::Some(ms) => {
+			logger.info("manifest-load-completed", {"manifest": _dup(manifest_path)});
 			// ONE shared, internally-pooled host (from the manifest's deployment db) for all requests.
 			val db_sub = _require_db(&ms.deployment);
 			val worker_id = _config_str(&ms.deployment, &"worker_id", "runner-1");
@@ -3147,11 +3185,30 @@ fn _service_run(manifest_path: &String, port: Int) throws -> Int {
 			// later flips it to draining at runtime. The drive applies the SAME admission rules.
 			val adm0 = _admission_from_env();
 			val app = conc.arc(ServiceApp(host = move host, registry = conc.mutex(conc.arc(ms)),
-			                              admission = conc.atomic_int(_admission_to_int(&adm0)), manifest_path = _dup(manifest_path)));
+			                              admission = conc.atomic_int(_admission_to_int(&adm0)), manifest_path = _dup(manifest_path),
+				                              logger = logger));
 
 			var ab = rest.new_app_builder();
 			rest.bind(ab, "0.0.0.0", port);
 			var web_app = rest.build_app(move ab);
+				// Global middleware: VT-scoped request context + a single terminal `req-out` audit line on
+				// every termination path (mirrors Bookkeeper). /perf/* (none today) would skip logging.
+				rest.add_middleware(web_app, |req, ctx, next| captures(share app) => {
+					val _ = logging.ensure_request_context();
+					val _g = logging.push_request_context(req.method + " " + req.path);
+					val start = time.now_monotonic();
+					val skip_logging = txt.starts_with(req.path, "/perf/");
+					val result = next.call(req, ctx);
+					if !skip_logging {
+						val elapsed = time.elapsed_ms(start);
+						val a = app.get();
+						match &result {
+							core.Result::Ok(resp) => { val _ = a.logger.info("req-out", {"status": fmt.format_int(resp.status), "elapsed": fmt.format_int(elapsed)}); },
+							core.Result::Err(e) => { val _ = a.logger.error("req-out", {"status": fmt.format_int(e.status), "elapsed": fmt.format_int(elapsed), "tag": e.tag}); }
+						}
+					}
+					return move result;
+				});
 			// AUTH SEAM (roadmap item 5): the `/v1/workflows` route group is where web.rest auth
 			// middleware / a request security context attaches later. No auth logic now.
 			val wf_rg = rest.add_route_group(web_app, "/v1/workflows").or_throw();
@@ -3164,7 +3221,7 @@ fn _service_run(manifest_path: &String, port: Int) throws -> Int {
 			rest.add_throws_route(web_app, "GET", "/readyz",
 				|req, ctx| captures(share app) => { return app.get().handle_readyz(req); }).or_throw();
 
-			console.println("microflows-service listening on " + fmt.format_int(port));
+			app.get().logger.info("uflowsd-listening", {"port": fmt.format_int(port)});
 			var running = rest.start(move web_app, conc.Duration(millis = 0));
 			// Signal loop: SIGUSR1 -> staged reload; SIGTERM -> drain (refuse new) + graceful shutdown.
 			var serving = true;
@@ -3175,7 +3232,7 @@ fn _service_run(manifest_path: &String, port: Int) throws -> Int {
 					conc.ProcessSignal::Interrupt => { serving = false; }
 				}
 			}
-			console.println("microflows-service draining + shutting down");
+			app.get().logger.info("uflowsd-shutdown", {"reason": "signal"});
 			val _ = rest.shutdown(running);
 			return 0;
 		},
