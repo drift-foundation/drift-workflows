@@ -260,12 +260,13 @@ Targets: `microflows/doc/uflowsd_participant_contract.md` (wire contract), `micr
   the prior stack). The throwing `_extract_result`/`_try_extract_result` are gone (a non-object result would
   otherwise reach Done, then throw in operation_settle = runner-fatal). Tests: first-op→compensated:false (replay
   stable), later-op→compensated:true (prior checkpoint unwound), GET-reconcile (lost-ack)→same, valid 200
-  still completes. **All of #2–#5 + the `.mf` comment switch + this harden are now landed.**
+  still completes. **The `.mf` comment switch + #3–#5 + this 200-harden are landed; #2's decision/design is
+  landed too, but its durable bounded reconcile budget (§B) remains the one open fork — not yet built.**
 - **Clear-cut, ready on greenlight:** C items 1–2 (doc + reference stub); G once direction is picked.
 - **One unit (keystone):** F (`failed` terminal) + D (authored-fail) share the durable reason/state — implement
   together; C item 3 (runner harden) lands behind them.
-- **Open forks:** B's durable budget (schema or not) and D's result-branching scope are the two real decisions
-  left.
+- **Open fork:** B's (#2) durable reconcile budget (schema or not) is the one real decision left. D's
+  result-branching scope is now DECIDED + LANDED (Step 5).
 
 ## Verified-in-code facts (so they aren't re-litigated)
 

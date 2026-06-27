@@ -2,9 +2,55 @@
 
 See `README.md` (charter). Toolchain: staged driftc 0.33.61 / ABI 18 (app-cert complete).
 
+---
+
+## Next-release landed set (`.mf` comments + #3–#5 + 200-harden) — ✅ root-gate-green  ·  #2 (`404` budget) still open
+
+**Status:** the `.mf` comment switch + **#3–#5 + the 200-result harden** are implemented and **committed
+step-by-step** (#2's *decision/design* is landed but its **durable reconcile budget is still open** — see the
+table). Commits:
+(`86a2fd2` C-family comments + node-address op-ids + 200-result-only → `244acdd` compensation envelope
+→ `fd8726a` failed/compensated terminal → `d81498b` result branching + authored fail → `8308354`
+200-result protocol harden). Design thread: [NEXT_RELEASE_PLAN.md](NEXT_RELEASE_PLAN.md).
+
+| # | Item | State |
+|---|---|---|
+| A | `.mf` C-family comments (`//`, `/* */`; `#` is an error) | ✅ landed |
+| #5(id) | Node-address operation ids `H(wf, content_hash, node_id)` | ✅ landed |
+| #3a | `200` = result-only (doc + stub) | ✅ landed |
+| E | Compensation forward-context envelope `{forward:{…}}` | ✅ landed |
+| #4 | `failed`/`compensated` durable terminal (+ migration 0001) | ✅ landed |
+| D/#5 | Result/local selectors + authored `fail` | ✅ landed |
+| #3b | `200`-without/non-object-`result` protocol harden | ✅ landed |
+| #2 | `404` retryable + **durable bounded reconcile budget** | ⏳ **NOT implemented** (open fork) |
+
+**Gate (root, full):**
+```
+DRIFT_TOOLCHAIN_ROOT=~/opt/drift/certified/current/toolchain \
+DRIFT_PKG_ROOT=~/opt/drift/certified/current/pkgs  just test
+```
+→ **GREEN**: singular `16`, microflows (parser fixtures `91/91`, e2e `20`, SP regression `110/110`),
+integration build `3`, **coordinator↔singular `180/180`**. (driftc 0.33.61 / ABI 18.)
+
+**Dirty (uncommitted) right now:**
+- `microflows/runner/src/runner.drift` — a one-line comment clarification (internal `reversed(5)`
+  wording in `_run_reversal`); inert, gate-green.
+- `work/uflowsd/NEXT_RELEASE_PLAN.md` — landed-status wording (excludes #2's budget from "landed").
+- `work/uflowsd/RELEASE_ANNOUNCEMENT_DRAFT.md` — **draft, not published** cross-team announcement.
+- `work/uflowsd/PROGRESS.md` — this update.
+(All substantive bundle code/tests/docs are already committed in `86a2fd2`…`8308354`.)
+
+**Literal next action:** commit the four dirty files above (one cut: "microflows: bundle closeout —
+doc sweep + release-announcement draft"). Then the only remaining bundle work is **#2's durable
+bounded reconcile budget** (`404` stays retryable today; the budget is designed in NEXT_RELEASE_PLAN
+§B but not built — likely a coordinator-schema field). Hand the announcement draft to the cross-team
+reviewer before publishing.
+
+---
+
 ## Status: DONE on staged 0.33.61 — app cert chain closed end-to-end (author → trust check → deploy → verify-app). Held for one clean commit; cert cut waits on the orchestrator promoting 0.33.61 + binding real evidence.
 
-**Next-release design plan (#2–#5 from the pushcoin bundle + `.mf` comment switch): see [NEXT_RELEASE_PLAN.md](NEXT_RELEASE_PLAN.md)** — converged design + verified-in-code facts + implementation map. Open forks: #2 durable reconcile budget (schema?), D result-branching/`fail` feature, #5 op-id (awaiting user).
+**Next-release design plan (#2–#5 from the pushcoin bundle + `.mf` comment switch): see [NEXT_RELEASE_PLAN.md](NEXT_RELEASE_PLAN.md)** — converged design + verified-in-code facts + implementation map. **D (result-branching/`fail`) and #5 (op-id) LANDED** (see the bundle-status table at the top). **Only open fork: #2's durable reconcile budget (schema?).** (The deep cert-chain log below this point is ARCHIVED history.)
 
 Naming settled: engine = `microflows` library (name unchanged); CLI = `microflows-runner` (one-shot driver
 + DB-free tooling: `--parse-check`/`--lower-source`/`--emit-content-hash`); daemon = **`uflowsd`** (renamed

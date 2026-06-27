@@ -2506,7 +2506,8 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 		match host.reverse_head(workflow_id) {
 			mf.ReverseHeadOutcome::NoneActive => {
 				// A reversing workflow with NO active checkpoint is an inconsistency (a
-				// fully-compensated workflow would be reversed). Do NOT exit holding the
+				// fully-compensated workflow would already be at the internal reversed(5)
+				// terminal, rendered to the client as failed/compensated:true). Do NOT exit holding the
 				// lease with no record — that recurs after lease expiry. Durably DEFER
 				// with an audit reason: the lease is released, a deduped diagnostic event
 				// is recorded, and the state is observable rather than silently pinning a
