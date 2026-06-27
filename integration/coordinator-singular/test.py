@@ -578,13 +578,13 @@ def main():
         # the GENERIC dispatcher, reaching reversed. ---
         # 6a. normal unwind: one active checkpoint -> dispatch 'release' -> reversed.
         code, body = run_runner(rcf.name, WF_REVERSING)
-        check("reverse_to_reversed", code == 0 and body.get("workflow") == "reversed", (code, body))
+        check("reverse_to_reversed", code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True, (code, body))
         # durable: a re-run finds it terminal (reversed) and makes NO new participant
         # request (no re-compensation).
         rc_before = _request_count(base)
         code, body = run_runner(rcf.name, WF_REVERSING)
         check("reverse_terminal_idempotent",
-              code == 0 and body.get("workflow") == "reversed"
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True
               and _request_count(base) == rc_before, (code, body, "request count changed"))
 
         # 6b. LOST ACK on the reverse dispatch: 'release' commits then drops the
@@ -595,7 +595,7 @@ def main():
         code, body = run_runner(rcf.name, WF_REVERSE_LOSTACK)
         ex1, rq1 = _exec_count(base), _request_count(base)
         check("reverse_lost_ack",
-              code == 0 and body.get("workflow") == "reversed"
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True
               and ex1 - ex0 == 1 and rq1 - rq0 >= 2, (code, body, f"exec+{ex1-ex0} req+{rq1-rq0}"))
 
         # 6c. RESTART recovery: a CONSISTENT post-request state — the compensation was
@@ -612,7 +612,7 @@ def main():
         # reconciliation, not a PUT-first re-dispatch and not zero interaction (which
         # would only prove the runner skipped the participant, not that it reconciled).
         check("reverse_restart_recovery",
-              code == 0 and body.get("workflow") == "reversed"
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True
               and ex_d == 0 and pu_d == 0 and rq_d == 1,
               (code, body, f"exec+{ex_d} put+{pu_d} req+{rq_d}"))
 
@@ -686,7 +686,7 @@ def main():
         ids_distinct = len(cps) == 2 and cps[0][2] != cps[1][2] and "" not in (cps[0][2], cps[1][2])
         inputs_ok = len(cps) == 2 and cps[0][3] == "b1" and cps[1][3] == "b2"
         check("reverse_stack_unwind",
-              code == 0 and body.get("workflow") == "reversed" and ex_d == 2
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True and ex_d == 2
               and both_reversed and ids_distinct and inputs_ok and order == [["2"], ["1"]],
               (code, body, ex_d, cps, order))
         # 7b. terminal re-run: the fully-reversed stack is terminal — no further
@@ -694,7 +694,7 @@ def main():
         ex1, rq1 = _exec_count(base), _request_count(base)
         code, body = run_runner(rcf.name, WF_REVERSE_STACK)
         check("reverse_stack_idempotent",
-              code == 0 and body.get("workflow") == "reversed"
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True
               and _exec_count(base) == ex1 and _request_count(base) == rq1, (code, body))
 
         # 7c. RESTART mid-stack: seq2 was already reversed (a worker settled it then
@@ -705,7 +705,7 @@ def main():
         mid = _mdb(f"SELECT seq, reversal_state FROM tb_mf_workflow_checkpoint "
                    f"WHERE workflow_id = UNHEX('{WF_REVERSE_STACK_MID}') ORDER BY seq")
         check("reverse_stack_restart_midstack",
-              code == 0 and body.get("workflow") == "reversed"
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True
               and _exec_count(base) - ex0 == 1 and mid == [["1", "2"], ["2", "2"]],
               (code, body, _exec_count(base) - ex0, mid))
 
@@ -719,7 +719,7 @@ def main():
         code, body = run_runner(rcf.name, WF_REVERSE_STACK_LOSTACK)
         ex_d, pu_d, rq_d = _exec_count(base) - ex0, _put_count(base) - pu0, _request_count(base) - rq0
         check("reverse_stack_lost_ack",
-              code == 0 and body.get("workflow") == "reversed"
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True
               and ex_d == 2 and pu_d == 2 and rq_d == 3,
               (code, body, f"exec+{ex_d} put+{pu_d} req+{rq_d}"))
 
@@ -1210,7 +1210,7 @@ def main():
         brB_ops = _mdb(f"SELECT COUNT(*) FROM tb_mf_operation WHERE workflow_id = UNHEX('{wfrb}') AND input_json LIKE '%brB%'")
         brB_cks = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wfrb}') AND payload LIKE '%brB%'")
         check("graph_branch_forward_fail_reverses_taken_path_only",
-              code == 0 and body.get("workflow") == "reversed" and ex_d == 2
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True and ex_d == 2
               and wf == [["5", "2"]] and cks == [["1", "2", "brA"]]
               and ops == [["1", "brA"], ["2", "fin"]]
               and brB_ops == [["0"]] and brB_cks == [["0"]],
@@ -1266,7 +1266,7 @@ def main():
                   f"JSON_UNQUOTE(JSON_EXTRACT(reverse_input_json,'$.forward.input.reservation')) "
                   f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{WF_REVERSE_BRANCH}') ORDER BY seq")
         check("graph_branch_reversal_restart_unwinds_from_checkpoint",
-              code == 0 and body.get("workflow") == "reversed" and ex_d == 1
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True and ex_d == 1
               and wf == [["5", "2"]] and ck == [["2", "release", "brA"]],
               (code, body, ex_d, wf, ck))
 
@@ -1472,7 +1472,7 @@ def main():
         untaken = _mdb(f"SELECT COUNT(*) FROM tb_mf_operation WHERE workflow_id = UNHEX('{wcrv}') "
                        f"AND (input_json LIKE '%cmB%' OR input_json LIKE '%cmD%')")
         check("graph_case_reversal_compensates_taken_path_only",
-              code == 0 and body.get("workflow") == "reversed" and ex_d == 2
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True and ex_d == 2
               and wf == [["5", "2"]] and cks == [["1", "2", "cmA"]] and untaken == [["0"]],
               (code, body, ex_d, wf, cks, untaken))
 
@@ -1573,7 +1573,7 @@ def main():
                    f"WHERE workflow_id = UNHEX('{wmd}') ORDER BY seq")
         untaken = _mdb(f"SELECT COUNT(*) FROM tb_mf_operation WHERE workflow_id = UNHEX('{wmd}') AND input_json LIKE '%mgB%'")
         check("graph_merge_reversal_compensates_taken_branch_and_shared",
-              code == 0 and body.get("workflow") == "reversed" and ex_d == 4
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True and ex_d == 4
               and wf == [["5", "2"]]
               and cks == [["1", "2", "release"], ["2", "2", "unconfirm"]] and untaken == [["0"]],
               (code, body, ex_d, wf, cks, untaken))
@@ -1739,9 +1739,17 @@ def main():
         wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wffr}')")
         ncp = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wffr}')")
         check("forward_first_reject_reverses",
-              code == 0 and body.get("workflow") == "reversed"
-              and _exec_count(base) - ex0 == 0 and wf == [["5", "2"]] and ncp == [["0"]],
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == False
+              and _exec_count(base) - ex0 == 0 and wf == [["7", "2"]] and ncp == [["0"]],
               (code, body, wf, ncp))
+
+        # AFTER REPLAY: re-driving the terminal-FAILED workflow renders the SAME outcome from DURABLE
+        # state (state 7 -> failed/compensated:false, exit 3), with NO participant call / NO re-execution.
+        # Together with the live check above this is the first-op-rejection before/after-replay pair.
+        rcode, rbody = run_runner(frplan, wffr)
+        check("forward_first_reject_reverses_replay",
+              rcode == 3 and rbody.get("workflow") == "failed" and rbody.get("compensated") == False
+              and _exec_count(base) - ex0 == 0, (rcode, rbody))
 
         # === SUB-STEP D: forward failure -> automatic reversal. op1 succeeds (checkpoint),
         # op2 is DEFINITELY rejected; the runner BEGINS reversal and unwinds op1 in the
@@ -1756,7 +1764,7 @@ def main():
         code, body = run_runner(dplan, wfd, arguments="{}")
         ex_d = _exec_count(base) - ex0
         check("forward_fail_begins_reversal",
-              code == 0 and body.get("workflow") == "reversed" and ex_d == 2, (code, body, ex_d))
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True and ex_d == 2, (code, body, ex_d))
         # D1b. DURABLE evidence: workflow reversed(5) RETAINING reverse direction(2), op1's
         # checkpoint reversed(2), and the audit trail shows reversal_begun then
         # compensation_settled — the forward failure drove the whole transition.
@@ -1779,7 +1787,7 @@ def main():
         ex_d = _exec_count(base) - ex0
         wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{WF_FWD_FAIL_RESTART}')")
         check("forward_fail_restart",
-              code == 0 and body.get("workflow") == "reversed" and ex_d == 1
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True and ex_d == 1
               and wf == [["5", "2"]], (code, body, ex_d, wf))
 
         # D3. LOST ACK across forward AND compensation: op1's reserve commits then drops
@@ -1800,7 +1808,7 @@ def main():
         code, body = run_runner(laplan, wfla, arguments="{}")
         ex_d, pu_d, rq_d = _exec_count(base) - ex0, _put_count(base) - pu0, _request_count(base) - rq0
         check("forward_fail_lost_ack",
-              code == 0 and body.get("workflow") == "reversed"
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True
               and ex_d == 2 and pu_d >= 3 and (rq_d - pu_d) >= 2,
               (code, body, f"exec+{ex_d} put+{pu_d} req+{rq_d}"))
 
@@ -2269,7 +2277,7 @@ def main():
                       f"WHERE workflow_id = UNHEX('{wmr2}') ORDER BY seq")
         untaken_rv = _mdb(f"SELECT COUNT(*) FROM tb_mf_operation WHERE workflow_id = UNHEX('{wmr2}') AND input_json LIKE '%mgB%'")
         check("parser_merge_reversal_compensates_taken_and_shared",
-              mrc == 0 and crv == 0 and brv.get("workflow") == "reversed" and ex_rv == 4
+              mrc == 0 and crv == 3 and brv.get("workflow") == "failed" and brv.get("compensated") == True and ex_rv == 4
               and wf_rv == [["5", "2"]]
               and cks_rv == [["1", "2", "release"], ["2", "2", "unconfirm"]] and untaken_rv == [["0"]],
               (mrc, crv, brv, ex_rv, wf_rv, cks_rv, untaken_rv))
@@ -2411,7 +2419,7 @@ def main():
                        f"WHERE workflow_id = UNHEX('{wcmr}') ORDER BY seq")
         cuntaken_rv = _mdb(f"SELECT COUNT(*) FROM tb_mf_operation WHERE workflow_id = UNHEX('{wcmr}') AND (input_json LIKE '%cmB%' OR input_json LIKE '%cmD%')")
         check("parser_case_merge_reversal_compensates_taken_arm_and_shared",
-              cmrc == 0 and ccrv == 0 and cbrv.get("workflow") == "reversed" and cex_rv == 4
+              cmrc == 0 and ccrv == 3 and cbrv.get("workflow") == "failed" and cbrv.get("compensated") == True and cex_rv == 4
               and cwf_rv == [["5", "2"]]
               and ccks_rv == [["1", "2", "release"], ["2", "2", "unconfirm"]] and cuntaken_rv == [["0"]],
               (cmrc, ccrv, cbrv, cex_rv, cwf_rv, ccks_rv, cuntaken_rv))
@@ -2921,7 +2929,7 @@ def main():
                                {"account_id": "acct-7", "amount": {"value": 500, "currency": "USD"}, "memo": "promo-credit", "ledger": "GL-1"})
             _arm_fault(base, "post_journal", "")  # disarm
             check("ex_account_rollback_compensates",
-                  bc == 200 and bb.get("workflow") == "reversed",
+                  bc == 200 and bb.get("workflow") == "failed" and bb.get("compensated") == True,
                   (bc, bb))
 
             # (c) refund flow completes.
@@ -3024,7 +3032,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 165
+    EXPECTED_CHECKS = 166
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

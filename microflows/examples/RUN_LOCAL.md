@@ -52,7 +52,8 @@ The response body is the **outcome document** (identical to the CLI's); the HTTP
 
 | Outcome | HTTP | Meaning |
 |---|---|---|
-| `completed` / `already_terminal` / `reversed` | 200 | reached a defined terminal state |
+| `completed` / `already_terminal` | 200 | success terminal |
+| `failed` (`compensated` true/false) | 200 | terminal failure; body carries `reason` + `compensated`; exit 3 |
 | `pending` / `deferred` / `pending_restart` | 202 / 503 | in flight; retry / drain back-pressure |
 | `refused` (draining) | 503 | not accepting new work |
 | `aborted` (invalid args / unknown script / malformed body) | 400 | client error, no workflow created |
@@ -76,7 +77,7 @@ Submit `account_adjustment_with_rollback` and arrange for `post_journal` to fail
 an out-of-band stub control). `adjust_balance` succeeds, `post_journal` fails, and the service unwinds:
 
 ```
--> {"workflow":"reversed"}     # reverse_adjustment ran against the durable adjustment checkpoint
+-> {"workflow":"failed","reason":"participant_invalid_request","compensated":true}   # reverse_adjustment ran against the durable adjustment checkpoint
 ```
 
 No reversal code is written in the workflow — the `compensation` binding in the deployment drives it.

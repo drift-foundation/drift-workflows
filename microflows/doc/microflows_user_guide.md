@@ -438,7 +438,7 @@ or a type-contract mismatch. Fix them before the config is ever submitted.
 
 **Run-time status** is a JSON line on stdout: `{"workflow":"completed"}`,
 `{"workflow":"pending"}` (in flight / deferred — resume later),
-`{"workflow":"reversed"}` (fully compensated), or an error status such as
+`{"workflow":"failed","reason":…,"compensated":true}` (failed after a full unwind), or an error status such as
 `invalid_config` / `revision_unavailable`. A `pending` instance is resumed by
 re-invoking with the same `--workflow-id` and no `--arguments`.
 

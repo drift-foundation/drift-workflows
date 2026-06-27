@@ -129,7 +129,7 @@ fn scenario_reversal() -> Int {
 		default => { return 301; }
 	}
 
-	// --- wf1: forward, one requested (failed) op, NO checkpoint -> Reversed ---
+	// --- wf1: forward, one requested (failed) op, NO checkpoint -> Failed (no completed unwind) ---
 	val wf1 = _wf_id(&"-rev-wf1");
 	match h.get().create_workflow(&wf1, &script, 1, &"2026-03-01 10:00:00.000000",
 		&"2026-03-01 10:00:00.000000", &"{\"pos\":\"start\"}", &"{}") {
@@ -147,11 +147,11 @@ fn scenario_reversal() -> Int {
 		default => { return 303; }
 	}
 	match h.get().begin_reversal(&wf1, tok1, 1, &op1, &"2026-03-01 10:00:03.000000", &"forward_rejected") {
-		host.BeginReversalOutcome::Reversed => {},
+		host.BeginReversalOutcome::Failed(_) => {},
 		default => { return 304; }
 	}
 	match h.get().begin_reversal(&wf1, tok1, 1, &op1, &"2026-03-01 10:00:04.000000", &"forward_rejected") {
-		host.BeginReversalOutcome::AlreadyBegun(st) => { if st != 5 { return 305; } },
+		host.BeginReversalOutcome::AlreadyBegun(st, _) => { if st != 7 { return 305; } },
 		default => { return 306; }
 	}
 	match h.get().begin_reversal(&wf1, tok1, 2, &op2, &"2026-03-01 10:00:05.000000", &"x") {
@@ -226,7 +226,7 @@ fn scenario_reversal() -> Int {
 	}
 	// reverse_settle -> Reversed (single checkpoint -> terminal)   [POSITIVE decode]
 	match h.get().reverse_settle(&wf2, tok2, 1, &rid, &"{\"released\":true}", &"2026-03-01 11:00:03.000000") {
-		host.ReverseSettleOutcome::Reversed => {},
+		host.ReverseSettleOutcome::Reversed(_) => {},
 		default => { return 349; }
 	}
 	match h.get().reverse_head(&wf2) {

@@ -318,7 +318,8 @@ the **HTTP-adapter binding** (advisory, per §0): the status is a coarse hint, n
 
 | Outcome (document `workflow`) | HTTP adapter (advisory) |
 |---|---|
-| `completed` / `already_terminal` / `reversed` | 200 |
+| `completed` / `already_terminal` | 200 |
+| `failed` (terminal; body has `reason` + `compensated`) | 200 |
 | `pending` / `deferred` / `pending_restart` | 202 / 503 |
 | `refused` (draining) | 503 |
 | `aborted` (bad args / unknown script / malformed body) | 400 |

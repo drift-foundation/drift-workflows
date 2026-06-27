@@ -592,7 +592,8 @@ def main():
     for t in ("tb_mf_workflow_args", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf5,))
 
-    # begin_reversal with NO active checkpoints -> straight to terminal reversed
+    # begin_reversal with NO active checkpoints -> straight to terminal FAILED(7),
+    # compensated:false semantics: durable state failed(7), terminal_reason persisted.
     wf6 = os.urandom(16)
     failed6 = bytes.fromhex("00000000000000000000000000000e61")
     call(cur, "sp_mf_workflow_create", (wf6, SCRIPT, 1, T(0), T(0), '{"pos":"start"}', "{}"))
@@ -600,13 +601,16 @@ def main():
     tok6 = r["fencing_token"]
     _seed_op(wf6, 1, failed6, 1, None)
     _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf6, EXEC, tok6, 1, failed6, T(2), "nothing_to_compensate"))
-    check("begin_reversal_no_checkpoint", r and r["outcome"] == "reversed", r)
-    cur.execute("SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id=%s", (wf6,))
-    check("begin_reversal_no_checkpoint_state", cur.fetchone() == (5, 2), "expected reversed/reverse")
-    # replay after TERMINAL reversed -> already_begun with state=5 (lease cleared)
+    check("begin_reversal_no_checkpoint",
+          r and r["outcome"] == "failed" and r["terminal_reason"] == "nothing_to_compensate", r)
+    cur.execute("SELECT state, execution_direction, terminal_reason FROM tb_mf_workflow WHERE workflow_id=%s", (wf6,))
+    check("begin_reversal_no_checkpoint_state",
+          cur.fetchone() == (7, 2, "nothing_to_compensate"), "expected failed(7)/reverse(2)/terminal_reason")
+    # replay after TERMINAL failed -> already_begun with the terminal state(7) + the DURABLE
+    # terminal_reason (the original reason, NOT the new "x"; lease cleared).
     _, r = call(cur, "sp_mf_workflow_begin_reversal", (wf6, EXEC, tok6, 1, failed6, T(3), "x"))
     check("begin_reversal_already_begun_reversed",
-          r and r["outcome"] == "already_begun" and r["state"] == 5, r)
+          r and r["outcome"] == "already_begun" and r["state"] == 7 and r["terminal_reason"] == "nothing_to_compensate", r)
     for t in ("tb_mf_workflow_args", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf6,))
 

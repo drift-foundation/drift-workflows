@@ -68,7 +68,7 @@ examples/
 | Template | Proven |
 |---|---|
 | payment_authorize_capture | completes; deterministic ledger entry |
-| account_adjustment_with_rollback | later-step failure → **automatic compensation** (workflow `reversed`) |
+| account_adjustment_with_rollback | later-step failure → **automatic compensation** (workflow `failed`, `compensated:true`) |
 | payment_refund | idempotent single-op corrective flow |
 | inventory_reserve_release | participant **pending → resume** completes |
 | checkout_branch_merge | branch + merge + compensation runs end to end |

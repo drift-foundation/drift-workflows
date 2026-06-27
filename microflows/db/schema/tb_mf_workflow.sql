@@ -10,9 +10,11 @@
 --
 -- state codes (must stay in sync with packages/microflows/src/state.drift):
 --   1=forward 2=reversing 3=blocked_resolution
---   4=completed 5=reversed 6=resolved_exception
---   (reversed = genuine full compensation; resolved_exception = audited
---    accepted exception WITHOUT full compensation — never conflate them)
+--   4=completed 5=reversed 6=resolved_exception 7=failed
+--   (reversed = unwind completed; resolved_exception = audited accepted
+--    exception WITHOUT full compensation; failed = definite failure with NO
+--    completed unwind — never conflate them. CLIENT renders 5->failed/
+--    compensated:true and 7->failed/compensated:false, see terminal_reason)
 -- execution_direction codes (the mode; retained across a block):
 --   1=forward 2=reverse
 -- current_disposition codes:
@@ -77,6 +79,11 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow` (
 	-- path. Binds begin_reversal's idempotent replay to the ORIGINAL trigger so a
 	-- different operation cannot masquerade as the same begin-reversal command.
 	`reversal_trigger_operation_id` varbinary(16) NULL,
+	-- Durable terminal failure reason (definite forward rejection / authored fail),
+	-- set at begin_reversal and persisted through the unwind so terminal REPLAY renders
+	-- the SAME client outcome deterministically (never recomputed locally). NULL on
+	-- non-failure terminals (completed). Width kept consistent with the SP/host plumbing.
+	`terminal_reason` varchar(190) NULL,
 	`created_at` datetime(6) NOT NULL,
 	`updated_at` datetime(6) NOT NULL,
 	PRIMARY KEY (`workflow_id`),
@@ -84,7 +91,7 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow` (
 	-- AND next_attempt_at <= :db_now ... ORDER BY next_attempt_at, workflow_id.
 	-- Script-scoped: an executor claims only scripts in its IR registry.
 	KEY `idx_mf_workflow_claim` (`script_name`,`state`,`next_attempt_at`),
-	CONSTRAINT `ck_mf_workflow_state` CHECK (`state` IN (1,2,3,4,5,6)),
+	CONSTRAINT `ck_mf_workflow_state` CHECK (`state` IN (1,2,3,4,5,6,7)),
 	CONSTRAINT `ck_mf_workflow_direction` CHECK (`execution_direction` IN (1,2)),
 	CONSTRAINT `ck_mf_workflow_disposition` CHECK (`current_disposition` IN (0,1,2,3,4)),
 	-- (state, disposition) representability (mirror of disposition_valid_for in
@@ -92,11 +99,11 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow` (
 	-- reversal cause (failed|cancelled) OR a forward indeterminate; completed=
 	-- completed; reversed=failed|cancelled; resolved_exception keeps the
 	-- underlying cause (failed|cancelled|indeterminate).
-	CONSTRAINT `ck_mf_workflow_state_disposition` CHECK ((`state` = 1 AND `current_disposition` = 0) OR (`state` = 2 AND `current_disposition` IN (2,3)) OR (`state` = 3 AND `current_disposition` IN (2,3,4)) OR (`state` = 4 AND `current_disposition` = 1) OR (`state` = 5 AND `current_disposition` IN (2,3)) OR (`state` = 6 AND `current_disposition` IN (2,3,4))),
+	CONSTRAINT `ck_mf_workflow_state_disposition` CHECK ((`state` = 1 AND `current_disposition` = 0) OR (`state` = 2 AND `current_disposition` IN (2,3)) OR (`state` = 3 AND `current_disposition` IN (2,3,4)) OR (`state` = 4 AND `current_disposition` = 1) OR (`state` = 5 AND `current_disposition` IN (2,3)) OR (`state` = 6 AND `current_disposition` IN (2,3,4)) OR (`state` = 7 AND `current_disposition` IN (2,3))),
 	-- (state, direction) consistency invariant (mirror of state_direction_valid
 	-- in state.drift). forward=forward, reversing=reverse, blocked=either,
 	-- completed=forward, reversed=reverse, resolved_exception=either.
-	CONSTRAINT `ck_mf_workflow_state_direction` CHECK ((`state` = 1 AND `execution_direction` = 1) OR (`state` = 2 AND `execution_direction` = 2) OR (`state` = 3 AND `execution_direction` IN (1,2)) OR (`state` = 4 AND `execution_direction` = 1) OR (`state` = 5 AND `execution_direction` = 2) OR (`state` = 6 AND `execution_direction` IN (1,2))),
+	CONSTRAINT `ck_mf_workflow_state_direction` CHECK ((`state` = 1 AND `execution_direction` = 1) OR (`state` = 2 AND `execution_direction` = 2) OR (`state` = 3 AND `execution_direction` IN (1,2)) OR (`state` = 4 AND `execution_direction` = 1) OR (`state` = 5 AND `execution_direction` = 2) OR (`state` = 6 AND `execution_direction` IN (1,2)) OR (`state` = 7 AND `execution_direction` = 2)),
 	-- A lease is either fully present or fully absent.
 	CONSTRAINT `ck_mf_workflow_lease_pair` CHECK (
 		(`lease_owner` IS NULL AND `lease_expires_at` IS NULL)

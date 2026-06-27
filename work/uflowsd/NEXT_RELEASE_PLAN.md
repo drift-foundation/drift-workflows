@@ -134,10 +134,10 @@ first; the rest inherit it.
   bool + **`reason`**. `blocked` = stuck mid-unwind (a compensation itself failed) → operator.
   - `{"workflow":"failed","reason":…,"compensated":true}` — aborted, rollback ran
   - `{"workflow":"failed","reason":…,"compensated":false}` — aborted, nothing to roll back (first-op / empty)
-- 🔧 **Verified: not renderer-only.** Single durable terminal `STATE_REVERSED=5` (runner.drift:226); no
-  `STATE_FAILED`. The live drive distinguishes empty (`BeginReversalOutcome::Reversed`) vs has-work
-  (`Reversing`), but durable state collapses them, so a **resume re-renders `reversed`** (runner.drift:2113).
-  The distinction must be durable → carried by the **same durable reason authored-fail adds** ⇒ **#4 bundles
+- 🔧 **Verified (pre-step-4 finding, now RESOLVED).** The old single durable terminal `STATE_REVERSED=5`
+  collapsed empty vs real unwinds, so a resume re-rendered `reversed`. Step 4 split them: empty →
+  `BeginReversalOutcome::Failed` → durable `STATE_FAILED(7)`; real unwind stays `STATE_REVERSED(5)`; both
+  carry a durable `terminal_reason` so replay renders deterministically ⇒ **#4 bundled
   with D**, not a convenience.
 - **Minimal storage:** new **`STATE_FAILED`** (→ `failed, compensated:false`) vs `STATE_REVERSED`
   (→ `failed, compensated:true`); both carry the durable `reason`. The `compensated` flag rides the state code.
@@ -228,8 +228,18 @@ Targets: `microflows/doc/uflowsd_participant_contract.md` (wire contract), `micr
   seed rows for the reverse fixtures (checkpoints lacked them). Docs: contract §4.6/§4.7, user guide §9.
   Reverse id kept seq-based (out of scope). NOTE: the microflows COMPONENT e2e (`live_reversal_test.drift`,
   proc-seeded) is a separate gate — verify it if it drives reversal through the runner.
-- **NEXT: step 4** — `failed`/`compensated` durable terminal (F), then step 5 (`fail` + result-branching),
-  step 6 (200-no-result harden). The payment-decline + compensation EXAMPLE (doc H) lands with step 5 (`fail`).
+- **STEP 4 LANDED + gate-green (166/166):** `failed`/`compensated` durable terminal (F). `state.drift`
+  `Failed`(7); schema `terminal_reason`+CHECKs+`migrations/0001`; SPs (`begin_reversal` empty→FAILED+reason /
+  non-empty stores / failed+already_begun return reason, `reverse_settle` returns reason, `inspect` terminal+7
+  +reason); host (`BeginReversalOutcome::Failed`+`AlreadyBegun` reason, `ReverseSettleOutcome::Reversed(reason)`,
+  `WorkflowSnapshot.terminal_reason`); runner `Outcome::TerminalFailure(reason,compensated)` (state 5→true,
+  7→false; exit 3; HTTP 200; replay from durable `terminal_reason`). ~20 reverse tests flipped `reversed`→
+  `failed`+`compensated`; +`forward_first_reject_reverses_replay`; client-facing `reversed` removed from docs.
+  COMPONENT gate also updated (`state_test.drift` state-7 coverage, `live_reversal_test.drift` new host
+  variants, `sp_operation_test.py` no-checkpoint→failed/7+terminal_reason). **ROOT `just test` GREEN**:
+  singular 16, microflows (parser 81/81, e2e 20, SP 110/110), integration 166/166.
+- **NEXT: step 5** (`fail` + result-branching) then step 6 (200-no-result harden). The payment-decline +
+  compensation EXAMPLE (doc H) lands with step 5.
 - **Clear-cut, ready on greenlight:** C items 1–2 (doc + reference stub); G once direction is picked.
 - **One unit (keystone):** F (`failed` terminal) + D (authored-fail) share the durable reason/state — implement
   together; C item 3 (runner harden) lands behind them.

@@ -33,6 +33,7 @@ proc:BEGIN
 	DECLARE v_next_seq int DEFAULT NULL;
 	DECLARE v_missing tinyint(1) DEFAULT 0;
 	DECLARE v_cp_missing tinyint(1) DEFAULT 0;
+	DECLARE v_term_reason varchar(190) DEFAULT NULL;
 
 	IF arg_workflow_id IS NULL OR LENGTH(arg_workflow_id) <> 16 THEN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfWorkflowIdInvalid';
@@ -58,8 +59,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`
-		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`, `terminal_reason`
+		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts, v_term_reason
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
 		FOR UPDATE;
@@ -163,7 +164,9 @@ proc:BEGIN
 			JSON_OBJECT('seq', arg_seq, 'terminal', 'reversed')
 		);
 
-		SELECT JSON_OBJECT('outcome', 'reversed') AS result;
+		-- Internal durable state stays reversed(5) = 'unwind completed'; terminal_reason (set at
+		-- begin_reversal) is preserved and returned so the client renders failed/compensated:true.
+		SELECT JSON_OBJECT('outcome', 'reversed', 'terminal_reason', v_term_reason) AS result;
 		LEAVE proc;
 	END IF;
 

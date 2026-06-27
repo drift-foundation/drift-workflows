@@ -128,7 +128,7 @@ fn _admission_label(a: &AdmissionState) nothrow -> String {
 variant Outcome {
 	Completed(operation_id: String, result: String),       // exit 0
 	AlreadyTerminal(operation_id: String, result: String), // exit 0
-	Reversed,                                              // exit 0
+	TerminalFailure(reason: String, compensated: Bool),    // exit 3: terminal failed; compensated = real unwind ran
 	ResolvedException,                                     // exit 0
 	TerminalState(state: Int),                             // exit 0
 	Active(reason: String),                                // exit 4
@@ -149,7 +149,10 @@ fn _oc_render(o: &Outcome) nothrow -> String {
 	match o {
 		Outcome::Completed(operation_id, result) => { return "{\"workflow\":\"completed\",\"operation_id\":\"" + _dup(operation_id) + "\",\"result\":" + _dup(result) + "}"; },
 		Outcome::AlreadyTerminal(operation_id, result) => { return "{\"workflow\":\"already_terminal\",\"operation_id\":\"" + _dup(operation_id) + "\",\"result\":" + _dup(result) + "}"; },
-		Outcome::Reversed() => { return "{\"workflow\":\"reversed\"}"; },
+		Outcome::TerminalFailure(reason, compensated) => {
+			if *compensated { return "{\"workflow\":\"failed\",\"reason\":\"" + _dup(reason) + "\",\"compensated\":true}"; }
+			return "{\"workflow\":\"failed\",\"reason\":\"" + _dup(reason) + "\",\"compensated\":false}";
+		},
 		Outcome::ResolvedException() => { return "{\"workflow\":\"resolved_exception\"}"; },
 		Outcome::TerminalState(state) => { return "{\"workflow\":\"terminal\",\"state\":" + fmt.format_int(state) + "}"; },
 		Outcome::Active(reason) => { return "{\"workflow\":\"active\",\"reason\":\"" + _dup(reason) + "\"}"; },
@@ -177,7 +180,7 @@ fn _oc_exit(o: &Outcome) nothrow -> Int {
 	match o {
 		Outcome::Completed(operation_id, result) => { return 0; },
 		Outcome::AlreadyTerminal(operation_id, result) => { return 0; },
-		Outcome::Reversed() => { return 0; },
+		Outcome::TerminalFailure(reason, compensated) => { return 3; },
 		Outcome::ResolvedException() => { return 0; },
 		Outcome::TerminalState(state) => { return 0; },
 		Outcome::Active(reason) => { return 4; },
@@ -224,6 +227,7 @@ fn _drain_release(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 const STATE_REVERSING: Int = 2;
 const STATE_COMPLETED: Int = 4;
 const STATE_REVERSED: Int = 5;
+const STATE_FAILED: Int = 7;
 const STATE_RESOLVED_EXCEPTION: Int = 6;
 
 pub error RunnerError { message: String }
@@ -1900,17 +1904,20 @@ fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflo
 		mf.BeginReversalOutcome::Reversing(_) => {
 			return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 		},
-		mf.BeginReversalOutcome::Reversed => {
-			// No active checkpoints: a trivial unwind (nothing to compensate).
-			return Outcome::Reversed();
+		mf.BeginReversalOutcome::Failed(reason) => {
+			// No active checkpoints: a definite failure with NO completed unwind.
+			return Outcome::TerminalFailure(reason = move reason, compensated = false);
 		},
-		mf.BeginReversalOutcome::AlreadyBegun(state) => {
-			// Idempotent replay of a committed begin: resume from the recorded state.
+		mf.BeginReversalOutcome::AlreadyBegun(state, terminal_reason) => {
+			// Idempotent replay of a committed begin: render from DURABLE terminal_reason.
 			if state == STATE_REVERSING {
 				return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 			}
 			if state == STATE_REVERSED {
-				return Outcome::Reversed();
+				return Outcome::TerminalFailure(reason = _dup(&terminal_reason), compensated = true);
+			}
+			if state == STATE_FAILED {
+				return Outcome::TerminalFailure(reason = _dup(&terminal_reason), compensated = false);
 			}
 			return Outcome::Blocked(reason = "");
 		},
@@ -2110,7 +2117,10 @@ fn _report_terminal(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>,
 		}
 	}
 	if snap.state_code == STATE_REVERSED {
-		return Outcome::Reversed();
+		return Outcome::TerminalFailure(reason = _dup(&snap.terminal_reason), compensated = true);
+	}
+	if snap.state_code == STATE_FAILED {
+		return Outcome::TerminalFailure(reason = _dup(&snap.terminal_reason), compensated = false);
 	}
 	if snap.state_code == STATE_RESOLVED_EXCEPTION {
 		return Outcome::ResolvedException();
@@ -2337,8 +2347,8 @@ fn _compensate(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_toke
 		DispatchResult::Done(result) => {
 			val ts = _now(host);
 			match host.reverse_settle(workflow_id, fencing_token, seq, rev_id, &result, &ts) {
-				mf.ReverseSettleOutcome::Reversed => {
-					return CompStep::Terminal(Outcome::Reversed());
+				mf.ReverseSettleOutcome::Reversed(reason) => {
+					return CompStep::Terminal(Outcome::TerminalFailure(reason = move reason, compensated = true));
 				},
 				mf.ReverseSettleOutcome::Reversing(_) => { return CompStep::Continue(); },
 				mf.ReverseSettleOutcome::AlreadyReversed => { return CompStep::Continue(); },
@@ -3112,7 +3122,7 @@ fn _outcome_http_status(o: &Outcome) nothrow -> Int {
 	match o {
 		Outcome::Completed(a, b) => { return 200; },
 		Outcome::AlreadyTerminal(a, b) => { return 200; },
-		Outcome::Reversed() => { return 200; },
+		Outcome::TerminalFailure(r, c) => { return 200; },
 		Outcome::ResolvedException() => { return 200; },
 		Outcome::TerminalState(s) => { return 200; },
 		Outcome::Pending(r, d) => { return 202; },

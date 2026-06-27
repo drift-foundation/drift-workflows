@@ -19,6 +19,7 @@ proc:BEGIN
 	DECLARE v_owner varbinary(16);
 	DECLARE v_expires datetime(6);
 	DECLARE v_cont mediumtext;
+	DECLARE v_term_reason varchar(190) DEFAULT NULL;
 	DECLARE v_missing tinyint(1) DEFAULT 0;
 	DECLARE v_terminal tinyint(1) DEFAULT 0;
 	DECLARE v_leased tinyint(1) DEFAULT 0;
@@ -33,8 +34,8 @@ proc:BEGIN
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
 		SELECT `state`, `execution_direction`, `current_disposition`,
-		       `lease_owner`, `lease_expires_at`, `continuation`
-		INTO v_state, v_dir, v_disp, v_owner, v_expires, v_cont
+		       `lease_owner`, `lease_expires_at`, `continuation`, `terminal_reason`
+		INTO v_state, v_dir, v_disp, v_owner, v_expires, v_cont, v_term_reason
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id;
 	END;
@@ -44,7 +45,7 @@ proc:BEGIN
 		LEAVE proc;
 	END IF;
 
-	IF v_state IN (4,5,6) THEN SET v_terminal = 1; END IF;
+	IF v_state IN (4,5,6,7) THEN SET v_terminal = 1; END IF;
 	IF v_owner IS NOT NULL AND v_expires >= arg_db_now THEN SET v_leased = 1; END IF;
 
 	-- CAST to SIGNED so JSON_OBJECT emits JSON NUMBERS, not strings (local
@@ -56,7 +57,9 @@ proc:BEGIN
 		'current_disposition', CAST(v_disp AS SIGNED),
 		'is_terminal', CAST(v_terminal AS SIGNED),
 		'leased', CAST(v_leased AS SIGNED),
-		'continuation', JSON_EXTRACT(v_cont, '$')
+		'continuation', JSON_EXTRACT(v_cont, '$'),
+		-- Durable terminal reason (NULL on non-failure terminals); replay renders from THIS, never recomputed.
+		'terminal_reason', v_term_reason
 	) AS result;
 END $$
 DELIMITER ;

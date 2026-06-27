@@ -76,8 +76,9 @@ pub variant WorkflowState {
 	Reversing,          // unwinding checkpoints newest-first; claimable
 	BlockedResolution,  // automatic execution cannot safely proceed; awaits resolution
 	Completed,          // terminal: forward success
-	Reversed,           // terminal: genuine full compensation completed
-	ResolvedException   // terminal: audited accepted exception, compensation NOT (fully) done
+	Reversed,           // terminal: genuine full compensation completed (client outcome: failed, compensated:true)
+	ResolvedException,  // terminal: audited accepted exception, compensation NOT (fully) done
+	Failed              // terminal: definite failure with NO completed unwind (client outcome: failed, compensated:false)
 }
 
 // ===== Execution direction =====
@@ -128,7 +129,8 @@ pub fn state_code(s: &WorkflowState) nothrow -> Int {
 		WorkflowState::BlockedResolution => { 3 },
 		WorkflowState::Completed => { 4 },
 		WorkflowState::Reversed => { 5 },
-		WorkflowState::ResolvedException => { 6 }
+		WorkflowState::ResolvedException => { 6 },
+		WorkflowState::Failed => { 7 }
 	};
 }
 
@@ -139,6 +141,7 @@ pub fn state_from_code(code: Int) nothrow -> Optional<WorkflowState> {
 	if code == 4 { return Optional<WorkflowState>::Some(WorkflowState::Completed()); }
 	if code == 5 { return Optional<WorkflowState>::Some(WorkflowState::Reversed()); }
 	if code == 6 { return Optional<WorkflowState>::Some(WorkflowState::ResolvedException()); }
+	if code == 7 { return Optional<WorkflowState>::Some(WorkflowState::Failed()); }
 	return Optional<WorkflowState>::None();
 }
 
@@ -149,7 +152,8 @@ pub fn state_name(s: &WorkflowState) nothrow -> String {
 		WorkflowState::BlockedResolution => { "blocked_resolution" },
 		WorkflowState::Completed => { "completed" },
 		WorkflowState::Reversed => { "reversed" },
-		WorkflowState::ResolvedException => { "resolved_exception" }
+		WorkflowState::ResolvedException => { "resolved_exception" },
+		WorkflowState::Failed => { "failed" }
 	};
 }
 
@@ -159,6 +163,7 @@ pub fn state_from_name(name: String) nothrow -> Optional<WorkflowState> {
 	if name == "blocked_resolution" { return Optional<WorkflowState>::Some(WorkflowState::BlockedResolution()); }
 	if name == "completed" { return Optional<WorkflowState>::Some(WorkflowState::Completed()); }
 	if name == "reversed" { return Optional<WorkflowState>::Some(WorkflowState::Reversed()); }
+	if name == "failed" { return Optional<WorkflowState>::Some(WorkflowState::Failed()); }
 	if name == "resolved_exception" { return Optional<WorkflowState>::Some(WorkflowState::ResolvedException()); }
 	return Optional<WorkflowState>::None();
 }
@@ -180,6 +185,7 @@ pub fn is_terminal(s: &WorkflowState) nothrow -> Bool {
 		WorkflowState::Completed => { true },
 		WorkflowState::Reversed => { true },
 		WorkflowState::ResolvedException => { true },
+		WorkflowState::Failed => { true },
 		default => { false }
 	};
 }
@@ -225,7 +231,8 @@ pub fn state_direction_valid(s: &WorkflowState, d: &ExecutionDirection) nothrow 
 		WorkflowState::BlockedResolution => { dc == 1 or dc == 2 },
 		WorkflowState::Completed => { dc == 1 },
 		WorkflowState::Reversed => { dc == 2 },
-		WorkflowState::ResolvedException => { dc == 1 or dc == 2 }
+		WorkflowState::ResolvedException => { dc == 1 or dc == 2 },
+		WorkflowState::Failed => { dc == 2 }
 	};
 }
 
@@ -254,6 +261,7 @@ fn _derived_direction(to: &WorkflowState, incoming: &ExecutionDirection) nothrow
 		WorkflowState::Completed => { ExecutionDirection::Forward() },
 		WorkflowState::Reversing => { ExecutionDirection::Reverse() },
 		WorkflowState::Reversed => { ExecutionDirection::Reverse() },
+		WorkflowState::Failed => { ExecutionDirection::Reverse() },
 		default => {
 			// blocked_resolution / resolved_exception: retain incoming direction.
 			match incoming {
@@ -428,6 +436,7 @@ pub fn disposition_valid_for(s: &WorkflowState, d: &Disposition) nothrow -> Bool
 		WorkflowState::BlockedResolution => { dc == 2 or dc == 3 or dc == 4 },
 		WorkflowState::Completed => { dc == 1 },
 		WorkflowState::Reversed => { dc == 2 or dc == 3 },
-		WorkflowState::ResolvedException => { dc == 2 or dc == 3 or dc == 4 }
+		WorkflowState::ResolvedException => { dc == 2 or dc == 3 or dc == 4 },
+		WorkflowState::Failed => { dc == 2 or dc == 3 }
 	};
 }

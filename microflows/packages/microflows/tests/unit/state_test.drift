@@ -44,7 +44,7 @@ fn _target(from_code: Int, dir_code: Int, cause: &st.TransitionCause) nothrow ->
 // ============================================================
 fn scenario_state_codes_names() nothrow -> Int {
 	var code = 1;
-	while code <= 6 {
+	while code <= 7 {
 		if !_has_state(code) { return 100 + code; }
 		val s = _state(code);
 		if st.state_code(&s) != code { return 110 + code; }
@@ -55,7 +55,7 @@ fn scenario_state_codes_names() nothrow -> Int {
 		code = code + 1;
 	}
 	if _has_state(0) { return 141; }
-	if _has_state(7) { return 142; }
+	if _has_state(8) { return 142; }
 	match st.state_from_name("running") { Optional::Some(_) => { return 143; }, Optional::None => {} }
 	val b = _state(3);
 	val re = _state(6);
@@ -66,17 +66,17 @@ fn scenario_state_codes_names() nothrow -> Int {
 
 // ============================================================
 // 2. Claimability and terminality (terminals: completed, reversed,
-//    resolved_exception).
+//    resolved_exception, failed).
 // ============================================================
 fn scenario_claimable_terminal() nothrow -> Int {
 	var code = 1;
-	while code <= 6 {
+	while code <= 7 {
 		val s = _state(code);
 		val claim = st.is_claimable(&s);
 		val term = st.is_terminal(&s);
 		if code == 1 or code == 2 { if !claim or term { return 200 + code; } }
 		if code == 3 { if claim or term { return 203; } }
-		if code == 4 or code == 5 or code == 6 { if claim or !term { return 220 + code; } }
+		if code == 4 or code == 5 or code == 6 or code == 7 { if claim or !term { return 220 + code; } }
 		code = code + 1;
 	}
 	return 0;
@@ -100,7 +100,7 @@ fn scenario_direction_invariant() nothrow -> Int {
 	}
 	// consistency matrix
 	var sc = 1;
-	while sc <= 6 {
+	while sc <= 7 {
 		var dc = 1;
 		while dc <= 2 {
 			val s = _state(sc);
@@ -113,6 +113,7 @@ fn scenario_direction_invariant() nothrow -> Int {
 			if sc == 4 and dc == 1 { want = true; }       // completed -> forward
 			if sc == 5 and dc == 2 { want = true; }       // reversed -> reverse
 			if sc == 6 { want = true; }                   // resolved_exception -> either
+			if sc == 7 and dc == 2 { want = true; }       // failed -> reverse
 			if got != want { return 350 + sc * 10 + dc; }
 			dc = dc + 1;
 		}
@@ -304,7 +305,7 @@ fn scenario_dispositions() nothrow -> Int {
 	if _has_disp(5) { return 841; }
 
 	var sc = 1;
-	while sc <= 6 {
+	while sc <= 7 {
 		var dc = 0;
 		while dc <= 4 {
 			val s = _state(sc);
@@ -317,6 +318,7 @@ fn scenario_dispositions() nothrow -> Int {
 			if sc == 4 and dc == 1 { want = true; }
 			if sc == 5 and (dc == 2 or dc == 3) { want = true; }
 			if sc == 6 and (dc == 2 or dc == 3 or dc == 4) { want = true; }
+			if sc == 7 and (dc == 2 or dc == 3) { want = true; }
 			if got != want { return 900 + sc * 10 + dc; }
 			dc = dc + 1;
 		}

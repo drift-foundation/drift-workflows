@@ -136,7 +136,8 @@ pub struct WorkflowSnapshot {
 	pub current_disposition: Int,
 	pub is_terminal: Bool,
 	pub leased: Bool,                // an unexpired lease is held at db_now
-	pub continuation_json: String
+	pub continuation_json: String,
+	pub terminal_reason: String      // durable failure reason on a terminal failure (5/7); "" otherwise
 }
 
 pub variant WorkflowInspectOutcome {
@@ -192,8 +193,8 @@ pub variant OperationFailOutcome {
 // idempotent replay (carrying the current reverse-direction state).
 pub variant BeginReversalOutcome {
 	Reversing(top_seq: Int),
-	Reversed,
-	AlreadyBegun(state: Int),
+	Failed(reason: String),                     // empty-stack reversal: terminal failed, compensated:false
+	AlreadyBegun(state: Int, terminal_reason: String),
 	TriggerMismatch,
 	OperationNotFound,
 	OperationConflict,
@@ -233,7 +234,7 @@ pub variant ReverseRequestOutcome {
 // checkpoint_reverse_settle: mark a checkpoint reversed then descend (Reversing
 // next_seq) or reach terminal Reversed. AlreadyReversed is the lost-ack replay.
 pub variant ReverseSettleOutcome {
-	Reversed,
+	Reversed(terminal_reason: String),         // unwind completed: terminal failed, compensated:true
 	Reversing(next_seq: Int),
 	AlreadyReversed,
 	ReverseIdMismatch,
@@ -1258,7 +1259,8 @@ implement MicroflowsHost for HostImpl {
 					current_disposition = disp,
 					is_terminal = terminal != 0,
 					leased = leased != 0,
-					continuation_json = move continuation
+					continuation_json = move continuation,
+					terminal_reason = _doc_str_opt(&doc, &"terminal_reason")
 				));
 			}
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:inspect_workflow"));
@@ -1390,8 +1392,8 @@ implement MicroflowsHost for HostImpl {
 			val doc = _call_sp_doc(conn, &sp, move args);
 			val outcome = _doc_outcome(&doc);
 			if outcome == "reversing" { return BeginReversalOutcome::Reversing(_doc_int_req(&doc, &"top_seq", "begin-no-top-seq")); }
-			if outcome == "reversed" { return BeginReversalOutcome::Reversed(); }
-			if outcome == "already_begun" { return BeginReversalOutcome::AlreadyBegun(_doc_int_req(&doc, &"state", "begin-no-state")); }
+			if outcome == "failed" { return BeginReversalOutcome::Failed(_doc_str_opt(&doc, &"terminal_reason")); }
+			if outcome == "already_begun" { return BeginReversalOutcome::AlreadyBegun(_doc_int_req(&doc, &"state", "begin-no-state"), _doc_str_opt(&doc, &"terminal_reason")); }
 			if outcome == "trigger_mismatch" { return BeginReversalOutcome::TriggerMismatch(); }
 			if outcome == "operation_not_found" { return BeginReversalOutcome::OperationNotFound(); }
 			if outcome == "operation_conflict" { return BeginReversalOutcome::OperationConflict(); }
@@ -1514,7 +1516,7 @@ implement MicroflowsHost for HostImpl {
 			val sp: String = "sp_mf_checkpoint_reverse_settle";
 			val doc = _call_sp_doc(conn, &sp, move args);
 			val outcome = _doc_outcome(&doc);
-			if outcome == "reversed" { return ReverseSettleOutcome::Reversed(); }
+			if outcome == "reversed" { return ReverseSettleOutcome::Reversed(_doc_str_opt(&doc, &"terminal_reason")); }
 			if outcome == "reversing" { return ReverseSettleOutcome::Reversing(_doc_int_req(&doc, &"next_seq", "revsettle-no-next")); }
 			if outcome == "already_reversed" { return ReverseSettleOutcome::AlreadyReversed(); }
 			if outcome == "reverse_id_mismatch" { return ReverseSettleOutcome::ReverseIdMismatch(); }
@@ -1818,6 +1820,20 @@ fn _doc_str_req(doc: &json.JsonNode, key: &String, detail: String) -> String {
 			}
 		},
 		Optional::None => { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = move detail)); }
+	}
+}
+
+// Optional string field: "" when the key is missing or JSON null (e.g. terminal_reason on a
+// non-failure terminal). Used so a nullable durable field never forces a hard decode error.
+fn _doc_str_opt(doc: &json.JsonNode, key: &String) nothrow -> String {
+	match doc.get(key) {
+		Optional::Some(n) => {
+			match n.as_string() {
+				Optional::Some(s) => { return move s; },
+				Optional::None => { return ""; }
+			}
+		},
+		Optional::None => { return ""; }
 	}
 }
 

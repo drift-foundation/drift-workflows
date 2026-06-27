@@ -24,7 +24,7 @@ CREATE PROCEDURE `sp_mf_workflow_begin_reversal`(
 	IN arg_operation_seq int,
 	IN arg_operation_id varbinary(16),
 	IN arg_event_ts datetime(6),
-	IN arg_reason varchar(64)
+	IN arg_reason varchar(190)
 )
 proc:BEGIN
 	DECLARE v_owner varbinary(16);
@@ -38,6 +38,7 @@ proc:BEGIN
 	DECLARE v_top_seq int DEFAULT NULL;
 	DECLARE v_missing tinyint(1) DEFAULT 0;
 	DECLARE v_op_missing tinyint(1) DEFAULT 0;
+	DECLARE v_term_reason varchar(190) DEFAULT NULL;
 
 	IF arg_workflow_id IS NULL OR LENGTH(arg_workflow_id) <> 16 THEN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfWorkflowIdInvalid';
@@ -63,8 +64,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`, `reversal_trigger_operation_id`
-		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts, v_trigger
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`, `reversal_trigger_operation_id`, `terminal_reason`
+		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts, v_trigger, v_term_reason
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
 		FOR UPDATE;
@@ -78,7 +79,7 @@ proc:BEGIN
 	-- Idempotent replay BOUND to the trigger, recognized across ALL reverse states
 	-- (lease-independent). Once the begin command committed, the trigger op id is
 	-- persisted; a retry then returns already_begun with the CURRENT state — whether
-	-- reversing(2), blocked_resolution(3), reversed(5), or resolved_exception(6) —
+	-- reversing(2), blocked_resolution(3), reversed(5), resolved_exception(6), or failed(7) —
 	-- never fence_lost. A different operation is trigger_mismatch. On the forward
 	-- path the trigger is NULL, so a genuine first begin proceeds below.
 	IF v_trigger IS NOT NULL THEN
@@ -86,7 +87,8 @@ proc:BEGIN
 			SELECT JSON_OBJECT('outcome', 'trigger_mismatch') AS result;
 			LEAVE proc;
 		END IF;
-		SELECT JSON_OBJECT('outcome', 'already_begun', 'state', CAST(v_state AS SIGNED)) AS result;
+		-- Replay returns the DURABLE terminal_reason so a terminal (5/7) replay renders from durable state.
+		SELECT JSON_OBJECT('outcome', 'already_begun', 'state', CAST(v_state AS SIGNED), 'terminal_reason', v_term_reason) AS result;
 		LEAVE proc;
 	END IF;
 
@@ -132,13 +134,16 @@ proc:BEGIN
 	SET v_event_seq = v_event_seq + 1;
 
 	IF v_top_seq IS NULL THEN
-		-- Nothing to compensate -> reversed (terminal), lease cleared.
+		-- Nothing to compensate -> terminal FAILED (definite failure with NO completed
+		-- unwind), lease cleared. Durable state = failed(7), terminal_reason = the reason;
+		-- the client renders {failed, compensated:false}. NOT 'reversed' on this path.
 		UPDATE `tb_mf_workflow`
-		SET `state` = 5,
+		SET `state` = 7,
 		    `execution_direction` = 2,
 		    `current_disposition` = 2,
-		    `continuation` = JSON_OBJECT('pos', 'reversed'),
+		    `continuation` = JSON_OBJECT('pos', 'failed'),
 		    `reversal_trigger_operation_id` = arg_operation_id,
+		    `terminal_reason` = arg_reason,
 		    `lease_owner` = NULL,
 		    `lease_expires_at` = NULL,
 		    `current_event_seq` = v_event_seq,
@@ -149,12 +154,12 @@ proc:BEGIN
 		INSERT INTO `tb_mf_workflow_event` (
 			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 		) VALUES (
-			arg_workflow_id, v_event_seq, arg_event_ts, 'reversed', arg_executor, NULL,
+			arg_workflow_id, v_event_seq, arg_event_ts, 'failed', arg_executor, NULL,
 			JSON_OBJECT('reason', arg_reason, 'compensated', 0,
 				'operation_seq', arg_operation_seq, 'operation_id', LOWER(HEX(arg_operation_id)))
 		);
 
-		SELECT JSON_OBJECT('outcome', 'reversed') AS result;
+		SELECT JSON_OBJECT('outcome', 'failed', 'terminal_reason', arg_reason) AS result;
 		LEAVE proc;
 	END IF;
 
@@ -165,6 +170,7 @@ proc:BEGIN
 	    `current_disposition` = 2,
 	    `continuation` = JSON_OBJECT('pos', 'reverse', 'seq', v_top_seq),
 	    `reversal_trigger_operation_id` = arg_operation_id,
+	    `terminal_reason` = arg_reason,
 	    `current_event_seq` = v_event_seq,
 	    `current_event_ts` = arg_event_ts,
 	    `updated_at` = arg_event_ts
