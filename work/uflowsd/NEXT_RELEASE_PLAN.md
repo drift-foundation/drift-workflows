@@ -85,11 +85,11 @@ first; the rest inherit it.
 - **Decision:** a business decline is a `200` result; the **workflow** decides whether to unwind, not the
   participant (a participant can't own workflow-policy without breaking reuse across workflows). Add `.mf`
   author-driven failure.
-- **Prerequisite = the real lift:** **result-conditional branching.** Today `if`/`case` select on **arg-paths
-  only** (parser grammar header parser.drift:24-33); `case result auth.status { … }` does not parse. Extend
-  `if`/`case` selectors to `result`/`local` paths — touches parser + IR + validation + drive-loop. `fail` is
+- **Prerequisite = the real lift:** **result-conditional branching** — **LANDED (Step 5).** `if`/`case` now
+  select on a path selector (arg/result/local); `case result auth.status { … }` parses. (Was: arg-paths only.)
+  Touched parser + IR validation (the IR/drive already evaluated result/local). `fail` is
   the easy leaf on top.
-- **`fail <object-expr>`:** terminal graph node in an `if`/`case` branch; durably records the reason and begins
+- **`fail <string-reason>`:** terminal graph node in an `if`/`case` branch (LANDED as a String reason code, not an object); durably records the reason and begins
   reversal over the **full** settled-compensable checkpoint stack. Empty stack → clean `failed` (no unwind);
   non-empty → compensated.
 - **Option A (decided):** `fail` unwinds **all** settled compensable checkpoints **including** the op whose
@@ -238,8 +238,22 @@ Targets: `microflows/doc/uflowsd_participant_contract.md` (wire contract), `micr
   COMPONENT gate also updated (`state_test.drift` state-7 coverage, `live_reversal_test.drift` new host
   variants, `sp_operation_test.py` no-checkpoint→failed/7+terminal_reason). **ROOT `just test` GREEN**:
   singular 16, microflows (parser 81/81, e2e 20, SP 110/110), integration 166/166.
-- **NEXT: step 5** (`fail` + result-branching) then step 6 (200-no-result harden). The payment-decline +
-  compensation EXAMPLE (doc H) lands with step 5.
+- **STEP 5 LANDED + root-gate-green** (singular 16, microflows parser 90/90 / e2e 20 / SP 110, integration
+  172/172). Result-conditional branching + authored `fail`:
+  - **Selectors (parser-only):** `if`/`case` take a path selector `arg`/`result`/`local` (bare = arg); IR
+    `EResult`/`ELocal` + `advance` already evaluate them, `_check_expr` dominance already enforces
+    prior-dominating OK / branch-local-without-merge REJECTED / merge-carried OK.
+  - **`fail <string>`:** `ir.NFail` + `StepOutcome::Fail`; reason is a String code (non-string/>190 rejected
+    at type-check/lower for literals; a dynamic non-string/overlong reason UNWINDS with the durable code
+    `invalid_fail_reason` — never stranding checkpointed side effects). New SP
+    `sp_mf_workflow_authored_fail` (own transition, NOT begin_reversal — follows a settled 200); fail command
+    id `H(workflow_id, content_hash, "fail:"+node_id)` = durable trigger (replay-safe; mismatch ->
+    trigger_mismatch). Reuses Step-4 terminal rendering (empty->compensated:false, unwind->true, blocked->blocked).
+  - **Finality fix:** runner PROBES `advance` with the settled result; `operation_settle` finality =
+    `seq==plan_length AND caller is_final` (downgrade-only) -> an op at plan_length whose result branches to
+    `fail` is checkpointed, not completed. `op_depth`/`nonfinal_operations`/`validate_graph` made fail-aware.
+  - **Example + docs:** `payment_decline_guard.mf` + manifest; user-guide selectors/`fail`; RUN_LOCAL 4b.
+- **NEXT: step 6** (200-no-result harden) — last of the bundle.
 - **Clear-cut, ready on greenlight:** C items 1–2 (doc + reference stub); G once direction is picked.
 - **One unit (keystone):** F (`failed` terminal) + D (authored-fail) share the durable reason/state — implement
   together; C item 3 (runner harden) lands behind them.
@@ -250,8 +264,9 @@ Targets: `microflows/doc/uflowsd_participant_contract.md` (wire contract), `micr
 
 - Hyphenated op idents work everywhere; comment lexer is C-family `//` + `/* */` (no `#`) after step 1 (parser.drift:221, 234-248).
 - Coordinator consumes status + `result`; `state` read nowhere (runner.drift:2459).
-- `if`/`case` select on arg-paths only today (parser.drift:24-33).
+- `if`/`case` select on a path selector — arg/result/local (LANDED Step 5; was arg-paths only).
 - Reversal can reach forward input (`operation_request_get`/`reverse_head`) AND result
   (`operation_result(seq)` host.drift:471) — envelope is wiring, no schema migration.
-- Single terminal `STATE_REVERSED=5`; resume re-renders `reversed` (runner.drift:226, 2113) — #4 needs durable
-  state, not just a renderer change.
+- (Pre-#4 finding, RESOLVED in Step 4) the old single terminal `STATE_REVERSED=5` made resume re-render
+  `reversed`; #4 split it into `reversed(5)`=unwound (compensated:true) vs `failed(7)`=no-unwind
+  (compensated:false), both carrying a durable `terminal_reason`.

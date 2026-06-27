@@ -1,0 +1,5 @@
+args { result: bool }
+op a { input: { x: string } }
+steps {
+  if result { a { "x": "1" } } else { a { "x": "2" } }
+}

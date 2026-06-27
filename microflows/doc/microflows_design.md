@@ -1063,8 +1063,9 @@ statement := <op> <expr>                              a remote call (operation s
            | let <name> = <op> <expr>                 a NAMED op; <name> aliases its result
            | let <name> = (map|filter) <src> each <e> <body>
            | let <name> = fold <src> from <init> each <e> <body>
-           | if <arg-path> { … } [ else { … } ] [ merge <n> = <e> | <e> ]
-           | case <arg-path> { (<json> { … })* default { … } } [ merge <n> = <e> | … | <e> ]
+           | if <selector> { … } [ else { … } ] [ merge <n> = <e> | <e> ]      (selector = arg/result/local path; -> Bool)
+           | case <selector> { (<json> { … })* default { … } } [ merge <n> = <e> | … | <e> ]
+           | fail <string-reason>     (authored terminal failure -> reversal; reason is a String code, <=190 bytes)
 expr      := { …json… } | const <json> | arg <path> | local <name>[.path] | result <name>[.path]
 type      := int | float | bool | string | null | { field: T, … } | [T] | T?
 ```

@@ -23,6 +23,7 @@ examples/
     payment_refund.mf                  # one idempotent corrective op
     inventory_reserve_release.mf       # reserve_inventory → commit_shipment  (1 compensation)
     account_adjustment_with_rollback.mf# adjust_balance → post_journal        (auto-rollback)
+    payment_decline_guard.mf           # authorize → case result status → fail (result-branch + authored fail)
     checkout_branch_merge.mf           # BRANCH + MERGE + COMPENSATION in one flow
   RUN_LOCAL.md                         # start the service, submit/resume/reload over HTTP
 ```
@@ -69,6 +70,7 @@ examples/
 |---|---|
 | payment_authorize_capture | completes; deterministic ledger entry |
 | account_adjustment_with_rollback | later-step failure → **automatic compensation** (workflow `failed`, `compensated:true`) |
+| payment_decline_guard | **result-conditional** branch on the gateway's 200 decision; a decline calls `fail` → unwinds the authorization → `failed`, `compensated:true` |
 | payment_refund | idempotent single-op corrective flow |
 | inventory_reserve_release | participant **pending → resume** completes |
 | checkout_branch_merge | branch + merge + compensation runs end to end |

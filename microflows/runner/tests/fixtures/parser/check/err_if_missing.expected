@@ -1,6 +1,6 @@
 {
   "byte_offset": 11,
-  "code": "expected-identifier",
+  "code": "expected-selector",
   "column": 12,
   "expected": "",
   "found": "",

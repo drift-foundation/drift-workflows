@@ -337,6 +337,11 @@ def main():
             {"name": "confirm", "participant": "ref", "schema_version": 1,
              "compensation": {"operation": "unconfirm", "schema_version": 1}},
             {"name": "unconfirm", "participant": "ref", "schema_version": 1},
+            # 'decide' returns the business status the workflow branches on; compensable -> 'undo-decide'
+            # (a safe no-op) so an authored `fail` after a settled decide can unwind it.
+            {"name": "decide", "participant": "ref", "schema_version": 1,
+             "compensation": {"operation": "undo-decide", "schema_version": 1}},
+            {"name": "undo-decide", "participant": "ref", "schema_version": 1},
         ],
     }
 
@@ -1729,8 +1734,8 @@ def main():
               and lease == [["NULL"]], (code, body, lease))
 
         # C6. FIRST-operation rejection begins reversal: a definite forward failure of op1
-        # (no prior checkpoint) reverses straight to `reversed` — never blocks. The second
-        # step never runs.
+        # (no prior checkpoint) goes straight to terminal `failed` (compensated:false, state 7) —
+        # nothing to unwind, never blocks. The second step never runs.
         frplan = plan_cfg([{"operation": "reserve", "input": {"reservation": "fr1", "_fault": {"reject": True}}},
                            {"operation": "reserve", "input": {"reservation": "fr2"}}])
         wffr = _wf_id()
@@ -2922,7 +2927,8 @@ def main():
                   (ac, ab))
 
             # (b) later-step failure -> automatic compensation: post_journal rejected, so the prior
-            # adjust_balance is unwound by reverse_adjustment; the workflow ends REVERSED.
+            # adjust_balance is unwound by reverse_adjustment; the workflow ends failed/compensated:true
+            # (durable reversed(5)).
             _arm_fault(base, "post_journal", "reject")
             exwf_b = _wf_id()
             bc, bb = _svc_post(exbase, f"/v1/workflows/{exwf_b}/submit?script=account_adjustment_with_rollback",
@@ -2985,6 +2991,111 @@ def main():
         finally:
             stop_service(exproc)
 
+        # ===== Step 5: result-conditional branching + authored `fail` =====
+        decline_mf = (
+            'args { ref: string, decision: string }\n'
+            'op decide { input: { ref: string, decision: string } result: { status: string, ref: string } }\n'
+            'op echo-transform { input: { values: [int] } result: { sum: int } }\n'
+            'steps {\n'
+            '  let d = decide { "ref": arg ref, "decision": arg decision }\n'
+            '  case result d.status {\n'
+            '    "approved" { echo-transform { "values": [1] } }\n'
+            '    "declined" { fail "payment_declined" }\n'
+            '    default { fail "unknown_status" }\n'
+            '  }\n'
+            '}\n')
+        lrc, decline_cfg = lower_source(decline_mf)
+        check("fail_decline_lowers", lrc == 0 and decline_cfg is not None, lrc)
+
+        # (1) APPROVED: the result-branch falls through; the workflow COMPLETES, no compensation runs.
+        wf_appr = _wf_id(); ex0 = _exec_count(base)
+        code, body = run_runner(decline_cfg, wf_appr, arguments=json.dumps({"ref": "r1", "decision": "approved"}))
+        appr = _mdb(f"SELECT state FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wf_appr}')")
+        appr_rev = _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wf_appr}') AND reversal_state = 2")
+        check("fail_approved_completes_no_comp",
+              code == 0 and body.get("workflow") == "completed" and appr == [["4"]] and appr_rev == [["0"]],
+              (code, body, appr, appr_rev))
+
+        # (2) DECLINED: the result-branch calls `fail`; the settled `decide` is unwound (undo-decide) ->
+        # failed/compensated:true, durable reversed(5)/reverse(2).
+        wf_dec = _wf_id()
+        code, body = run_runner(decline_cfg, wf_dec, arguments=json.dumps({"ref": "r2", "decision": "declined"}))
+        dec = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wf_dec}')")
+        # the settled `decide` checkpoint is reversed via its compensation binding (undo-decide).
+        undo = _mdb(f"SELECT reversal_state, reverse_operation_name FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wf_dec}')")
+        check("fail_declined_unwinds",
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True
+              and body.get("reason") == "payment_declined" and dec == [["5", "2"]]
+              and undo == [["2", "undo-decide"]],
+              (code, body, dec, undo))
+
+        # (2b) DYNAMIC invalid reason (>190): `fail result d.long_reason` type-checks as String but the
+        # value is overlong at drive -> mapped to the fixed durable reason "invalid_fail_reason" and STILL
+        # unwinds the settled `decide` (never strands a checkpointed side effect forward).
+        overlong_mf = (
+            'args { ref: string }\n'
+            'op decide { input: { ref: string, decision: string } result: { status: string, ref: string, long_reason: string } }\n'
+            'op echo-transform { input: { values: [int] } result: { sum: int } }\n'
+            'steps {\n'
+            '  let d = decide { "ref": arg ref, "decision": "overlong" }\n'
+            '  case result d.status {\n'
+            '    "approved" { echo-transform { "values": [1] } }\n'
+            '    default { fail result d.long_reason }\n'
+            '  }\n'
+            '}\n')
+        orc, overlong_cfg = lower_source(overlong_mf)
+        wf_ov = _wf_id()
+        code, body = run_runner(overlong_cfg, wf_ov, arguments=json.dumps({"ref": "r4"}))
+        ov_undo = _mdb(f"SELECT reversal_state, reverse_operation_name FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wf_ov}')")
+        check("fail_invalid_dynamic_reason_still_unwinds",
+              orc == 0 and code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True
+              and body.get("reason") == "invalid_fail_reason" and ov_undo == [["2", "undo-decide"]],
+              (orc, code, body, ov_undo))
+
+        # (3+4) REPLAY after authored fail: re-drive resumes from durable reversed state, renders the
+        # DURABLE reason, and does NO forward re-dispatch (participant exec count unchanged).
+        ex_pre = _exec_count(base)
+        code, body = run_runner(decline_cfg, wf_dec)
+        check("fail_replay_terminal_durable_reason",
+              code == 3 and body.get("workflow") == "failed" and body.get("compensated") == True
+              and body.get("reason") == "payment_declined" and _exec_count(base) - ex_pre == 0,
+              (code, body, _exec_count(base) - ex_pre))
+
+        # (5) EMPTY-STACK fail: `fail` reached before any settled op -> failed/compensated:false, state 7.
+        empty_mf = (
+            'args { decline: bool, ref: string }\n'
+            'op decide { input: { ref: string, decision: string } result: { status: string, ref: string } }\n'
+            'steps {\n'
+            '  if decline { fail "upfront_decline" } else { decide { "ref": arg ref, "decision": "approved" } }\n'
+            '}\n')
+        erc, empty_cfg = lower_source(empty_mf)
+        wf_emp = _wf_id(); ex_e = _exec_count(base)
+        code, body = run_runner(empty_cfg, wf_emp, arguments=json.dumps({"decline": True, "ref": "r3"}))
+        emp = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wf_emp}')")
+        check("fail_empty_stack_compensated_false",
+              erc == 0 and code == 3 and body.get("workflow") == "failed" and body.get("compensated") == False
+              and body.get("reason") == "upfront_decline" and emp == [["7", "2"]] and _exec_count(base) - ex_e == 0,
+              (erc, code, body, emp))
+
+        # (6) INVALID dominance: a selector on a branch-local result (no merge) is rejected at LOWER/build.
+        bad_mf = (
+            'args { flag: bool }\n'
+            'op a { input: { x: string } result: { ok: bool } }\n'
+            'op b { input: { x: string } }\n'
+            'steps {\n'
+            '  if flag { let z = a { "x": "y" } } else { b { "x": "n" } }\n'
+            '  if result z.ok { b { "x": "1" } } else { b { "x": "2" } }\n'
+            '}\n')
+        brc, bad_cfg = lower_source(bad_mf)
+        check("fail_invalid_dominance_rejected", brc != 0 and bad_cfg is None, brc)
+
+        # (7) FAIL-ONLY / zero-operation workflow is rejected at BUILD (lower) — a contract decision: a
+        # workflow must execute at least one operation. Asserts nonzero exit + the diagnostic SUBSTRING.
+        foc, fo_err = lower_source_stderr('args { x: string }\nsteps { fail "always" }\n')
+        check("fail_only_rejected_at_build",
+              foc != 0 and "must execute at least one operation" in fo_err,
+              (foc, fo_err))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the LOCAL authoritative
         # result; no dependency on the participant. MUST be the LAST stub-using block — it terminates
         # the stub and never restarts it, so any check after this would hit a dead participant.
@@ -3032,7 +3143,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 166
+    EXPECTED_CHECKS = 174
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

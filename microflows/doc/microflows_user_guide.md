@@ -190,8 +190,12 @@ confirm result total                // ... feed that result downstream
 let p = arg request.reservation     // pure value binding (no remote call)
 reserve local p
 
-if flag { … } else { … }            // branch on a Bool durable argument
-case tier { "gold" { … } "silver" { … } default { … } }   // N-way branch
+if flag { … } else { … }            // branch on a Bool — durable ARG, settled RESULT, or local
+case result auth.status {           // ... or N-way on a scalar RESULT/local/arg path
+  "approved" { capture … }
+  "declined" { fail "payment_declined" }   // authored TERMINAL failure -> unwind + {workflow:failed}
+  default    { fail "status_unknown" }
+}
 
 let ids = map arg items each it local it.id      // finite PURE transform
 let kept = filter arg items each it local it.ok
@@ -202,8 +206,22 @@ let last = fold arg items from const null each it local it
   *names* the call so `result n` references its result later.
 - **`let n = <value-expr>`**: a pure binding (no remote call). Recomputed on
   replay; never a durable boundary.
-- **`if` / `case`**: branch on a durable-argument path (the decision comes from
-  durable args). `case` requires a `default`, last.
+- **`if` / `case`**: branch on a **path selector** — `arg <path>` (a durable
+  argument), `result <name>.<path>` (a prior operation's settled result), or
+  `local <name>.<path>` (a `let`/merge binding); a bare path is `arg`. `if`'s
+  selector must be `Bool`; `case` branches on a scalar value and requires a
+  `default`, last. The result/local must be **dominating** — settled/bound on
+  every path into the branch — or lowering rejects it (carry a branch-local value
+  past a join with `merge`).
+- **`fail <reason>`**: a **terminal** that durably enters reversal. `<reason>` is
+  a machine-readable **String** code — a literal (`fail "payment_declined"`) or a
+  string-typed selector (`fail result auth.decline_code`); a non-string or >190
+  bytes is rejected at lower/type-check. `fail` records the reason, unwinds every
+  settled compensable step in reverse (including the op whose result triggered it),
+  and terminates as `{"workflow":"failed","reason":…,"compensated":<bool>}`
+  (`compensated:true` when an unwind ran, `false` when the stack was empty). This
+  is how the workflow — not the participant — turns a `200` business decline into
+  a durable, compensated failure.
 - **`merge`** (a join): `if … else … merge picked = result a | result b` (and
   the `case` form with one value per arm + default) selects a branch-local
   result at the join to feed shared downstream work. See

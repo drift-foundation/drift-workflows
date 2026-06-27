@@ -374,7 +374,7 @@ def main():
          (wf5, EXEC, tok5, 1, op5a, "reserve", 1, '{"reservation":"m1"}', "h1", '{"pos":"op:1:dispatched"}', T(2), "{}"))
     _, r = call(cur, "sp_mf_operation_settle",
                 (wf5, EXEC, tok5, 1, op5a, 1, '{"reserved":"m1"}', '{"reservation":"m1"}', '{"pos":"x"}', T(3), "{}", 1))
-    check("settle_finality_violation", r and r["outcome"] == "plan_violation" and r["reason"] == "finality", r)
+    check("settle_finality_violation", r and r["outcome"] == "plan_violation" and r["reason"] == "finality_early", r)
     # A seq OUTSIDE the pinned plan (seq 3 of a 2-step plan) is rejected.
     _, r = call(cur, "sp_mf_operation_settle",
                 (wf5, EXEC, tok5, 3, op5a, 3, '{"reserved":"m1"}', '{"reservation":"m1"}', '{"pos":"x"}', T(3), "{}", 0))

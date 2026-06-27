@@ -82,6 +82,25 @@ an out-of-band stub control). `adjust_balance` succeeds, `post_journal` fails, a
 
 No reversal code is written in the workflow — the `compensation` binding in the deployment drives it.
 
+## 4b. Result-conditional branch + authored `fail` (business decline)
+
+`payment_decline_guard` shows the workflow — not the participant — deciding what a gateway result
+means. `authorize` returns a **200** carrying its decision (`status`); the workflow branches on it:
+
+```
+# decision "approved" -> capture, complete
+-> {"workflow":"completed","operation_id":"…","result":{"capture_id":"…"}}   (HTTP 200)
+
+# decision "declined" -> the `fail "payment_declined"` branch runs: the authorization is voided
+# (compensation) and the instance terminates as a durable, compensated failure
+-> {"workflow":"failed","reason":"payment_declined","compensated":true}      (HTTP 200, exit 3)
+```
+
+A 200 is a valid *result*, not a transport success — the `.mf` expresses the decline-then-unwind
+policy with `case result authorization.status { … "declined" { fail "payment_declined" } … }`. With
+no compensable step yet settled, a `fail` terminates as `{"…":"failed",…,"compensated":false}`.
+
+
 ## 5. Reload a new manifest (zero-downtime redeploy)
 
 Edit `manifest.json` (add/replace scripts, bump versions), then signal the running service:

@@ -103,6 +103,8 @@ const OP_RELEASE: String = "release";
 // Compensable: its REVERSE is `unconfirm` (input = the confirm checkpoint payload {"reserved": id}).
 const OP_CONFIRM: String = "confirm";
 const OP_UNCONFIRM: String = "unconfirm";
+const OP_DECIDE: String = "decide";            // echoes input.decision -> result.status (drives result-branch + authored fail)
+const OP_UNDO_DECIDE: String = "undo-decide";   // no-op compensation for `decide`
 
 // ===== Entry point =====
 
@@ -600,10 +602,42 @@ fn _effective_input(input: &json.JsonNode) nothrow -> json.JsonNode {
 	}
 }
 
+// `decide` returns the business status the workflow branches on, echoed from the forward input so the
+// TEST controls the branch: decision "declined" -> {status:"declined"}, else {status:"approved"}.
+fn _decide(input: &json.JsonNode) -> String {
+	val decision = _str_field(input, &"decision");
+	var st: String = "approved";
+	if decision == "declined" { st = "declined"; }
+	if decision == "overlong" { st = "overlong"; }
+	var o = json.new_object();
+	o.set("status", json.JsonNode::String(move st));
+	o.set("ref", json.JsonNode::String(_str_field(input, &"ref")));
+	// decision "overlong" adds a deliberately >190-byte string field, so a workflow that does
+	// `fail result d.long_reason` exercises the dynamic invalid-reason path (String-typed, too long at
+	// drive). Other decisions omit it, matching a {status,ref} result contract.
+	if decision == "overlong" { o.set("long_reason", json.JsonNode::String(_repeat_z(200))); }
+	return json.encode(o.to_node());
+}
+
+fn _repeat_z(n: Int) nothrow -> String {
+	var out: String = "";
+	var i = 0;
+	while i < n { out = out + "z"; i = i + 1; }
+	return move out;
+}
+
+// No-op compensation for `decide`: the decision had no external side effect (safe no-op on a
+// business-negative result, per the saga model). Echoes ref for observability.
+fn _undo_decide(input: &json.JsonNode) -> String {
+	var o = json.new_object();
+	o.set("undone_ref", json.JsonNode::String(_str_field(input, &"ref")));
+	return json.encode(o.to_node());
+}
+
 fn _supported_op(op: &String) nothrow -> Bool {
 	match _biz_spec(op) { Optional::Some(_) => { return true; }, Optional::None => {} }
 	return op == OP_ECHO_TRANSFORM or op == OP_STRING_JOIN or op == OP_RELEASE or op == OP_RESERVE
-	    or op == OP_CONFIRM or op == OP_UNCONFIRM;
+	    or op == OP_CONFIRM or op == OP_UNCONFIRM or op == OP_DECIDE or op == OP_UNDO_DECIDE;
 }
 
 fn _validate_input(op: &String, input: &json.JsonNode) nothrow -> Bool {
@@ -614,6 +648,8 @@ fn _validate_input(op: &String, input: &json.JsonNode) nothrow -> Bool {
 	if op == OP_RESERVE { return _validate_reserve(input); }
 	if op == OP_CONFIRM { return _validate_confirm(input); }
 	if op == OP_UNCONFIRM { return _validate_confirm(input); }
+	if op == OP_DECIDE { return _has_str(input, &"ref") and _has_str(input, &"decision"); }
+	if op == OP_UNDO_DECIDE { return _has_str(input, &"ref"); }
 	return false;
 }
 
@@ -624,6 +660,8 @@ fn _execute_op(op: &String, input: &json.JsonNode) -> String {
 	if op == OP_RESERVE { return _reserve(input); }
 	if op == OP_CONFIRM { return _confirm(input); }
 	if op == OP_UNCONFIRM { return _unconfirm(input); }
+	if op == OP_DECIDE { return _decide(input); }
+	if op == OP_UNDO_DECIDE { return _undo_decide(input); }
 	// default: echo-transform (op already validated/supported before dispatch).
 	return _echo_transform(input);
 }

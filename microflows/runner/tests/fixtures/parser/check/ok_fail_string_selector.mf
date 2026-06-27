@@ -1,0 +1,6 @@
+args { amount: int }
+op authorize { input: { amount: int } result: { decline_reason: string } }
+steps {
+  let auth = authorize { "amount": arg amount }
+  fail result auth.decline_reason
+}

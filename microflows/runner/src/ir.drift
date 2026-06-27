@@ -390,7 +390,8 @@ pub variant IrNode {
 	NCase(id: String, scrutinee: IrExpr, arms: Array<IrCaseArm>, default_node: String),
 	NLoop(id: String, kind: LoopKind, source: IrExpr, elem: String, acc: String, init: IrExpr, body: IrExpr, next: String),
 	NMerge(id: String, name: String, sources: Array<MergeArm>, next: String),  // phi: rejoin paths, bind `name`
-	NReturn(id: String, value: IrExpr)                                        // terminal: the workflow result
+	NReturn(id: String, value: IrExpr),                                       // terminal: the workflow result
+	NFail(id: String, reason: IrExpr)                                         // terminal: authored fail -> reversal; reason is a String code
 }
 
 pub struct IrGraph {
@@ -519,6 +520,11 @@ fn _parse_node(n: &json.JsonNode) -> IrNode {
 		val value = _parse_expr_at(n, &"value");
 		_reject_extra(nkeys, 3);   // kind, id, value
 		return IrNode::NReturn(id = move id, value = move value);
+	}
+	if _str_eq(&kind, &"fail") {
+		val reason = _parse_expr_at(n, &"reason");
+		_reject_extra(nkeys, 3);   // kind, id, reason
+		return IrNode::NFail(id = move id, reason = move reason);
 	}
 	// Finite array expressions (map/filter/fold over a finite array source). The result binds to
 	// a downstream local named `as`; the body is a pure IrExpr over `elem` (+ the `as` accumulator
@@ -814,6 +820,9 @@ fn _node_canonical(n: &IrNode) nothrow -> String {
 		},
 		IrNode::NReturn(id, value) => {
 			return "R" + _lp(id) + _expr_canonical(value);
+		},
+		IrNode::NFail(id, reason) => {
+			return "F" + _lp(id) + _expr_canonical(reason);
 		}
 	}
 }
@@ -961,7 +970,8 @@ fn _node_id(n: &IrNode) nothrow -> String {
 		IrNode::NCase(id, scrutinee, arms, default_node) => { return _dup(id); },
 		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { return _dup(id); },
 		IrNode::NMerge(id, name, sources, next) => { return _dup(id); },
-		IrNode::NReturn(id, value) => { return _dup(id); }
+		IrNode::NReturn(id, value) => { return _dup(id); },
+		IrNode::NFail(id, reason) => { return _dup(id); }
 	}
 }
 
@@ -994,6 +1004,7 @@ pub struct OpResult {
 pub variant StepOutcome {
 	NeedOperation(node_id: String, operation: String, input_json: String),   // next unsettled remote op
 	Completed(result_json: String),                                          // reached NReturn
+	Fail(node_id: String, reason_json: String),                              // reached NFail; reason_json = canonical JSON of the evaluated reason
 	Fault(message: String)                                                   // defensive (validate first)
 }
 
@@ -1022,6 +1033,14 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 			IrNode::NReturn(id, value) => {
 				match _eval(g, value, &args_node, settled, &local_names, &local_vals) {
 					core.Result::Ok(n) => { return StepOutcome::Completed(result_json = _canon_node(&n)); },
+					core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
+				}
+			},
+			IrNode::NFail(id, reason) => {
+				// Authored fail: evaluate the reason (a String code) and stop here. The drive validates
+				// the value (string, <=190) then enters reversal via its OWN durable transition.
+				match _eval(g, reason, &args_node, settled, &local_names, &local_vals) {
+					core.Result::Ok(n) => { return StepOutcome::Fail(node_id = _dup(id), reason_json = _canon_node(&n)); },
 					core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
 				}
 			},
@@ -1353,7 +1372,7 @@ pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
 	while i < nn {
 		var succs: Array<String> = [];
 		_succs(&g.nodes[i], &mut succs);
-		if succs.len == 0 and !_is_return(&g.nodes[i]) {
+		if succs.len == 0 and !_is_return(&g.nodes[i]) and !_is_fail(&g.nodes[i]) {
 			return Optional<String>::Some("non-terminal node has no successor: " + _dup(&_node_id(&g.nodes[i])));
 		}
 		i = i + 1;
@@ -1436,12 +1455,65 @@ fn _succs(n: &IrNode, out: &mut Array<String>) nothrow -> Void {
 		},
 		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { out.push(_dup(next)); },
 		IrNode::NMerge(id, name, sources, next) => { out.push(_dup(next)); },
-		IrNode::NReturn(id, value) => {}
+		IrNode::NReturn(id, value) => {},
+		IrNode::NFail(id, reason) => {}
 	}
 }
 
 fn _is_return(n: &IrNode) nothrow -> Bool {
 	match n { IrNode::NReturn(id, value) => { return true; }, default => { return false; } }
+}
+
+fn _is_fail(n: &IrNode) nothrow -> Bool {
+	match n { IrNode::NFail(id, reason) => { return true; }, default => { return false; } }
+}
+
+// True if an NFail node is reachable from `start` along control-flow successors (EXCLUDING `start`).
+// An operation that can reach an authored fail is unwound by it, so it must be compensable even when
+// it sits at seq == plan_length. DAG, so a `seen` set bounds the walk.
+fn _reaches_fail(g: &IrGraph, start: Int) nothrow -> Bool {
+	var seen: Array<Bool> = [];
+	var k = 0;
+	while k < g.nodes.len { seen.push(false); k = k + 1; }
+	var frontier: Array<String> = [];
+	_succs(&g.nodes[start], &mut frontier);
+	var qi = 0;
+	while qi < frontier.len {
+		val ni = _find_node(g, &frontier[qi]);
+		qi = qi + 1;
+		if ni < 0 { continue; }
+		if seen[ni] { continue; }
+		seen[ni] = true;
+		if _is_fail(&g.nodes[ni]) { return true; }
+		_succs(&g.nodes[ni], &mut frontier);
+	}
+	return false;
+}
+
+// plan_length from node depths. All RETURN nodes share one depth (the completing op lands at seq ==
+// plan_length); FAIL nodes may sit at any depth <= plan_length (a fail path may be shorter, and an
+// op at plan_length followed by fail is checkpointed, not completed). plan_length = the return
+// depth, or (no return) the max fail depth. A fail path LONGER than the completing path is rejected
+// (its ops would land beyond plan_length / out of the pinned seq range).
+fn _plan_length_from_depths(g: &IrGraph, depth: &Array<Int>) nothrow -> core.Result<Int, IrError> {
+	var ret_pl = -1;
+	var max_fail = -1;
+	var i = 0;
+	while i < g.nodes.len {
+		if depth[i] >= 0 {
+			if _is_return(&g.nodes[i]) {
+				if ret_pl < 0 { ret_pl = depth[i]; }
+				else { if ret_pl != depth[i] { return core.Result<Int, IrError>::Err(IrError(message = "op-unbalanced branch (terminal paths have differing operation counts)")); } }
+			}
+			if _is_fail(&g.nodes[i]) { if depth[i] > max_fail { max_fail = depth[i]; } }
+		}
+		i = i + 1;
+	}
+	if ret_pl < 0 and max_fail < 0 { return core.Result<Int, IrError>::Err(IrError(message = "no reachable terminal")); }
+	var pl = ret_pl;
+	if pl < 0 { pl = max_fail; }
+	if max_fail > pl { return core.Result<Int, IrError>::Err(IrError(message = "fail path has more operations than the completing path")); }
+	return core.Result<Int, IrError>::Ok(pl);
 }
 
 fn _is_operation(n: &IrNode) nothrow -> Bool {
@@ -1564,6 +1636,26 @@ fn _binder_available_after(g: &IrGraph, name: &String, x: Int) nothrow -> Bool {
 }
 
 // Validate one node's expressions + (for NLoop) its finite shape.
+// A CONST fail reason must be a JSON string of <= 190 bytes: terminal_reason is a machine-readable
+// reason code, never arbitrary JSON and never silently truncated. Non-const reasons (result/local/arg)
+// get their String type proven by type_check_graph; their length is enforced at drive time.
+fn _check_fail_reason_const(reason: &IrExpr) nothrow -> Optional<String> {
+	match reason {
+		IrExpr::EConst(cj) => {
+			match json.parse_strict(cj) {
+				core.Result::Ok(n) => {
+					match n.as_string() {
+						Optional::Some(sv) => { if sv.byte_length() > 190 { return Optional<String>::Some("fail reason string literal exceeds 190 bytes"); } return Optional<String>::None(); },
+						Optional::None => { return Optional<String>::Some("fail reason must be a string (got a non-string constant)"); }
+					}
+				},
+				core.Result::Err(e) => { return Optional<String>::Some("fail reason constant is not valid JSON"); }
+			}
+		},
+		default => { return Optional<String>::None(); }
+	}
+}
+
 fn _check_node(g: &IrGraph, idx: Int) nothrow -> Optional<String> {
 	var no_locals: Array<String> = [];
 	match &g.nodes[idx] {
@@ -1590,6 +1682,13 @@ fn _check_node(g: &IrGraph, idx: Int) nothrow -> Optional<String> {
 			return _check_expr(g, scrutinee, idx, &no_locals);
 		},
 		IrNode::NReturn(id, value) => { return _check_expr(g, value, idx, &no_locals); },
+		IrNode::NFail(id, reason) => {
+			match _check_expr(g, reason, idx, &no_locals) {
+				Optional::Some(m) => { return Optional<String>::Some(move m); },
+				Optional::None => {}
+			}
+			return _check_fail_reason_const(reason);
+		},
 		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
 			// The result binds to a downstream local named `acc` (for fold it is ALSO the in-body
 			// accumulator). It must be named and distinct from the element binding.
@@ -1793,6 +1892,18 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 						match &it {
 							InferType::Known(t) => { if !_str_eq(&canonical(t), &"b") { return Optional<String>::Some("NIf condition must be Bool (got " + canonical(t) + "): " + _dup(id)); } },
 							InferType::Imprecise() => { return Optional<String>::Some("NIf condition must be Bool (got an imprecise literal): " + _dup(id)); },
+							InferType::Unknown() => {}
+						}
+					},
+					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
+				}
+			},
+			IrNode::NFail(id, reason) => {
+				match _infer_expr_type(g, reason, arg_type, contracts, &lt_names, &lt_types) {
+					core.Result::Ok(it) => {
+						match &it {
+							InferType::Known(t) => { if !_str_eq(&canonical(t), &"s") { return Optional<String>::Some("fail reason must be String (got " + canonical(t) + "): " + _dup(id)); } },
+							InferType::Imprecise() => {},
 							InferType::Unknown() => {}
 						}
 					},
@@ -2494,17 +2605,16 @@ pub fn op_depth(g: &IrGraph) nothrow -> core.Result<Int, IrError> {
 		core.Result::Ok(d) => { depth = move d; },
 		core.Result::Err(e) => { return core.Result<Int, IrError>::Err(IrError(message = e.message)); }
 	}
-	var pl = -1;
-	var i = 0;
-	while i < g.nodes.len {
-		if depth[i] >= 0 and _is_return(&g.nodes[i]) {
-			if pl < 0 { pl = depth[i]; }
-			else { if pl != depth[i] { return core.Result<Int, IrError>::Err(IrError(message = "op-unbalanced branch (terminal paths have differing operation counts)")); } }
-		}
-		i = i + 1;
+	match _plan_length_from_depths(g, &depth) {
+		core.Result::Ok(pl) => {
+			// A workflow must execute at least one operation. plan_length 0 is a fail-only or empty
+			// `steps {}` graph (no remote call) — nothing to complete or compensate, and the durable
+			// plan rejects plan_length < 1. Reject here with a clear build-time diagnostic.
+			if pl < 1 { return core.Result<Int, IrError>::Err(IrError(message = "a workflow must execute at least one operation (a fail-only or empty workflow has no executable step)")); }
+			return core.Result<Int, IrError>::Ok(pl);
+		},
+		core.Result::Err(e) => { return core.Result<Int, IrError>::Err(IrError(message = e.message)); }
 	}
-	if pl < 0 { return core.Result<Int, IrError>::Err(IrError(message = "no reachable terminal")); }
-	return core.Result<Int, IrError>::Ok(pl);
 }
 
 // Operation NAMES of NOperation nodes that are NON-FINAL — they execute at a position strictly
@@ -2518,23 +2628,19 @@ pub fn nonfinal_operations(g: &IrGraph) nothrow -> core.Result<Array<String>, Ir
 		core.Result::Err(e) => { return core.Result<Array<String>, IrError>::Err(IrError(message = e.message)); }
 	}
 	var pl = -1;
-	var i = 0;
-	while i < g.nodes.len {
-		if depth[i] >= 0 and _is_return(&g.nodes[i]) {
-			if pl < 0 { pl = depth[i]; }
-			else { if pl != depth[i] { return core.Result<Array<String>, IrError>::Err(IrError(message = "op-unbalanced branch (terminal paths have differing operation counts)")); } }
-		}
-		i = i + 1;
+	match _plan_length_from_depths(g, &depth) {
+		core.Result::Ok(p) => { pl = p; },
+		core.Result::Err(e) => { return core.Result<Array<String>, IrError>::Err(IrError(message = e.message)); }
 	}
-	if pl < 0 { return core.Result<Array<String>, IrError>::Err(IrError(message = "no reachable terminal")); }
 	var out: Array<String> = [];
-	i = 0;
+	var i = 0;
 	while i < g.nodes.len {
 		if depth[i] >= 0 {
 			match &g.nodes[i] {
 				IrNode::NOperation(id, operation, input, next) => {
-					// seq = depth + 1; non-final iff seq < plan_length.
-					if depth[i] + 1 < pl { out.push(_dup(operation)); }
+					// seq = depth + 1; non-final iff a later op exists (seq < plan_length) OR an authored
+					// fail is reachable from it (the fail unwinds it, so it must be compensable).
+					if depth[i] + 1 < pl or _reaches_fail(g, i) { out.push(_dup(operation)); }
 				},
 				default => {}
 			}

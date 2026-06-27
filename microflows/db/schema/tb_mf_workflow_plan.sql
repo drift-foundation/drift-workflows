@@ -19,9 +19,12 @@
 -- followed by a 32-byte SHA-256 over the canonical revision IR = 33 bytes fixed.
 -- (Distinct from the per-operation input_hash, which keys participant idempotency.)
 --
--- `plan_length` makes operation finality DURABLE: operation_request/settle and
--- terminal replay read it from storage, never from the registry. The last step is
--- seq == plan_length.
+-- `plan_length` bounds the durable plan: operation_request/settle and terminal replay
+-- read it from storage, never from the registry. The last RETURN-path op is at
+-- seq == plan_length. Finality is `seq == plan_length AND the caller's is_final`: the
+-- runner probes the graph with the just-settled result and may DOWNGRADE a plan_length
+-- op to non-final (when its result branches to an authored `fail`, so it is checkpointed
+-- and compensated, not completed) — but may never mark final before plan end.
 --
 -- Only PLAN workflows have a row here; legacy single-operation workflows do not.
 CREATE TABLE IF NOT EXISTS `tb_mf_workflow_plan` (
@@ -33,7 +36,9 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow_plan` (
 	-- Versioned content digest of the pinned plan: 0x01 scheme byte ‖
 	-- SHA-256(canonical IR) = 33 bytes. Immutable identity ("never substitute").
 	`content_hash` varbinary(33) NOT NULL,
-	-- Number of operations in the plan. The last step is seq == plan_length.
+	-- Operation count on every RETURN (completing) path; a `fail` path may be shorter. The completing
+	-- op lands at seq == plan_length, but an op at plan_length whose settled result branches to an
+	-- authored `fail` is CHECKPOINTED (downgraded by the runner), not completed.
 	`plan_length` int NOT NULL,
 	`created_at` datetime(6) NOT NULL,
 	PRIMARY KEY (`workflow_id`),

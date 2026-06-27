@@ -1,0 +1,8 @@
+args { flag: bool }
+op a { input: { x: string } result: { approved: bool } }
+op b { input: { x: string } }
+steps {
+  if flag { let l = a { "x": "y" } } else { let r = a { "x": "z" } } merge picked = result l.approved | result r.approved
+  if local picked { b { "x": "1" } } else { b { "x": "2" } }
+  b { "x": "fin" }
+}

@@ -1,0 +1,8 @@
+args { flag: bool }
+op a { input: { x: string } result: { approved: bool } }
+op b { input: { x: string } }
+steps {
+  if flag { let auth = a { "x": "y" } } else { b { "x": "z" } }
+  if result auth.approved { b { "x": "1" } } else { b { "x": "2" } }
+  b { "x": "fin" }
+}

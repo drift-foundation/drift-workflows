@@ -58,6 +58,7 @@ export {
 	OperationRequestRecord,
 	OperationRequestGetOutcome,
 	BeginReversalOutcome,
+	AuthoredFailOutcome,
 	ReverseRequestOutcome,
 	ReverseSettleOutcome,
 	ReverseBlockOutcome,
@@ -199,6 +200,19 @@ pub variant BeginReversalOutcome {
 	OperationNotFound,
 	OperationConflict,
 	OperationNotFailed(status: Int),
+	FenceLost,
+	NotFound,
+	EventTimeSkew(defer_until: String)
+}
+
+// Outcome of sp_mf_workflow_authored_fail (a .mf `fail` node). Mirrors BeginReversalOutcome but with
+// NO operation precondition: an authored fail follows a settled 200 result, so there is no failed op
+// to verify. The fail command identity (a stable id) is the durable trigger.
+pub variant AuthoredFailOutcome {
+	Reversing(top_seq: Int),
+	Failed(reason: String),                       // empty stack: terminal failed, compensated:false
+	AlreadyBegun(state: Int, terminal_reason: String),
+	TriggerMismatch,                              // a different fail id committed for this instance
 	FenceLost,
 	NotFound,
 	EventTimeSkew(defer_until: String)
@@ -481,6 +495,9 @@ pub interface MicroflowsHost {
 	fn begin_reversal(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
 	                  operation_seq: Int, operation_id: &Array<Byte>, event_ts: &String,
 	                  reason: &String) -> BeginReversalOutcome;
+	// Begin reversal on an AUTHORED fail (.mf `fail` node); fail_id is the stable command identity.
+	fn authored_fail(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                 fail_id: &Array<Byte>, event_ts: &String, reason: &String) -> AuthoredFailOutcome;
 	// The authoritative top active checkpoint (reverse cursor) + durable binding.
 	fn reverse_head(self: &Self, workflow_id: &Array<Byte>) -> ReverseHeadOutcome;
 	// Persist a checkpoint's reverse-invocation id + compensation binding before
@@ -1402,6 +1419,40 @@ implement MicroflowsHost for HostImpl {
 			if outcome == "not_found" { return BeginReversalOutcome::NotFound(); }
 			if outcome == "event_time_skew" { return BeginReversalOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "begin-no-defer-until")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:begin_reversal"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn authored_fail(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                     fail_id: &Array<Byte>, event_ts: &String, reason: &String) -> AuthoredFailOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("fail_id", fail_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		_validate_nonempty("event_ts", event_ts);
+		_validate_nonempty("reason", reason);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_bytes(_dup_bytes(fail_id)));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(rpc.arg_string(_dup(reason)));
+			val sp: String = "sp_mf_workflow_authored_fail";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "reversing" { return AuthoredFailOutcome::Reversing(_doc_int_req(&doc, &"top_seq", "afail-no-top-seq")); }
+			if outcome == "failed" { return AuthoredFailOutcome::Failed(_doc_str_opt(&doc, &"terminal_reason")); }
+			if outcome == "already_begun" { return AuthoredFailOutcome::AlreadyBegun(_doc_int_req(&doc, &"state", "afail-no-state"), _doc_str_opt(&doc, &"terminal_reason")); }
+			if outcome == "trigger_mismatch" { return AuthoredFailOutcome::TriggerMismatch(); }
+			if outcome == "fence_lost" { return AuthoredFailOutcome::FenceLost(); }
+			if outcome == "not_found" { return AuthoredFailOutcome::NotFound(); }
+			if outcome == "event_time_skew" { return AuthoredFailOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "afail-no-defer-until")); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:authored_fail"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
 			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));

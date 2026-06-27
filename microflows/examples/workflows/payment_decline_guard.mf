@@ -1,0 +1,42 @@
+// payment_decline_guard — authorize a payment, then BRANCH on the gateway's decision.
+//
+// Business intent: a payment gateway returns a 200 result that carries its DECISION (approved or
+// declined) — a 200 is a valid operation result, not a transport success signal. The WORKFLOW (not
+// the participant) decides what a decline means: here it AUTHORS a failure with `fail`, which unwinds
+// every settled compensable step in reverse and terminates as
+//   {"workflow":"failed","reason":"payment_declined","compensated":true}
+// On an approved authorization the workflow captures and completes normally.
+//
+// This shows the two Step-5 primitives:
+//   - a RESULT-CONDITIONAL branch:  `case result authorization.status { … }`
+//   - the authored fail terminal:    `fail "payment_declined"`
+// Business policy lives in the .mf; the participant just reports its result. Compensations are bound
+// in the deployment (authorize -> void_authorization), never here.
+//
+// Operation contracts (owned by PARTICIPANT services; routing/compensation in the deployment):
+//   authorize  payments  {order_id,customer_id,amount} -> {auth_id,status}  compensation: void_authorization
+//   capture    payments  {auth_id,amount}              -> {capture_id}      compensation: refund_capture
+//
+// `decision` carries the simulated gateway outcome into the authorize input so the example is
+// reproducible end-to-end; a real gateway derives `status` from the card network.
+
+args {
+  order_id:    string
+  customer_id: string
+  decision:    string
+  amount:      { value: int, currency: string }
+}
+
+op authorize { input: { order_id: string, customer_id: string, decision: string, amount: { value: int, currency: string } }  result: { auth_id: string, status: string } }
+op capture   { input: { auth_id: string, amount: { value: int, currency: string } }                                          result: { capture_id: string } }
+
+steps {
+  let authorization = authorize { order_id: arg order_id, customer_id: arg customer_id, decision: arg decision, amount: arg amount }
+  // The gateway's 200 result decides the path. A decline is a normal business outcome, not a
+  // transport error — the workflow turns it into a durable, compensated failure.
+  case result authorization.status {
+    "approved" { capture { auth_id: result authorization.auth_id, amount: arg amount } }
+    "declined" { fail "payment_declined" }
+    default    { fail "gateway_status_unknown" }
+  }
+}

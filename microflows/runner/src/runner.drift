@@ -1621,10 +1621,12 @@ fn _build_graph(plan: &Array<PlanStep>) -> ir.IrGraph {
 
 // The forward driver executes operation / let / if / case / return / loop nodes. NLoop is a FINITE
 // ARRAY EXPRESSION (map/filter/fold): a pure, non-suspending value step (no operation seq, no
-// durable write), so it does not affect the uniform per-path operation count. The driver requires
-// that UNIFORM count so the durable execution-position seq lands the final op at seq ==
-// plan_length (the storage layer's finality derivation). Returns plan_length (the uniform op
-// count); throws RunnerError on an op-unbalanced branch. Called at registry build so rejection is
+// durable write), so it does not affect the per-path operation count. plan_length = the op count on
+// every RETURN (completing) path — those must agree; a `fail` path may be SHORTER (a fail node is a
+// terminal sink). The completing op lands at seq == plan_length, but finality is confirmed per-drive
+// by probing the graph with the settled result (an op at plan_length whose result branches to `fail`
+// is checkpointed, not completed). Returns plan_length; throws RunnerError on a return-path imbalance
+// or a zero-op (fail-only/empty) graph. Called at registry build so rejection is
 // BEFORE any claim (invalid_config / revision_unavailable, no lease leak).
 fn _assert_executable(graph: &ir.IrGraph) -> Int {
 	match ir.op_depth(graph) {
@@ -1684,8 +1686,8 @@ fn _lp(s: &String) nothrow -> String {
 // from durable state, persist the request, dispatch via the GENERIC dispatcher, and
 // settle (intermediate or final). A definite rejection of ANY operation BEGINS
 // reversal and unwinds in the same drive: any prior compensable checkpoints are
-// compensated, and with none (e.g. the FIRST operation rejected) it reaches `reversed`
-// immediately — never `blocked_resolution` for a definite forward rejection.
+// compensated, and with none (e.g. the FIRST operation rejected) it reaches a terminal `failed`
+// (compensated:false) immediately — never `blocked_resolution` for a definite forward rejection.
 fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
                 workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int, content_hash_hex: &String, admission: &AdmissionState) -> Outcome {
 	val n = plan_length;
@@ -1731,11 +1733,23 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				console.eprintln("graph replay fault: " + m);
 				return _defer_dispatch(host, workflow_id, fencing_token, "graph_replay_fault", admission);
 			},
+			ir.StepOutcome::Fail(node_id, reason_json) => {
+				// Authored fail at replay -> reversal via the authored-fail durable transition. A non-string /
+				// overlong DYNAMIC reason maps to the fixed durable code "invalid_fail_reason" and STILL unwinds:
+				// the op whose result reached this fail is already checkpointed, so its side effects MUST be
+				// compensated, never stranded forward (and replay stays stable).
+				var reason: String = "invalid_fail_reason";
+				match _fail_reason_string(&reason_json) {
+					Optional::Some(rs) => { reason = move rs; },
+					Optional::None => {}
+				}
+				return _authored_fail_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, content_hash_hex, &node_id, move reason, admission);
+			},
 			ir.StepOutcome::NeedOperation(node_id, op, input) => {
 				// Durable seq = EXECUTION POSITION on the taken path (settled.len+1); ops settle
-				// contiguously (the DB enforces predecessor-settled). Build validation guarantees a
-				// UNIFORM op count per path (op_depth == plan_length), so the path's final op lands
-				// at seq == plan_length, matching the storage layer's finality derivation.
+				// contiguously (the DB enforces predecessor-settled). RETURN paths share op_depth ==
+				// plan_length; finality is NOT inferred from seq alone — it is probed below from the
+				// settled result (so an op at plan_length that then branches to `fail` is checkpointed).
 				val seq = settled.len + 1;
 				// Already durably settled (resume)? Feed its result back into replay — keyed by the
 				// node id advance chose for THIS execution position — and re-advance; never
@@ -1761,8 +1775,6 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 					mf.OperationResultOutcome::NotFound => {}
 				}
 				if prior_done { continue; }
-				var is_final = false;
-				if seq == n { is_final = true; }
 
 				// Recover the durable request for this seq, or derive it from the graph step's
 				// operation + canonical input. The durable request (if any) is authoritative — a
@@ -1837,6 +1849,22 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// prior drive) reconciles GET-first; a FRESH request is PUT-first.
 				match _dispatch_or_reconcile(recovered, &base_url, &op_name, &operation_id_hex, &input_json) {
 					DispatchResult::Done(r) => {
+						// Finality PROBE: replay with the just-returned result. Completed -> this op is final; Fail /
+						// another operation -> CHECKPOINT it (a later fail/op can unwind it). The settle SP ANDs this
+						// with seq == plan_length, so the runner can only DOWNGRADE finality, never upgrade it -> an op
+						// at plan_length whose result branches to `fail` is checkpointed, not prematurely completed.
+						var probe: Array<ir.OpResult> = [];
+						var pj = 0;
+						while pj < settled.len {
+							probe.push(ir.OpResult(node_id = _dup(&settled[pj].node_id), result_json = _dup(&settled[pj].result_json)));
+							pj = pj + 1;
+						}
+						probe.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&r)));
+						var is_final = false;
+						match ir.advance(graph, &args, &probe) {
+							ir.StepOutcome::Completed(_) => { is_final = true; },
+							default => {}
+						}
 						// Checkpoint payload = the operation INPUT (what compensation needs to
 						// reverse it); the result is recorded separately + fed back into replay.
 						val t_settle = _now(host);
@@ -1877,8 +1905,9 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						// A DEFINITE forward rejection ALWAYS begins reversal (the model: every
 						// definite forward failure reverses). begin_reversal unwinds any prior
 						// compensable checkpoints; with NONE (e.g. the first operation rejected) it
-						// reaches `reversed` immediately. Never `blocked_resolution` for a definite
-						// forward rejection — that is reserved for an UNCERTAIN forward outcome.
+						// reaches terminal `failed` (compensated:false) immediately. Never
+						// `blocked_resolution` for a definite forward rejection — that is reserved for
+						// an UNCERTAIN forward outcome.
 						return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, move reason, admission);
 					}
 				}
@@ -1896,6 +1925,62 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 // existing begin_reversal transition, then drive the unwind in the SAME claim. The
 // trigger operation is still status=requested (rejected, never settled), which
 // begin_reversal requires.
+fn _fail_reason_string(reason_json: &String) nothrow -> Optional<String> {
+	match json.parse_strict(reason_json) {
+		core.Result::Ok(n) => {
+			match n.as_string() {
+				Optional::Some(sv) => { if sv.byte_length() > 190 { return Optional<String>::None(); } return Optional<String>::Some(move sv); },
+				Optional::None => { return Optional<String>::None(); }
+			}
+		},
+		core.Result::Err(_) => { return Optional<String>::None(); }
+	}
+}
+
+// Authored fail (.mf `fail`) -> reversal via its OWN durable transition (NOT begin_reversal: follows a
+// settled 200). Fail command identity H(workflow_id, content_hash, "fail:"+node_id) is the durable
+// trigger. Reuses Step-4 terminal rendering: empty -> compensated:false, completed -> compensated:true,
+// blocked -> blocked.
+fn _authored_fail_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
+                         workflow_canon_hex: &String, fencing_token: Int, content_hash_hex: &String,
+                         fail_node_id: &String, reason: String, admission: &AdmissionState) -> Outcome {
+	val tagged = "fail:" + _dup(fail_node_id);
+	val fail_id = _operation_id_node(workflow_canon_hex, content_hash_hex, &tagged);
+	val t = _now(host);
+	match host.authored_fail(workflow_id, fencing_token, &fail_id, &t, &reason) {
+		mf.AuthoredFailOutcome::Reversing(_) => {
+			return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
+		},
+		mf.AuthoredFailOutcome::Failed(r) => {
+			return Outcome::TerminalFailure(reason = move r, compensated = false);
+		},
+		mf.AuthoredFailOutcome::AlreadyBegun(state, terminal_reason) => {
+			if state == STATE_REVERSING {
+				return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
+			}
+			if state == STATE_REVERSED {
+				return Outcome::TerminalFailure(reason = _dup(&terminal_reason), compensated = true);
+			}
+			if state == STATE_FAILED {
+				return Outcome::TerminalFailure(reason = _dup(&terminal_reason), compensated = false);
+			}
+			return Outcome::Blocked(reason = "");
+		},
+		mf.AuthoredFailOutcome::TriggerMismatch => {
+			return Outcome::Aborted(reason = "authored_fail_trigger_mismatch", code = 8);
+		},
+		mf.AuthoredFailOutcome::FenceLost => {
+			return Outcome::ReverseAborted(reason = "authored_fail_fence_lost", code = 7);
+		},
+		mf.AuthoredFailOutcome::EventTimeSkew(defer_until) => {
+			return _defer(host, workflow_id, fencing_token, &defer_until, "authored_fail_skew", admission);
+		},
+		mf.AuthoredFailOutcome::NotFound => {
+			return Outcome::Aborted(reason = "authored_fail_not_found", code = 8);
+		}
+	}
+}
+
 fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
                           workflow_canon_hex: &String, fencing_token: Int, operation_seq: Int,
                           operation_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Outcome {

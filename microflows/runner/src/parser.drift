@@ -2,12 +2,14 @@
 //
 // This module is a PURE FRONT END: it lowers `.mf` source text into the SAME config the manual IR
 // already executes and hashes — a flat `"plan"` (straight-line) or a control-flow `"graph"`
-// (if/case), plus `"argument_type"` + per-operation `input_type`/`result_type` contracts — reusing
+// (if/case/fail), plus `"argument_type"` + per-operation `input_type`/`result_type` contracts — reusing
 // the runner's existing `_build_plan` / `parse_graph` / `validate_graph` / `type_check_graph` /
-// `content_hash` machinery UNCHANGED. It adds NO IR nodes, NO execution paths, NO durable state, and
-// NO new runtime semantics — the acceptance criterion is LOWERING PARITY (a parser-emitted config
-// and the hand-authored manual config for the same workflow produce the identical content_hash and
-// the identical run outcome; branch/case selection comes from durable args).
+// `content_hash` machinery. Slices 1–2 added NO IR nodes and NO runtime semantics (pure LOWERING
+// PARITY — a parser-emitted config and the hand-authored manual config for the same workflow produce
+// the identical content_hash and run outcome). Step 5 extended if/case selectors to settled-RESULT /
+// LOCAL paths and added the authored `fail` terminal (an `NFail` node); those semantics live in the
+// IR — the parser still only LOWERS to config the IR executes + hashes. Branch/case selection comes
+// from a path selector over durable args, settled results, or locals.
 //
 // Parse failures are STRUCTURED diagnostics — `ParseError` carries a stable kebab-case `code` + a
 // source position (byte_offset/line/column) + optional expected/found (mirroring std.source's and
@@ -18,27 +20,34 @@
 //   args { name: <type>, ... }                  -> the closed-object argument_type
 //   op <name> { input: <type>  result: <type> } -> operation input/result CONTRACTS (both optional)
 //   steps { <stmt> ... }                         -> the workflow body (>=1 statement)
-//   # ... line comments to end of line
+//   // ... line comments to end of line; /* … */ block comments (C-family; there is NO `#` comment)
 //
 //   <stmt> := <op> <expr>                                   (an operation step; input is an expression)
 //           | let <ident> = <expr>                          (a pure-value binding -> NLet; slice 2b-i)
 //           | let <ident> = <op> <expr>                     (a NAMED op; <ident> aliases its RESULT; 2b-ii-a)
 //           | let <ident> = <loop>                          (a finite array expression -> NLoop; 2b-iii)
-//           | if <arg-path> { <stmt>* } [ else { <stmt>* } ] [ merge <ident> = <expr> '|' <expr> ]
-//           | case <arg-path> { (<json-value> { <stmt>* })* default { <stmt>* } } [ merge <ident> = <expr> ('|' <expr>)* ]
+//           | if <selector> { <stmt>* } [ else { <stmt>* } ] [ merge <ident> = <expr> '|' <expr> ]   (selector -> Bool)
+//           | case <selector> { (<json-value> { <stmt>* })* default { <stmt>* } } [ merge <ident> = <expr> ('|' <expr>)* ]
+//           | fail <reason>                                   (authored terminal failure -> reversal; NFail)
 //   <loop> := (map|filter) <expr> each <ident> <expr>       (the body is a pure expr over local <elem>)
 //           | fold <expr> from <expr> each <ident> <expr>   (the body is a pure expr over local <elem>/<as>)
 //   <expr> := { …json-object… }   (const object) | const <json-value> | arg <arg-path>
 //           | local <ident> ('.' <ident>)*    (a let/merge binding ref, optionally projected)
 //           | result <ident> ('.' <ident>)*   (a NAMED op's result, optionally projected; 2b-ii-a)
+//   <selector> := arg <arg-path> | result <ident>('.'<ident>)* | local <ident>('.'<ident>)* | <arg-path>
+//                 (a path expression; a BARE path is `arg`; arg/result/local are reserved selector heads)
+//   <reason> := <string-literal> | <string-typed selector>   (a machine-readable String reason code, <=190 bytes)
 //   <type> := int | float | bool | string | null
 //           | { <ident>: <type>, ... }   (object; trailing/optional commas tolerated)
 //           | [ <type> ]                  (array)
 //           | <type> ?                    (optional; postfix, repeatable)
 //
 // if/case lower to operation/if/case/return graph nodes with PRE-ORDER ids ("n0","n1",…); branch
-// bodies re-converge at the following statement (the join). Conditions/scrutinees are durable-arg
-// paths. The runtime's uniform-op-depth rule rejects op-imbalanced branches at the build gate.
+// bodies re-converge at the following statement (the join). Conditions/scrutinees are PATH SELECTORS
+// (arg/result/local; a result/local must DOMINATE the branch — settled/bound on every path in, or it
+// is rejected at build). The uniform-op-depth rule rejects op-imbalanced RETURN paths; a `fail` path
+// may be shorter, and an op at plan_length whose result branches to `fail` is checkpointed (not
+// completed) so compensation includes it.
 // `result <name>` resolves through a parser symbol table (result-name -> the named op's id) — node
 // ids are STABLE under source formatting; cross-branch/undominated refs are rejected by validate_graph.
 //
@@ -140,8 +149,9 @@ variant StmtKind {
 	KNamedOp(bind: String, op: String, input: json.JsonNode),                 // let <bind> = <op> <input> — a NAMED op (result aliased by <bind>); slice 2b-ii-a
 	KLet(name: String, value: json.JsonNode),                                 // let <name> = <expr> (a pure-value binding -> NLet)
 	KLoop(as_name: String, kind: String, source: json.JsonNode, elem: String, init: Optional<json.JsonNode>, body: json.JsonNode), // let <as> = map/filter/fold … -> NLoop; 2b-iii
-	KIf(cond: Array<String>, then_body: Array<Stmt>, else_body: Array<Stmt>, merge: Optional<MergeSpec>), // if … else … [merge …]
-	KCase(scrut: Array<String>, arms: Array<SCaseArm>, default_body: Array<Stmt>, merge: Optional<CaseMergeSpec>) // case … [merge …]
+	KIf(cond: json.JsonNode, then_body: Array<Stmt>, else_body: Array<Stmt>, merge: Optional<MergeSpec>), // if … else … [merge …] — cond = lowered selector expr
+	KCase(scrut: json.JsonNode, arms: Array<SCaseArm>, default_body: Array<Stmt>, merge: Optional<CaseMergeSpec>), // case … [merge …] — scrut = lowered selector expr
+	KFail(reason: json.JsonNode)                                              // authored fail — terminal; reason = lowered String expr
 }
 struct SCaseArm {
 	match_json: json.JsonNode,
@@ -500,6 +510,7 @@ fn _parse_stmt(c: &mut Cursor) -> Stmt {
 	if _str_eq(&kw, &"if") { return _parse_if(c, move id); }
 	if _str_eq(&kw, &"case") { return _parse_case(c, move id); }
 	if _str_eq(&kw, &"let") { return _parse_let(c, move id); }
+	if _str_eq(&kw, &"fail") { return _parse_fail(c, move id); }
 	// op_step: `kw` is the operation name, followed by an INPUT EXPRESSION (a `{…}` const object,
 	// or `const`/`arg`/`local` — slice 2b-i). The runtime requires the op input to be an object;
 	// a non-object expression is caught by the build-time type check, not here.
@@ -514,6 +525,31 @@ fn _parse_stmt(c: &mut Cursor) -> Stmt {
 //     parser-generated id, and <bind> aliases its RESULT (referenced downstream as `result <bind>`).
 // The disambiguator is the first RHS token: `{`/expr-keyword => expression; map/filter/fold => loop;
 // any other identifier => the operation name. (NLet/NLoop are pure value steps; a named op is durable.)
+// fail_stmt := 'fail' <reason> — a terminal node that durably enters reversal. <reason> is a STRING
+// expression: a string LITERAL (`fail "payment_declined"`) or a path selector (`fail result auth.status`,
+// `fail local code`). Non-string / >190 is rejected at type-check/lower (literal) or fails the drive
+// deterministically (dynamic). `fail` is a reserved statement keyword (never an operation name).
+fn _parse_fail(c: &mut Cursor, var id: String) -> Stmt {
+	val reason = _parse_fail_reason(c);
+	return Stmt(id = move id, kind = StmtKind::KFail(reason = move reason));
+}
+
+fn _parse_fail_reason(c: &mut Cursor) -> json.JsonNode {
+	_skip_ws(c);
+	if _eof(c) {
+		throw ParseError(code = "expected-fail-reason", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a fail reason (string literal or result/local path)");
+	}
+	val b = cast<Int>(c.src.byte_at(c.pos));
+	if b == 34 {   // '"' — a JSON string literal, lowered as a const expression
+		val v = _parse_json_value(c);
+		var o = json.new_object();
+		o.set("const", move v);
+		return o.to_node();
+	}
+	// otherwise a path selector (arg/result/local or bare arg-path), evaluated to a String at drive.
+	return _parse_selector(c);
+}
+
 fn _parse_let(c: &mut Cursor, var id: String) -> Stmt {
 	val bind = _read_ident(c);
 	_expect(c, 61, &"'='");   // '='
@@ -831,13 +867,58 @@ fn _local_expr(segs: &Array<String>) -> json.JsonNode {
 	return o.to_node();
 }
 
-// if_stmt := 'if' arg-path block ('else' block)? ('merge' ident '=' <expr> '|' <expr>)?
-// The condition is a durable-argument PATH (the runtime requires Bool). 'else' is optional. An
+// if_stmt := 'if' selector block ('else' block)? ('merge' ident '=' <expr> '|' <expr>)?
+// The condition is a PATH SELECTOR — arg/result/local (a bare path is arg); the runtime requires it
+// to be Bool. A branch-local result/local must be merge-carried to dominate the branch. 'else' is
+// optional. An
 // optional trailing `merge` clause makes the join an NMerge that binds <name> to the then-value (when
 // control came from the then-branch) or the else-value (else-branch). Merge requires BOTH branches
 // non-empty and ending in a single-exit statement (op/let), so each contributes one merge source.
+// A branch selector (if/case) is a PATH expression ONLY: `arg <path>` | `result <name>[.path]` |
+// `local <name>[.path]`, or a BARE <arg-path> (= arg, back-compat). NOT an object/array/const — a
+// branch tests a scalar path value (`if` -> Bool). Returns the lowered config expr; the IR's
+// _check_expr (dominance) then rejects a branch-local result/local that no merge carries.
+fn _parse_selector(c: &mut Cursor) -> json.JsonNode {
+	_skip_ws(c);
+	if _eof(c) or !_is_ident_start(c.src.byte_at(c.pos)) {
+		throw ParseError(code = "expected-selector", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a branch selector (arg/result/local path)");
+	}
+	val save = c.pos;
+	val kw = _read_ident(c);
+	// A selector KEYWORD (`arg`/`result`/`local`) applies ONLY when a path identifier follows it
+	// (`if result auth.status`). If the word stands alone or is dotted (`if result {`, `if result.x`),
+	// it is a durable-arg FIELD literally named result/local/arg — fall back to a bare arg-path. This
+	// keeps pre-Step-5 scripts using such field names parsing as before.
+	if _selector_path_follows(c) {
+		if _str_eq(&kw, &"result") {
+			val segs = _parse_arg_path(c);
+			match _res_lookup(c, &segs[0]) {
+				Optional::Some(rid) => { return _result_expr(&rid, &segs); },
+				Optional::None => { throw ParseError(code = "unknown-result-name", byte_offset = save, line = 0, column = 0, expected = "", found = "", message = "unknown result name '" + _dup(&segs[0]) + "' (declare it with `let <name> = <op> …` before referencing)"); }
+			}
+		}
+		if _str_eq(&kw, &"local") { val segs = _parse_arg_path(c); return _local_expr(&segs); }
+		if _str_eq(&kw, &"arg") { val path = _parse_arg_path(c); return _arg_expr(&path); }
+	}
+	// bare arg-path (back-compat): rewind and parse the whole dotted path as a durable-arg ref.
+	c.pos = save;
+	val path = _parse_arg_path(c);
+	return _arg_expr(&path);
+}
+
+// After a selector keyword, does a path identifier follow (so the keyword is a selector head, not an
+// arg field literally named arg/result/local)? Peeks past whitespace WITHOUT consuming.
+fn _selector_path_follows(c: &mut Cursor) nothrow -> Bool {
+	val save = c.pos;
+	_skip_ws(c);
+	var r = false;
+	if !_eof(c) and _is_ident_start(c.src.byte_at(c.pos)) { r = true; }
+	c.pos = save;
+	return r;
+}
+
 fn _parse_if(c: &mut Cursor, var id: String) -> Stmt {
-	val cond = _parse_arg_path(c);
+	val cond = _parse_selector(c);
 	val then_body = _parse_block(c);
 	var else_body: Array<Stmt> = [];
 	var has_else = false;
@@ -877,11 +958,11 @@ fn _require_merge_branch(c: &Cursor, body: &Array<Stmt>, which: &String) -> Void
 	if !single { throw ParseError(code = "merge-branch-not-single-exit", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "`merge` " + _dup(which) + "-branch must end in an operation or let (not nested if/case)"); }
 }
 
-// case_stmt := 'case' arg-path '{' (json-value block)* 'default' block '}' — the scrutinee is a
-// durable-argument PATH; each arm matches a constant JSON value; 'default' (required) is taken when
-// no arm matches.
+// case_stmt := 'case' selector '{' (json-value block)* 'default' block '}' — the scrutinee is a
+// PATH SELECTOR (arg/result/local; bare = arg) over a scalar value; each arm matches a constant JSON
+// value; 'default' (required) is taken when no arm matches.
 fn _parse_case(c: &mut Cursor, var id: String) -> Stmt {
-	val scrut = _parse_arg_path(c);
+	val scrut = _parse_selector(c);
 	_expect(c, 123, &"'{'");
 	var arms: Array<SCaseArm> = [];
 	var default_body: Array<Stmt> = [];
@@ -1094,10 +1175,39 @@ fn _build_plan_body(stmts: &Array<Stmt>) -> json.JsonNode {
 
 // Build a control-flow "graph" object `{entry, nodes}`. The return node gets the id AFTER all
 // statements (node_count); each statement node is emitted with edges to the next sibling / the join.
+// Does control reach the implicit exit (the unit `return`) after this statement list? False when the
+// last statement is `fail` (or an if/case whose every path is terminal) — then the trailing return
+// would be unreachable, which validate_graph rejects, so we omit it.
+fn _stmts_fall_through(stmts: &Array<Stmt>) nothrow -> Bool {
+	if stmts.len == 0 { return true; }
+	return _stmt_falls_through(&stmts[stmts.len - 1]);
+}
+
+fn _stmt_falls_through(s: &Stmt) nothrow -> Bool {
+	match &s.kind {
+		StmtKind::KFail(reason) => { return false; },
+		StmtKind::KIf(cond, then_body, else_body, merge) => {
+			match merge { Optional::Some(ms) => { return true; }, Optional::None => {} }
+			if else_body.len == 0 { return true; }   // no else: the false path falls through
+			return _stmts_fall_through(then_body) or _stmts_fall_through(else_body);
+		},
+		StmtKind::KCase(scrut, arms, default_body, merge) => {
+			match merge { Optional::Some(cms) => { return true; }, Optional::None => {} }
+			if _stmts_fall_through(default_body) { return true; }
+			var i = 0;
+			while i < arms.len { if _stmts_fall_through(&arms[i].body) { return true; } i = i + 1; }
+			return false;
+		},
+		default => { return true; }   // op / named-op / let / loop fall through
+	}
+}
+
 fn _build_graph_body(stmts: &Array<Stmt>, node_count: Int) -> json.JsonNode {
 	val return_id = "n" + fmt.format_int(node_count);
 	var nodes = json.new_array();
-	nodes.push(_return_node(&return_id));
+	// Only emit the implicit return when some path can reach it; an all-terminal body (ends in fail)
+	// leaves it unreachable.
+	if _stmts_fall_through(stmts) { nodes.push(_return_node(&return_id)); }
 	_lower_stmts(stmts, &return_id, &mut nodes);
 	var entry: String = _dup(&return_id);
 	if stmts.len > 0 { entry = _dup(&stmts[0].id); }
@@ -1131,6 +1241,11 @@ fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 		},
 		StmtKind::KLet(name, value) => {
 			out.push(_let_node(&stmt.id, name, value, succ));
+		},
+		StmtKind::KFail(reason) => {
+			// Terminal: NFail has no successor (`succ` ignored). Any statement after `fail` in the same
+			// block is unreachable; the graph reachability check surfaces it.
+			out.push(_fail_node(&stmt.id, reason));
 		},
 		StmtKind::KLoop(as_name, kind, source, elem, init, body) => {
 			out.push(_loop_node(&stmt.id, kind, source, elem, as_name, init, body, succ));
@@ -1302,21 +1417,29 @@ fn _loop_node(id: &String, kind: &String, source: &json.JsonNode, elem: &String,
 	return o.to_node();
 }
 
-fn _if_node(id: &String, cond: &Array<String>, then_id: &String, else_id: &String) -> json.JsonNode {
+fn _if_node(id: &String, cond_expr: &json.JsonNode, then_id: &String, else_id: &String) -> json.JsonNode {
 	var o = json.new_object();
 	o.set("kind", _jstr("if"));
 	o.set("id", _jstr(_dup(id)));
-	o.set("cond", _arg_expr(cond));
+	o.set("cond", cond_expr.clone_deep());
 	o.set("then", _jstr(_dup(then_id)));
 	o.set("else", _jstr(_dup(else_id)));
 	return o.to_node();
 }
 
-fn _case_node(id: &String, scrut: &Array<String>, arms_node: json.JsonNode, default_id: &String) -> json.JsonNode {
+fn _fail_node(id: &String, reason_expr: &json.JsonNode) -> json.JsonNode {
+	var o = json.new_object();
+	o.set("kind", _jstr("fail"));
+	o.set("id", _jstr(_dup(id)));
+	o.set("reason", reason_expr.clone_deep());
+	return o.to_node();
+}
+
+fn _case_node(id: &String, scrut_expr: &json.JsonNode, arms_node: json.JsonNode, default_id: &String) -> json.JsonNode {
 	var o = json.new_object();
 	o.set("kind", _jstr("case"));
 	o.set("id", _jstr(_dup(id)));
-	o.set("scrutinee", _arg_expr(scrut));
+	o.set("scrutinee", scrut_expr.clone_deep());
 	o.set("arms", move arms_node);
 	o.set("default", _jstr(_dup(default_id)));
 	return o.to_node();

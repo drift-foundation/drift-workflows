@@ -1,0 +1,7 @@
+{
+  "canonical": "G{2:n0;|I2:n0;a[4:flag;]2:n1;2:n2;;P2:n1;1:a;k9:{\"x\":\"y\"};2:n3;;P2:n2;1:a;k9:{\"x\":\"z\"};2:n3;;M2:n3;6:picked;[2:n1;r2:n1;[8:approved;]2:n2;r2:n2;[8:approved;]]2:n4;;I2:n4;l6:picked;[]2:n5;2:n6;;P2:n5;1:b;k9:{\"x\":\"1\"};2:n7;;P2:n6;1:b;k9:{\"x\":\"2\"};2:n7;;P2:n7;1:b;k11:{\"x\":\"fin\"};2:n8;;R2:n8;k4:null;;}",
+  "is_graph": true,
+  "status": "ok",
+  "type_check": "ok",
+  "validate": "ok"
+}

@@ -1,0 +1,7 @@
+{
+  "canonical": "G{2:n0;|P2:n0;9:authorize;o1;6:amount;12:a[6:amount;];2:n1;;C2:n1;r2:n0;[6:status;][10:\"approved\";2:n2;10:\"declined\";2:n3;]2:n4;;P2:n2;7:capture;k13:{\"token\":\"a\"};2:n5;;P2:n3;7:capture;k13:{\"token\":\"d\"};2:n5;;P2:n4;7:capture;k13:{\"token\":\"x\"};2:n5;;P2:n5;7:capture;k15:{\"token\":\"fin\"};2:n6;;R2:n6;k4:null;;}",
+  "is_graph": true,
+  "status": "ok",
+  "type_check": "ok",
+  "validate": "ok"
+}

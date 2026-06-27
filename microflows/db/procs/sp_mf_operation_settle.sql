@@ -122,8 +122,12 @@ proc:BEGIN
 				'plan_length', CAST(v_plan_length AS SIGNED)) AS result;
 			LEAVE proc;
 		END IF;
-		IF (arg_is_final = 1) <> (arg_operation_seq = v_plan_length) THEN
-			SELECT JSON_OBJECT('outcome', 'plan_violation', 'reason', 'finality',
+		-- Finality: the runner may DOWNGRADE a plan-length op to non-final (a settled result that
+		-- branches to an authored `fail` must be CHECKPOINTED so compensation can include it, not
+		-- completed), but may NEVER mark final before plan end. So reject only an EARLY final claim
+		-- (is_final at seq < plan_length); is_final=0 at plan_length is the legitimate fail-path case.
+		IF arg_is_final = 1 AND arg_operation_seq <> v_plan_length THEN
+			SELECT JSON_OBJECT('outcome', 'plan_violation', 'reason', 'finality_early',
 				'plan_length', CAST(v_plan_length AS SIGNED)) AS result;
 			LEAVE proc;
 		END IF;

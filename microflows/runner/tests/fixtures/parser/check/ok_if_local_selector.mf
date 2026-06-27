@@ -1,0 +1,7 @@
+args { flag: bool }
+op reserve { input: { reservation: string } }
+steps {
+  let ok = arg flag
+  if local ok { reserve { "reservation": "A" } } else { reserve { "reservation": "B" } }
+  reserve { "reservation": "fin" }
+}

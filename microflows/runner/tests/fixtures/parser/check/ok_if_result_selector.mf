@@ -1,0 +1,8 @@
+args { amount: int }
+op authorize { input: { amount: int } result: { approved: bool } }
+op capture { input: { token: string } }
+steps {
+  let auth = authorize { "amount": arg amount }
+  if result auth.approved { capture { "token": "yes" } } else { capture { "token": "no" } }
+  capture { "token": "fin" }
+}
