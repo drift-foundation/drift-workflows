@@ -674,7 +674,7 @@ def main():
         code, body = run_runner(rcf.name, WF_REVERSE_STACK)
         ex_d = _exec_count(base) - ex0
         cps = _mdb(f"SELECT seq, reversal_state, LOWER(HEX(reverse_invocation_id)), "
-                   f"JSON_UNQUOTE(JSON_EXTRACT(reverse_input_json,'$.reservation')) "
+                   f"JSON_UNQUOTE(JSON_EXTRACT(reverse_input_json,'$.forward.input.reservation')) "
                    f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{WF_REVERSE_STACK}') "
                    f"ORDER BY seq")
         # settle order, read from the audit trail: seq 2 settled (descend, next_seq 1)
@@ -1263,7 +1263,7 @@ def main():
         ex_d = _exec_count(base) - ex0
         wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{WF_REVERSE_BRANCH}')")
         ck = _mdb(f"SELECT reversal_state, reverse_operation_name, "
-                  f"JSON_UNQUOTE(JSON_EXTRACT(reverse_input_json,'$.reservation')) "
+                  f"JSON_UNQUOTE(JSON_EXTRACT(reverse_input_json,'$.forward.input.reservation')) "
                   f"FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{WF_REVERSE_BRANCH}') ORDER BY seq")
         check("graph_branch_reversal_restart_unwinds_from_checkpoint",
               code == 0 and body.get("workflow") == "reversed" and ex_d == 1
@@ -1669,10 +1669,12 @@ def main():
               and _exec_count(base) - ex0 == 0,
               (code_s, body_s, code_r, body_r))
 
-        # C10f. COMPENSATION contract: a compensation receives the forward op's checkpoint payload
-        # (its input), so the reverse op's declared input type must match the forward op's. reserve
-        # declares input {reservation:string} but its compensation `release` declares {reservation:int}
-        # -> rejected at build (invalid_config), no dispatch.
+        # C10f. COMPENSATION input typing (envelope model, E): a compensation receives the standard
+        # forward-context envelope {forward:{input,result,...}}, NOT the forward op's input directly. So a
+        # comp's declared input type is no longer cross-linked to the forward op's — the old build-time
+        # comp-input==forward-input check is GONE (structural/opaque v1). reserve {reservation:string} with
+        # its compensation `release` declaring {reservation:int} is now ACCEPTED at build (release is never
+        # invoked in this straight-line plan); the workflow dispatches reserve and completes.
         RESV_IN_INT = {"type": "object", "fields": [{"name": "reservation", "type": T_INT}]}
         tg_comp = {"entry": "n0", "nodes": [
             {"kind": "operation", "id": "n0", "operation": "reserve", "input": {"const": {"reservation": "cmp"}}, "next": "n1"},
@@ -1682,9 +1684,9 @@ def main():
         ex0 = _exec_count(base)
         code, body = run_runner(typed_graph_cfg(tg_comp, {"reserve": {"input_type": RESV_IN}, "release": {"input_type": RESV_IN_INT}}, argument_type=TY_AT),
                                 wcc, arguments=json.dumps({"flag": True}))
-        check("typed_compensation_input_mismatch_rejected",
-              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config"
-              and _exec_count(base) - ex0 == 0, (code, body))
+        check("typed_compensation_input_type_not_cross_checked",
+              code == 0 and body.get("workflow") == "completed"
+              and _exec_count(base) - ex0 == 1, (code, body))
 
         # C10g. A COMPENSATION op's type contract is part of the content_hash: submit a pending
         # workflow whose `release` declares input {reservation:string}; resume where release's input

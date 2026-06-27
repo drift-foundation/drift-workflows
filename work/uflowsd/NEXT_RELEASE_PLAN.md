@@ -122,9 +122,11 @@ first; the rest inherit it.
   **only** input-conflict (409) detection, not identity. `forward.operation_id` is **correlation**.
 - **Inconsistency:** `operation_result` not `Succeeded` for a reverse checkpoint → defer/block/abort **loudly**;
   never synthesize an envelope.
-- **Code:** `_run_reversal` (assemble + the extra `operation_result` read); `_assert_compensation_types`
-  (runner.drift:1586 — flip from "comp input == forward input" to "comp input == envelope"); participant
-  compensation handlers migrate by `schema_version`.
+- **Code (LANDED — see Sequencing/step 3):** `_run_reversal` (assemble from durable state + strict-parse the
+  forward input/result, distinct `reverse_forward_{input,result}_invalid` defers, never synthesize);
+  `_assert_compensation_types` **no-op'd** (structural/opaque v1 — comp input type no longer cross-linked to
+  the forward; types still fold into `content_hash`); participant compensation handlers migrate by
+  `schema_version`.
 
 ## F. #4 — `failed`/`compensated` terminal  ✅ (bundles with D)
 
@@ -215,7 +217,19 @@ Targets: `microflows/doc/uflowsd_participant_contract.md` (wire contract), `micr
   (domain-tagged, length-prefixed, "node ≤ once" invariant documented); pinned `content_hash` threaded into
   `_run_forward`; fresh dispatch + prior-settled use node-address, terminal-replay reads the stored id, legacy
   single-op kept seq-based (forward-only). Reverse id deferred to step 3 (rides the reversal/envelope edits).
-- **NEXT: step 3** — compensation forward-context envelope (E).
+- **STEP 3 LANDED + gate-green (165/165):** compensation forward-context envelope (E). Runner: `_run_reversal`
+  Pending arm assembles `{forward:{workflow_id,operation,operation_id,schema_version,input,result}}` from
+  durable state (`operation_request_get` for id/sv, `operation_result` for result; missing → defer
+  `reverse_forward_request_missing`/`_result_missing`); `_comp_envelope` helper; `_assert_compensation_types`
+  no-op'd (structural/opaque v1, comp type no longer cross-linked to forward). Stub: `_effective_input` unwraps
+  the envelope (forward.input for comps, body for forward ops) — all validate/execute/fault reads use it; the
+  409 item-meta hash still covers the full body. Tests: repurposed `typed_compensation_input_type_not_cross_checked`,
+  fixed 2 `reverse_input_json` JSON paths → `$.forward.input.reservation`, added 13 forward `tb_mf_operation`
+  seed rows for the reverse fixtures (checkpoints lacked them). Docs: contract §4.6/§4.7, user guide §9.
+  Reverse id kept seq-based (out of scope). NOTE: the microflows COMPONENT e2e (`live_reversal_test.drift`,
+  proc-seeded) is a separate gate — verify it if it drives reversal through the runner.
+- **NEXT: step 4** — `failed`/`compensated` durable terminal (F), then step 5 (`fail` + result-branching),
+  step 6 (200-no-result harden). The payment-decline + compensation EXAMPLE (doc H) lands with step 5 (`fail`).
 - **Clear-cut, ready on greenlight:** C items 1–2 (doc + reference stub); G once direction is picked.
 - **One unit (keystone):** F (`failed` terminal) + D (authored-fail) share the durable reason/state — implement
   together; C item 3 (runner harden) lands behind them.

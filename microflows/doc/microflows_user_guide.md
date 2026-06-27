@@ -464,8 +464,11 @@ GET  /microflows/v1/operations/{operation}/{operation_id}
 Your participant owns the **business effect, its idempotency, and its durable
 outcome replay**; Microflows owns coordination. Each forward operation that can
 be compensated needs a **reverse operation** (same protocol, its own stable id)
-that accepts the forward op's input as *its* input — declare it as the
-`compensation` in the deployment config. Build a participant against the
+whose request body is the **forward-context envelope** `{forward:{operation_id,
+input, result, …}}` — it can undo by the forward op's input *or* its
+result-produced ids, and must be idempotent/safe-to-no-op when the result shows
+no external effect (see `uflowsd_participant_contract.md` §4.6). Declare it as
+the `compensation` in the deployment config. Build a participant against the
 conformance reference (`microflows/participant-stub/`) and its black-box harness
 before integrating.
 

@@ -263,10 +263,15 @@ implement StubApp {
 	fn handle_put_input(self: &StubApp, op: &String, op_id: &String, input: &json.JsonNode) throws -> rest.Response {
 		// Validate operation name + input schema BEFORE touching Singular: an
 		// invalid request must return 400 and create NO operation.
+		// A COMPENSATION arrives as the standard forward-context envelope {forward:{input,result,...}};
+		// `eff` is the effective business payload the op logic operates on — the forward INPUT for a
+		// compensation (a comp may also read forward.result), or the body itself for a forward op. The
+		// item-meta hash below still covers the WHOLE received body (envelope) for the 409 conflict check.
+		val eff = _effective_input(input);
 		if !_supported_op(op) {
 			return _json(400, _envelope_error("unknown-operation"));
 		}
-		if !_validate_input(op, input) {
+		if !_validate_input(op, &eff) {
 			return _json(400, _envelope_error("invalid-input"));
 		}
 		// Out-of-band armed fault for THIS operation name (test control; keeps business payloads clean).
@@ -274,7 +279,7 @@ implement StubApp {
 		// Fault injection: DEFINITE rejection (non-retryable 400) BEFORE Singular, so
 		// no operation is created and the body never runs. Exercises the runner's
 		// reverse-path block (and the forward block).
-		if _fault_reject(input) or armed == "reject" {
+		if _fault_reject(&eff) or armed == "reject" {
 			return _json(400, _envelope_error("fault-rejected"));
 		}
 		// Out-of-band SOFT pending: 202 BEFORE Singular, so NO operation is created and the coordinator
@@ -302,12 +307,12 @@ implement StubApp {
 				// path yet, so this exercises only the runner's INITIAL pending
 				// deferral, not end-to-end pending recovery. No body execution, so
 				// exec_count is unchanged.
-				if _fault_respond_pending(input) {
+				if _fault_respond_pending(&eff) {
 					return _json(202, _envelope_pending());
 				}
 				// First submit: run the operation body EXACTLY ONCE.
 				val _prev = self.exec_count.fetch_add(1, conc.MemoryOrder::SeqCst());
-				val result_json = _execute_op(op, input);
+				val result_json = _execute_op(op, &eff);
 				val settle_time = time.now_utc();
 				match self.gateway.get().complete(&lease, &settle_time, &result_json) {
 					singular.SettleOutcome::Settled(tr) => {
@@ -316,7 +321,7 @@ implement StubApp {
 						// timeout makes the client experience a genuine uncertain
 						// outcome (timeout) — a real lost ack, not a discarded
 						// known response. The operation still executed exactly once.
-						val delay_ms = _fault_delay_after_commit_ms(input);
+						val delay_ms = _fault_delay_after_commit_ms(&eff);
 						if delay_ms > 0 {
 							val _ = conc.sleep(conc.Duration(millis = delay_ms));
 						}
@@ -579,6 +584,21 @@ fn _id_result(id_field: String, prefix: String, src: String) nothrow -> String {
 }
 
 // ===== Generic operation dispatch (by operation name) =====
+
+// A compensation request body is the standard forward-context envelope {forward:{input,result,...}}; the
+// effective business payload is forward.input (a comp may also consult forward.result). A forward op's
+// body IS its input. Detect the envelope structurally — the coordinator sends it only for compensations.
+fn _effective_input(input: &json.JsonNode) nothrow -> json.JsonNode {
+	match input.get(&"forward") {
+		Optional::Some(fwd) => {
+			match fwd.get(&"input") {
+				Optional::Some(fi) => { return fi.clone_deep(); },
+				Optional::None => { return input.clone_deep(); }
+			}
+		},
+		Optional::None => { return input.clone_deep(); }
+	}
+}
 
 fn _supported_op(op: &String) nothrow -> Bool {
 	match _biz_spec(op) { Optional::Some(_) => { return true; }, Optional::None => {} }

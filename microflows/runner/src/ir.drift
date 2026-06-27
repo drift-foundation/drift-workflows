@@ -1723,9 +1723,10 @@ fn _contains_int(xs: &Array<Int>, x: Int) nothrow -> Bool {
 //
 // An operation's CONTRACT in terms of IR value types: its declared input + result types (each
 // OPTIONAL — an undeclared type means that op is UNCHECKED, so existing untyped configs keep their
-// current behavior). A compensation receives the forward op's checkpoint payload (its input), so the
-// reverse op's declared input type is validated against the forward op's by the runner
-// (`_assert_compensation_types`) and folded into the content_hash — not modeled in OpContract.
+// current behavior). A compensation receives the standard forward-context envelope
+// {forward:{input,result,…}}, NOT the forward op's input directly, so its declared input type is NOT
+// cross-checked against the forward op's (structural/opaque v1); type tags still fold into the
+// content_hash — not modeled in OpContract.
 pub struct OpContract {
 	pub name: String,
 	pub input_type: Optional<IrType>,

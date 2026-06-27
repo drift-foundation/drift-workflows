@@ -252,11 +252,45 @@ There is **no `200 {"state":"failed"}`** — that shape mixes "valid terminal re
   (idempotency conflict). For these the coordinator decides reject/reverse/block.
 - **No record / infra:** `404` (no durable record) / `5xx` / transport — uflowsd reconciles/retries.
 
-### 4.6 Conformance reference
+### 4.6 Compensation requests — the forward-context envelope
+
+A compensation is dispatched like any other operation (PUT/GET under **its own** stable `operation_id`), but
+its request **body is always the standard forward-context envelope** — never the forward op's input directly:
+
+```json
+{
+  "forward": {
+    "workflow_id":     "…",
+    "operation":       "authorize-payment",
+    "operation_id":    "…",
+    "schema_version":  1,
+    "input":           { … },
+    "result":          { … }
+  }
+}
+```
+
+- `forward.input` is the forward op's input (its checkpoint payload); `forward.result` is the forward op's
+  **settled result** — so a compensation can undo by a *result-produced* id (e.g. `auth_id`, `reservation_id`)
+  it could not see under an input-only body.
+- **`forward.operation_id` is correlation** — it identifies the forward operation being undone. It is **not**
+  the compensation's idempotency key: that is the compensation request's **own URL `{operation_id}`** (a
+  distinct, stable id). Don't conflate them — keying durable state on the wrong one undoes the wrong thing.
+- The coordinator assembles the envelope from **durable state** (the stored forward request + result), not by
+  re-derivation; `forward.input`/`forward.result` are passed through opaquely (structural v1 — the coordinator
+  validates the envelope *shape*, not the semantic types of the wrapped objects).
+- **A compensation MUST be idempotent and safe to no-op when `forward.result` shows no external effect
+  happened** — voiding a *declined* authorization, for example, is a no-op (there is nothing to void). Because
+  authored `fail` unwinds **every** settled compensable checkpoint, a compensation may be invoked for an
+  operation whose business result was negative; it must tolerate that.
+
+The compensation's response follows the same rules as any operation (§4.1/§4.2/§4.5): a `200` is result-only.
+
+### 4.7 Conformance reference
 
 `microflows/participant-stub/src/app.drift` is the **runnable conformance participant** the integration gate
-drives — Singular-backed, implements all of the above (idempotent PUT, history-based 409, 404 on unknown).
-Read it as the executable spec.
+drives — Singular-backed, implements all of the above (idempotent PUT, history-based 409, 404 on unknown, and
+the forward-context envelope unwrap for compensations). Read it as the executable spec.
 
 ---
 

@@ -1027,10 +1027,10 @@ three-way inference — `Known` (assignability-checked), `Unknown` (only from an
 untyped op result — the backward-compatible escape hatch), and `Imprecise` (a
 const whose precise type is undetermined — never permissive: a static const is
 checked by value, an imprecise const reaching a typed input through a
-non-static path is rejected). A **compensation** receives the forward op's
-checkpoint payload, so its declared input type must match the forward op's; type
-tags fold into `content_hash`. An untyped config behaves exactly as before
-(every contract is optional).
+non-static path is rejected). A **compensation** receives the standard
+forward-context envelope (`{forward:{input,result,…}}`), NOT the forward op's input directly, so its
+declared input type is **not** cross-checked against the forward op's (structural/opaque v1); type tags
+still fold into `content_hash`. An untyped config behaves exactly as before (every contract is optional).
 
 ### 12.5 Execution & reversal (unchanged in mechanism, generalized to the graph)
 
