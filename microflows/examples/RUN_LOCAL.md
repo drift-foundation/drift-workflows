@@ -3,6 +3,10 @@
 Drive the example workflows through `uflowsd` over HTTP. This is the same path your
 application will use: submit a named script, resume pending work, inspect outcomes, redeploy by reload.
 
+> Implementing a **participant service** or authoring a **manifest**? See
+> [`../doc/uflowsd_participant_contract.md`](../doc/uflowsd_participant_contract.md) — the as-built,
+> conformance-pinned contract (manifest schema, `.mf` op naming, the participant PUT/GET wire protocol).
+
 ## 0. Prerequisites
 
 - The certified toolchain (driftc 0.33.53 / abi 18) and a built `uflowsd` binary

@@ -401,6 +401,11 @@ feasibility slice. The parser and this filesystem manifest registry follow
 
 ## 5. Remote participant protocol (proposed minimum)
 
+> **SUPERSEDED for implementers.** This section is the original *proposal* and has drifted from as-built
+> (e.g. `201`, `deferred`, and `indeterminate` here are not built). If you are implementing a participant or
+> authoring a manifest, follow **`uflowsd_participant_contract.md`** (as-built, conformance-pinned) instead;
+> it lists the divergences in its Appendix A. This section is kept for design rationale.
+
 The contract specifies **observable behavior**, not an implementation.
 Participants MAY satisfy it with Singular (preferred inside PushCoin) or any
 other mechanism. **Microflows must not require Singular at the wire level.**

@@ -4,6 +4,8 @@ See `README.md` (charter). Toolchain: staged driftc 0.33.61 / ABI 18 (app-cert c
 
 ## Status: DONE on staged 0.33.61 — app cert chain closed end-to-end (author → trust check → deploy → verify-app). Held for one clean commit; cert cut waits on the orchestrator promoting 0.33.61 + binding real evidence.
 
+**Next-release design plan (#2–#5 from the pushcoin bundle + `.mf` comment switch): see [NEXT_RELEASE_PLAN.md](NEXT_RELEASE_PLAN.md)** — converged design + verified-in-code facts + implementation map. Open forks: #2 durable reconcile budget (schema?), D result-branching/`fail` feature, #5 op-id (awaiting user).
+
 Naming settled: engine = `microflows` library (name unchanged); CLI = `microflows-runner` (one-shot driver
 + DB-free tooling: `--parse-check`/`--lower-source`/`--emit-content-hash`); daemon = **`uflowsd`** (renamed
 from `microflows-service`, the `microflows.runner::service_main` HTTP front-door).
