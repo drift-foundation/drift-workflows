@@ -67,7 +67,7 @@ first; the rest inherit it.
 ## C. #3 — `200` = result-only  ✅ (items 1–2 clear-cut; item 3 behind #4)
 
 - **Decision:** `200` ⇒ `result` **mandatory**; `state` advisory (coordinator consumes status + `result` only
-  — `_try_extract_result` runner.drift:2459). Business outcomes (approved/declined/indeterminate) live in
+  — `_classify_result` runner.drift:2057). Business outcomes (approved/declined/indeterminate) live in
   `result`. Non-200: `400`=app rejection, `409`=input conflict, `202`=pending, `404`/`5xx`/transport=infra →
   reconcile/bounded-block.
   1. **Doc** → `200` result-only (partly landed via §0/§4; finalize §4.5 envelope wording, remove the
@@ -75,10 +75,10 @@ first; the rest inherit it.
   2. **Reference stub** → `participant-stub/app.drift` `_envelope_terminal` Failed arm (:824) stops rendering
      `200 {state:failed}`; map to a `result` object so 200 stays result-only. Safe: the stub never produces a
      Failed terminal (only `complete()`s with success); no test depends on it. **CLEAR-CUT.**
-  3. **Runner harden** → `200`-without-`result` becomes a clear rejection (`participant_protocol_missing_result`),
-     not a thrown runner fatal. Sites: `_classify_dispatch`:1988, `_reconcile`:2047 (PUT), `_get_op`:2012 (GET,
-     currently → `TransportFailed`). Remove the now-unused throwing `_extract_result` (:2451). **HOLD behind
-     #4** so it lands as `failed`, not `reversed`.
+  3. **Runner harden — LANDED (Step 6).** `200`-without-`result` is now a non-throwing definite rejection
+     (`participant_protocol_missing_result`) via `_classify_200_body` in the PUT + reconcile-PUT paths and a
+     `GetOutcome::Rejected` in the GET path; it flows through the Step-4 terminal `failed` surface (exit 3,
+     compensated per the prior stack). The throwing `_extract_result` was removed.
 
 ## D. #3 decline-unwind + authored `fail` (the big feature)  ✅ shape
 
@@ -253,7 +253,14 @@ Targets: `microflows/doc/uflowsd_participant_contract.md` (wire contract), `micr
     `seq==plan_length AND caller is_final` (downgrade-only) -> an op at plan_length whose result branches to
     `fail` is checkpointed, not completed. `op_depth`/`nonfinal_operations`/`validate_graph` made fail-aware.
   - **Example + docs:** `payment_decline_guard.mf` + manifest; user-guide selectors/`fail`; RUN_LOCAL 4b.
-- **NEXT: step 6** (200-no-result harden) — last of the bundle.
+- **STEP 6 LANDED + gate-green** (last of the bundle): a participant `200` with a MISSING or NON-OBJECT
+  `result` is a non-throwing definite rejection — `participant_protocol_missing_result` /
+  `participant_protocol_invalid_result` — via `_classify_result` (object/invalid/missing) in `_classify_200_body`
+  (PUT + reconcile-PUT) and `GetOutcome::Rejected` (GET) → Step-4 terminal `failed` (exit 3; compensated per
+  the prior stack). The throwing `_extract_result`/`_try_extract_result` are gone (a non-object result would
+  otherwise reach Done, then throw in operation_settle = runner-fatal). Tests: first-op→compensated:false (replay
+  stable), later-op→compensated:true (prior checkpoint unwound), GET-reconcile (lost-ack)→same, valid 200
+  still completes. **All of #2–#5 + the `.mf` comment switch + this harden are now landed.**
 - **Clear-cut, ready on greenlight:** C items 1–2 (doc + reference stub); G once direction is picked.
 - **One unit (keystone):** F (`failed` terminal) + D (authored-fail) share the durable reason/state — implement
   together; C item 3 (runner harden) lands behind them.
@@ -263,7 +270,7 @@ Targets: `microflows/doc/uflowsd_participant_contract.md` (wire contract), `micr
 ## Verified-in-code facts (so they aren't re-litigated)
 
 - Hyphenated op idents work everywhere; comment lexer is C-family `//` + `/* */` (no `#`) after step 1 (parser.drift:221, 234-248).
-- Coordinator consumes status + `result`; `state` read nowhere (runner.drift:2459).
+- Coordinator consumes status + `result`; `state` read nowhere (`_classify_result` runner.drift:2057; missing/non-object result -> `_classify_200_body`:2074).
 - `if`/`case` select on a path selector — arg/result/local (LANDED Step 5; was arg-paths only).
 - Reversal can reach forward input (`operation_request_get`/`reverse_head`) AND result
   (`operation_result(seq)` host.drift:471) — envelope is wiring, no schema migration.

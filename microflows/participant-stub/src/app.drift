@@ -314,7 +314,18 @@ implement StubApp {
 				}
 				// First submit: run the operation body EXACTLY ONCE.
 				val _prev = self.exec_count.fetch_add(1, conc.MemoryOrder::SeqCst());
-				val result_json = _execute_op(op, &eff);
+				// _fault.omit_result: the participant "succeeds" (200) but produces NO `result` — a
+				// protocol violation. Store a sentinel so BOTH the PUT response and a later GET reconcile
+				// envelope omit `result`, exercising the runner's participant_protocol_missing_result path.
+				// Protocol-violation faults store a sentinel so BOTH the PUT response and a later GET
+				// reconcile envelope reproduce it: omit_result -> no `result`; invalid_result -> a
+				// non-object `result`. Otherwise run the op body normally.
+				var result_json: String = "";
+				if _fault_omit_result(&eff) { result_json = "{\"__omit_result__\":true}"; }
+				else {
+					if _fault_invalid_result(&eff) { result_json = "{\"__invalid_result__\":true}"; }
+					else { result_json = _execute_op(op, &eff); }
+				}
 				val settle_time = time.now_utc();
 				match self.gateway.get().complete(&lease, &settle_time, &result_json) {
 					singular.SettleOutcome::Settled(tr) => {
@@ -452,6 +463,34 @@ fn _fault_respond_pending(input: &json.JsonNode) nothrow -> Bool {
 	match input.get(&"_fault") {
 		Optional::Some(f) => {
 			match f.get(&"respond_pending") {
+				Optional::Some(n) => { match n.as_bool() { Optional::Some(v) => { return v; }, Optional::None => { return false; } } },
+				Optional::None => { return false; }
+			}
+		},
+		Optional::None => { return false; }
+	}
+}
+
+// Fault: the participant COMMITS and returns a conformant-looking 200 but WITHOUT `result` (a
+// protocol violation) — exercises the runner's participant_protocol_missing_result path.
+fn _fault_omit_result(input: &json.JsonNode) nothrow -> Bool {
+	match input.get(&"_fault") {
+		Optional::Some(f) => {
+			match f.get(&"omit_result") {
+				Optional::Some(n) => { match n.as_bool() { Optional::Some(v) => { return v; }, Optional::None => { return false; } } },
+				Optional::None => { return false; }
+			}
+		},
+		Optional::None => { return false; }
+	}
+}
+
+// Fault: the participant commits + returns a 200 whose `result` is present but NOT an object (e.g. a
+// scalar) — a protocol violation -> participant_protocol_invalid_result.
+fn _fault_invalid_result(input: &json.JsonNode) nothrow -> Bool {
+	match input.get(&"_fault") {
+		Optional::Some(f) => {
+			match f.get(&"invalid_result") {
 				Optional::Some(n) => { match n.as_bool() { Optional::Some(v) => { return v; }, Optional::None => { return false; } } },
 				Optional::None => { return false; }
 			}
@@ -874,7 +913,16 @@ fn _envelope_terminal(tr: &singular.TerminalResult) -> String {
 			var o = json.new_object();
 			o.set("state", json.JsonNode::String("succeeded"));
 			match json.parse(payload) {
-				core.Result::Ok(n) => { o.set("result", n); },
+				core.Result::Ok(n) => {
+					// sentinel objects -> emit a conformant-looking 200 with a missing (omit) or non-object
+					// (invalid) `result`, reproduced identically on PUT and GET reconcile.
+					var omit = false;
+					var invalid = false;
+					match n.get(&"__omit_result__") { Optional::Some(_) => { omit = true; }, Optional::None => {} }
+					match n.get(&"__invalid_result__") { Optional::Some(_) => { invalid = true; }, Optional::None => {} }
+					if invalid { o.set("result", json.JsonNode::String("not-an-object")); }
+					else { if !omit { o.set("result", n); } }
+				},
 				core.Result::Err(_) => {}
 			}
 			return json.encode(o.to_node());

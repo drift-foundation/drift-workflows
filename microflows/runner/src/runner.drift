@@ -2045,6 +2045,40 @@ pub variant GetOutcome {
 //   Rejected -> definite protocol rejection; abort
 pub variant DispatchResult { Done(result: String), Pending, Rejected(reason: String) }
 
+// A 200 carries a MANDATORY `result` (§3 / contract §4.5). A 200 body without one is a definite
+// PROTOCOL failure, not a runner fatal: classify it as a Rejected outcome so it flows through the
+// same definite-rejection -> reversal -> Step-4 terminal `failed` surface (never throws/crashes).
+// A 200 success body MUST carry an OBJECT `result` (contract §4: {"result": {…}}); operation_settle
+// likewise requires object result JSON. So classify a missing OR non-object result as a definite
+// protocol failure here — never reaching Done, where settle would later throw on non-object JSON
+// (the runner-fatal path Step 6 closes).
+variant ResultClass { Object(json: String), Invalid, Missing }
+
+fn _classify_result(envelope: &String) nothrow -> ResultClass {
+	match json.parse(envelope) {
+		core.Result::Ok(n) => {
+			match n.get(&"result") {
+				Optional::Some(r) => {
+					match r.as_object() {
+						Optional::Some(_) => { return ResultClass::Object(json.encode_compact(r)); },
+						Optional::None => { return ResultClass::Invalid(); }
+					}
+				},
+				Optional::None => { return ResultClass::Missing(); }
+			}
+		},
+		core.Result::Err(_) => { return ResultClass::Invalid(); }
+	}
+}
+
+fn _classify_200_body(body: &String) nothrow -> DispatchResult {
+	match _classify_result(body) {
+		ResultClass::Object(r) => { return DispatchResult::Done(move r); },
+		ResultClass::Invalid => { return DispatchResult::Rejected("participant_protocol_invalid_result"); },
+		ResultClass::Missing => { return DispatchResult::Rejected("participant_protocol_missing_result"); }
+	}
+}
+
 fn _op_url(base: &String, operation_name: &String, operation_id_hex: &String) nothrow -> String {
 	return _dup(base) + "/microflows/v1/operations/" + _dup(operation_name) + "/" + _dup(operation_id_hex);
 }
@@ -2076,7 +2110,7 @@ fn _dispatch_put(base: &String, operation_name: &String, operation_id_hex: &Stri
 fn _classify_dispatch(base: &String, operation_name: &String, operation_id_hex: &String, input_json: &String) -> DispatchResult {
 	match _dispatch_put(base, operation_name, operation_id_hex, input_json, PUT_IO_TIMEOUT_MS) {
 		PutOutcome::Responded(status, body) => {
-			if status == 200 { return DispatchResult::Done(_extract_result(&body)); }
+			if status == 200 { return _classify_200_body(&body); }
 			if status == 202 { return DispatchResult::Pending(); }
 			if status == 400 { return DispatchResult::Rejected("participant_invalid_request"); }
 			if status == 409 { return DispatchResult::Rejected("participant_identity_conflict"); }
@@ -2103,9 +2137,12 @@ fn _get_op(base: &String, operation_name: &String, operation_id_hex: &String) no
 			if resp.status == 200 {
 				match client.response_body_string(&resp) {
 					core.Result::Ok(body) => {
-						match _try_extract_result(&body) {
-							Optional::Some(r) => { return GetOutcome::Terminal(move r); },
-							Optional::None => { return GetOutcome::TransportFailed(); }
+						// 200 with a missing/non-object `result` is a definite PROTOCOL failure (the participant
+						// claims success but produced no usable result), not transport uncertainty -> Rejected.
+						match _classify_result(&body) {
+							ResultClass::Object(r) => { return GetOutcome::Terminal(move r); },
+							ResultClass::Invalid => { return GetOutcome::Rejected("participant_protocol_invalid_result"); },
+							ResultClass::Missing => { return GetOutcome::Rejected("participant_protocol_missing_result"); }
 						}
 					},
 					core.Result::Err(_) => { return GetOutcome::TransportFailed(); }
@@ -2135,7 +2172,7 @@ fn _reconcile(base: &String, operation_name: &String, operation_id_hex: &String,
 			// 404-reconcile: participant has no record -> resubmit identical PUT.
 			match _dispatch_put(base, operation_name, operation_id_hex, input_json, RECONCILE_IO_TIMEOUT_MS) {
 				PutOutcome::Responded(status, body) => {
-					if status == 200 { return DispatchResult::Done(_extract_result(&body)); }
+					if status == 200 { return _classify_200_body(&body); }
 					if status == 202 { return DispatchResult::Pending(); }
 					if status == 400 { return DispatchResult::Rejected("participant_invalid_request"); }
 					if status == 409 { return DispatchResult::Rejected("participant_identity_conflict"); }
@@ -2596,25 +2633,6 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 }
 
 // Extract the participant envelope's `result` object as compact JSON text.
-fn _extract_result(envelope: &String) -> String {
-	match _try_extract_result(envelope) {
-		Optional::Some(r) => { return move r; },
-		Optional::None => { throw RunnerError(message = "participant response has no result"); }
-	}
-}
-
-fn _try_extract_result(envelope: &String) nothrow -> Optional<String> {
-	match json.parse(envelope) {
-		core.Result::Ok(n) => {
-			match n.get(&"result") {
-				Optional::Some(r) => { return Optional<String>::Some(json.encode_compact(r)); },
-				Optional::None => { return Optional<String>::None(); }
-			}
-		},
-		core.Result::Err(_) => { return Optional<String>::None(); }
-	}
-}
-
 // ===== time =====
 
 fn _clock(host: &mf.MicroflowsHost) -> mf.ClockReading {

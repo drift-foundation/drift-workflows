@@ -178,7 +178,7 @@ uflowsd issues a PUT to start an operation. It classifies your response **by sta
 
 | Your status | uflowsd interprets as | Required body |
 |---|---|---|
-| **200** | terminal success — settles the operation | `{"state":"succeeded","result":{…}}` — **`result` is mandatory** (uflowsd extracts it; a 200 without `result` is a hard error, `runner.drift:2459`). `state` is not read on 200. |
+| **200** | terminal success — settles the operation | `{"state":"succeeded","result":{…}}` — **`result` is mandatory** (uflowsd extracts it). A 200 with a **missing** `result` (`participant_protocol_missing_result`) or a **non-object** `result` (`participant_protocol_invalid_result`) is a definite PROTOCOL failure: the workflow terminates `failed` (exit 3) — never a runner crash. `state` is not read on 200. |
 | **202** | accepted / in-progress — uflowsd defers and re-polls | `{"state":"pending"}` (body not parsed) |
 | **400** | definite rejection — abort, no retry | `{"state":"error","reason":"…"}` (reason informational) |
 | **409** | identity/input conflict — abort, no retry | `{"reason":"input-conflict"}` (see §4.3) |
@@ -339,7 +339,7 @@ as-built:
 |---|---|
 | PUT `201/200` for success | **only 200** is success; 201 falls through to reconcile (`runner.drift:1988`) |
 | GET `deferred {state,not_before}` and `indeterminate` states | **not built** — GET is classified by status only; 202→pending, no `not_before`, no `indeterminate` path |
-| GET 200 `{state, result\|error}` with `state` significant | uflowsd reads **`result`** only on a 200; `state` is not consulted there (`runner.drift:2459`) |
+| GET 200 `{state, result\|error}` with `state` significant | uflowsd reads **`result`** only on a 200; `state` is not consulted there (`_classify_result` runner.drift:2057; a missing/non-object `result` -> `_classify_200_body`:2074 = `participant_protocol_missing_result` / `participant_protocol_invalid_result`) |
 | body state vocabulary `pending\|succeeded\|failed\|indeterminate` | `indeterminate` is not produced or consumed; uncertainty is handled by reconcile/defer, not a wire state |
 
 When §5 is reconciled to as-built, this table should shrink to empty.

@@ -3096,6 +3096,83 @@ def main():
               foc != 0 and "must execute at least one operation" in fo_err,
               (foc, fo_err))
 
+        # ===== Step 6: a 200 WITHOUT mandatory `result` is a definite PROTOCOL failure, never a runner
+        # fatal — it flows through the Step-4 terminal `failed` surface as
+        # participant_protocol_missing_result. =====
+        # (1) FIRST op 200-without-result -> failed, compensated:false; replay stable (no re-dispatch).
+        mr1 = plan_cfg([{"operation": "reserve", "input": {"reservation": "no1", "_fault": {"omit_result": True}}}])
+        wf_mr1 = _wf_id()
+        code, body = run_runner(mr1, wf_mr1, arguments="{}")
+        st1 = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wf_mr1}')")
+        ex1 = _exec_count(base)
+        rcode, rbody = run_runner(mr1, wf_mr1)
+        check("missing_result_first_op_failed",
+              code == 3 and body.get("workflow") == "failed"
+              and body.get("reason") == "participant_protocol_missing_result"
+              and body.get("compensated") == False and st1 == [["7", "2"]]
+              and rcode == 3 and rbody.get("workflow") == "failed" and rbody.get("compensated") == False
+              and _exec_count(base) == ex1,
+              (code, body, st1, rcode, rbody))
+
+        # (2) LATER op 200-without-result after a prior checkpoint -> failed, compensated:true; the prior
+        # reserve checkpoint is unwound via release.
+        mr2 = plan_cfg([
+            {"operation": "reserve", "input": {"reservation": "ok1"}},
+            {"operation": "reserve", "input": {"reservation": "no2", "_fault": {"omit_result": True}}},
+        ])
+        wf_mr2 = _wf_id()
+        code, body = run_runner(mr2, wf_mr2, arguments="{}")
+        st2 = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wf_mr2}')")
+        cks2 = _mdb(f"SELECT reversal_state, reverse_operation_name FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wf_mr2}')")
+        check("missing_result_later_op_unwinds",
+              code == 3 and body.get("workflow") == "failed"
+              and body.get("reason") == "participant_protocol_missing_result"
+              and body.get("compensated") == True and st2 == [["5", "2"]] and cks2 == [["2", "release"]],
+              (code, body, st2, cks2))
+
+        # (3) GET-RECONCILE path: PUT lost-ack (delay > 3s PUT timeout) -> reconcile GET returns 200
+        # without `result` -> SAME classification, NO runner fatal.
+        mr3 = plan_cfg([{"operation": "reserve", "input": {"reservation": "no3", "_fault": {"omit_result": True, "delay_after_commit_ms": 5000}}}])
+        wf_mr3 = _wf_id()
+        code, body = run_runner(mr3, wf_mr3, arguments="{}")
+        st3 = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wf_mr3}')")
+        check("missing_result_get_reconcile_failed",
+              code == 3 and body.get("workflow") == "failed"
+              and body.get("reason") == "participant_protocol_missing_result"
+              and body.get("compensated") == False and st3 == [["7", "2"]],
+              (code, body, st3))
+
+        # (4) a VALID 200 result still completes/settles as before (no regression).
+        mr4 = plan_cfg([{"operation": "reserve", "input": {"reservation": "good"}}])
+        wf_mr4 = _wf_id()
+        code, body = run_runner(mr4, wf_mr4, arguments="{}")
+        check("missing_result_valid_still_completes",
+              code == 0 and body.get("workflow") == "completed" and body.get("result") == {"reserved": "good"},
+              (code, body))
+
+        # (5) PUT 200 with a NON-OBJECT `result` -> participant_protocol_invalid_result. (Pre-fix this
+        # would classify as Done, then operation_settle would throw on non-object JSON = runner-fatal.)
+        iv1 = plan_cfg([{"operation": "reserve", "input": {"reservation": "iv1", "_fault": {"invalid_result": True}}}])
+        wf_iv1 = _wf_id()
+        code, body = run_runner(iv1, wf_iv1, arguments="{}")
+        sti1 = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wf_iv1}')")
+        check("invalid_result_first_op_failed",
+              code == 3 and body.get("workflow") == "failed"
+              and body.get("reason") == "participant_protocol_invalid_result"
+              and body.get("compensated") == False and sti1 == [["7", "2"]],
+              (code, body, sti1))
+
+        # (6) GET-RECONCILE 200 with a NON-OBJECT result (lost ack) -> same classification, no runner fatal.
+        iv2 = plan_cfg([{"operation": "reserve", "input": {"reservation": "iv2", "_fault": {"invalid_result": True, "delay_after_commit_ms": 5000}}}])
+        wf_iv2 = _wf_id()
+        code, body = run_runner(iv2, wf_iv2, arguments="{}")
+        sti2 = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wf_iv2}')")
+        check("invalid_result_get_reconcile_failed",
+              code == 3 and body.get("workflow") == "failed"
+              and body.get("reason") == "participant_protocol_invalid_result"
+              and body.get("compensated") == False and sti2 == [["7", "2"]],
+              (code, body, sti2))
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the LOCAL authoritative
         # result; no dependency on the participant. MUST be the LAST stub-using block — it terminates
         # the stub and never restarts it, so any check after this would hit a dead participant.
@@ -3143,7 +3220,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 174
+    EXPECTED_CHECKS = 180
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")
