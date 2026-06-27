@@ -1,0 +1,5 @@
+/* a block comment
+   spanning multiple lines */
+args { x: int }
+op echo { input: { x: int } result: { y: int } }
+steps { echo /* inline block */ { x: arg x } }

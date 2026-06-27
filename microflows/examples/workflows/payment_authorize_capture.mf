@@ -1,17 +1,17 @@
-# payment_authorize_capture — authorize a card payment, capture it, record it in the ledger.
-#
-# Business intent: take money for an order in the standard two-phase card flow (authorize then
-# capture), then write an immutable ledger entry. If any later step fails, Microflows automatically
-# unwinds the completed steps in reverse order using the compensations declared in the deployment.
-#
-# Operation contracts (each operation is owned by a PARTICIPANT service; see deployment.json):
-#   authorize     payments   {order_id,customer_id,amount} -> {auth_id}        compensation: void_authorization
-#   capture       payments   {auth_id,amount}              -> {capture_id}     compensation: refund_capture
-#   record_ledger payments   {reference}                   -> {ledger_entry_id}   (terminal; no compensation)
-#
-# Compensation behavior: if `capture` fails after `authorize` succeeded, `void_authorization` runs.
-# If `record_ledger` fails after both, `refund_capture` then `void_authorization` run in that order.
-# Compensations are bound in the deployment, never here — this file only expresses the business flow.
+// payment_authorize_capture — authorize a card payment, capture it, record it in the ledger.
+//
+// Business intent: take money for an order in the standard two-phase card flow (authorize then
+// capture), then write an immutable ledger entry. If any later step fails, Microflows automatically
+// unwinds the completed steps in reverse order using the compensations declared in the deployment.
+//
+// Operation contracts (each operation is owned by a PARTICIPANT service; see deployment.json):
+//   authorize     payments   {order_id,customer_id,amount} -> {auth_id}        compensation: void_authorization
+//   capture       payments   {auth_id,amount}              -> {capture_id}     compensation: refund_capture
+//   record_ledger payments   {reference}                   -> {ledger_entry_id}   (terminal; no compensation)
+//
+// Compensation behavior: if `capture` fails after `authorize` succeeded, `void_authorization` runs.
+// If `record_ledger` fails after both, `refund_capture` then `void_authorization` run in that order.
+// Compensations are bound in the deployment, never here — this file only expresses the business flow.
 
 args {
   order_id:    string

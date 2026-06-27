@@ -1,15 +1,15 @@
-# account_adjustment_with_rollback — adjust an account balance, then post it to the journal.
-#
-# Business intent: mutate an account balance (a compensable adjustment), then post the matching
-# double-entry journal record. If posting the journal fails, the balance adjustment is rolled back so
-# the account is never left mutated without a journal entry.
-#
-# Operation contracts:
-#   adjust_balance  accounts  {account_id,amount,memo} -> {adjustment_id}   compensation: reverse_adjustment
-#   post_journal    accounts  {adjustment_id,ledger}   -> {journal_id}       (terminal)
-#
-# Compensation behavior: if `post_journal` fails after `adjust_balance` succeeded,
-# `reverse_adjustment` runs against the durable adjustment checkpoint, undoing the balance change.
+// account_adjustment_with_rollback — adjust an account balance, then post it to the journal.
+//
+// Business intent: mutate an account balance (a compensable adjustment), then post the matching
+// double-entry journal record. If posting the journal fails, the balance adjustment is rolled back so
+// the account is never left mutated without a journal entry.
+//
+// Operation contracts:
+//   adjust_balance  accounts  {account_id,amount,memo} -> {adjustment_id}   compensation: reverse_adjustment
+//   post_journal    accounts  {adjustment_id,ledger}   -> {journal_id}       (terminal)
+//
+// Compensation behavior: if `post_journal` fails after `adjust_balance` succeeded,
+// `reverse_adjustment` runs against the durable adjustment checkpoint, undoing the balance change.
 
 args {
   account_id: string

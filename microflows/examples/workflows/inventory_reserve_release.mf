@@ -1,14 +1,14 @@
-# inventory_reserve_release — reserve stock for an order, then commit the shipment.
-#
-# Business intent: hold inventory (a compensable reservation), then commit it to a shipment. If the
-# shipment commit fails, the reservation is automatically released so stock is never stranded.
-#
-# Operation contracts:
-#   reserve_inventory  inventory  {order_id,sku,quantity} -> {reservation_id}   compensation: release_inventory
-#   commit_shipment    inventory  {reservation_id}        -> {shipment_id}       (terminal)
-#
-# Compensation behavior: if `commit_shipment` fails after `reserve_inventory` succeeded,
-# `release_inventory` runs against the durable reservation checkpoint, freeing the held stock.
+// inventory_reserve_release — reserve stock for an order, then commit the shipment.
+//
+// Business intent: hold inventory (a compensable reservation), then commit it to a shipment. If the
+// shipment commit fails, the reservation is automatically released so stock is never stranded.
+//
+// Operation contracts:
+//   reserve_inventory  inventory  {order_id,sku,quantity} -> {reservation_id}   compensation: release_inventory
+//   commit_shipment    inventory  {reservation_id}        -> {shipment_id}       (terminal)
+//
+// Compensation behavior: if `commit_shipment` fails after `reserve_inventory` succeeded,
+// `release_inventory` runs against the durable reservation checkpoint, freeing the held stock.
 
 args {
   order_id: string

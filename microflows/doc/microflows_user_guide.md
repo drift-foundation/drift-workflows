@@ -52,13 +52,13 @@ A one-call workflow: reserve an order, complete.
 `reserve.mf`:
 
 ```mf
-# Arguments: the durable instance input, validated + frozen at submission.
+// Arguments: the durable instance input, validated + frozen at submission.
 args {
   request: { reservation: string }
 }
 
-# The remote operation this workflow calls. Both contracts are optional but
-# recommended — they are type-checked before any dispatch.
+// The remote operation this workflow calls. Both contracts are optional but
+// recommended — they are type-checked before any dispatch.
 op reserve {
   input:  { reservation: string }
   result: { reserved: string }
@@ -114,7 +114,7 @@ the *durable* arguments, never the command line).
 ## 3. The `.mf` language
 
 A file has three top-level blocks: `args`, zero or more `op`, and `steps`.
-`#` starts a comment to end-of-line.
+`//` starts a line comment; `/* … */` is a block comment (C-family). `#` is **not** a comment.
 
 ### 3.1 Types
 
@@ -183,17 +183,17 @@ result <name>[.path]  a named operation's result      -> { "result": {…} }
 ### 3.5 Statements
 
 ```mf
-reserve arg request                 # operation step = a remote call
-let total = sum arg lines           # NAMED op: `total` aliases its result
-confirm result total                # ... feed that result downstream
+reserve arg request                 // operation step = a remote call
+let total = sum arg lines           // NAMED op: `total` aliases its result
+confirm result total                // ... feed that result downstream
 
-let p = arg request.reservation     # pure value binding (no remote call)
+let p = arg request.reservation     // pure value binding (no remote call)
 reserve local p
 
-if flag { … } else { … }            # branch on a Bool durable argument
-case tier { "gold" { … } "silver" { … } default { … } }   # N-way branch
+if flag { … } else { … }            // branch on a Bool durable argument
+case tier { "gold" { … } "silver" { … } default { … } }   // N-way branch
 
-let ids = map arg items each it local it.id      # finite PURE transform
+let ids = map arg items each it local it.id      // finite PURE transform
 let kept = filter arg items each it local it.ok
 let last = fold arg items from const null each it local it
 ```
@@ -226,7 +226,7 @@ steps {
   if express {
     expedite result r
   } else {
-    # nothing -> flows straight to the join
+    // nothing -> flows straight to the join
   }
 }
 ```
@@ -244,7 +244,7 @@ steps {
     let b = reserve { "reservation": "std-pool" }
   }
   merge picked = result a | result b
-  confirm local picked          # confirm gets the taken branch's reservation
+  confirm local picked          // confirm gets the taken branch's reservation
 }
 ```
 
@@ -254,7 +254,7 @@ The `case` form lists one value per arm **plus the default, last**:
 ### 4.3 Finite transforms
 
 ```mf
-# Project a field from each element (pure; no remote calls in the body).
+// Project a field from each element (pure; no remote calls in the body).
 let ids = map arg orders each o local o.id
 ```
 
@@ -293,7 +293,7 @@ op record_ledger {
 }
 
 steps {
-  # The authorize input is BUILT inline from two argument subtrees (expression construction).
+  // The authorize input is BUILT inline from two argument subtrees (expression construction).
   let auth     = authorize { customer: arg customer.id, amount: arg order.amount }
   let captured = capture { auth_id: result auth.auth_id }
   record_ledger { capture_id: result captured.capture_id }

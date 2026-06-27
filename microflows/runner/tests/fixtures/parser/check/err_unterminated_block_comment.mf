@@ -1,0 +1,3 @@
+args { x: int }
+/* this block comment never closes
+steps { echo { x: arg x } }

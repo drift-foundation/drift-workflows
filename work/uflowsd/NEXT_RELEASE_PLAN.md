@@ -184,10 +184,38 @@ first; the rest inherit it.
 
 ---
 
+## H. User-facing doc update (lands WITH its implementing code, not ahead)
+
+Each doc section becomes true only when its code lands; gate accordingly. Content to cover:
+- `200 {"result":…}` = a **valid business result**, not necessarily business *success* (ships step 1).
+- Business policy lives in `.mf`: branch on results, then `fail` to trigger compensation (with D).
+- `fail` unwinds **all** settled compensable checkpoints, including the op whose result caused it (with D).
+- Compensation input is always the standard forward-context envelope `{forward:{workflow_id, operation,
+  operation_id, schema_version, input, result}}` (with E).
+- Compensation must be idempotent + safe-no-op when the forward result says no external effect happened (with E).
+- `forward.operation_id` = correlation; the compensation request **URL** operation_id = the compensation's
+  idempotency key (with E).
+- Transport-neutral terminal outcomes: `{"workflow":"completed","result":…}` /
+  `{"workflow":"failed","reason":…,"compensated":true|false}` / `{"workflow":"blocked","reason":…}`;
+  **`reversed` is not a client-facing success status** (with F).
+- Dynamic side-effect fan-out is unsupported inside loops; one bulk operation now, child workflows later (G).
+
+Targets: `microflows/doc/uflowsd_participant_contract.md` (wire contract), `microflows/doc/microflows_user_guide.md`
+(author examples), `microflows/examples/` (a concrete **payment-decline + compensation** example).
+
 ## Sequencing & dependencies
 
-- **Landed (doc-only, uncommitted on `76032d4`):** contract doc (`uflowsd_participant_contract.md`, incl. §0 +
-  comment note + §5.1 table reframe), design `§5` superseded banner, `RUN_LOCAL.md` see-also pointer.
+- **STEP 1 LANDED + gate-green (165/165), uncommitted on `76032d4`:** A (`.mf` comments `#`→`//`+`/* */`:
+  lexer + 8 `.mf` migrated + 4 new fixtures, 81/81; inline `#` fixtures in test.py×2 + parser_test.drift×2
+  migrated — caught by the gate) and C items 1–2 (`200` result-only: stub Failed arm + contract doc §4.5).
+  Build note: certified deps now live under `~/opt/drift/certified/current/pkgs` (not `libs`).
+- **Landed (doc-only):** contract doc (`uflowsd_participant_contract.md`, incl. §0 + comment note + §4.5
+  result-only + §5.1 table reframe), design `§5` superseded banner, `RUN_LOCAL.md` see-also pointer.
+- **STEP 2 LANDED + gate-green (165/165):** node-address forward operation IDs (G) — `_operation_id_node`
+  (domain-tagged, length-prefixed, "node ≤ once" invariant documented); pinned `content_hash` threaded into
+  `_run_forward`; fresh dispatch + prior-settled use node-address, terminal-replay reads the stored id, legacy
+  single-op kept seq-based (forward-only). Reverse id deferred to step 3 (rides the reversal/envelope edits).
+- **NEXT: step 3** — compensation forward-context envelope (E).
 - **Clear-cut, ready on greenlight:** C items 1–2 (doc + reference stub); G once direction is picked.
 - **One unit (keystone):** F (`failed` terminal) + D (authored-fail) share the durable reason/state — implement
   together; C item 3 (runner harden) lands behind them.
@@ -196,7 +224,7 @@ first; the rest inherit it.
 
 ## Verified-in-code facts (so they aren't re-litigated)
 
-- Hyphenated op idents work everywhere; the comment lexer skips `#` only (parser.drift:226, 234-248).
+- Hyphenated op idents work everywhere; comment lexer is C-family `//` + `/* */` (no `#`) after step 1 (parser.drift:221, 234-248).
 - Coordinator consumes status + `result`; `state` read nowhere (runner.drift:2459).
 - `if`/`case` select on arg-paths only today (parser.drift:24-33).
 - Reversal can reach forward input (`operation_request_get`/`reverse_head`) AND result

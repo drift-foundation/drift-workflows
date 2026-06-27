@@ -822,12 +822,20 @@ fn _envelope_terminal(tr: &singular.TerminalResult) -> String {
 			return json.encode(o.to_node());
 		},
 		singular.TerminalResult::Failed(payload) => {
+			// Contract (uflowsd_participant_contract.md §4): a 200 is RESULT-ONLY — terminal failure is
+			// NOT signaled as `200 {state:failed}` (the coordinator consumes `result`, not `state`). A
+			// business-negative outcome is a result. This stub never produces a Failed terminal (it only
+			// complete()s with a success result), so this arm is defensive; it stays 200-conformant by
+			// carrying the failure under `result`.
 			var o = json.new_object();
-			o.set("state", json.JsonNode::String("failed"));
+			o.set("state", json.JsonNode::String("succeeded"));
+			var r = json.new_object();
+			r.set("status", json.JsonNode::String("failed"));
 			match json.parse(payload) {
-				core.Result::Ok(n) => { o.set("error", n); },
+				core.Result::Ok(n) => { r.set("error", n); },
 				core.Result::Err(_) => {}
 			}
+			o.set("result", r.to_node());
 			return json.encode(o.to_node());
 		}
 	}

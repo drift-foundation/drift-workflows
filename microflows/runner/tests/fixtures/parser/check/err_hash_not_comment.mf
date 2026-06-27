@@ -1,0 +1,3 @@
+args { x: int }
+# `#` is no longer a comment — this must be a parse error
+steps { echo { x: arg x } }

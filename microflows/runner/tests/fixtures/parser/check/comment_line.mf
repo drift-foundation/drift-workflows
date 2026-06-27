@@ -1,0 +1,7 @@
+// leading line comment (C-family; `#` is no longer a comment)
+args { x: int }
+op echo { input: { x: int } result: { y: int } }  // trailing line comment
+steps {
+  // a comment inside the steps block
+  echo { x: arg x }
+}

@@ -18,7 +18,7 @@ error TestError { message: String }
 
 // A straight-line workflow: declared arguments, two operation contracts, two constant-input steps.
 fn _src() nothrow -> String {
-	return "# straight-line refund (slice 1)\n"
+	return "// straight-line refund (slice 1)\n"
 		+ "args { amount: int, currency: string }\n"
 		+ "op reserve { input: { reservation: string } result: { reserved: string } }\n"
 		+ "op release { input: { reservation: string } }\n"
@@ -365,7 +365,7 @@ fn scenario() -> Int {
 	// RESULT REFS ARE STABLE under source formatting AND the result-var name: reformatting + renaming
 	// `r` -> `myRes` yields the IDENTICAL graph identity (the result name is a parser alias, never in
 	// the IR — `result r` resolves to the stable pre-order node id).
-	val res2 = "# reformatted\nop reserve { input: { reservation: string }  result: { reserved: string } }\n"
+	val res2 = "// reformatted\nop reserve { input: { reservation: string }  result: { reserved: string } }\n"
 		+ "op confirm { input: { reserved: string } }\n"
 		+ "steps {\n  let   myRes  =  reserve  {  \"reservation\":  \"A\"  }\n  confirm   result   myRes\n}\n";
 	val res2_body = _parse_body(&res2);

@@ -121,8 +121,8 @@ Each `scripts[]` entry names a `.mf` source file. At startup uflowsd **lowers (c
 declared `.mf`** over the shared deployment, builds its plan, and type/contract-checks it. App teams author
 **`.mf` + manifest** — not a plan.
 
-**Comments:** `.mf` uses `#` to end-of-line **only** — there is no `//` form. A `//` is not skipped and
-surfaces as a misleading `expected an identifier` parse error at the `/`. (Lexer: `parser.drift:226`.)
+**Comments:** `.mf` uses C-family comments — `//` to end-of-line and `/* … */` (non-nesting) block
+comments. There is **no `#` comment**; a `#` is a parse error. (Lexer: `parser.drift:221`.)
 
 Operation naming, which matters for the wire path:
 
@@ -143,7 +143,7 @@ Operation naming, which matters for the wire path:
 Minimal one-op script:
 
 ```
-# proto_check.mf
+// proto_check.mf
 args { payload: string }
 op microflow-proto-check { input: { payload: string } result: { state: string } }
 steps {
@@ -228,14 +228,29 @@ tracked future Singular enhancement — not required for Phase 3.)
 - uflowsd **never** intentionally re-PUTs a *changed* body for one `operation_id` — inputs are pinned per
   (workflow instance, pinned script revision, call site).
 
-### 4.5 Envelope vocabulary (real)
+### 4.5 Envelope vocabulary
 
-- **Succeeded:** `{"state":"succeeded","result":{…}}` — `result` mandatory, returned on a 200 (PUT or GET).
+**A `200` means the participant produced a *valid operation result* — not necessarily business *success*.**
+`result` is mandatory on a `200`; the coordinator extracts it and never reads `state` there (`state` is
+advisory, per §0). **Business-negative outcomes are results, not failures** — approved, declined, and
+indeterminate are all `200` with the outcome inside `result`:
+
+```json
+{"state":"succeeded","result":{"status":"approved","auth_id":"a1"}}
+{"state":"succeeded","result":{"status":"declined","reason":"insufficient_funds"}}
+{"state":"succeeded","result":{"kind":"indeterminate","processor_ref":"p9","requires_manual_review":true}}
+```
+
+There is **no `200 {"state":"failed"}`** — that shape mixes "valid terminal result" (HTTP) with "no result"
+(body) and the coordinator falls through the crack. A participant does **not** signal failure via `200`.
+
+- **Result (200):** `{"result":{…}}` — mandatory `result`; `state` advisory. Business policy (decline → stop,
+  indeterminate → park, or unwind prior steps) is decided in the **workflow** (`.mf` branches on the result),
+  not inferred from the envelope. *(Authoring side: see the workflow guide once the `fail` construct lands.)*
 - **Pending:** `{"state":"pending"}` — returned on a 202; body not parsed by uflowsd.
-- **Failed:** `{"state":"failed","error":{…}}` — supported by the reference envelope. Note uflowsd settles a
-  200 by extracting **`result`**; signal a business failure per your agreed contract (a 200 with no `result`
-  is an error to uflowsd). Confirm the failure-signalling shape with the workflows team before relying on it.
-- **Error / conflict:** `{"state":"error","reason":"…"}` (4xx) / `{"reason":"input-conflict"}` (409).
+- **Rejection (no valid result):** `400 {"reason":"…"}` (definite app rejection) / `409 {"reason":"input-conflict"}`
+  (idempotency conflict). For these the coordinator decides reject/reverse/block.
+- **No record / infra:** `404` (no durable record) / `5xx` / transport — uflowsd reconciles/retries.
 
 ### 4.6 Conformance reference
 

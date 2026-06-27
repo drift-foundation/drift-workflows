@@ -1814,7 +1814,7 @@ def main():
         P_AT = {"type": "object", "fields": [{"name": "amount", "type": {"type": "int"}},
                                              {"name": "currency", "type": {"type": "string"}}]}
         mf_src = (
-            "# straight-line refund (slice 1)\n"
+            "// straight-line refund (slice 1)\n"
             "args { amount: int, currency: string }\n"
             "op reserve { input: { reservation: string } result: { reserved: string } }\n"
             "op release { input: { reservation: string } }\n"
@@ -2107,7 +2107,7 @@ def main():
         # RESULT REFS ARE STABLE under source formatting AND the alias name: reformatting + renaming
         # `r` -> `myRes` yields the IDENTICAL content_hash (the alias is never in the IR).
         res2_code, res2_low = lower_source(
-            "# reformatted + renamed alias\n"
+            "// reformatted + renamed alias\n"
             "op reserve { input: { reservation: string }  result: { reserved: string } }\n"
             "op confirm { input: { reserved: string } }\n"
             "steps {\n  let   myRes = reserve { \"reservation\": \"A\" }\n  confirm    result    myRes\n}\n")

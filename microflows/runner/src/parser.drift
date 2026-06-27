@@ -173,15 +173,25 @@ struct CaseMergeSpec {
 // (where ParseError is a local type) and reconstructed as a movable native value, so callers in
 // other modules need no error-type-qualified catch (errors-as-values; mirrors ir.parse_object_type).
 pub fn parse_source(source: &String) -> core.Result<ParsedWorkflow, ParseError> {
+	var rn0: Array<String> = [];
+	var ri0: Array<String> = [];
+	var c = Cursor(src = _dup(source), pos = 0, node_count = 0, res_names = move rn0, res_ids = move ri0, open_comment_at = -1);
+	val uc_code: String = "unterminated-block-comment";
+	val uc_msg: String = "unterminated block comment ('/*' without a closing '*/')";
+	val empty: String = "";
 	try {
-		var rn0: Array<String> = [];
-		var ri0: Array<String> = [];
-		var c = Cursor(src = _dup(source), pos = 0, node_count = 0, res_names = move rn0, res_ids = move ri0);
 		val pw = _parse(&mut c);
+		if c.open_comment_at >= 0 {
+			return core.Result<ParsedWorkflow, ParseError>::Err(_finalize(source, &uc_code, c.open_comment_at, &empty, &empty, &uc_msg));
+		}
 		return core.Result<ParsedWorkflow, ParseError>::Ok(move pw);
 	} catch ParseError(e) {
-		// Fill line/column from the byte offset ONCE here (the source is in scope), and return a
-		// movable error value (typed-catch binders are read-only views).
+		// An unterminated `/*` consumes to EOF, so the parse fails late with a generic error; prefer the
+		// precise comment diagnostic when one was recorded. Otherwise fill line/column from the byte
+		// offset ONCE here (the source is in scope) and return a movable error value.
+		if c.open_comment_at >= 0 {
+			return core.Result<ParsedWorkflow, ParseError>::Err(_finalize(source, &uc_code, c.open_comment_at, &empty, &empty, &uc_msg));
+		}
 		return core.Result<ParsedWorkflow, ParseError>::Err(_finalize(source, &e.code, e.byte_offset, &e.expected, &e.found, &e.message));
 	}
 }
@@ -193,14 +203,23 @@ pub fn parse_source(source: &String) -> core.Result<ParsedWorkflow, ParseError> 
 // A `base` without an "operations" registry, or a contract for an operation absent from it, is a
 // lowering error (surfaced before any DB/dispatch).
 pub fn lower(source: &String, base: &json.JsonNode) -> core.Result<json.JsonNode, ParseError> {
+	var rn0: Array<String> = [];
+	var ri0: Array<String> = [];
+	var c = Cursor(src = _dup(source), pos = 0, node_count = 0, res_names = move rn0, res_ids = move ri0, open_comment_at = -1);
+	val uc_code: String = "unterminated-block-comment";
+	val uc_msg: String = "unterminated block comment ('/*' without a closing '*/')";
+	val empty: String = "";
 	try {
-		var rn0: Array<String> = [];
-		var ri0: Array<String> = [];
-		var c = Cursor(src = _dup(source), pos = 0, node_count = 0, res_names = move rn0, res_ids = move ri0);
 		val pw = _parse(&mut c);
+		if c.open_comment_at >= 0 {
+			return core.Result<json.JsonNode, ParseError>::Err(_finalize(source, &uc_code, c.open_comment_at, &empty, &empty, &uc_msg));
+		}
 		val merged = _merge(base, &pw);
 		return core.Result<json.JsonNode, ParseError>::Ok(move merged);
 	} catch ParseError(e) {
+		if c.open_comment_at >= 0 {
+			return core.Result<json.JsonNode, ParseError>::Err(_finalize(source, &uc_code, c.open_comment_at, &empty, &empty, &uc_msg));
+		}
 		return core.Result<json.JsonNode, ParseError>::Err(_finalize(source, &e.code, e.byte_offset, &e.expected, &e.found, &e.message));
 	}
 }
@@ -212,19 +231,47 @@ struct Cursor {
 	pos: Int,
 	node_count: Int,        // pre-order graph-node id allocator (slice 2a)
 	res_names: Array<String>,  // source result-name -> op node id (slice 2b-ii-a); parallel arrays
-	res_ids: Array<String>
+	res_ids: Array<String>,
+	open_comment_at: Int    // byte offset of the first unterminated `/*`, or -1 (set by _skip_ws, nothrow)
 }
 
 fn _eof(c: &Cursor) nothrow -> Bool { return c.pos >= c.src.byte_length(); }
 
-// Skip whitespace AND `#`-to-end-of-line comments.
+// Skip whitespace AND comments. Comment syntax is C-family: `//` to end-of-line and `/* … */`
+// (non-nesting). There is NO `#` comment. An unterminated `/*` is recorded on the cursor
+// (open_comment_at) and surfaced as a precise error by parse_source/lower — `_skip_ws` stays nothrow.
 fn _skip_ws(c: &mut Cursor) nothrow -> Void {
+	val n = c.src.byte_length();
 	while !_eof(c) {
 		val b = c.src.byte_at(c.pos);
 		if text.is_space(b) {
 			c.pos = c.pos + 1;
-		} else if cast<Int>(b) == 35 {   // '#': line comment
-			while !_eof(c) and cast<Int>(c.src.byte_at(c.pos)) != 10 { c.pos = c.pos + 1; }
+		} else if cast<Int>(b) == 47 {   // '/': maybe a `//` line or `/*` block comment
+			if c.pos + 1 < n and cast<Int>(c.src.byte_at(c.pos + 1)) == 47 {
+				// `//` line comment -> skip to end of line
+				c.pos = c.pos + 2;
+				while !_eof(c) and cast<Int>(c.src.byte_at(c.pos)) != 10 { c.pos = c.pos + 1; }
+			} else if c.pos + 1 < n and cast<Int>(c.src.byte_at(c.pos + 1)) == 42 {
+				// `/* … */` block comment (non-nesting)
+				val start = c.pos;
+				c.pos = c.pos + 2;
+				var closed = false;
+				while !_eof(c) {
+					if cast<Int>(c.src.byte_at(c.pos)) == 42 and c.pos + 1 < n and cast<Int>(c.src.byte_at(c.pos + 1)) == 47 {
+						c.pos = c.pos + 2;
+						closed = true;
+						break;
+					}
+					c.pos = c.pos + 1;
+				}
+				if !closed {
+					if c.open_comment_at < 0 { c.open_comment_at = start; }
+					return;
+				}
+			} else {
+				// a lone `/` is not a comment -> let the caller's token read report it
+				return;
+			}
 		} else {
 			return;
 		}

@@ -1242,7 +1242,14 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		// TERMINAL REPLAY / leased / deferred: report from DURABLE state — the (now reloaded)
 		// pinned `plan_length` gives the final operation seq. Reached BEFORE any registry build
 		// or `_validate_registry`, so it never depends on current participant/operation config.
-		val last_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, pin_len));
+		// node_id isn't available on this no-graph-walk path, so report the DURABLY-STORED final-op id
+		// (node-address for planned, positional for legacy). Fall back to the positional derivation only
+		// when the final op was never reached/stored (leased/deferred mid-flight) — a stable placeholder.
+		var last_hex: String = "";
+		match host.operation_request_get(workflow_id, pin_len) {
+			mf.OperationRequestGetOutcome::Found(rec) => { last_hex = _bytes_to_hex(&rec.operation_id); },
+			mf.OperationRequestGetOutcome::NotFound => { last_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, pin_len)); }
+		}
 		return _inspect_report(host, workflow_id, &last_hex, pin_len);
 	}
 
@@ -1294,7 +1301,8 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 	if claimed_state == STATE_REVERSING {
 		return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 	}
-	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].graph, reg.revisions[ridx].plan_length, admission);
+	val ch_hex = _bytes_to_hex(&reg.revisions[ridx].content_hash);
+	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].graph, reg.revisions[ridx].plan_length, &ch_hex, admission);
 }
 
 // ===== ScriptRegistry build + lookup (v1: one configured generation per process) =====
@@ -1693,7 +1701,7 @@ fn _lp(s: &String) nothrow -> String {
 // compensated, and with none (e.g. the FIRST operation rejected) it reaches `reversed`
 // immediately — never `blocked_resolution` for a definite forward rejection.
 fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
-                workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int, admission: &AdmissionState) -> Outcome {
+                workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int, content_hash_hex: &String, admission: &AdmissionState) -> Outcome {
 	val n = plan_length;
 	var final_result: String = "{}";
 	var last_op_id_hex: String = "";
@@ -1749,7 +1757,16 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				var prior_done = false;
 				match host.operation_result(workflow_id, seq) {
 					mf.OperationResultOutcome::Succeeded(r) => {
-						last_op_id_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, seq));
+						// ADOPT the durably-stored operation id (authoritative), never re-derive: an op
+						// settled under a PRIOR id scheme must report exactly that stored id on resume, not
+						// a freshly-derived node-address id (migration-safety). A settled op with no request
+						// row is a durable inconsistency -- defer, don't mint a new external id.
+						match host.operation_request_get(workflow_id, seq) {
+							mf.OperationRequestGetOutcome::Found(rec) => { last_op_id_hex = _bytes_to_hex(&rec.operation_id); },
+							mf.OperationRequestGetOutcome::NotFound => {
+								return _defer_dispatch(host, workflow_id, fencing_token, "settled_op_request_missing", admission);
+							}
+						}
 						settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&r)));
 						final_result = move r;
 						prior_done = true;
@@ -1767,7 +1784,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				var op_name: String = "";
 				var input_json: String = "";
 				var schema_version: Int = 0;
-				var operation_id: Array<Byte> = _operation_id(workflow_canon_hex, seq);
+				var operation_id: Array<Byte> = _operation_id_node(workflow_canon_hex, content_hash_hex, node_id);
 				var input_hash: String = "";
 				var recovered = false;
 				match host.operation_request_get(workflow_id, seq) {
@@ -2485,11 +2502,27 @@ fn _join3(a: &String, b: &String, c: &String) nothrow -> String {
 	     + fmt.format_int(c.byte_length()) + ":" + _dup(c) + ";";
 }
 
+// LEGACY single-op path only (--operation/--config): positional id. The planned/manifest path uses
+// node-address identity (_operation_id_node). Kept unchanged so legacy workflows keep their persisted ids.
 fn _operation_id(workflow_hex: &String, operation_seq: Int) nothrow -> Array<Byte> {
 	val rev = fmt.format_int(SCRIPT_REVISION);
 	val seq = fmt.format_int(operation_seq);
 	// invocation = 1 (first occurrence of this static call site).
 	val seed = _join3(workflow_hex, &rev, &seq) + "inv:1";
+	val u = uuid.v3_from_string(&seed);
+	return uuid.to_bytes(&u);
+}
+
+// Node-address operation identity (planned path). INVARIANT: a compiled operation node executes AT MOST
+// ONCE per workflow instance — the validated graph is acyclic and loops are side-effect-free (no op
+// statements inside map/filter/fold), so there is no occurrence dimension. Thus (workflow instance,
+// pinned script content_hash, compiled node id) uniquely + stably identifies one executed operation:
+// branch-distinct (two arms are different nodes), retry/resume-stable (content_hash + node id are
+// pinned). Derived ONLY at fresh dispatch; resume/replay adopts the durably-stored id. `_join3` is
+// length-prefixed and the seed carries the `mf-op;` domain tag, so this id space is disjoint from any
+// reverse-id space.
+fn _operation_id_node(workflow_hex: &String, content_hash_hex: &String, node_id: &String) nothrow -> Array<Byte> {
+	val seed = "mf-op;" + _join3(workflow_hex, content_hash_hex, node_id);
 	val u = uuid.v3_from_string(&seed);
 	return uuid.to_bytes(&u);
 }
