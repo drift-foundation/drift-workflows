@@ -1,6 +1,6 @@
 # Drift Workflows — umbrella monorepo.
 #
-# Components (each independently buildable, testable, versioned, signed):
+# Components (each independently buildable + testable; versioned/signed/released ONLY from the root drift/manifest.json):
 #   singular/      reusable language-neutral idempotency protocol + library
 #   microflows/    typed durable workflow manager/service + runtime
 # Cross-component suites:
@@ -119,12 +119,15 @@ _integration-gate GATE:
 # drift/manifest.json (singular + microflows + uflowsd), signed with the Foundation key (The Drift
 # Foundation owns this repo). The root manifest is ALSO the SOLE source of truth for the shipped
 # artifact VERSIONS — the per-component manifests are local-dev only and pin every artifact to the
-# sentinel `0.0.0-dev` (drift requires a non-empty version; the sentinel makes clear no release-
+# sentinel `0.0.0` (drift requires a non-empty version; the sentinel makes clear no release-
 # authoritative version lives in a component tree). Bump versions in the root, then `just reseal`.
-# The orchestrator's stage_packages runs the bare
-# `drift deploy --dest <libs_root>` and binds real cert-suite evidence; the local recipes
-# here are the dev fallback (`--cert-suite-id drift-workflows/dev --cert-suite-no-evidence`).
-# No bespoke evidence ceremony — same as the other Foundation cert-pool repos.
+# The orchestrator's stage_packages stages the PACKAGES ONLY:
+# `drift deploy --artifact singular --artifact microflows --dest <libs_root>` and binds real cert-suite
+# evidence. `uflowsd` is a kind:app artifact — NOT staged via the cert pool — its
+# stage_packages is package-only BY POLICY (the app author/cert legs DO work: shipped driftc 0.33.61,
+# `drift verify-app` green). uflowsd is built/signed LOCALLY by `just deploy` (which adds --app-dest + key). The local recipes
+# here are the dev fallback (`--cert-suite-id drift-workflows/dev --cert-suite-no-evidence`) — no bespoke
+# evidence ceremony, same as the other Foundation cert-pool repos.
 
 # Re-mint drift/{singular,microflows}.author-claim under the Foundation author key.
 #   DRIFT_LANG_ROOT (default ~/src/drift-lang); DRIFT_SIGN_KEY_FILE (default seed).
@@ -166,17 +169,25 @@ reseal:
 	@just trust-check
 	@echo "[reseal] done — review & commit: drift/manifest.json, drift/lock.json, drift/*.author-claim"
 
-# Build, sign, and publish singular + microflows. Dev fallback cert-suite; the orchestrator
-# overrides --cert-suite-id and binds real evidence (deps resolved from DRIFT_PKG_ROOT).
+# Build, sign, and publish singular + microflows (packages) + uflowsd (app). Dev fallback cert-suite;
+# the orchestrator overrides --cert-suite-id and binds real evidence (deps resolved from DRIFT_PKG_ROOT).
 deploy *ARGS:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
 	LIBS="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
 	DEST="${DRIFT_DEPLOY_DEST:-build/deploy}"
-	mkdir -p "$DEST"
+	APP_DEST="${DRIFT_APP_DEST:-build/deploy-app}"   # uflowsd is kind:app -> drift deploy requires --app-dest
+	KEY_FILE="${DRIFT_SIGN_KEY_FILE:-$HOME/.config/drift/keys/default.seed}"
+	# Preflight: deploying the app artifact needs a signing key — fail clearly rather than deep in `drift deploy`.
+	[[ "{{ARGS}}" == *--sign-key-file* || -f "$KEY_FILE" ]] || { echo "error: signing key not found: $KEY_FILE (set DRIFT_SIGN_KEY_FILE or pass --sign-key-file)" >&2; exit 1; }
+	mkdir -p "$DEST" "$APP_DEST"
 	EXTRA=""
-	if [[ "{{ARGS}}" != *--cert-suite* ]]; then
+	# Dev fallback ONLY when neither --cert-suite* (CLI) nor DRIFT_DEPLOY_CERT_SUITE_* (env) supplies one —
+	# otherwise an env-driven real cert-suite would be clobbered by the dev sentinel.
+	if [[ "{{ARGS}}" != *--cert-suite* ]] && [[ -z "$(env | grep '^DRIFT_DEPLOY_CERT_SUITE_' || true)" ]]; then
 	  EXTRA="--cert-suite-id drift-workflows/dev --cert-suite-no-evidence"
 	fi
+	[[ "{{ARGS}}" == *--app-dest* ]]      || EXTRA="$EXTRA --app-dest $APP_DEST"
+	[[ "{{ARGS}}" == *--sign-key-file* ]] || EXTRA="$EXTRA --sign-key-file $KEY_FILE"
 	"$DRIFT" deploy --dest "$DEST" --package-root "$LIBS" ${EXTRA} {{ARGS}}

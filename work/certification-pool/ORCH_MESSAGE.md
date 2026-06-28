@@ -39,7 +39,7 @@ contains the OOM-triggering compile.
     "test":           ["just", "test"],
     "stress":         ["just", "stress"],
     "perf":           ["just", "perf"],
-    "stage_packages": ["{staged_drift}", "deploy", "--dest", "{libs_root}"]
+    "stage_packages": ["{staged_drift}", "deploy", "--artifact", "singular", "--artifact", "microflows", "--dest", "{libs_root}"]
   }
 }
 ```
@@ -52,11 +52,14 @@ independent Git roots — so per-subdir entries can't materialize as fresh check
 multiple artifacts, one manifest, one deploy). They remain two individually-versioned artifacts with
 separate author-claims.
 
-- `stage_packages` is the **bare** deploy you specified — no cert-suite flags in the recipe (cert-suite
-  policy is yours). The deploy emits cert claims, so it requires the **cert-suite evidence digest you
-  supply** (via your `--cert-suite-*` / `DRIFT_DEPLOY_CERT_SUITE_*` mechanism); with that supplied, one
-  `drift deploy --dest <libs_root>` from the checkout root stages **both** `singular/<v>` and
-  `microflows/<v>` (verified locally with the empty-evidence sentinel). A deploy with NO evidence at all
+- `stage_packages` is **package-only** — no cert-suite flags in the recipe (cert-suite policy is yours).
+  The deploy emits cert claims, so it requires the **cert-suite evidence digest you supply** (via your
+  `--cert-suite-*` / `DRIFT_DEPLOY_CERT_SUITE_*` mechanism); with that supplied,
+  `drift deploy --artifact singular --artifact microflows --dest <libs_root>` from the checkout root stages
+  **both** `singular/<v>` and `microflows/<v>` (verified locally with the empty-evidence sentinel). The root
+  manifest also declares `uflowsd` (a `kind:app` artifact), which is **NOT** staged via the pool — its
+  stage_packages is package-only **by policy** (the app author/cert legs work: shipped 0.33.61,
+  `verify-app` green) — it is built/signed locally (`just deploy` adds `--app-dest`). A deploy with NO evidence at all
   correctly refuses — as expected; we do not synthesize one.
 - `depends_on`: our **direct** runtime foundations — the libraries depend on `mariadb-rpc`; the
   integration apps (runner/service/stub) link `web` (`web.rest`/`web.client`). We do **not** import

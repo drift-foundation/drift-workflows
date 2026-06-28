@@ -25,12 +25,15 @@ the exact proposed entries for them to add. Locally-published `build/dist/lib` a
   - `test`  — correctness gate (`just test`)
   - `stress`— stability/contention gate (`just stress`)
   - `perf`  — perf-regression gate (`just perf`)
-  - `stage_packages` — **bare** `{staged_drift} deploy --dest {libs_root}` (publishes every artifact in
-    the project's `drift/manifest.json`).
+  - `stage_packages` — **package-only**: `{staged_drift} deploy --artifact singular --artifact microflows
+    --dest {libs_root}` (the two cert-pool PACKAGES). `uflowsd` is a `kind:app` artifact and is **not**
+    staged via the pool — its stage_packages is **package-only by policy** (the app author/cert legs DO
+    work: shipped 0.33.61, `verify-app` green). It deploys locally via `just deploy` (`--app-dest`).
 - **Cert-suite policy is orchestrator-owned.** Project recipes/commands **must NOT** pass
   `--cert-suite-id` / `--cert-suite-evidence-sha256` / `--cert-suite-no-evidence`; the orchestrator
   appends them (`stage` → `--cert-suite-no-evidence`; `release` → `--cert-suite-evidence-sha256`). Our
-  local `just deploy` may inject a dev default *only when ARGS carries no `--cert-suite`* (the
+  local `just deploy` may inject a dev default *only when neither `--cert-suite*` (CLI) nor
+  `DRIFT_DEPLOY_CERT_SUITE_*` (env) is supplied* (the
   drift-mariadb-client / drift-web pattern) — already how `singular/drift/justfile` works.
 - The orchestrator sets `DRIFT_TOOLCHAIN_ROOT` (staged toolchain) and `DRIFT_PKG_ROOT` (staged
   `libs_root`, populated by upstream `stage_packages`). Recipes must rely only on these, not on ambient
@@ -59,7 +62,7 @@ from one `drift/manifest.json` + one `deploy`):
   "depends_on": ["drift-lang","drift-mariadb-client","drift-web"],
   "commands": {
     "test":  ["just","test"], "stress": ["just","stress"], "perf": ["just","perf"],
-    "stage_packages": ["{staged_drift}","deploy","--dest","{libs_root}"]
+    "stage_packages": ["{staged_drift}","deploy","--artifact","singular","--artifact","microflows","--dest","{libs_root}"]
   }
 }
 ```
@@ -74,8 +77,8 @@ individually pinnable by Bookkeeper), just staged from one repo entry — exactl
 
 - Root `just test/stress/perf` already aggregate the per-component gates (singular → microflows →
   integration); they run from the checkout root, satisfying the contract.
-- `drift deploy --dest {libs_root}` from the root reads the **top-level** manifest and stages both
-  libraries. The per-component `drift/` projects stay for local dev; the cert entry point is the new
+- `drift deploy --artifact singular --artifact microflows --dest {libs_root}` from the root reads the
+  **top-level** manifest and stages the two packages (the uflowsd app is excluded). The per-component `drift/` projects stay for local dev; the cert entry point is the new
   top-level manifest.
 - `bookkeeper` `depends_on` `["drift-workflows"]` is NOT right (it pins *packages*, not repos) — it pins
   the certified **`singular` 0.5.0** + **`microflows` 0.1.0** artifacts the drift-workflows entry stages.
@@ -117,19 +120,19 @@ that stages a pre-reshape singular.
 | `just test` | root justfile aggregates: singular test → microflows test (unit + **full DB-backed e2e** integration, real HTTP) |
 | `just stress` | **NEW** singular lease-contention/idempotent-replay + **NEW** microflows concurrent-drive/effectively-once |
 | `just perf` | **NEW** singular acquire→settle counts + **NEW** microflows workflow-drive counts, each **vs a committed baseline** |
-| `stage_packages` | bare `{staged_drift} deploy --dest {libs_root}` reads the **top-level `drift/manifest.json`**, stages `singular` + `microflows` |
+| `stage_packages` | **package-only** `{staged_drift} deploy --artifact singular --artifact microflows --dest {libs_root}` reads the **top-level `drift/manifest.json`**, stages `singular` + `microflows` (uflowsd app excluded) |
 
 ## Gaps to close (repo-side, this lane)
 
 1. **NEW top-level `drift/manifest.json` (+ `drift/{singular,microflows}.author-claim`, `lock.json`,
    `trust.json`) at the repo root** declaring both libraries, so the orchestrator's root-level `drift
-   deploy --dest` stages both (the drift-web pattern). Module paths reach into `singular/drift/packages/`
+   deploy --artifact singular --artifact microflows --dest` stages both packages (the drift-web pattern). Module paths reach into `singular/drift/packages/`
    and `microflows/packages/`. Author-claims re-minted over the top-level source (6DSIXZVQ identity).
 2. **`singular/drift` has NO `stress`/`perf` recipes** (only `test`/`deploy`). Add them; the root justfile
    already calls them.
 3. **`microflows` `stress`/`perf` are echo-only stubs.** Replace with real bounded gates + committed
    baselines (not placeholders, per directive).
-4. **Verify the bare `drift deploy --dest <tmp>` contract** from the repo root (top-level manifest +
+4. **Verify the package-only `drift deploy --artifact singular --artifact microflows --dest <tmp>` contract** from the repo root (top-level manifest +
    author-claims resolve; no `--cert-suite` hardcoded; deps from `{libs_root}` + toolchain).
 5. **Make the DB/environment contract explicit + deterministic**: MariaDB is a **repo-private** Docker
    fixture the gate provisions itself (`tools/db_instance.sh`, `127.0.0.1:34214`, flocker
@@ -227,11 +230,11 @@ source); the published microflows **library** has no singular dep, so it is unaf
    committed baseline). Root `just stress/perf` already call them.
 2. Replace `microflows` `stress` + `perf` stubs with bounded gates + committed baselines.
 3. **Create the top-level `drift/manifest.json` (+ author-claims, lock, trust) at the repo root**
-   declaring `singular` + `microflows`; `drift prepare` the top-level lock; verify a bare
-   `drift deploy --dest <tmp>` from the ROOT stages both (the orchestrator's stage_packages shape).
+   declaring `singular` + `microflows`; `drift prepare` the top-level lock; verify a package-only
+   `drift deploy --artifact singular --artifact microflows --dest <tmp>` from the ROOT stages both (the orchestrator's stage_packages shape).
 4. Make the DB env contract explicit in each gate; resolve the Mariachi availability question.
 5. **Local dry-run** from a clean state with `DRIFT_TOOLCHAIN_ROOT`/`DRIFT_PKG_ROOT` set to staged roots:
-   `just test`, `just stress`, `just perf` (from the root), and the bare root `drift deploy --dest
+   `just test`, `just stress`, `just perf` (from the root), and the package-only root `drift deploy --artifact singular --artifact microflows --dest
    <tmp-libs>` — all green, no ambient-dist dependence.
 6. Craft the orchestrator-team message (the single `drift-workflows` entry + dep/affects edges + the
    monorepo-vs-split call-out + env/Mariachi contract + version pins + 0.5.0-sequencing). Hand it over;
@@ -240,7 +243,7 @@ source); the published microflows **library** has no singular dep, so it is unaf
 ## Verification target
 
 - Repo gates green locally (`test`/`stress`/`perf` per project).
-- Bare `deploy --dest` stages singular + microflows cleanly from committed source.
+- Package-only `deploy --artifact singular --artifact microflows --dest` stages singular + microflows cleanly from committed source.
 - Evidence that drift-workflows can pass `test`, `stress`, `perf`, `stage_packages` under a staged
   toolchain + libs root (no ambient `build/dist/lib`).
 

@@ -4,10 +4,14 @@
 > participant HTTP surface stays `/microflows/v1/…` — the v1 *contract* tightened, it was not forked to
 > v2. Full prose: `work/uflowsd/RELEASE_ANNOUNCEMENT_DRAFT.md`.
 
-## microflows 0.4.0 · uflowsd / microflows-runner 0.2.0 — unreleased
+## microflows 0.4.0 · uflowsd 0.2.0 — unreleased
 
 Certified driftc 0.33.63 / ABI 18. Root `just test` green (singular, microflows component, and the
 coordinator↔singular integration suite — 202 checks).
+
+> Released artifacts (versioned in the root `drift/manifest.json`): **singular 0.7.0**, **microflows 0.4.0**,
+> **uflowsd 0.2.0**. `microflows-runner` (one-shot CLI) + `microflows-participant-stub` are **component-local
+> dev artifacts** (version `0.0.0`) — not Drift release artifacts, no release version.
 
 ### ⚠️ BREAKING (see RELEASE_ANNOUNCEMENT_DRAFT.md → *Breaking changes* + *Migration*)
 - **Participant `200` contract is result-only.** A `200` body must be `{"result":{…}}` with `result` an

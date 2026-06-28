@@ -2,15 +2,14 @@
   "schema_version": 2,
   "project": {
     "name": "microflows",
-    "license": "MIT",
-    "author_profile": "the-drift-foundation.author-profile"
+    "license": "MIT"
   },
   "artifacts": [
     {
       "kind": "package",
       "name": "microflows",
       "module_namespace": "microflows",
-      "version": "0.0.0-dev",
+      "version": "0.0.0",
       "description": "Microflows \u2014 typed durable workflow coordinator (control state over MariaDB)",
       "entry_module": "packages/microflows/src/lib.drift",
       "modules": [

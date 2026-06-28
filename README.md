@@ -8,8 +8,8 @@ durable, typed workflows. It comprises two distinct components:
 | **Microflows** | Typed durable workflow manager/service + runtime | [`microflows/`](microflows/) |
 | **Singular** | Language-neutral idempotency protocol + library (used by *participant* services) | [`singular/`](singular/) |
 
-Both components live in this repository and are independently buildable,
-testable, versioned, signed, and publishable. **Microflows** is the component
+Both components live in this repository and **are independently buildable and testable**; they are versioned, signed, and **released only from the
+repo-root `drift/manifest.json`** (the per-component manifests are local-dev, version `0.0.0`). **Microflows** is the component
 furthest along; most of this README describes it. **Singular** is the
 authoritative in-repository idempotency component — its normative contract is
 [`singular/doc/singular-protocol.md`](singular/doc/singular-protocol.md), with

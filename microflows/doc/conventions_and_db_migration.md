@@ -42,21 +42,18 @@ The repository directory is historically named `phase-drift`; that is cosmetic
 
 ### Foundation signing / publication planning
 
-```text
-the Microflows artifact is signed under the DRIFT FOUNDATION key
-  (the-drift-foundation.author-profile, namespaces ["microflows.*"];
-   key ed25519:6DSI…; DRIFT_SIGN_KEY_FILE default ~/.config/drift/keys/
-   default.seed; author-claim via tools.drift_author) — landed.
+The repo-ROOT `drift/manifest.json` is the **sole release + signing surface** for the shipped artifacts
+— `singular`, `microflows`, and `uflowsd` — signed under the **Drift Foundation** key
+(`the-drift-foundation.author-profile`; `DRIFT_SIGN_KEY_FILE` default `~/.config/drift/keys/default.seed`;
+author-claims via `just author-claim`, lock + trust via `just reseal`, publish via `just deploy`).
 
-Singular keeps its own independent PushCoin signing identity and versioning
-  as an external dependency; its trust entry (singular.* -> PushCoin key)
-  lives wherever Singular is consumed (e.g. the participant-stub trust store),
-  NOT in the Microflows repo trust store.
+The per-component manifests (`microflows/drift`, `singular/drift/drift`, `microflows/runner/drift`,
+`microflows/participant-stub/drift`) are **local-dev only**: every artifact is version `0.0.0` and carries
+**no `author_profile`**, so an accidental `drift deploy` from a component tree fails closed. **Do not add
+`author_profile` (or a real version) to a component manifest — release is root-only.**
 
-when Singular is eventually relocated under Drift Workflows it stays an
-  independently versioned, separately published library artifact — not folded
-  into the Microflows artifact.
-```
+`singular` now lives under Drift Workflows and is a **root-released, Foundation-signed artifact** (0.7.0) —
+it is no longer an external / PushCoin-signed dependency.
 
 ---
 
@@ -79,21 +76,22 @@ Concrete diffs from our current (Singular-derived) setup:
 | Test layout | `packages/<a>/tests/{unit,e2e}` | same, **+ `tests/stress/`, `perf/scenarios/`, optional `tests/spike/`** |
 | `assets` in manifest | `[]` | `docs/integration-guide.md`, `README.md` (+ `effective-*.md`) |
 | `.gitignore` | `tmp_db_instances/` only | + `build/`, `.claude-session`, `.codex*`, `perf/{captures,results}/`, db temp dirs |
-| Deploy | custom `cert`+`deploy` | `drift deploy --cert-suite-id microflows/dev --cert-suite-no-evidence` (test gate IS cert) |
+| Deploy | custom `cert`+`deploy` | root `just deploy` — **multi-artifact** (singular + microflows packages + the uflowsd **app**, `--app-dest`); cert-suite is **orchestrator-owned** for staging; `just deploy` adds a dev-only fallback locally, suppressed when `--cert-suite*` or `DRIFT_DEPLOY_CERT_SUITE_*` is supplied |
 | Docs | none | `docs/integration-guide.md` required; `AGENTS.md` (already standard) |
 
 Notes:
+- `author_profile`, signing, the lock, and `drift deploy` are **ROOT-only** (top-level `drift/manifest.json`); the `pushcoin → foundation` author_profile row above refers to the ROOT. Per-component manifests are local-dev (`0.0.0`, no `author_profile`).
 - Foundation repos are **multi-package** (`packages/<libA>`, `<libB>` under one
-  manifest with an `artifacts[]` entry each). Microflows is a single
-  artifact for now; we keep the `packages/microflows/` layout, which is
-  forward-compatible.
+  manifest with an `artifacts[]` entry each). The root `drift/manifest.json` now declares THREE
+  artifacts — `singular` + `microflows` (packages) and `uflowsd` (**app**) — the Foundation
+  multi-package shape; the `packages/<pkg>/` layout fits it.
 - Foundation **commits `drift/lock.json`** and does **not** generate a
   `version.drift`; version lives only in the manifest.
 
 **Confirmed + landed (2026-06-08):**
 1. Signing identity switched to the **Foundation key**
-   (`the-drift-foundation.author-profile` namespaces `["microflows.*"]`;
-   `trust.json` Foundation-key-only with `microflows.*` -> Foundation key;
+   (`the-drift-foundation.author-profile`; the root artifacts span namespaces `singular`,
+   `microflows.*`, and `microflows.runner.*` (uflowsd); `trust.json` Foundation-key-only;
    `author-claim` recipe uses `tools.drift_author` + `DRIFT_SIGN_KEY_FILE`).
    `pushcoin.author-profile` removed. Deps still resolve; build/test green.
 2. **`stress` and `perf` gates** added as empty Foundation-standard stubs

@@ -154,7 +154,7 @@ prepare:
 # compilation + the component's own tests. It is intentionally NOT signed and NOT deployable as a
 # release. The canonical, CERTIFIED, DB-asset-bearing `singular` package (code + `singular/db`) is
 # published ONLY from the repo-root `drift/manifest.json` via the root `just deploy`. Invariant: exactly
-# ONE signed meaning per public version (singular 0.6.0 = code + singular/db). Apps that import singular
+# ONE signed meaning per public version (singular = code + singular/db). Apps that import singular
 # (e.g. the participant-stub) compile it FROM SOURCE — they never consume a per-component package — so
 # there is deliberately no component-local `author-claim` / `deploy` here (a second, same-version,
 # no-asset signed identity must never be created; a direct `drift deploy`/`author` from this tree would

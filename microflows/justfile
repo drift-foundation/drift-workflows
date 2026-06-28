@@ -119,7 +119,7 @@ prepare:
 # component tests only. It is intentionally NOT signed or deployed as a release here (no per-component
 # `author-claim` / `deploy`). The certified, DB-asset-bearing `microflows` package (code + microflows/db)
 # is published ONLY from the repo-root `drift/manifest.json` via the root `just deploy` — exactly one
-# signed meaning per public version (microflows 0.2.0 = code + microflows/db). Apps that import microflows
+# signed meaning per public version (microflows = code + microflows/db). Apps that import microflows
 # (the runner/service) compile it FROM SOURCE; a second same-version no-asset signed identity must never
 # be created (do not run `drift author`/`drift deploy` from this component tree).
 
