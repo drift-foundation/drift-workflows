@@ -10,7 +10,7 @@
       "kind": "package",
       "name": "microflows",
       "module_namespace": "microflows",
-      "version": "0.4.0",
+      "version": "0.0.0-dev",
       "description": "Microflows \u2014 typed durable workflow coordinator (control state over MariaDB)",
       "entry_module": "packages/microflows/src/lib.drift",
       "modules": [

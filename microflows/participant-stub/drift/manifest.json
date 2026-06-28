@@ -9,7 +9,7 @@
       "kind": "app",
       "name": "microflows-participant-stub",
       "module_namespace": "microflows.participant_stub",
-      "version": "0.1.0",
+      "version": "0.0.0-dev",
       "description": "Microflows reference participant \u2014 narrow PUT/GET operation endpoint backed by Singular (protocol conformance reference)",
       "entry_module": "src/app.drift",
       "entry_point": "microflows.participant_stub::main",

@@ -116,8 +116,12 @@ _integration-gate GATE:
 
 # --- Certification author/deploy surface (the drift-web / drift-mariadb-client convention) ---
 # The repo ROOT owns the multi-artifact author-claim + lock + deploy over the top-level
-# drift/manifest.json (singular + microflows), signed with the Foundation key (The Drift
-# Foundation owns this repo). The orchestrator's stage_packages runs the bare
+# drift/manifest.json (singular + microflows + uflowsd), signed with the Foundation key (The Drift
+# Foundation owns this repo). The root manifest is ALSO the SOLE source of truth for the shipped
+# artifact VERSIONS — the per-component manifests are local-dev only and pin every artifact to the
+# sentinel `0.0.0-dev` (drift requires a non-empty version; the sentinel makes clear no release-
+# authoritative version lives in a component tree). Bump versions in the root, then `just reseal`.
+# The orchestrator's stage_packages runs the bare
 # `drift deploy --dest <libs_root>` and binds real cert-suite evidence; the local recipes
 # here are the dev fallback (`--cert-suite-id drift-workflows/dev --cert-suite-no-evidence`).
 # No bespoke evidence ceremony — same as the other Foundation cert-pool repos.
