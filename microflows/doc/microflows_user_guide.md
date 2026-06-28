@@ -456,9 +456,13 @@ or a type-contract mismatch. Fix them before the config is ever submitted.
 
 **Run-time status** is a JSON line on stdout: `{"workflow":"completed"}`,
 `{"workflow":"pending"}` (in flight / deferred — resume later),
-`{"workflow":"failed","reason":…,"compensated":true}` (failed after a full unwind), or an error status such as
-`invalid_config` / `revision_unavailable`. A `pending` instance is resumed by
-re-invoking with the same `--workflow-id` and no `--arguments`.
+`{"workflow":"failed","reason":…,"compensated":<bool>}` (a definite failure;
+`compensated:true` = a full unwind ran), `{"workflow":"blocked","direction":…,"reason":…}`
+(**parked for an operator** — automatic execution can't safely proceed, e.g. a persistent
+participant route-404 that exhausted the reconcile budget, or a compensation that could not
+complete; exit 3 / HTTP 409 — this is **not** a failure, it awaits manual resolution), or an
+error status such as `invalid_config` / `revision_unavailable`. A `pending` instance is resumed
+by re-invoking with the same `--workflow-id` and no `--arguments`.
 
 ---
 
@@ -475,8 +479,10 @@ PUT  /microflows/v1/operations/{operation}/{operation_id}
   same id + DIFFERENT input -> 409. 202 = accepted/in-progress.
 
 GET  /microflows/v1/operations/{operation}/{operation_id}
-  durable lookup: succeeded|failed (terminal), pending, deferred (busy, with a
-  due time), indeterminate. 404 = no record (Microflows may safely re-PUT).
+  durable lookup: a terminal SUCCESS carries an object `result` (200; `state` is
+  advisory, not read); pending; deferred (busy, with a due time). 404 = no record
+  (Microflows safely re-PUTs; a PERSISTENT route-404 is bounded by the reconcile
+  budget and then parks the workflow `blocked`).
 ```
 
 Your participant owns the **business effect, its idempotency, and its durable

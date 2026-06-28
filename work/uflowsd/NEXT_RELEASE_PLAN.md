@@ -44,7 +44,7 @@ first; the rest inherit it.
   goldens unaffected). Add fixtures for `//`, `/* */`, unterminated `/*`, and `#`-now-error; regen via
   `tests/run_parser_fixtures.py --update`. Update the contract-doc comment note (currently says `#`-only).
 
-## B. #2 — PUT/GET 404 + persistent-404  ✅ LANDED (increments 1–4); ⏳ root gate re-running after review fixes (expect 202) on 0.33.63
+## B. #2 — PUT/GET 404 + persistent-404  ✅ LANDED (increments 1–4, root-gate-green 202/202 on 0.33.63)
 
 - **LANDED 2026-06-28** exactly to the contract below (one deviation: `DispatchResult::Route404` is added,
   but the GET-404 signal reuses the existing `GetOutcome::Unknown` rather than a new `RouteUnknown` — same
@@ -52,7 +52,7 @@ first; the rest inherit it.
   SP-test 127/127; (2) host `reconcile_defer`/`checkpoint_reconcile_defer` + typed outcomes; (3) runner
   `Route404` classification + budget handlers + `Outcome::Blocked(direction,reason)` + `_inspect_report`
   blocked render (gated on `STATE_BLOCKED`) + strict `reconcile_budget` validation; (4) stub `route_404`
-  fault + integration 195/195 (forward/reverse exhaustion, transient recovery, replay, invalid-budget).
+  fault + integration 202/202 (forward/reverse exhaustion, 2-op forward-404-with-checkpoint, transient recovery, replay, invalid-budget).
 - **APPROVED IMPLEMENTATION CONTRACT (locked 2026-06-27).** PUT/GET 404 stays **retryable** (infra/rollout
   404s are transient; definite-abort would false-abort financial flows). A **durable, fenced, bounded
   reconcile budget** bounds the retry; on exhaustion the workflow durably **blocks** (operator-visible),

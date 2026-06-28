@@ -4,7 +4,7 @@ See `README.md` (charter). Toolchain: certified driftc 0.33.63 / ABI 18 (app-cer
 
 ---
 
-## Next-release landed set (`.mf` comments + #2–#5 + 200-harden) — ⏳ root gate RE-RUNNING after review fixes (last green 195; +1 new 2-op 404 test → expect 202)
+## Next-release landed set (`.mf` comments + #2–#5 + 200-harden) — ✅ root-gate-green (202) on 0.33.63
 
 **Status:** the `.mf` comment switch + **#2–#5 + the 200-result harden** are implemented and gate-green;
 #2–#5 + the harden are **committed step-by-step**, and **#2's durable bounded reconcile budget is now
@@ -30,10 +30,9 @@ sits as the current uncommitted set. Commits:
 DRIFT_TOOLCHAIN_ROOT=~/opt/drift/certified/current/toolchain \
 DRIFT_PKG_ROOT=~/opt/drift/certified/current/pkgs  just test
 ```
-→ **last confirmed GREEN**: singular `16`, microflows (parser fixtures `91/91`, e2e `20`, SP regression
-`127/127`), integration build `3`, **coordinator↔singular `195/195`**. (driftc 0.33.63 / ABI 18.)
-→ **PENDING**: re-run in progress after the review fixes (the 2-op forward-404 test raises the integration
-guard to **202**); this header flips back to ✅ only when that run lands green.
+→ **GREEN**: singular `16`, microflows (parser fixtures `91/91`, e2e `20`, SP regression `127/127`),
+integration build `3`, **coordinator↔singular `202/202`** (incl. the 2-op forward-404-with-checkpoint test).
+(driftc 0.33.63 / ABI 18.)
 
 **Dirty (uncommitted) right now — #2 durable reconcile budget (increments 1–4):**
 - Schema/migration: `microflows/db/schema/{tb_mf_operation,tb_mf_workflow_checkpoint}.sql` +
@@ -46,7 +45,7 @@ guard to **202**); this header flips back to ✅ only when that run lands green.
   `Outcome::Blocked(direction,reason)`, `_inspect_report` blocked render gated on `STATE_BLOCKED`,
   strict `reconcile_budget` validation).
 - Stub/tests/docs: `microflows/participant-stub/src/app.drift` (route_404 fault),
-  `integration/coordinator-singular/test.py` (195 checks) + the two fixture CSVs,
+  `integration/coordinator-singular/test.py` (202 checks) + the two fixture CSVs,
   `microflows/doc/microflows_design.md` + `microflows/examples/RUN_LOCAL.md` (404-budget docs),
   `work/uflowsd/{NEXT_RELEASE_PLAN.md,RELEASE_ANNOUNCEMENT_DRAFT.md,PROGRESS.md}`.
 
