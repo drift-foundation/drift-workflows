@@ -744,6 +744,106 @@ def main():
     except pymysql.MySQLError as e:
         check("status_result_invariant", "ck_mf_operation_status_result" in str(e), e)
 
+    # ===== #2: durable reconcile budget — FORWARD (route-404) =====
+    # Sequence proves: within-budget defer, the min_attempts FLOOR (elapsed enough but attempts<min ->
+    # still defer), exhaustion -> blocked, and that the budget is durable across re-claims (first_seen
+    # anchored once, attempts accumulate). max_elapsed_ms=5000, min_attempts=3.
+    wfb = os.urandom(16)
+    opb = bytes.fromhex("00000000000000000000000000000f01")
+    call(cur, "sp_mf_workflow_create", (wfb, SCRIPT, 1, T(0), T(0), '{"pos":"op:1:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfb, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    tokb = r["fencing_token"]
+    _seed_op(wfb, 1, opb, 1, None)
+    _, r = call(cur, "sp_mf_workflow_reconcile_defer", (wfb, EXEC, tokb, 1, opb, T(2), T(5), T(2), 5000, 3))
+    check("reconcile_within_budget_defers", r and r["outcome"] == "deferred" and r["attempts"] == 1, r)
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfb, EXEC, T(6), "2026-02-01 13:30:00.000000"))
+    tokb = r["fencing_token"]
+    _, r = call(cur, "sp_mf_workflow_reconcile_defer", (wfb, EXEC, tokb, 1, opb, T(20), T(25), T(20), 5000, 3))
+    check("reconcile_min_attempts_floor", r and r["outcome"] == "deferred" and r["attempts"] == 2, r)
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfb, EXEC, T(26), "2026-02-01 13:30:00.000000"))
+    tokb = r["fencing_token"]
+    _, r = call(cur, "sp_mf_workflow_reconcile_defer", (wfb, EXEC, tokb, 1, opb, T(30), T(35), T(30), 5000, 3))
+    check("reconcile_exhausted_blocks",
+          r and r["outcome"] == "blocked" and r["direction"] == "forward" and r["reason"] == "participant_route_unknown", r)
+    cur.execute("SELECT state, execution_direction, current_disposition FROM tb_mf_workflow WHERE workflow_id=%s", (wfb,))
+    check("reconcile_blocked_state", cur.fetchone() == (3, 1, 4), "expected blocked_resolution(3)/forward(1)/indeterminate(4)")
+    cur.execute("SELECT continuation FROM tb_mf_workflow WHERE workflow_id=%s", (wfb,))
+    _cont = json.loads(cur.fetchone()[0])
+    check("reconcile_blocked_continuation",
+          _cont.get("pos") == "blocked" and _cont.get("reason") == "participant_route_unknown"
+          and _cont.get("direction") == "forward" and _cont.get("operation_seq") == 1,
+          f"continuation must carry the durable blocked reason for inspect replay: {_cont}")
+    cur.execute("SELECT reconcile_attempts, reconcile_first_seen_at FROM tb_mf_operation WHERE workflow_id=%s AND operation_seq=1", (wfb,))
+    row = cur.fetchone()
+    check("reconcile_budget_durable", row[0] == 3 and "13:00:02" in str(row[1]),
+          f"attempts=3 + first_seen anchored at T(2): {row}")
+    # fence-lost: a stale token never advances the budget (on a fresh forward wf).
+    wfb2 = os.urandom(16); opb2 = bytes.fromhex("00000000000000000000000000000f02")
+    call(cur, "sp_mf_workflow_create", (wfb2, SCRIPT, 1, T(0), T(0), '{"pos":"op:1:dispatched"}', "{}"))
+    call(cur, "sp_mf_workflow_claim_by_id", (wfb2, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    _seed_op(wfb2, 1, opb2, 1, None)
+    _, r = call(cur, "sp_mf_workflow_reconcile_defer", (wfb2, EXEC, 999999, 1, opb2, T(2), T(5), T(2), 5000, 3))
+    check("reconcile_fence_lost", r and r["outcome"] == "fence_lost", r)
+
+    # ===== #2: durable reconcile budget — REVERSE (compensation route-404) =====
+    wfr = os.urandom(16)
+    cpr = bytes.fromhex("00000000000000000000000000000f11")
+    failr = bytes.fromhex("00000000000000000000000000000f12")
+    revr = bytes.fromhex("00000000000000000000000000000f1a")
+    call(cur, "sp_mf_workflow_create", (wfr, SCRIPT, 1, T(0), T(0), '{"pos":"op:2:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfr, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    tokr = r["fencing_token"]
+    _seed_checkpoint(wfr, 1, cpr, '{"reservation":"rr"}')
+    _seed_op(wfr, 2, failr, 1, None)
+    call(cur, "sp_mf_workflow_begin_reversal", (wfr, EXEC, tokr, 2, failr, T(2), "forward_op_rejected"))
+    rev_req(wfr, tokr, 1, revr, T(3))   # dispatch the compensation binding on checkpoint 1
+    _, r = call(cur, "sp_mf_checkpoint_reconcile_defer", (wfr, EXEC, tokr, 1, revr, T(4), T(8), T(4), 5000, 3))
+    check("reverse_reconcile_within_budget", r and r["outcome"] == "deferred" and r["attempts"] == 1, r)
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfr, EXEC, T(9), "2026-02-01 13:30:00.000000"))
+    tokr = r["fencing_token"]
+    _, r = call(cur, "sp_mf_checkpoint_reconcile_defer", (wfr, EXEC, tokr, 1, revr, T(20), T(25), T(20), 5000, 3))
+    check("reverse_reconcile_floor", r and r["outcome"] == "deferred" and r["attempts"] == 2, r)
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfr, EXEC, T(26), "2026-02-01 13:30:00.000000"))
+    tokr = r["fencing_token"]
+    _, r = call(cur, "sp_mf_checkpoint_reconcile_defer", (wfr, EXEC, tokr, 1, revr, T(30), T(35), T(30), 5000, 3))
+    check("reverse_reconcile_exhausted_blocks",
+          r and r["outcome"] == "blocked" and r["direction"] == "reverse" and r["reason"] == "participant_route_unknown", r)
+    cur.execute("SELECT state, execution_direction, current_disposition FROM tb_mf_workflow WHERE workflow_id=%s", (wfr,))
+    check("reverse_reconcile_blocked_state", cur.fetchone() == (3, 2, 4), "expected blocked_resolution(3)/reverse(2)/indeterminate(4)")
+    cur.execute("SELECT reversal_state, reconcile_attempts FROM tb_mf_workflow_checkpoint WHERE workflow_id=%s AND seq=1", (wfr,))
+    check("reverse_reconcile_checkpoint", cur.fetchone() == (3, 3), "expected checkpoint resolution_required(3) + attempts=3")
+    # F3 (reverse): a committed block replays idempotently as already_blocked (lease-independent).
+    _, r = call(cur, "sp_mf_checkpoint_reconcile_defer", (wfr, EXEC, tokr, 1, revr, T(40), T(45), T(40), 5000, 3))
+    check("reverse_reconcile_already_blocked", r and r["outcome"] == "already_blocked", r)
+
+    # F1 (forward): an EXHAUSTED block with a NON-advancing event_ts returns event_time_skew and does
+    # NOT commit/advance the budget; a later proper-time attempt blocks. (Mirrors reverse_block/op_fail.)
+    wfs = os.urandom(16); ops = bytes.fromhex("00000000000000000000000000000f21")
+    call(cur, "sp_mf_workflow_create", (wfs, SCRIPT, 1, T(0), T(0), '{"pos":"op:1:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfs, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    toks = r["fencing_token"]
+    _seed_op(wfs, 1, ops, 1, None)
+    call(cur, "sp_mf_workflow_reconcile_defer", (wfs, EXEC, toks, 1, ops, T(2), T(5), T(2), 1000, 2))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfs, EXEC, T(6), "2026-02-01 13:30:00.000000")); toks = r["fencing_token"]
+    _, r = call(cur, "sp_mf_workflow_reconcile_defer", (wfs, EXEC, toks, 1, ops, T(20), T(25), T(2), 1000, 2))
+    check("reconcile_block_skew_guard", r and r["outcome"] == "event_time_skew", r)
+    cur.execute("SELECT reconcile_attempts FROM tb_mf_operation WHERE workflow_id=%s AND operation_seq=1", (wfs,))
+    check("reconcile_block_skew_no_commit", cur.fetchone()[0] == 1, "a skewed block must not advance the budget")
+    _, r = call(cur, "sp_mf_workflow_reconcile_defer", (wfs, EXEC, toks, 1, ops, T(30), T(35), T(30), 1000, 2))
+    check("reconcile_block_after_skew", r and r["outcome"] == "blocked", r)
+
+    # F2 (forward): a SETTLED op never route-404s -> operation_not_requested (no budget advance/block).
+    wfn = os.urandom(16); opn = bytes.fromhex("00000000000000000000000000000f22")
+    call(cur, "sp_mf_workflow_create", (wfn, SCRIPT, 1, T(0), T(0), '{"pos":"op:1:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfn, EXEC, T(1), "2026-02-01 13:30:00.000000")); tokn = r["fencing_token"]
+    _seed_op(wfn, 1, opn, 2, '{"reserved":"x"}')
+    _, r = call(cur, "sp_mf_workflow_reconcile_defer", (wfn, EXEC, tokn, 1, opn, T(2), T(5), T(2), 1000, 2))
+    check("reconcile_op_not_requested", r and r["outcome"] == "operation_not_requested", r)
+
+    for t in ("tb_mf_workflow_args", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+        for w in (wfb, wfb2, wfr, wfs, wfn):
+            cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (w,))
+
     # cleanup
     for t in ("tb_mf_workflow_args", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (WF,))
@@ -752,7 +852,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: if a check is accidentally deleted or bypassed, the
     # ran-count drifts from this manifest and the run FAILS (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 110
+    EXPECTED_CHECKS = 127
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

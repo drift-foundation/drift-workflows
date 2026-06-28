@@ -46,17 +46,50 @@ first; the rest inherit it.
 
 ## B. #2 — PUT/GET 404 + persistent-404  ✅ / 🟡 (schema fork)
 
-- **Decision:** PUT 404 is **not** a definite rejection (infra LB/mesh/ingress/rollout 404s are transient;
-  definite-abort would false-abort financial flows). Keep PUT/GET 404 **retryable**. `GET 404 = no durable
-  record`. Add a **durable, bounded reconcile budget** (count **+** elapsed wall-time; wall-time primary with
-  a generous min-elapsed floor to outlast deploy windows; **configurable in the deployment manifest**).
-  Per-attempt structured warn event `participant-route-404` (op, operation_id, participant, endpoint, attempt).
-  On budget expiry → non-success terminal **`blocked`** (resumable, operator) / `failed` with
-  `participant_route_unknown` — never silent infinite pending, never `reversed`. Counter increment is
-  fence-guarded.
-- 🟡 **Open fork:** the budget must be **durable** (survive resume/restart, else it resets and the spin
-  survives) → likely a coordinator-schema field (operation/checkpoint row or a reconcile-state record).
-  *This is the decision that makes #2 runner-only vs schema+runner.*
+- **APPROVED IMPLEMENTATION CONTRACT (locked 2026-06-27).** PUT/GET 404 stays **retryable** (infra/rollout
+  404s are transient; definite-abort would false-abort financial flows). A **durable, fenced, bounded
+  reconcile budget** bounds the retry; on exhaustion the workflow durably **blocks** (operator-visible),
+  never `failed`, never `reversed`, never silent infinite pending.
+- **(G1) Distinct outcome.** New `DispatchResult::Route404` (+ `GetOutcome::RouteUnknown`). ONLY a confirmed
+  participant no-record/route-unknown advances the budget. Conclusive forms: `GET 404 → re-PUT 404` AND
+  `GET 404 → re-PUT(5xx/transport) → GET 404`. 202 / 5xx / body-read / transport stay `Pending` (unchanged).
+- **(Budget homes)** Forward: `tb_mf_operation` (key `(workflow_id, operation_seq)`). Reverse:
+  `tb_mf_workflow_checkpoint` (key `(workflow_id, seq)`). New cols on both: `reconcile_attempts int NOT NULL
+  DEFAULT 0`, `reconcile_first_seen_at`/`reconcile_last_seen_at datetime(6) NULL`, `reconcile_reason
+  varchar(64) NULL`. Resume re-reads the same row → budget never resets.
+- **(G4) Exhaustion rule:** `elapsed >= max_elapsed_ms AND attempts >= min_attempts` (wall-time is the only
+  real bound; min_attempts is a small floor so one 404 + clock skew can't block). **No max_attempts cap.**
+- **(Transition, fenced + atomic, one SP per direction)** Within budget → advance cols + clear lease +
+  set next_attempt + per-attempt warn event `participant_route_404` → `Deferred`. Exhausted:
+  - **forward** → `forward(1)→blocked_resolution(3)`, dir forward(1), **disposition indeterminate(4)**, lease
+    cleared, event `participant_route_unknown`; **op stays `requested`, NO compensation, prior checkpoints
+    untouched**.
+  - **reverse** → the EXISTING `sp_mf_checkpoint_reverse_block` path (already takes disposition∈{2,4}; 4 =
+    "indeterminate after reconcile exhaustion") → `blocked_resolution(3)` dir reverse, checkpoint
+    `resolution_required(3)`.
+- **(G2 + G3) Durable blocked reason = the `continuation`** (already returned by inspect). Forward exhaustion
+  sets `{"pos":"blocked","direction":"forward","reason":"participant_route_unknown","operation_seq":N,
+  "operation_id":"<hex>"}`; reverse sets `{"pos":"blocked","seq":N,"direction":"reverse","reason":
+  "participant_route_unknown"}` (preserve checkpoint `seq` — the existing reverse-block continuation uses it).
+  `_inspect_report`'s non-terminal branch parses `pos=="blocked"` → `Outcome::Blocked(direction, reason)`,
+  with a **fallback**: `direction` ← continuation else `snap.execution_direction`; `reason` ← continuation
+  else `""`. So NEW blocks replay with full reason; pre-existing reverse-block rows (which carry
+  `{pos:blocked,seq}` only) replay as `blocked`/reverse with an empty reason — **no migration of old
+  continuations is claimed.**
+- **Config:** `deployment.reconcile_budget = { max_elapsed_ms, min_attempts }`. Default production-generous
+  (`1_800_000` ≈ 30 min, `2`); gate/dev override short. One knob, forward + reverse.
+- **Render:** parameterize `Outcome::Blocked(direction, reason)` → `{"workflow":"blocked","direction":
+  forward|reverse,"reason":…}`, exit 3 (unchanged).
+- **Operator resolution/reset is a NAMED FOLLOW-UP — NOT shipped here.** Docs say "persistent route-404 →
+  operator-visible block; the resolution/reset API is a follow-up." Do NOT write "fix routing then resume."
+- **(G4-stub) Tests need a real route-404 fault:** a stub hook returning 404 on PUT *and* GET **without
+  creating a Singular op** (no record), in persistent + transient (N-then-recover) forms. Transient proves
+  the budget increments then route recovery completes with NO compensation.
+- **Build order (incremental, SP tests before integration):** (1) schema + migration `0002` + the two budget
+  SPs (forward reconcile-defer; reverse reconcile-defer→reverse_block) + sp_operation_test units; (2) host
+  decode (`Route404`/budget outcomes, `Outcome::Blocked` direction); (3) runner routing (`Route404`
+  classification in `_reconcile`/`_reconcile_after_resubmit`) + `_inspect_report` blocked render; (4) stub
+  route-404 fault + integration tests + docs.
 - **Future (separate, not a blocker):** a non-mutating participant capability endpoint for deploy-time
   preflight (collection-level `GET /microflows/v1/operations/{operation}` preferred over `OPTIONS` for
   infra-predictability). Preflight is impossible on the current 2-route contract (GET 404 ambiguous, PUT

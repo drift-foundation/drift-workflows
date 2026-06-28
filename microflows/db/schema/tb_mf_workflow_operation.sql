@@ -38,6 +38,13 @@ CREATE TABLE IF NOT EXISTS `tb_mf_operation` (
 	`result_json` mediumtext NULL,
 	`created_at` datetime(6) NOT NULL,
 	`updated_at` datetime(6) NOT NULL,
+	-- Durable bounded reconcile budget for persistent participant route-404s (#2). Advanced ONLY by
+	-- sp_mf_workflow_reconcile_defer on a confirmed Route404. Keyed by (workflow_id, operation_seq) so a
+	-- resume re-reads the same row and the budget never resets. NULL/0 until the first route-404.
+	`reconcile_attempts` int NOT NULL DEFAULT 0,
+	`reconcile_first_seen_at` datetime(6) NULL,
+	`reconcile_last_seen_at` datetime(6) NULL,
+	`reconcile_reason` varchar(64) NULL,
 	PRIMARY KEY (`workflow_id`,`operation_seq`),
 	UNIQUE KEY `uq_mf_operation_opid` (`operation_id`),
 	CONSTRAINT `ck_mf_operation_status` CHECK (`status` IN (1,2)),

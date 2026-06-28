@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow_checkpoint` (
 	`resolution_event_seq` bigint NULL,
 	`created_at` datetime(6) NOT NULL,
 	`updated_at` datetime(6) NOT NULL,
+	-- Durable bounded reconcile budget for a persistent route-404 on THIS checkpoint's compensation
+	-- dispatch (#2, reverse side). Advanced ONLY by the reverse reconcile-defer SP on a confirmed Route404,
+	-- keyed by (workflow_id, seq) so resume never resets it. NULL/0 until the first route-404.
+	`reconcile_attempts` int NOT NULL DEFAULT 0,
+	`reconcile_first_seen_at` datetime(6) NULL,
+	`reconcile_last_seen_at` datetime(6) NULL,
+	`reconcile_reason` varchar(64) NULL,
 	PRIMARY KEY (`workflow_id`,`seq`),
 	UNIQUE KEY `uq_mf_checkpoint_invocation` (`workflow_id`,`operation_id`),
 	CONSTRAINT `ck_mf_checkpoint_reversal_state` CHECK (`reversal_state` IN (1,2,3,4)),
