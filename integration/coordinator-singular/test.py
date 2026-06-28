@@ -343,6 +343,9 @@ def main():
              "compensation": {"operation": "undo-decide", "schema_version": 1}},
             {"name": "undo-decide", "participant": "ref", "schema_version": 1},
         ],
+        # #2: a SHORT reconcile budget so a persistent route-404 exhausts on the 2nd attempt (the first
+        # anchors first_seen at elapsed 0; the second, after a next_attempt nudge, has elapsed > 1ms).
+        "reconcile_budget": {"max_elapsed_ms": 1, "min_attempts": 2},
     }
 
     scf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(stub_cfg, scf); scf.close()
@@ -657,8 +660,10 @@ def main():
         # blocked workflow does NOT redispatch on rerun (non-claimable) -> no new request.
         rq1 = _request_count(base)
         code, body = run_runner(rcf.name, WF_REVERSE_REJECT)
+        # A blocked_resolution workflow replays {workflow:blocked,direction:reverse} from its DURABLE
+        # continuation (#2: inspect render), still non-claimable -> no redispatch.
         check("reverse_block_no_redispatch",
-              code == 5 and body.get("workflow") == "deferred"
+              code == 3 and body.get("workflow") == "blocked" and body.get("direction") == "reverse"
               and _request_count(base) == rq1, (code, body, "redispatched while blocked"))
 
         # 6f. PRE-dispatch resolution failure: the checkpoint's forward op declares NO
@@ -3173,6 +3178,120 @@ def main():
               and body.get("compensated") == False and sti2 == [["7", "2"]],
               (code, body, sti2))
 
+        # ===== #2: persistent participant route-404 -> durable bounded reconcile budget =====
+        PAST = "2000-01-01 00:00:00.000000"
+        # (validator) a malformed reconcile_budget is REJECTED at build, never silently defaulted.
+        _bad = dict(runner_cfg); _bad["reconcile_budget"] = {"max_elapsed_ms": 0}
+        _bad["plan"] = [{"operation": "reserve", "input": {"reservation": "x"}}]
+        _bf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(_bad, _bf); _bf.close(); plan_cfgs.append(_bf.name)
+        # Captured directly so we can pin the diagnostic: aborted/invalid_config(2) AND stderr names the
+        # offending key (the runner eprintln's the validator message before rendering invalid_config).
+        _p = subprocess.run([str(RUNNER_BIN), "--config", _bf.name, "--workflow-id", _wf_id(), "--arguments", "{}"],
+                            capture_output=True, text=True, timeout=40)
+        _bd = json.loads(_p.stdout.strip().splitlines()[-1]) if _p.stdout.strip() else {}
+        check("reconcile_budget_invalid_rejected",
+              _p.returncode == 2 and _bd.get("workflow") == "aborted" and _bd.get("reason") == "invalid_config"
+              and "reconcile_budget" in _p.stderr, (_p.returncode, _bd, _p.stderr.strip()[-160:]))
+
+        # (1) FORWARD persistent 404: 404 on PUT+GET (no record) -> Route404 -> budget. Attempt 1 defers;
+        # attempt 2 (after a next_attempt nudge, elapsed > 1ms) exhausts -> blocked/forward. Replay stable.
+        _arm_fault(base, "reserve", "route_404")
+        r4 = plan_cfg([{"operation": "reserve", "input": {"reservation": "rt1"}}])
+        wf4 = _wf_id()
+        code, body = run_runner(r4, wf4, arguments="{}")
+        check("route404_forward_deferred",
+              code == 9 and body.get("workflow") == "deferred" and body.get("reason") == "participant_route_404", (code, body))
+        check("route404_budget_advanced",
+              _mdb(f"SELECT reconcile_attempts FROM tb_mf_operation WHERE workflow_id=UNHEX('{wf4}') AND operation_seq=1") == [["1"]], "attempt 1")
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '{PAST}' WHERE workflow_id = UNHEX('{wf4}')")
+        code, body = run_runner(r4, wf4)
+        check("route404_forward_blocked",
+              code == 3 and body.get("workflow") == "blocked" and body.get("direction") == "forward"
+              and body.get("reason") == "participant_route_unknown", (code, body))
+        check("route404_forward_blocked_state",
+              _mdb(f"SELECT state, execution_direction, current_disposition FROM tb_mf_workflow WHERE workflow_id=UNHEX('{wf4}')") == [["3", "1", "4"]],
+              "blocked_resolution(3)/forward(1)/indeterminate(4)")
+        check("route404_no_compensation",
+              _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id=UNHEX('{wf4}')") == [["0"]], "no checkpoint")
+        # replay: re-drive a blocked workflow -> renders blocked from DURABLE continuation, no re-dispatch.
+        rq = _request_count(base)
+        code, body = run_runner(r4, wf4)
+        check("route404_replay_blocked",
+              code == 3 and body.get("workflow") == "blocked" and body.get("direction") == "forward"
+              and body.get("reason") == "participant_route_unknown" and _request_count(base) == rq, (code, body))
+        _arm_fault(base, "reserve", "")
+
+        # (1b) FORWARD persistent 404 WITH a prior checkpoint: op1 (reserve) settles + checkpoints, op2
+        # (decide) route-404s and exhausts. A forward block must NOT unwind -> prior checkpoint stays
+        # ACTIVE, disposition indeterminate, and zero compensation occurs.
+        _arm_fault(base, "decide", "route_404")
+        r4b = plan_cfg([
+            {"operation": "reserve", "input": {"reservation": "f2a"}},
+            {"operation": "decide", "input": {"ref": "f2b", "decision": "go"}},
+        ])
+        wf4b = _wf_id()
+        code, body = run_runner(r4b, wf4b, arguments="{}")
+        check("route404_fwd_ck_deferred", code == 9 and body.get("workflow") == "deferred", (code, body))
+        check("route404_fwd_ck_checkpoint_active",
+              _mdb(f"SELECT reversal_state FROM tb_mf_workflow_checkpoint WHERE workflow_id=UNHEX('{wf4b}') AND seq=1") == [["1"]],
+              "op1 checkpoint active before exhaustion")
+        check("route404_fwd_ck_budget",
+              _mdb(f"SELECT reconcile_attempts FROM tb_mf_operation WHERE workflow_id=UNHEX('{wf4b}') AND operation_seq=2") == [["1"]],
+              "op2 budget attempt 1")
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '{PAST}' WHERE workflow_id = UNHEX('{wf4b}')")
+        code, body = run_runner(r4b, wf4b)
+        check("route404_fwd_ck_blocked",
+              code == 3 and body.get("workflow") == "blocked" and body.get("direction") == "forward"
+              and body.get("reason") == "participant_route_unknown", (code, body))
+        check("route404_fwd_ck_blocked_state",
+              _mdb(f"SELECT state, execution_direction, current_disposition FROM tb_mf_workflow WHERE workflow_id=UNHEX('{wf4b}')") == [["3", "1", "4"]],
+              "blocked_resolution(3)/forward(1)/indeterminate(4)")
+        check("route404_fwd_ck_prior_untouched",
+              _mdb(f"SELECT reversal_state FROM tb_mf_workflow_checkpoint WHERE workflow_id=UNHEX('{wf4b}') AND seq=1") == [["1"]],
+              "prior checkpoint still ACTIVE (forward block never unwinds)")
+        check("route404_fwd_ck_no_compensation",
+              _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id=UNHEX('{wf4b}') AND kind IN ('reversal_begun','compensation_requested','compensation_settled','compensation_blocked')") == [["0"]],
+              "no reverse/compensation event")
+        _arm_fault(base, "decide", "")
+
+        # (2) TRANSIENT 404: budget advances, then the route RECOVERS (disarm) -> completes, no compensation.
+        _arm_fault(base, "reserve", "route_404")
+        tr = plan_cfg([{"operation": "reserve", "input": {"reservation": "tr1"}}])
+        wft = _wf_id()
+        code, body = run_runner(tr, wft, arguments="{}")
+        check("route404_transient_deferred", code == 9 and body.get("workflow") == "deferred", (code, body))
+        check("route404_transient_budget_advanced",
+              _mdb(f"SELECT reconcile_attempts FROM tb_mf_operation WHERE workflow_id=UNHEX('{wft}') AND operation_seq=1") == [["1"]], "attempt 1")
+        _arm_fault(base, "reserve", "")
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '{PAST}' WHERE workflow_id = UNHEX('{wft}')")
+        code, body = run_runner(tr, wft)
+        check("route404_transient_recovers",
+              code == 0 and body.get("workflow") == "completed" and body.get("result") == {"reserved": "tr1"}, (code, body))
+        check("route404_transient_no_compensation",
+              _mdb(f"SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id=UNHEX('{wft}') AND reversal_state = 2") == [["0"]], "no comp")
+
+        # (3) REVERSE persistent 404: the COMPENSATION (release) route-404s -> reverse budget -> exhausted
+        # -> blocked/reverse + checkpoint resolution_required.
+        _arm_fault(base, "release", "route_404")
+        rv = plan_cfg([
+            {"operation": "reserve", "input": {"reservation": "rv1"}},
+            {"operation": "reserve", "input": {"reservation": "rv2", "_fault": {"reject": True}}},
+        ])
+        wfv = _wf_id()
+        code, body = run_runner(rv, wfv, arguments="{}")
+        check("route404_reverse_deferred", code == 9 and body.get("workflow") == "deferred", (code, body))
+        check("route404_reverse_budget_advanced",
+              _mdb(f"SELECT reconcile_attempts FROM tb_mf_workflow_checkpoint WHERE workflow_id=UNHEX('{wfv}') AND seq=1") == [["1"]], "attempt 1")
+        _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '{PAST}' WHERE workflow_id = UNHEX('{wfv}')")
+        code, body = run_runner(rv, wfv)
+        check("route404_reverse_blocked",
+              code == 3 and body.get("workflow") == "blocked" and body.get("direction") == "reverse"
+              and body.get("reason") == "participant_route_unknown", (code, body))
+        check("route404_reverse_checkpoint",
+              _mdb(f"SELECT reversal_state FROM tb_mf_workflow_checkpoint WHERE workflow_id=UNHEX('{wfv}') AND seq=1") == [["3"]],
+              "checkpoint resolution_required(3)")
+        _arm_fault(base, "release", "")
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the LOCAL authoritative
         # result; no dependency on the participant. MUST be the LAST stub-using block — it terminates
         # the stub and never restarts it, so any check after this would hit a dead participant.
@@ -3220,7 +3339,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 180
+    EXPECTED_CHECKS = 202
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

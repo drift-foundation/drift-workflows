@@ -1,0 +1,7 @@
+args { amt: int }
+op reserve { input: { amt: int } }
+op charge  { input: { amt: int } }
+steps {
+  reserve { "amt": arg amt }
+  charge  { "amt": arg amt }
+}

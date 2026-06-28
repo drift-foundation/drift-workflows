@@ -140,7 +140,7 @@ variant Outcome {
 	Aborted(reason: String, code: Int),                    // exit 2 / 3 / 8
 	Deferred(reason: String, defer_until: String, code: Int), // defer_until "" -> omitted; exit 5 / 6 / 9
 	DeferFailed(reason: String, code: Int),                // exit 7 / 8
-	Blocked(reason: String),                               // direction reverse; reason "" -> omitted; exit 3
+	Blocked(direction: String, reason: String),           // direction forward|reverse; reason "" -> omitted; exit 3
 	ReverseAborted(reason: String, code: Int),             // exit 7 / 8
 	FailAborted(reason: String, code: Int)                 // exit 7 / 8
 }
@@ -167,9 +167,9 @@ fn _oc_render(o: &Outcome) nothrow -> String {
 			return "{\"workflow\":\"deferred\",\"reason\":\"" + _dup(reason) + "\",\"defer_until\":\"" + _dup(defer_until) + "\"}";
 		},
 		Outcome::DeferFailed(reason, code) => { return "{\"workflow\":\"defer_failed\",\"reason\":\"" + _dup(reason) + "\"}"; },
-		Outcome::Blocked(reason) => {
-			if reason.byte_length() == 0 { return "{\"workflow\":\"blocked\",\"direction\":\"reverse\"}"; }
-			return "{\"workflow\":\"blocked\",\"direction\":\"reverse\",\"reason\":\"" + _dup(reason) + "\"}";
+		Outcome::Blocked(direction, reason) => {
+			if reason.byte_length() == 0 { return "{\"workflow\":\"blocked\",\"direction\":\"" + _dup(direction) + "\"}"; }
+			return "{\"workflow\":\"blocked\",\"direction\":\"" + _dup(direction) + "\",\"reason\":\"" + _dup(reason) + "\"}";
 		},
 		Outcome::ReverseAborted(reason, code) => { return "{\"workflow\":\"reverse_aborted\",\"reason\":\"" + _dup(reason) + "\"}"; },
 		Outcome::FailAborted(reason, code) => { return "{\"workflow\":\"fail_aborted\",\"reason\":\"" + _dup(reason) + "\"}"; }
@@ -192,7 +192,7 @@ fn _oc_exit(o: &Outcome) nothrow -> Int {
 		Outcome::Aborted(reason, code) => { return code; },
 		Outcome::Deferred(reason, defer_until, code) => { return code; },
 		Outcome::DeferFailed(reason, code) => { return code; },
-		Outcome::Blocked(reason) => { return 3; },
+		Outcome::Blocked(direction, reason) => { return 3; },
 		Outcome::ReverseAborted(reason, code) => { return code; },
 		Outcome::FailAborted(reason, code) => { return code; }
 	}
@@ -225,6 +225,7 @@ fn _drain_release(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 
 // microflows.state terminal storage codes.
 const STATE_REVERSING: Int = 2;
+const STATE_BLOCKED: Int = 3;
 const STATE_COMPLETED: Int = 4;
 const STATE_REVERSED: Int = 5;
 const STATE_FAILED: Int = 7;
@@ -311,6 +312,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 	val _ = p.flag("emit-content-hash", "", "build the registry from --config and print the active revision's content_hash (hex), then exit; no DB or --workflow-id needed (used to (re)compute fixtures)");
 	val _ = p.option_string("lower-source", "", "FILE", "lower a .mf source file into a runnable config: use --config as the base routing registry, print the merged config JSON to stdout, then exit (no DB/dispatch; the textual frontend)", false);
 	val _ = p.option_string("parse-check", "", "FILE", "parse a .mf source and print a CANONICAL JSON outcome (status/is_graph/canonical/validate/type_check, or status/code/position for a parse error) to stdout, then exit 0; DB-free, no routing registry — the parser/IR test driver (golden-fixture tooling)", false);
+	val _ = p.option_string("emit-graph", "", "FILE", "lower a .mf source and print its IR graph as a Mermaid `flowchart` to stdout, then exit; DB-free, no routing registry (microflows-viz / docs)", false);
 	val _ = p.option_string("manifest", "m", "FILE", "deployment manifest (named scripts + shared deployment routing). Compiles+validates EVERY declared script at startup; a SUBMISSION names a script via --script, a RESUME drives by the durable pin. Alternative to --config", false);
 	val _ = p.option_string("script", "s", "NAME", "the manifest script to SUBMIT (manifest mode, fresh submission only; a resume uses the durable pin)", false);
 
@@ -323,6 +325,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 	var emit_hash: Bool = false;
 	var lower_source_path: String = "";
 	var parse_check_path: String = "";
+	var emit_graph_path: String = "";
 	var manifest_path: String = "";
 	var script_name: String = "";
 	var has_script: Bool = false;
@@ -336,6 +339,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 			match parsed.get_string("arguments", p) { Some(v) => { arguments_json = _dup(v); has_arguments = true; }, None => {} }
 			match parsed.get_string("lower-source", p) { Some(v) => { lower_source_path = _dup(v); }, None => {} }
 				match parsed.get_string("parse-check", p) { Some(v) => { parse_check_path = _dup(v); }, None => {} }
+				match parsed.get_string("emit-graph", p) { Some(v) => { emit_graph_path = _dup(v); }, None => {} }
 			match parsed.get_string("manifest", p) { Some(v) => { manifest_path = _dup(v); }, None => {} }
 			match parsed.get_string("script", p) { Some(v) => { script_name = _dup(v); has_script = true; }, None => {} }
 			emit_hash = parsed.has_flag("emit-content-hash", p);
@@ -349,6 +353,9 @@ fn main(argv: Array<String>) nothrow -> Int {
 	// DB-free and registry-free — the golden-fixture driver for the parser unit suite.
 	if parse_check_path.byte_length() != 0 {
 		return try _parse_check(&parse_check_path) catch { console.eprintln("runner: parse-check failed"); 1 };
+	}
+	if emit_graph_path.byte_length() != 0 {
+		return try _emit_graph(&emit_graph_path) catch { console.eprintln("runner: emit-graph failed"); 1 };
 	}
 	// Frontend mode: lower a .mf source file into a runnable config (base routing from --config),
 	// print the merged config JSON, then exit. Pure front end — no DB, no claim, no dispatch.
@@ -444,6 +451,43 @@ fn _parse_check(source_path: &String) -> Int {
 
 // Canonical IR identity of a parsed body — a "graph" via parse_graph, a flat "plan" lifted through
 // flat_to_graph (the degenerate-graph identity the runner pins). Mirrors the old test helpers.
+fn _emit_graph(source_path: &String) -> Int {
+	val source = _read_text(source_path);
+	match parser.parse_source(&source) {
+		core.Result::Err(e) => {
+			console.eprintln("emit-graph: parse error " + _dup(&e.code) + " at line " + fmt.format_int(e.line));
+			return 1;
+		},
+		core.Result::Ok(pw) => {
+			if pw.is_graph {
+				match ir.parse_graph(&pw.body) {
+					core.Result::Ok(g) => { console.println(ir.emit_mermaid(&g)); return 0; },
+					core.Result::Err(e) => { console.eprintln("emit-graph: bad graph: " + _dup(&e.message)); return 1; }
+				}
+			}
+			var steps: Array<ir.FlatStep> = [];
+			match pw.body.as_array() {
+				Optional::Some(items) => {
+					var i = 0;
+					while i < items.len {
+						var op: String = "";
+						match items[i].get(&"operation") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { op = move s; }, Optional::None => {} } }, Optional::None => {} }
+						var inp: String = "{}";
+						match items[i].get(&"input") { Optional::Some(n) => { inp = json.encode_compact(n); }, Optional::None => {} }
+						steps.push(ir.FlatStep(operation = move op, input_json = move inp));
+						i = i + 1;
+					}
+				},
+				Optional::None => {}
+			}
+			match ir.flat_to_graph(&steps) {
+				core.Result::Ok(g) => { console.println(ir.emit_mermaid(&g)); return 0; },
+				core.Result::Err(e) => { console.eprintln("emit-graph: " + _dup(&e.message)); return 1; }
+			}
+		}
+	}
+}
+
 fn _pc_canon(body: &json.JsonNode, is_graph: Bool) -> String {
 	if is_graph {
 		match ir.parse_graph(body) {
@@ -850,6 +894,11 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 			// blocked_resolution, lease cleared) so the workflow stops advancing and
 			// cannot repeat after lease expiry. Never exit still forward/requested.
 			return _fail_operation(host.get(), &workflow_id, fencing_token, &operation_id, move reason, admission);
+		},
+		DispatchResult::Route404 => {
+			// Persistent route-404 -> advance the durable reconcile budget (within budget -> defer,
+			// exhausted -> blocked forward).
+			return _reconcile_budget_forward(host.get(), cfg, &workflow_id, fencing_token, OPERATION_SEQ, &operation_id, admission);
 		}
 	}
 
@@ -1909,6 +1958,9 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						// `blocked_resolution` for a definite forward rejection — that is reserved for
 						// an UNCERTAIN forward outcome.
 						return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, move reason, admission);
+					},
+					DispatchResult::Route404 => {
+						return _reconcile_budget_forward(host, cfg, workflow_id, fencing_token, seq, &operation_id, admission);
 					}
 				}
 			}
@@ -1964,7 +2016,7 @@ fn _authored_fail_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow
 			if state == STATE_FAILED {
 				return Outcome::TerminalFailure(reason = _dup(&terminal_reason), compensated = false);
 			}
-			return Outcome::Blocked(reason = "");
+			return Outcome::Blocked(direction = "reverse", reason = "");
 		},
 		mf.AuthoredFailOutcome::TriggerMismatch => {
 			return Outcome::Aborted(reason = "authored_fail_trigger_mismatch", code = 8);
@@ -2004,7 +2056,7 @@ fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflo
 			if state == STATE_FAILED {
 				return Outcome::TerminalFailure(reason = _dup(&terminal_reason), compensated = false);
 			}
-			return Outcome::Blocked(reason = "");
+			return Outcome::Blocked(direction = "reverse", reason = "");
 		},
 		mf.BeginReversalOutcome::FenceLost => {
 			return Outcome::ReverseAborted(reason = "begin_reversal_fence_lost", code = 7);
@@ -2043,7 +2095,7 @@ pub variant GetOutcome {
 //   Done     -> a terminal result to settle
 //   Pending  -> not terminal (or unreachable); durably defer and re-poll later
 //   Rejected -> definite protocol rejection; abort
-pub variant DispatchResult { Done(result: String), Pending, Rejected(reason: String) }
+pub variant DispatchResult { Done(result: String), Pending, Rejected(reason: String), Route404 }
 
 // A 200 carries a MANDATORY `result` (§3 / contract §4.5). A 200 body without one is a definite
 // PROTOCOL failure, not a runner fatal: classify it as a Rejected outcome so it flows through the
@@ -2157,6 +2209,62 @@ fn _get_op(base: &String, operation_name: &String, operation_id_hex: &String) no
 
 // Reconcile an uncertain outcome by GET on the stable operation id. Terminal ->
 // Done; 202/working or unreachable -> Pending (defer); 400/409 -> Rejected; a
+// ===== #2: durable reconcile budget (persistent route-404) =====
+const RECONCILE_MAX_ELAPSED_MS_DEFAULT: Int = 1800000;
+const RECONCILE_MIN_ATTEMPTS_DEFAULT: Int = 2;
+
+struct ReconcileBudget { max_elapsed_ms: Int, min_attempts: Int }
+
+fn _reconcile_budget(cfg: &json.JsonNode) nothrow -> ReconcileBudget {
+	var me = RECONCILE_MAX_ELAPSED_MS_DEFAULT;
+	var ma = RECONCILE_MIN_ATTEMPTS_DEFAULT;
+	match cfg.get(&"reconcile_budget") {
+		Optional::Some(rb) => {
+			match rb.get(&"max_elapsed_ms") { Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { if v > 0 { me = v; } }, Optional::None => {} } }, Optional::None => {} }
+			match rb.get(&"min_attempts") { Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { if v >= 1 { ma = v; } }, Optional::None => {} } }, Optional::None => {} }
+		},
+		Optional::None => {}
+	}
+	return ReconcileBudget(max_elapsed_ms = me, min_attempts = ma);
+}
+
+fn _reconcile_budget_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
+                             fencing_token: Int, operation_seq: Int, operation_id: &Array<Byte>,
+                             admission: &AdmissionState) -> Outcome {
+	val b = _reconcile_budget(cfg);
+	val clock = host.clock_read(DISPATCH_DEFER_SECONDS);
+	match host.reconcile_defer(workflow_id, fencing_token, operation_seq, operation_id, &clock.now, &clock.deadline, &clock.now, b.max_elapsed_ms, b.min_attempts) {
+		mf.ReconcileDeferOutcome::Deferred(_) => { return Outcome::Deferred(reason = "participant_route_404", defer_until = _dup(&clock.deadline), code = 9); },
+		mf.ReconcileDeferOutcome::Blocked(direction, reason) => { return Outcome::Blocked(direction = move direction, reason = move reason); },
+		mf.ReconcileDeferOutcome::EventTimeSkew(defer_until) => { return _defer(host, workflow_id, fencing_token, &defer_until, "reconcile_skew", admission); },
+		mf.ReconcileDeferOutcome::FenceLost => { return Outcome::Aborted(reason = "reconcile_fence_lost", code = 3); },
+		mf.ReconcileDeferOutcome::OperationNotFound => { return _defer_dispatch(host, workflow_id, fencing_token, "reconcile_op_not_found", admission); },
+		mf.ReconcileDeferOutcome::OperationConflict => { return _defer_dispatch(host, workflow_id, fencing_token, "reconcile_op_conflict", admission); },
+		mf.ReconcileDeferOutcome::OperationNotRequested(_) => { return _defer_dispatch(host, workflow_id, fencing_token, "reconcile_op_not_requested", admission); },
+		mf.ReconcileDeferOutcome::NotFound => { return Outcome::Aborted(reason = "reconcile_workflow_not_found", code = 8); }
+	}
+}
+
+fn _reconcile_budget_reverse(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
+                             fencing_token: Int, seq: Int, rev_id: &Array<Byte>,
+                             admission: &AdmissionState) -> Outcome {
+	val b = _reconcile_budget(cfg);
+	val clock = host.clock_read(DISPATCH_DEFER_SECONDS);
+	match host.checkpoint_reconcile_defer(workflow_id, fencing_token, seq, rev_id, &clock.now, &clock.deadline, &clock.now, b.max_elapsed_ms, b.min_attempts) {
+		mf.CheckpointReconcileDeferOutcome::Deferred(_) => { return Outcome::Deferred(reason = "participant_route_404", defer_until = _dup(&clock.deadline), code = 9); },
+		mf.CheckpointReconcileDeferOutcome::Blocked(direction, reason) => { return Outcome::Blocked(direction = move direction, reason = move reason); },
+		mf.CheckpointReconcileDeferOutcome::AlreadyBlocked => { return Outcome::Blocked(direction = "reverse", reason = "participant_route_unknown"); },
+		mf.CheckpointReconcileDeferOutcome::EventTimeSkew(defer_until) => { return _defer(host, workflow_id, fencing_token, &defer_until, "reconcile_skew", admission); },
+		mf.CheckpointReconcileDeferOutcome::FenceLost => { return Outcome::ReverseAborted(reason = "reconcile_fence_lost", code = 7); },
+		mf.CheckpointReconcileDeferOutcome::NotFound => { return Outcome::Aborted(reason = "reconcile_workflow_not_found", code = 8); },
+		mf.CheckpointReconcileDeferOutcome::CheckpointNotFound => { return _defer_dispatch(host, workflow_id, fencing_token, "reconcile_checkpoint_not_found", admission); },
+		mf.CheckpointReconcileDeferOutcome::NotRequested => { return _defer_dispatch(host, workflow_id, fencing_token, "reconcile_comp_not_requested", admission); },
+		mf.CheckpointReconcileDeferOutcome::ReverseIdMismatch => { return _defer_dispatch(host, workflow_id, fencing_token, "reconcile_reverse_id_mismatch", admission); },
+		mf.CheckpointReconcileDeferOutcome::CheckpointNotActive(_) => { return _defer_dispatch(host, workflow_id, fencing_token, "reconcile_checkpoint_not_active", admission); },
+		mf.CheckpointReconcileDeferOutcome::OutOfOrder(_) => { return _defer_dispatch(host, workflow_id, fencing_token, "reconcile_out_of_order", admission); }
+	}
+}
+
 // 404 means the participant has no record -> safe re-PUT the identical request
 // under the same id, then GET again (effectively-once replay).
 fn _reconcile(base: &String, operation_name: &String, operation_id_hex: &String, input_json: &String) -> DispatchResult {
@@ -2176,6 +2284,7 @@ fn _reconcile(base: &String, operation_name: &String, operation_id_hex: &String,
 					if status == 202 { return DispatchResult::Pending(); }
 					if status == 400 { return DispatchResult::Rejected("participant_invalid_request"); }
 					if status == 409 { return DispatchResult::Rejected("participant_identity_conflict"); }
+					if status == 404 { return DispatchResult::Route404(); }
 					return _reconcile_after_resubmit(base, operation_name, operation_id_hex);
 				},
 				PutOutcome::TransportFailed => { return _reconcile_after_resubmit(base, operation_name, operation_id_hex); }
@@ -2188,8 +2297,36 @@ fn _reconcile_after_resubmit(base: &String, operation_name: &String, operation_i
 	match _get_op(base, operation_name, operation_id_hex) {
 		GetOutcome::Terminal(r) => { return DispatchResult::Done(move r); },
 		GetOutcome::Rejected(reason) => { return DispatchResult::Rejected(move reason); },
-		// Still not terminal (pending / unreachable / 404 again) -> defer + retry.
+		// A 404 AFTER the resubmit confirms a persistent no-record / route-unknown -> advance the budget.
+		GetOutcome::Unknown => { return DispatchResult::Route404(); },
+		// Pending / unreachable -> defer + retry (transport uncertainty, not a route condition).
 		default => { return DispatchResult::Pending(); }
+	}
+}
+
+// Render a blocked_resolution workflow from its DURABLE continuation, so a crash-after-block replays
+// the EXACT {workflow:blocked,direction,reason} from durable state. NEW blocks carry
+// {pos:blocked,direction,reason}; pre-existing reverse-block rows carry {pos:blocked,seq} only -> fall
+// back to the row's execution_direction + an empty reason (no migration of old continuations).
+fn _blocked_from_continuation(snap: &mf.WorkflowSnapshot) nothrow -> Optional<Outcome> {
+	// Render blocked ONLY for a durable blocked_resolution(3) row. A stale/malformed `pos:blocked` on a
+	// forward/reversing/deferred row must NOT suppress normal retry — the durable state is authoritative.
+	if snap.state_code != STATE_BLOCKED { return Optional<Outcome>::None(); }
+	match json.parse_strict(&snap.continuation_json) {
+		core.Result::Ok(n) => {
+			var pos = "";
+			match n.get(&"pos") { Optional::Some(pp) => { match pp.as_string() { Optional::Some(v) => { pos = move v; }, Optional::None => {} } }, Optional::None => {} }
+			if pos == "blocked" {
+				var direction = "reverse";
+				if snap.execution_direction == 1 { direction = "forward"; }
+				match n.get(&"direction") { Optional::Some(dd) => { match dd.as_string() { Optional::Some(v) => { direction = move v; }, Optional::None => {} } }, Optional::None => {} }
+				var reason = "";
+				match n.get(&"reason") { Optional::Some(rr) => { match rr.as_string() { Optional::Some(v) => { reason = move v; }, Optional::None => {} } }, Optional::None => {} }
+				return Optional<Outcome>::Some(Outcome::Blocked(direction = move direction, reason = move reason));
+			}
+			return Optional<Outcome>::None();
+		},
+		core.Result::Err(_) => { return Optional<Outcome>::None(); }
 	}
 }
 
@@ -2205,6 +2342,11 @@ fn _inspect_report(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, operatio
 			}
 			if snap.leased {
 				return Outcome::Active(reason = "leased_by_another");
+			}
+			// A blocked_resolution(3) workflow renders {workflow:blocked,direction,reason} from durable state.
+			match _blocked_from_continuation(&snap) {
+				Optional::Some(o) => { return o; },
+				Optional::None => {}
 			}
 			return Outcome::Deferred(reason = "not_yet_due_or_blocked", defer_until = "", code = 5);
 		},
@@ -2428,10 +2570,10 @@ fn _reverse_block(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 	val ts = _now(host);
 	match host.reverse_block(workflow_id, fencing_token, seq, rev_id, 2, &reason, &ts) {
 		mf.ReverseBlockOutcome::Blocked => {
-			return Outcome::Blocked(reason = move reason);
+			return Outcome::Blocked(direction = "reverse", reason = move reason);
 		},
 		mf.ReverseBlockOutcome::AlreadyBlocked => {
-			return Outcome::Blocked(reason = move reason);
+			return Outcome::Blocked(direction = "reverse", reason = move reason);
 		},
 		mf.ReverseBlockOutcome::FenceLost => {
 			return Outcome::ReverseAborted(reason = "block_fence_lost", code = 7);
@@ -2462,7 +2604,7 @@ fn _dispatch_or_reconcile(recover: Bool, base: &String, operation_name: &String,
 	return _classify_dispatch(base, operation_name, operation_id_hex, input_json);
 }
 
-fn _compensate(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
+fn _compensate(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>, fencing_token: Int,
                seq: Int, comp_op: &String, base: &String, rev_id: &Array<Byte>,
                rev_id_hex: &String, rev_input: &String, recover: Bool, admission: &AdmissionState) -> CompStep {
 	match _dispatch_or_reconcile(recover, base, comp_op, rev_id_hex, rev_input) {
@@ -2491,6 +2633,9 @@ fn _compensate(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_toke
 		DispatchResult::Rejected(reason) => {
 			// Persist the CLASSIFIED participant reason as blocked-resolution evidence.
 			return CompStep::Terminal(_reverse_block(host, workflow_id, fencing_token, seq, rev_id, move reason, admission));
+		},
+		DispatchResult::Route404 => {
+			return CompStep::Terminal(_reconcile_budget_reverse(host, cfg, workflow_id, fencing_token, seq, rev_id, admission));
 		}
 	}
 }
@@ -2596,7 +2741,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				}
 				if ready {
 					// Fresh dispatch of a just-persisted binding: PUT-first.
-					match _compensate(host, workflow_id, fencing_token, seq, &comp_op, &base, &rev_id, &rev_id_hex, &rev_input, false, admission) {
+					match _compensate(host, cfg, workflow_id, fencing_token, seq, &comp_op, &base, &rev_id, &rev_id_hex, &rev_input, false, admission) {
 						CompStep::Continue => {},
 						CompStep::Terminal(code) => { return code; }
 					}
@@ -2624,7 +2769,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				}
 				// Durable binding already dispatched (recovery): GET-first reconcile,
 				// never a blind re-PUT.
-				match _compensate(host, workflow_id, fencing_token, seq, &rev_op, &base, &rev_id, &rev_id_hex, &rev_input, true, admission) {
+				match _compensate(host, cfg, workflow_id, fencing_token, seq, &rev_op, &base, &rev_id, &rev_id_hex, &rev_input, true, admission) {
 					CompStep::Continue => {},
 					CompStep::Terminal(code) => { return code; }
 				}
@@ -2703,6 +2848,41 @@ fn _input_hash(input_json: &String) -> String {
 fn _validate_registry(cfg: &json.JsonNode) -> Void {
 	val ids = _validate_participants(cfg);
 	_validate_operations(cfg, &ids);
+	_validate_reconcile_budget(cfg);
+}
+
+// If reconcile_budget is present it is validated STRICTLY (fail-fast at registry build), so a typo can't
+// silently become the 30-min production default (hanging a test) or silently change prod behavior. Absent
+// keys default. Must be an object; max_elapsed_ms (if present) an integer > 0; min_attempts (if present)
+// an integer >= 1.
+fn _validate_reconcile_budget(cfg: &json.JsonNode) -> Void {
+	match cfg.get(&"reconcile_budget") {
+		Optional::Some(rb) => {
+			match rb.as_object() {
+				Optional::Some(_) => {},
+				Optional::None => { throw RunnerError(message = "reconcile_budget must be an object"); }
+			}
+			match rb.get(&"max_elapsed_ms") {
+				Optional::Some(n) => {
+					match n.as_int() {
+						Optional::Some(v) => { if v <= 0 { throw RunnerError(message = "reconcile_budget.max_elapsed_ms must be an integer > 0"); } },
+						Optional::None => { throw RunnerError(message = "reconcile_budget.max_elapsed_ms must be an integer"); }
+					}
+				},
+				Optional::None => {}
+			}
+			match rb.get(&"min_attempts") {
+				Optional::Some(n) => {
+					match n.as_int() {
+						Optional::Some(v) => { if v < 1 { throw RunnerError(message = "reconcile_budget.min_attempts must be an integer >= 1"); } },
+						Optional::None => { throw RunnerError(message = "reconcile_budget.min_attempts must be an integer"); }
+					}
+				},
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
 }
 
 // Validate every participant's transport; return the owned set of participant ids.
@@ -3235,7 +3415,7 @@ fn _outcome_http_status(o: &Outcome) nothrow -> Int {
 		Outcome::Deferred(r, d, c) => { if _str_eq(r, &"workflow_conflict") { return 409; } return 202; },
 		Outcome::Aborted(r, c) => { if _str_eq(r, &"not_found") { return 404; } return 400; },
 		Outcome::Active(r) => { return 409; },
-		Outcome::Blocked(r) => { return 409; },
+		Outcome::Blocked(d, r) => { return 409; },
 		Outcome::Failed(r) => { return 409; },
 		Outcome::DeferFailed(r, c) => { return 500; },
 		Outcome::ReverseAborted(r, c) => { return 500; },

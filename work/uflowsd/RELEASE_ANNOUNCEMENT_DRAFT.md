@@ -1,8 +1,8 @@
 # DRAFT — NOT PUBLISHED — uflowsd / microflows next-release announcement
 
 > Internal draft for cross-team review. Do not distribute. Covers the shipped pushcoin bundle work (the
-> `.mf` comment switch + #3–#5 + the `200`-result protocol hardening), plus the still-open #2 / `404` item.
-> Verified on certified driftc 0.33.61 / ABI 18; full root `just test` green.
+> `.mf` comment switch + #2–#5 + the `200`-result protocol hardening).
+> Verified on certified driftc 0.33.63 / ABI 18; full root `just test` green.
 
 ## TL;DR
 
@@ -56,22 +56,26 @@ services and for any consumer that parsed the old `reversed` outcome** — see *
 - `.mf` now uses **C-family comments**: `//` to end-of-line and `/* … */` (non-nesting). **`#` is no
   longer a comment** (it's a parse error). All shipped examples/fixtures migrated.
 
-## Still pending (not in this release)
-
-- **#2 — participant `404` handling.** PUT/GET `404` remains **retryable** (an infra LB/mesh/ingress
-  404 is transient; a definite-abort would false-abort financial flows). The planned **durable,
-  bounded reconcile budget** (count + wall-time, configurable per deployment; on expiry → a
-  non-success terminal, never silent infinite pending) is **designed but NOT yet implemented** —
-  tracked as an open fork (likely a coordinator-schema field). Until then, an unreachable participant
-  keeps deferring/retrying.
+### 7. Durable bounded reconcile budget for persistent participant `404`s (#2)
+- A participant `404` stays **retryable** (an infra LB/mesh/ingress 404 is transient), but a *persistent*
+  route-404 — no record AND won't accept the resubmit — is now **bounded**. Each confirmed route-404
+  (re-PUT 404, or GET-after-resubmit 404 — never a 202/5xx/transport blip) advances a **durable budget**
+  on the operation row (forward) or checkpoint row (reverse), keyed so a resume can never reset it.
+- Within budget the workflow **defers + retries**; on exhaustion — wall-time elapsed **and** a
+  min-attempts floor — it enters **`blocked`**: forward (direction forward, disposition *indeterminate* —
+  the op never executed) or, when a **compensation** is the one 404ing, the reverse-block path (checkpoint
+  `resolution_required`). No compensation runs; the durable `participant_route_unknown` reason is carried
+  in the continuation so inspect/replay renders the same `{"workflow":"blocked",…}` outcome (exit 3).
+- Configurable per deployment: `reconcile_budget.{max_elapsed_ms, min_attempts}` (default **30 min / 2**),
+  validated strictly at startup (no silent fallback). **No more infinite silent pending.**
 
 ## Breaking changes
 
-1. **Participant `200` contract.** A `200` body **must** be `{"state":"succeeded","result":{…}}`
-   with `result` an **object**. Participants that returned `200` with no `result`, a scalar/`null`
-   `result`, or signaled terminal failure as `200 {state:"failed"}` must change: a business-negative
-   outcome is a `200` **result** the workflow branches on; the protocol-violation cases now terminate
-   the workflow `failed`.
+1. **Participant `200` contract.** A `200` body **must** be `{"result":{…}}` with `result` an
+   **object**; **`state` is not read on a 200** (optional/advisory, never required). Participants that
+   returned `200` with no `result`, a scalar/`null` `result`, or signaled terminal failure as
+   `200 {state:"failed"}` must change: a business-negative outcome is a `200` **result** the workflow
+   branches on (via `case`/`fail`); the protocol-violation cases now terminate the workflow `failed`.
 2. **Client outcome vocabulary.** `{"workflow":"reversed"}` (exit 0) is **removed**; consumers must
    read `{"workflow":"failed","reason","compensated"}` (exit 3, HTTP 200). Read the outcome
    *document*, never infer from the HTTP status / exit code (both are advisory adapters).
@@ -83,8 +87,10 @@ services and for any consumer that parsed the old `reversed` outcome** — see *
 
 ## Migration notes
 
-- **Coordinator schema:** apply `microflows/db/migrations/0001_terminal_failed_state.sql` — adds the
-  `terminal_reason` column + the `failed`(7) state, and **backfills** legacy `reversed`(5) rows
+- **Coordinator schema:** apply `microflows/db/migrations/0001_terminal_failed_state.sql` and
+  `microflows/db/migrations/0002_reconcile_budget.sql` (the latter adds the per-dispatch
+  `reconcile_*` budget columns to `tb_mf_operation` + `tb_mf_workflow_checkpoint`, NULL/0 defaults,
+  online-safe). `0001` adds the `terminal_reason` column + the `failed`(7) state, and **backfills** legacy `reversed`(5) rows
   deterministically from the audit log (rows with `compensation_settled` events stay `reversed(5)` =
   `compensated:true`; the old empty-stack `reversed` rows become `failed(7)` = `compensated:false`),
   with documented fallbacks. Fresh installs get this from the schema directly.
@@ -96,6 +102,6 @@ services and for any consumer that parsed the old `reversed` outcome** — see *
 
 ## Verification
 
-- Certified driftc 0.33.61 / ABI 18. Root `just test` green: singular, microflows
+- Certified driftc 0.33.63 / ABI 18. Root `just test` green: singular, microflows
   (parser fixtures, e2e, stored-procedure regression), and the coordinator↔singular integration suite
   (incl. the new result-branch / `fail` / `200`-protocol cases).

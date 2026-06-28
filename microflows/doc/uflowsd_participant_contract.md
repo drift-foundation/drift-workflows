@@ -178,7 +178,7 @@ uflowsd issues a PUT to start an operation. It classifies your response **by sta
 
 | Your status | uflowsd interprets as | Required body |
 |---|---|---|
-| **200** | terminal success — settles the operation | `{"state":"succeeded","result":{…}}` — **`result` is mandatory** (uflowsd extracts it). A 200 with a **missing** `result` (`participant_protocol_missing_result`) or a **non-object** `result` (`participant_protocol_invalid_result`) is a definite PROTOCOL failure: the workflow terminates `failed` (exit 3) — never a runner crash. `state` is not read on 200. |
+| **200** | terminal success — settles the operation | `{"result":{…}}` — **`result` is mandatory** and must be an **object** (uflowsd extracts it). A 200 with a **missing** `result` (`participant_protocol_missing_result`) or a **non-object** `result` (`participant_protocol_invalid_result`) is a definite PROTOCOL failure: the workflow terminates `failed` (exit 3) — never a runner crash. **`state` is not read on a 200** (optional/advisory); a business-negative outcome is a `result` the workflow branches on, never `state:"failed"`. |
 | **202** | accepted / in-progress — uflowsd defers and re-polls | `{"state":"pending"}` (body not parsed) |
 | **400** | definite rejection — abort, no retry | `{"state":"error","reason":"…"}` (reason informational) |
 | **409** | identity/input conflict — abort, no retry | `{"reason":"input-conflict"}` (see §4.3) |
@@ -195,7 +195,7 @@ uflowsd GETs to poll in-flight work and to reconcile after an uncertain PUT. Cla
 
 | Your status | uflowsd interprets as | Body |
 |---|---|---|
-| **200** | terminal — settles | `{"state":"succeeded","result":{…}}` — `result` mandatory |
+| **200** | terminal — settles | `{"result":{…}}` — `result` mandatory (object); `state` not read (advisory) |
 | **202** | pending — keep polling | `{"state":"pending"}` (not parsed) |
 | **404** | **no record** of this operation (§4.4) | not parsed — any body, or none |
 | **400 / 409** | definite rejection — abort | informational |
@@ -236,10 +236,13 @@ advisory, per §0). **Business-negative outcomes are results, not failures** —
 indeterminate are all `200` with the outcome inside `result`:
 
 ```json
-{"state":"succeeded","result":{"status":"approved","auth_id":"a1"}}
-{"state":"succeeded","result":{"status":"declined","reason":"insufficient_funds"}}
-{"state":"succeeded","result":{"kind":"indeterminate","processor_ref":"p9","requires_manual_review":true}}
+{"result":{"status":"approved","auth_id":"a1"}}
+{"result":{"status":"declined","reason":"insufficient_funds"}}
+{"result":{"kind":"indeterminate","processor_ref":"p9","requires_manual_review":true}}
 ```
+
+Older participants may still include a `state` field (e.g. `{"state":"succeeded","result":{…}}`); uflowsd
+**ignores `state` on a 200** and reads only `result`.
 
 There is **no `200 {"state":"failed"}`** — that shape mixes "valid terminal result" (HTTP) with "no result"
 (body) and the coordinator falls through the crack. A participant does **not** signal failure via `200`.
@@ -340,7 +343,7 @@ as-built:
 | PUT `201/200` for success | **only 200** is success; 201 falls through to reconcile (`runner.drift:1988`) |
 | GET `deferred {state,not_before}` and `indeterminate` states | **not built** — GET is classified by status only; 202→pending, no `not_before`, no `indeterminate` path |
 | GET 200 `{state, result\|error}` with `state` significant | uflowsd reads **`result`** only on a 200; `state` is not consulted there (`_classify_result` runner.drift:2057; a missing/non-object `result` -> `_classify_200_body`:2074 = `participant_protocol_missing_result` / `participant_protocol_invalid_result`) |
-| body state vocabulary `pending\|succeeded\|failed\|indeterminate` | `indeterminate` is not produced or consumed; uncertainty is handled by reconcile/defer, not a wire state |
+| body state vocabulary `pending\|succeeded\|failed\|indeterminate` | neither `failed` nor `indeterminate` is a 200 wire state — a 200 carries an object `result` (`state` advisory); failure is a status code (400/409) or a `result` the workflow branches on; uncertainty is reconcile/defer |
 
 When §5 is reconciled to as-built, this table should shrink to empty.
 

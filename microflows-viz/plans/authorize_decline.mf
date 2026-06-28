@@ -1,0 +1,11 @@
+args { amt: int }
+op authorize { input: { amt: int }  result: { status: string } }
+op capture   { input: { amt: int } }
+steps {
+  let a = authorize { "amt": arg amt }
+  case result a.status {
+    "approved" { capture { "amt": arg amt } }
+    "declined" { fail "payment_declined" }
+    default    { fail "gateway_status_unknown" }
+  }
+}

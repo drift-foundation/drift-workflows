@@ -1,0 +1,2 @@
+# Vendored, minified third-party bundle — treat as an opaque blob (no diff/whitespace checks).
+microflows-viz/vendor/mermaid.min.js -text -diff linguist-vendored

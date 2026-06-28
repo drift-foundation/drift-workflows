@@ -435,11 +435,12 @@ PUT /microflows/v1/operations/{operation}/{operation_id}
   400      invalid input
 
 GET /microflows/v1/operations/{operation}/{operation_id}
-  200  terminal     { state: succeeded|failed, result|error }
+  200  terminal     { result: {…} }   (terminal SUCCESS; `result` is the contract, `state` advisory)
   202  pending      { state: pending }
        deferred     { state: deferred, not_before: "..." }   (busy, due time)
   404  unknown      participant has NO record of this operation
-  body state vocabulary: pending | succeeded | failed | indeterminate
+  result-only: a 200 carries an object `result`; a business-negative outcome is a RESULT the workflow
+  branches on (via case/fail) — never `state:"failed"`. `state` is advisory, not interpreted on 200.
 ```
 
 `{operation}` is the static operation name; `{operation_id}` is the
@@ -451,6 +452,21 @@ then **safely resubmit the identical request under the same ID**: idempotent
 creation makes a genuine first execution and a re-creation indistinguishable.
 (A 404 is therefore *not* a failure — it is a "not yet" that the dispatch gap
 permits.)
+
+A **persistent** 404 — the participant has no record AND will not accept the
+resubmit — is bounded by a **durable reconcile budget** (per deployment:
+`reconcile_budget.{max_elapsed_ms, min_attempts}`, default 30 min / 2 attempts).
+Each *confirmed* route-404 (a re-PUT 404, or a GET-after-resubmit 404 — never a
+202/5xx/transport blip) advances the budget on the durable operation row
+(forward) or checkpoint row (reverse), keyed so a resume can **never** reset it.
+Within budget the workflow defers and retries; on exhaustion — wall-time elapsed
+**and** the min-attempts floor met — it enters `blocked_resolution`. Forward:
+direction forward, disposition *indeterminate* (the op never executed, so the
+outcome is uncertain, not failed); reverse (a compensation 404): the existing
+reverse-block path, checkpoint `resolution_required`. No compensation runs, prior
+checkpoints are untouched, and the durable `participant_route_unknown` reason is
+carried in the `continuation` so inspect/replay renders the same
+`{"workflow":"blocked",...}` outcome.
 
 ### 5.2 Properties
 

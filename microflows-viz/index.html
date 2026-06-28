@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>μFlows-viz — live workflow lifecycle</title>
+<!--
+  SELF-CONTAINED: no CDN, no second tab, no network. Works under `python3 -m http.server` OR
+  double-clicked as a file. Two synced views:
+    • Sequence (default) — the actual calls: uflowsd ↔ participant ↔ MariaDB, one step per event.
+    • State machine     — the durable lifecycle (state.drift states 1–7).
+  The inline reducer + messagesFor() mirror microflows.machine.js / the real tb_mf_workflow_event kinds.
+-->
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --mut:#8b949e;
+          --accent:#58a6ff; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --blocked:#bc8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.5 ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif; }
+  header { padding:14px 28px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:24px; flex-wrap:wrap; }
+  h1 { margin:0; font-size:20px; } h1 small { color:var(--mut); font-weight:400; font-size:14px; }
+  .hscenario { display:flex; align-items:center; gap:10px; }
+  .hscenario label { color:var(--mut); font-weight:600; font-size:13px; }
+  #scenario { min-width:360px; }
+  .wrap { display:grid; grid-template-columns:330px 1fr 360px; min-height:calc(100vh - 66px); }
+  .col { padding:18px 22px; } .col + .col { border-left:1px solid var(--line); }
+  select,button { font:inherit; color:var(--fg); background:var(--panel); border:1px solid var(--line);
+                  border-radius:8px; padding:9px 12px; }
+  button { cursor:pointer; } button.primary { background:var(--accent); color:#08111f; border-color:var(--accent); font-weight:700; }
+  button:disabled { opacity:.5; cursor:default; }
+  .controls { display:flex; gap:10px; flex-wrap:wrap; margin:14px 0 4px; }
+  .toggle { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-top:6px; }
+  .toggle button { border:0; border-radius:0; background:var(--panel); padding:7px 12px; }
+  .toggle button.on { background:var(--accent); color:#08111f; font-weight:700; }
+  .blurb { color:var(--mut); margin:12px 0 14px; min-height:58px; }
+  .status { font-size:13px; color:var(--mut); line-height:1.9; }
+  .status b { color:var(--fg); } .pill { display:inline-block; padding:2px 9px; border-radius:999px; border:1px solid var(--line); font-weight:700; }
+  .legend { margin-top:18px; font-size:12.5px; color:var(--mut); } .legend code{color:var(--fg)}
+  svg { width:100%; height:auto; } .hidden { display:none; }
+  /* sequence view */
+  .lhead { fill:var(--fg); font-weight:700; font-size:12px; text-anchor:middle; }
+  .lcap  { fill:var(--mut); font-size:10px; text-anchor:middle; }
+  .lifeline { stroke:var(--line); stroke-dasharray:3 4; }
+  .msg { opacity:0; transition:.3s; } .msg.show { opacity:1; }
+  .marrow { stroke-width:1.8; fill:none; }
+  .k-req .marrow{stroke:var(--accent)} .k-ok .marrow{stroke:var(--ok)} .k-err .marrow{stroke:var(--bad)}
+  .k-db .marrow{stroke:var(--mut)} .k-block .marrow{stroke:var(--blocked)}
+  .mlab { font-size:10px; text-anchor:middle; fill:var(--fg); }
+  .k-db .mlab{fill:var(--mut)} .k-err .mlab{fill:var(--bad)} .k-block .mlab{fill:var(--blocked)} .k-ok .mlab{fill:var(--ok)}
+  .msg.now .marrow{ stroke-width:3; filter:drop-shadow(0 0 6px currentColor); }
+  /* state view */
+  .node rect { fill:var(--panel); stroke:var(--line); stroke-width:1.5; rx:10; transition:.2s; }
+  .node text { fill:var(--fg); font-weight:600; } .node .sub { fill:var(--mut); font-weight:400; font-size:11px; }
+  .node.terminal rect { stroke-dasharray:4 3; } .node.active rect { stroke-width:3; filter:drop-shadow(0 0 10px currentColor); } .node.active text { fill:#fff; }
+  .c-forward.active rect{stroke:var(--accent);color:var(--accent)} .c-reversing.active rect{stroke:var(--warn);color:var(--warn)}
+  .c-blocked.active rect{stroke:var(--blocked);color:var(--blocked)} .c-completed.active rect{stroke:var(--ok);color:var(--ok)}
+  .c-reversed.active rect,.c-failed.active rect{stroke:var(--bad);color:var(--bad)} .c-resolved_exception.active rect{stroke:var(--ok);color:var(--ok)}
+  .edge { stroke:var(--line); stroke-width:1.5; fill:none; } .elab { fill:var(--mut); font-size:10.5px; }
+  /* IR-graph view (mermaid) */
+  .irbox { padding-top:6px; } .irbox svg { max-width:100%; height:auto; }
+  #ir g.node rect, #ir g.node polygon, #ir g.node path { transition:.2s; }
+  #ir g.node.ir-on rect, #ir g.node.ir-on polygon, #ir g.node.ir-on path,
+  #ir g.node.ir-on > * { stroke:var(--accent)!important; stroke-width:3px!important; filter:drop-shadow(0 0 7px var(--accent)); }
+  #ir g.node.ir-fail rect, #ir g.node.ir-fail polygon, #ir g.node.ir-fail path { stroke:var(--bad)!important; stroke-width:3px!important; filter:drop-shadow(0 0 7px var(--bad)); }
+  #ir g.node.ir-block rect, #ir g.node.ir-block polygon, #ir g.node.ir-block path { stroke:var(--blocked)!important; stroke-width:3px!important; filter:drop-shadow(0 0 7px var(--blocked)); }
+  #ir g.node.ir-comp rect, #ir g.node.ir-comp polygon, #ir g.node.ir-comp path { stroke:var(--warn)!important; stroke-width:3px!important; filter:drop-shadow(0 0 7px var(--warn)); }
+  #ir g.node.ir-retry rect, #ir g.node.ir-retry polygon, #ir g.node.ir-retry path { stroke:var(--warn)!important; stroke-width:2.5px!important; stroke-dasharray:5 3; }
+  #ir g.node.ir-done rect, #ir g.node.ir-done polygon, #ir g.node.ir-done path { stroke:var(--ok)!important; stroke-width:3px!important; filter:drop-shadow(0 0 7px var(--ok)); }
+  /* mf-plan view */
+  .mfbox { margin:0; padding:14px 16px; background:#0b0f14; border:1px solid var(--line); border-radius:8px;
+           font:13px/1.6 ui-monospace,Menlo,Consolas,monospace; color:var(--fg); white-space:pre; overflow:auto; }
+  .mfbox .mfhead { color:var(--mut); }
+  /* trace */
+  ol#log { list-style:none; padding:0; margin:12px 0 0; }
+  ol#log li .thead { cursor:pointer; } ol#log li .caret { float:right; color:var(--mut); transition:transform .2s; }
+  ol#log li.open .caret { transform:rotate(90deg); }
+  ol#log li .io { display:none; margin-top:8px; border-top:1px solid var(--line); padding-top:6px; }
+  ol#log li.open .io { display:block; }
+  ol#log li .io .iolbl { font-size:11px; color:var(--mut); margin:6px 0 2px; }
+  ol#log li .io pre { margin:0; font:11.5px ui-monospace,Menlo,monospace; color:var(--fg); background:#0b0f14;
+                      border:1px solid var(--line); border-radius:6px; padding:6px 8px; overflow-x:auto; white-space:pre-wrap; }
+  ol#log li { padding:9px 11px; border:1px solid var(--line); border-radius:8px; margin-bottom:7px; background:var(--panel);
+              opacity:0; transform:translateY(4px); transition:.25s; }
+  ol#log li.show { opacity:1; transform:none; } ol#log li.now { border-color:var(--accent); }
+  ol#log li .kind { font:12px ui-monospace,Menlo,monospace; color:var(--accent); } ol#log li .note{color:var(--fg)}
+</style>
+</head>
+<body>
+<header>
+  <h1>μFlows-viz &nbsp;<small>live workflow — the actual coordinator ↔ participant calls</small></h1>
+  <div class="hscenario"><label for="scenario">Scenario</label><select id="scenario"></select></div>
+</header>
+<div class="wrap">
+  <div class="col">
+    <div class="controls">
+      <button id="play" class="primary">▶ Play</button>
+      <button id="reset">⟲ Reset</button>
+    </div>
+    <div class="toggle" id="view">
+      <button data-v="seq" class="on">Sequence</button>
+      <button data-v="ir">IR graph</button>
+      <button data-v="state">State machine</button>
+      <button data-v="mf">MF plan</button>
+    </div>
+    <div class="blurb" id="blurb"></div>
+    <div class="status">
+      durable state: <span id="now" class="pill">—</span><br/>
+      phase: <b id="sub">—</b> &nbsp; op: <b id="op">—</b><br/>
+      reconcile attempts: <b id="att">0</b> &nbsp; reason: <b id="rsn">—</b>
+    </div>
+    <div class="legend">
+      Each arrow is a real interaction; each box (State view) is a durable state in <code>state.drift</code>.
+      Every step commits atomically — recovery replays to the same picture.
+    </div>
+  </div>
+
+  <div class="col">
+    <!-- SEQUENCE VIEW -->
+    <svg id="seq" viewBox="0 0 480 520" role="img" aria-label="call sequence">
+      <defs>
+        <marker id="mk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/></marker>
+      </defs>
+      <text class="lhead" x="80"  y="24">MariaDB</text><text class="lcap" x="80"  y="38">durable state</text>
+      <text class="lhead" x="240" y="24">uflowsd</text><text class="lcap" x="240" y="38">coordinator</text>
+      <text class="lhead" x="400" y="24">participant</text><text class="lcap" x="400" y="38">the service</text>
+      <line class="lifeline" x1="80"  y1="48" x2="80"  y2="508"/>
+      <line class="lifeline" x1="240" y1="48" x2="240" y2="508"/>
+      <line class="lifeline" x1="400" y1="48" x2="400" y2="508"/>
+      <g id="seqmsgs"></g>
+    </svg>
+
+    <!-- STATE-MACHINE VIEW -->
+    <svg id="state" class="hidden" viewBox="0 0 560 430" role="img" aria-label="workflow lifecycle">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/></marker>
+        <marker id="arl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/></marker>
+      </defs>
+      <path id="e-f-c"  class="edge" d="M220,72  H360" marker-end="url(#ar)"/><text class="elab" x="240" y="64">SETTLED_FINAL</text>
+      <path id="e-f-r"  class="edge" d="M120,112 V176" marker-end="url(#ar)"/><text class="elab" x="126" y="150">REJECTED · FAIL</text>
+      <path id="e-r-rv" class="edge" d="M220,208 H360" marker-end="url(#ar)"/><text class="elab" x="234" y="200">ALL_COMPENSATED</text>
+      <path id="e-r-b"  class="edge" d="M120,248 V300" marker-end="url(#ar)"/><text class="elab" x="126" y="282">compensation fails</text>
+      <path id="e-f-b"  class="edge" d="M40,92 C8,160 8,290 36,330" marker-end="url(#ar)"/><text class="elab" x="6" y="220" transform="rotate(-90 6,220)">forward 404 EXHAUSTED</text>
+      <path id="e-b-re" class="edge" d="M220,332 H330" marker-end="url(#ar)"/><text class="elab" x="226" y="324">OPERATOR_RESOLVE</text>
+      <path id="e-f-fa" class="edge" d="M220,98 C300,118 322,128 360,136" marker-end="url(#ar)"/><text class="elab" x="252" y="120">REJECTED_FIRST</text>
+      <g id="n-forward" class="node c-forward"><rect x="40" y="40" width="180" height="72"/><text x="56" y="68">forward</text><text class="sub" x="56" y="92">driving · awaiting · reconciling</text></g>
+      <g id="n-completed" class="node terminal c-completed"><rect x="360" y="46" width="160" height="52"/><text x="376" y="77">completed</text></g>
+      <g id="n-failed" class="node terminal c-failed"><rect x="360" y="116" width="160" height="44"/><text x="376" y="143">failed</text></g>
+      <g id="n-reversing" class="node c-reversing"><rect x="40" y="176" width="180" height="72"/><text x="56" y="204">reversing</text><text class="sub" x="56" y="228">compensating · reconciling</text></g>
+      <g id="n-reversed" class="node terminal c-reversed"><rect x="360" y="182" width="160" height="52"/><text x="376" y="213">reversed</text></g>
+      <g id="n-blocked" class="node c-blocked"><rect x="40" y="300" width="180" height="64"/><text x="56" y="328">blocked</text><text class="sub" x="56" y="350">awaiting operator</text></g>
+      <g id="n-resolved_exception" class="node terminal c-resolved_exception"><rect x="330" y="308" width="200" height="52"/><text x="346" y="339">resolved_exception</text></g>
+    </svg>
+
+    <!-- IR-GRAPH VIEW (the compiled plan; rendered by the embedded Mermaid) -->
+    <div id="ir" class="irbox hidden"></div>
+    <!-- MF PLAN VIEW (the actual .mf language source) -->
+    <pre id="mf" class="mfbox hidden"></pre>
+  </div>
+
+  <div class="col">
+    <b>Trace</b> <span style="color:var(--mut)">— the append-only event log (tb_mf_workflow_event)</span>
+    <ol id="log"></ol>
+  </div>
+</div>
+
+<script src="vendor/mermaid.min.js"></script>
+<script>
+// ---- scenarios (mirror scenarios.js) -------------------------------------------------------------
+const scenarios = {
+  happy: { title:'Happy path — reserve → charge → completed',
+    blurb:'A two-step workflow runs clean to a success terminal — watch each PUT and its 200.',
+    events:[
+      {type:'DISPATCH',op:'reserve',kind:'operation_requested',note:'PUT reserve → participant'},
+      {type:'SETTLED',kind:'operation_settled',note:'200 {reserved} → durable checkpoint'},
+      {type:'DISPATCH',op:'charge',kind:'operation_requested',note:'PUT charge → participant'},
+      {type:'SETTLED_FINAL',kind:'workflow_completed',note:'200 {charged}, final node → completed'} ]},
+  compensate: { title:'Reject → compensation — charge fails, reserve released',
+    blurb:'A definite failure unwinds the prior checkpoint in reverse (the saga model). No undo code is written — the compensation binding drives it.',
+    events:[
+      {type:'DISPATCH',op:'reserve',kind:'operation_requested',note:'PUT reserve'},
+      {type:'SETTLED',kind:'operation_settled',note:'200 {reserved} → checkpoint (compensable)'},
+      {type:'DISPATCH',op:'charge',kind:'operation_requested',note:'PUT charge'},
+      {type:'REJECTED',reason:'charge_declined',kind:'operation_failed',note:'400 → definite failure → begin reversal'},
+      {type:'COMPENSATED',kind:'compensation_settled',note:'PUT release(reservation_id) → 200'},
+      {type:'ALL_COMPENSATED',kind:'failed',note:'stack empty → reversed = {failed, compensated:true}'} ]},
+  route404: { title:'Persistent route-404 → blocked (durable budget) ★',
+    blurb:'A participant goes dark. The coordinator retries within a DURABLE, bounded budget — a resume cannot reset it — then parks the workflow for an operator instead of hanging forever or corrupting state.',
+    events:[
+      {type:'DISPATCH',op:'reserve',kind:'operation_requested',note:'PUT reserve'},
+      {type:'ROUTE_404',kind:'participant_route_404',note:'404 + re-PUT 404 → route-unknown · budget attempt 1'},
+      {type:'DEFER',kind:'(deferred)',note:'within budget → release lease, retry later (resume re-reads the SAME row)'},
+      {type:'ROUTE_404',kind:'participant_route_404',note:'still 404 → budget attempt 2'},
+      {type:'EXHAUSTED',reason:'participant_route_unknown',kind:'participant_route_unknown',note:'wall-time budget spent → blocked(forward), indeterminate'},
+      {type:'OPERATOR_RESOLVE',kind:'(operator action)',note:'operator resolves the block → resolved_exception'} ]},
+  authoredFail: { title:'Result branch + authored fail — case result → fail',
+    blurb:'A 200 decline is a normal RESULT the workflow branches on, then authors its own failure — which still unwinds.',
+    events:[
+      {type:'DISPATCH',op:'authorize',kind:'operation_requested',note:'PUT authorize'},
+      {type:'SETTLED',kind:'operation_settled',note:'200 {status:"declined"} → checkpoint (a result, not an error)'},
+      {type:'FAIL',reason:'payment_declined',kind:'operation_failed',note:'case result auth.status { "declined" { fail } } → begin reversal'},
+      {type:'COMPENSATED',kind:'compensation_settled',note:'PUT undo-authorize → 200'},
+      {type:'ALL_COMPENSATED',kind:'failed',note:'stack empty → reversed = {failed, reason:"payment_declined", compensated:true}'} ]},
+  compBlocked: { title:'Compensation FAILS → blocked (reverse) ★ ops worst case',
+    blurb:'The dangerous one: a settled side-effect can NOT be undone. charge fails, the unwind PUTs release, the participant REJECTS the undo — so the workflow parks for an operator with the reservation stranded. Never silently "reversed", never lost.',
+    events:[
+      {type:'DISPATCH',op:'reserve',kind:'operation_requested',note:'PUT reserve'},
+      {type:'SETTLED',kind:'operation_settled',note:'200 {reserved} → checkpoint (compensable)'},
+      {type:'DISPATCH',op:'charge',kind:'operation_requested',note:'PUT charge'},
+      {type:'REJECTED',reason:'charge_declined',kind:'operation_failed',note:'400 → definite failure → begin reversal'},
+      {type:'COMP_REJECTED',reason:'release_rejected',kind:'compensation_blocked',note:'PUT release → 4xx: cannot undo the reservation → BLOCKED (reverse); checkpoint resolution_required, awaits an operator'} ]},
+};
+
+// ---- durable-state reducer (mirrors microflows.machine.js) ---------------------------------------
+const init = () => ({ top:'forward', sub:'driving', op:'—', attempts:0, reason:'—' });
+function reduce(s, ev) {
+  const { top, sub } = s;
+  if (top==='forward') {
+    if (sub==='driving') {
+      if (ev.type==='DISPATCH') return {...s,sub:'awaiting',op:ev.op};
+      if (ev.type==='FAIL') return {...s,top:'reversing',sub:'compensating',attempts:0,reason:ev.reason};
+      if (ev.type==='COMPLETE'||ev.type==='SETTLED_FINAL') return {...s,top:'completed',sub:'—'};
+    }
+    if (sub==='awaiting') {
+      if (ev.type==='SETTLED') return {...s,sub:'driving',attempts:0};
+      if (ev.type==='SETTLED_FINAL') return {...s,top:'completed',sub:'—'};
+      if (ev.type==='REJECTED'||ev.type==='FAIL') return {...s,top:'reversing',sub:'compensating',attempts:0,reason:ev.reason};
+      if (ev.type==='REJECTED_FIRST') return {...s,top:'failed',sub:'—',reason:ev.reason};
+      if (ev.type==='ROUTE_404') return {...s,sub:'reconciling',attempts:s.attempts+1};
+    }
+    if (sub==='reconciling') {
+      if (ev.type==='DEFER') return {...s,sub:'awaiting'};
+      if (ev.type==='ROUTE_404') return {...s,attempts:s.attempts+1};
+      if (ev.type==='EXHAUSTED') return {...s,top:'blocked',sub:'—',reason:ev.reason};
+    }
+  } else if (top==='reversing') {
+    if (sub==='compensating') {
+      if (ev.type==='COMPENSATED') return {...s,sub:'compensating'};
+      if (ev.type==='ALL_COMPENSATED') return {...s,top:'reversed',sub:'—'};
+      if (ev.type==='COMP_ROUTE_404') return {...s,sub:'reconciling',attempts:s.attempts+1};
+      if (ev.type==='COMP_REJECTED') return {...s,top:'blocked',sub:'—',reason:ev.reason};
+    }
+    if (sub==='reconciling') {
+      if (ev.type==='DEFER') return {...s,sub:'compensating'};
+      if (ev.type==='EXHAUSTED') return {...s,top:'blocked',sub:'—',reason:ev.reason};
+    }
+  } else if (top==='blocked') {
+    if (ev.type==='OPERATOR_RESOLVE') return {...s,top:'resolved_exception',sub:'—'};
+  }
+  return s;
+}
+// edge to light up for a top→top transition (state view)
+const EDGE = { 'forward>completed':'f-c','forward>reversing':'f-r','reversing>reversed':'r-rv',
+               'reversing>blocked':'r-b','forward>blocked':'f-b','blocked>resolved_exception':'b-re','forward>failed':'f-fa' };
+
+// ---- one event -> the concrete call(s) it makes (sequence view) ----------------------------------
+// f/t = lifeline (D=MariaDB, C=uflowsd, P=participant); k = colour class.
+let lastOp = '';
+function messagesFor(ev) {
+  const op = lastOp || 'op';
+  switch (ev.type) {
+    case 'DISPATCH':       return [{f:'C',t:'P',k:'req',l:'PUT '+ev.op}];                                   // operation_requested
+    case 'SETTLED':        return [{f:'P',t:'C',k:'ok', l:'200 ✓ '+op+' settled'},{f:'C',t:'D',k:'db',l:'settle + checkpoint'}];
+    case 'SETTLED_FINAL':  return [{f:'P',t:'C',k:'ok', l:'200 ✓ '+op+' (final)'},{f:'C',t:'D',k:'db',l:'completed'}];
+    case 'REJECTED':       return [{f:'P',t:'C',k:'err',l:'400 rejected'},{f:'C',t:'D',k:'db',l:'operation_failed → begin reversal'}];
+    case 'FAIL':           return [{f:'C',t:'D',k:'err',l:'case → fail "'+ev.reason+'"'},{f:'C',t:'D',k:'db',l:'begin reversal'}];
+    case 'ROUTE_404':      return [{f:'C',t:'P',k:'req',l:'PUT '+op},{f:'P',t:'C',k:'err',l:'404 — no record'}];
+    case 'DEFER':          return [{f:'C',t:'D',k:'db', l:'budget++ · release lease · defer'}];
+    case 'EXHAUSTED':      return [{f:'C',t:'D',k:'block',l:'budget spent → BLOCK ('+ev.reason+')'}];
+    case 'COMPENSATED':    return [{f:'C',t:'P',k:'req',l:'PUT compensate'},{f:'P',t:'C',k:'ok',l:'200 ✓'},{f:'C',t:'D',k:'db',l:'compensation_settled'}];
+    case 'COMP_REJECTED':  return [{f:'C',t:'P',k:'req',l:'PUT release'},{f:'P',t:'C',k:'err',l:'4xx — cannot undo'},{f:'C',t:'D',k:'block',l:'compensation_blocked → BLOCK (reverse)'}];
+    case 'ALL_COMPENSATED':return [{f:'C',t:'D',k:'db', l:'stack empty → reversed'}];
+    case 'OPERATOR_RESOLVE':return [{f:'C',t:'D',k:'ok',l:'operator → resolved_exception'}];
+    default: return [];
+  }
+}
+
+// ---- view ----------------------------------------------------------------------------------------
+const NS = 'http://www.w3.org/2000/svg', LX = {D:80,C:240,P:400};
+const $ = id => document.getElementById(id);
+const sel=$('scenario'), blurb=$('blurb'), logEl=$('log'), playBtn=$('play'), seqG=$('seqmsgs');
+for (const [k,s] of Object.entries(scenarios)) { const o=document.createElement('option'); o.value=k; o.textContent=s.title; sel.appendChild(o); }
+const showBlurb = () => blurb.textContent = scenarios[sel.value].blurb;
+sel.onchange = () => { showBlurb(); reset(); renderIR(); renderMF(); }; showBlurb();
+
+// view toggle
+$('view').addEventListener('click', e => { const v=e.target.dataset.v; if(!v) return;
+  [...$('view').children].forEach(b=>b.classList.toggle('on', b.dataset.v===v));
+  $('seq').classList.toggle('hidden', v!=='seq'); $('state').classList.toggle('hidden', v!=='state'); $('ir').classList.toggle('hidden', v!=='ir'); $('mf').classList.toggle('hidden', v!=='mf'); });
+
+let state, runToken=0, seqY=0;
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+
+function renderStatus(){ $('now').textContent=state.top; $('now').className='pill c-'+state.top+' active';
+  $('sub').textContent=state.sub; $('op').textContent=state.op; $('att').textContent=state.attempts; $('rsn').textContent=state.reason; }
+function renderStateNode(prevTop){
+  document.querySelectorAll('.node.active').forEach(n=>n.classList.remove('active'));
+  $('n-'+state.top).classList.add('active');
+  if (prevTop && prevTop!==state.top){ const e=EDGE[prevTop+'>'+state.top]; if(e){ const ee=$('e-'+e); if(ee) ee.setAttribute('marker-end','url(#arl)'); } }
+}
+function addSeqMsg(m){
+  const y = 64 + seqY*30; seqY++;
+  const x1=LX[m.f], x2=LX[m.t];
+  const g=document.createElementNS(NS,'g'); g.setAttribute('class','msg k-'+m.k);
+  const ln=document.createElementNS(NS,'line'); ln.setAttribute('x1',x1); ln.setAttribute('y1',y); ln.setAttribute('x2',x2); ln.setAttribute('y2',y);
+  ln.setAttribute('class','marrow'); ln.setAttribute('marker-end','url(#mk)');
+  const tx=document.createElementNS(NS,'text'); tx.setAttribute('x',(x1+x2)/2); tx.setAttribute('y',y-5); tx.setAttribute('class','mlab'); tx.textContent=m.l;
+  g.appendChild(ln); g.appendChild(tx); seqG.appendChild(g);
+  document.querySelectorAll('#seqmsgs .msg.now').forEach(n=>n.classList.remove('now'));
+  requestAnimationFrame(()=>{ g.classList.add('show'); g.classList.add('now'); });
+}
+function addTrace(ev){
+  const li=document.createElement('li'); const io=payloadFor(ev);
+  li.innerHTML=`<div class="thead"><span class="kind">${ev.kind}</span> &nbsp; <span class="note">${ev.note}</span>`
+    + (io.length?'<span class="caret">▸</span>':'') + `</div>`;
+  if(io.length){ const d=document.createElement('div'); d.className='io';
+    d.innerHTML=io.map(x=>`<div class="iolbl">${x[0]}</div><pre>${x[1]}</pre>`).join('');
+    li.appendChild(d); li.querySelector('.thead').onclick=()=>li.classList.toggle('open'); }
+  document.querySelectorAll('#log li.now').forEach(n=>n.classList.remove('now')); li.classList.add('now');
+  logEl.appendChild(li); requestAnimationFrame(()=>li.classList.add('show')); }
+
+function reset(){ runToken++; state=init(); lastOp=''; seqY=0;
+  document.querySelectorAll('.node.active').forEach(n=>n.classList.remove('active'));
+  document.querySelectorAll('#state .edge').forEach(e=>e.setAttribute('marker-end','url(#ar)'));
+  seqG.innerHTML=''; logEl.innerHTML=''; renderStatus(); $('now').className='pill'; clearIR();
+  playBtn.disabled=false; sel.disabled=false; }
+$('reset').onclick = reset;
+
+playBtn.onclick = async () => {
+  reset(); const my=++runToken; playBtn.disabled=true; sel.disabled=true;
+  const evs = scenarios[sel.value].events;
+  for (let i=0;i<evs.length;i++) {
+    const ev = evs[i];
+    await sleep(650); if (my!==runToken) return;
+    if (ev.type==='DISPATCH') lastOp = ev.op;
+    const prev=state.top; state=reduce(state,ev); renderStateNode(prev); renderStatus(); addTrace(ev); highlightIR(i);
+    for (const m of messagesFor(ev)) { addSeqMsg(m); await sleep(430); if (my!==runToken) return; }
+  }
+  playBtn.disabled=false; sel.disabled=false;
+};
+
+// ---- IR-graph view (the compiled plan) ---------------------------------------------------------
+// def = REAL lowered IR, generated by `microflows-runner --emit-graph plans/<name>.mf` (see plans/).
+// nodes[i] = [graphNodeId, state] highlighted at scenario step i (n-ids are the runner's node ids).
+const IR = {
+  happy: { def:`flowchart TD
+  n0["reserve"] --> n1
+  n1["charge"] --> n2
+  n2(["return"]):::term
+  classDef fail stroke:#f85149,color:#fff;
+  classDef term stroke:#3fb950;`,
+    nodes:[['n0','on'],['n0','on'],['n1','on'],['n2','done']] },
+  compensate: { def:`flowchart TD
+  n0["reserve"] --> n1
+  n1["charge"] --> n2
+  n2(["return"]):::term
+  classDef fail stroke:#f85149,color:#fff;
+  classDef term stroke:#3fb950;`,
+    nodes:[['n0','on'],['n0','on'],['n1','on'],['n1','fail'],['n0','comp'],['n0','comp']] },
+  route404: { def:`flowchart TD
+  n0["reserve"] --> n1
+  n1(["return"]):::term
+  classDef fail stroke:#f85149,color:#fff;
+  classDef term stroke:#3fb950;`,
+    nodes:[['n0','on'],['n0','retry'],['n0','retry'],['n0','retry'],['n0','block'],['n0','done']] },
+  authoredFail: { def:`flowchart TD
+  n0["authorize"] --> n1
+  n1{"case"}
+  n1 -->|"approved"| n2
+  n1 -->|"declined"| n3
+  n1 -->|default| n4
+  n2["capture"] --> n5
+  n3["fail"]:::fail
+  n4["fail"]:::fail
+  n5(["return"]):::term
+  classDef fail stroke:#f85149,color:#fff;
+  classDef term stroke:#3fb950;`,
+    nodes:[['n0','on'],['n1','on'],['n3','fail'],['n0','comp'],['n0','comp']] },
+  compBlocked: { def:`flowchart TD
+  n0["reserve"] --> n1
+  n1["charge"] --> n2
+  n2(["return"]):::term
+  classDef fail stroke:#f85149,color:#fff;
+  classDef term stroke:#3fb950;`,
+    nodes:[['n0','on'],['n0','on'],['n1','on'],['n1','fail'],['n0','block']] },
+};
+mermaid.initialize({ startOnLoad:false, theme:'dark', securityLevel:'loose', flowchart:{ htmlLabels:true, curve:'basis' } });
+let irSeq=0, irNodes={};
+async function renderIR(){
+  try {
+    const { svg } = await mermaid.render('irg'+(irSeq++), IR[sel.value].def);
+    $('ir').innerHTML = svg; irNodes = {};
+    // mermaid node group id = "flowchart-<planNodeId>-<counter>"; map by matching a known id as a token.
+    const ids=[...new Set(IR[sel.value].nodes.map(n=>n[0]))];
+    $('ir').querySelectorAll('g.node').forEach(g=>{ const parts=(g.id||'').split('-'); const f=ids.find(id=>parts.includes(id)); if(f) irNodes[f]=g; });
+  } catch(e){ $('ir').innerHTML = '<p style="color:var(--mut);padding:10px">IR render error: '+e.message+'</p>'; }
+}
+const HLCOLOR = { on:'#58a6ff', fail:'#f85149', block:'#bc8cff', comp:'#d29922', retry:'#d29922', done:'#3fb950' };
+const SHAPES = 'rect,polygon,path,circle,ellipse';
+function paintNode(g, color, dash){
+  g.querySelectorAll(SHAPES).forEach(s=>{ s.style.setProperty('stroke',color,'important'); s.style.setProperty('stroke-width','3px','important');
+    s.style.setProperty('filter','drop-shadow(0 0 6px '+color+')','important'); if(dash) s.style.setProperty('stroke-dasharray','5 3','important'); });
+}
+function clearIR(){ Object.values(irNodes).forEach(g=>g.querySelectorAll(SHAPES).forEach(s=>{
+  ['stroke','stroke-width','filter','stroke-dasharray'].forEach(p=>s.style.removeProperty(p)); })); }
+function highlightIR(i){ const n=IR[sel.value].nodes[i]; if(!n) return; clearIR(); const g=irNodes[n[0]]; if(g) paintNode(g, HLCOLOR[n[1]]||'#58a6ff', n[1]==='retry'); }
+
+// ---- MF-plan view: the ACTUAL .mf source behind each scenario (several scenarios share one plan) ----
+const PLAN_OF = { happy:'reserve_charge', compensate:'reserve_charge', compBlocked:'reserve_charge', route404:'reserve_only', authoredFail:'authorize_decline' };
+const MF = {
+  reserve_charge:`args { amt: int }
+op reserve { input: { amt: int } }
+op charge  { input: { amt: int } }
+steps {
+  reserve { "amt": arg amt }
+  charge  { "amt": arg amt }
+}`,
+  reserve_only:`args { amt: int }
+op reserve { input: { amt: int } }
+steps {
+  reserve { "amt": arg amt }
+}`,
+  authorize_decline:`args { amt: int }
+op authorize { input: { amt: int }  result: { status: string } }
+op capture   { input: { amt: int } }
+steps {
+  let a = authorize { "amt": arg amt }
+  case result a.status {
+    "approved" { capture { "amt": arg amt } }
+    "declined" { fail "payment_declined" }
+    default    { fail "gateway_status_unknown" }
+  }
+}`,
+};
+function renderMF(){ const plan=PLAN_OF[sel.value]; $('mf').innerHTML='<span class="mfhead">// plans/'+plan+'.mf  ('+sel.value+' runs this plan)</span>\n\n'+MF[plan].replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+
+// ---- payloads behind each trace line (illustrative for the demo; a real run = tb_mf_workflow_event.payload) ----
+const FAKE = { reserve:{reservation_id:'R-8842'}, charge:{charge_id:'C-7A1'}, authorize:{auth_id:'A-5F3',status:'declined'} };
+function pj(o){ return JSON.stringify(o,null,1); }
+function payloadFor(ev){
+  const op=lastOp||'op';
+  switch(ev.type){
+    case 'DISPATCH':       return [['PUT input → participant', pj({amt:100})]];
+    case 'SETTLED': case 'SETTLED_FINAL': return [['200 result ← participant', pj(FAKE[op]||{ok:true})]];
+    case 'REJECTED':       return [['4xx body ← participant', pj({error:ev.reason||'rejected'})]];
+    case 'FAIL':           return [['authored fail (durable)', pj({reason:ev.reason,kind:'non_retryable_failure'})]];
+    case 'ROUTE_404':      return [['404 ← participant (no record)', pj({state:'unknown'})]];
+    case 'DEFER':          return [['reconcile budget (durable, op row)', pj({reconcile_attempts:1,reason:'participant_route_404'})]];
+    case 'EXHAUSTED':      return [['blocked (durable continuation)', pj({pos:'blocked',direction:'forward',reason:ev.reason,operation_seq:1})]];
+    case 'COMPENSATED':    return [['undo body → participant (forward envelope)', pj({forward:{input:{amt:100},result:FAKE.reserve}})],['200 ← participant', pj({released:true})]];
+    case 'COMP_REJECTED':  return [['undo body → participant (forward envelope)', pj({forward:{input:{amt:100},result:FAKE.reserve}})],['4xx ← participant (CANNOT undo)', pj({error:ev.reason,held:FAKE.reserve.reservation_id})]];
+    case 'ALL_COMPENSATED':return [['terminal outcome (durable)', pj({workflow:'failed',compensated:true})]];
+    case 'OPERATOR_RESOLVE':return [['operator action', pj({resolution:'resolved_exception'})]];
+    default: return [];
+  }
+}
+
+reset(); renderIR(); renderMF();
+</script>
+</body>
+</html>

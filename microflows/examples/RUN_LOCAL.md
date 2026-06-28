@@ -57,12 +57,26 @@ The response body is the **outcome document** (identical to the CLI's); the HTTP
 | `pending` / `deferred` / `pending_restart` | 202 / 503 | in flight; retry / drain back-pressure |
 | `refused` (draining) | 503 | not accepting new work |
 | `aborted` (invalid args / unknown script / malformed body) | 400 | client error, no workflow created |
+| `blocked` (`direction` forward/reverse) | 409 | manual resolution required (e.g. a persistent participant route-404 that exhausted the reconcile budget); body carries `direction` + `reason`; exit 3 |
 | `not_found` | 404 | no such workflow |
 
 ## 3. Resume pending work
 
 If a participant is momentarily unavailable or returns "pending", the workflow defers. Re-drive it by
-**resuming the same id** (no script, no body — it runs strictly by the durable pin):
+**resuming the same id** (no script, no body — it runs strictly by the durable pin). A participant `404`
+(no record of the operation) is reconciled — Microflows safely re-submits the identical request — and a
+*persistent* route-404 is bounded by the **reconcile budget**: it keeps deferring within budget, then
+enters `blocked` (direction forward, or reverse if a compensation is the one 404ing) for manual
+resolution, never an infinite silent pending. Tune it per deployment (optional;
+defaults 30 min / 2 attempts):
+
+```json
+"deployment": { "...": "...", "reconcile_budget": { "max_elapsed_ms": 1800000, "min_attempts": 2 } }
+```
+
+`max_elapsed_ms` is the wall-time bound (integer > 0); `min_attempts` a small floor (integer ≥ 1) so one
+404 plus clock skew can't block. A malformed `reconcile_budget` is rejected at startup, never silently
+defaulted.
 
 ```bash
 curl -s -X POST "localhost:8088/v1/workflows/$WF/resume"

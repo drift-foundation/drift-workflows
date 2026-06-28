@@ -1,14 +1,15 @@
 # uflowsd — PROGRESS
 
-See `README.md` (charter). Toolchain: staged driftc 0.33.61 / ABI 18 (app-cert complete).
+See `README.md` (charter). Toolchain: certified driftc 0.33.63 / ABI 18 (app-cert complete).
 
 ---
 
-## Next-release landed set (`.mf` comments + #3–#5 + 200-harden) — ✅ root-gate-green  ·  #2 (`404` budget) still open
+## Next-release landed set (`.mf` comments + #2–#5 + 200-harden) — ⏳ root gate RE-RUNNING after review fixes (last green 195; +1 new 2-op 404 test → expect 202)
 
-**Status:** the `.mf` comment switch + **#3–#5 + the 200-result harden** are implemented and **committed
-step-by-step** (#2's *decision/design* is landed but its **durable reconcile budget is still open** — see the
-table). Commits:
+**Status:** the `.mf` comment switch + **#2–#5 + the 200-result harden** are implemented and gate-green;
+#2–#5 + the harden are **committed step-by-step**, and **#2's durable bounded reconcile budget is now
+implemented** (increments 1–4: schema/SPs → host decode → runner routing/render → stub/tests/docs) and
+sits as the current uncommitted set. Commits:
 (`86a2fd2` C-family comments + node-address op-ids + 200-result-only → `244acdd` compensation envelope
 → `fd8726a` failed/compensated terminal → `d81498b` result branching + authored fail → `8308354`
 200-result protocol harden). Design thread: [NEXT_RELEASE_PLAN.md](NEXT_RELEASE_PLAN.md).
@@ -22,29 +23,36 @@ table). Commits:
 | #4 | `failed`/`compensated` durable terminal (+ migration 0001) | ✅ landed |
 | D/#5 | Result/local selectors + authored `fail` | ✅ landed |
 | #3b | `200`-without/non-object-`result` protocol harden | ✅ landed |
-| #2 | `404` retryable + **durable bounded reconcile budget** | ⏳ **NOT implemented** (open fork) |
+| #2 | `404` retryable + **durable bounded reconcile budget** | ✅ landed (blocked on exhaustion; forward + reverse) |
 
 **Gate (root, full):**
 ```
 DRIFT_TOOLCHAIN_ROOT=~/opt/drift/certified/current/toolchain \
 DRIFT_PKG_ROOT=~/opt/drift/certified/current/pkgs  just test
 ```
-→ **GREEN**: singular `16`, microflows (parser fixtures `91/91`, e2e `20`, SP regression `110/110`),
-integration build `3`, **coordinator↔singular `180/180`**. (driftc 0.33.61 / ABI 18.)
+→ **last confirmed GREEN**: singular `16`, microflows (parser fixtures `91/91`, e2e `20`, SP regression
+`127/127`), integration build `3`, **coordinator↔singular `195/195`**. (driftc 0.33.63 / ABI 18.)
+→ **PENDING**: re-run in progress after the review fixes (the 2-op forward-404 test raises the integration
+guard to **202**); this header flips back to ✅ only when that run lands green.
 
-**Dirty (uncommitted) right now:**
-- `microflows/runner/src/runner.drift` — a one-line comment clarification (internal `reversed(5)`
-  wording in `_run_reversal`); inert, gate-green.
-- `work/uflowsd/NEXT_RELEASE_PLAN.md` — landed-status wording (excludes #2's budget from "landed").
-- `work/uflowsd/RELEASE_ANNOUNCEMENT_DRAFT.md` — **draft, not published** cross-team announcement.
-- `work/uflowsd/PROGRESS.md` — this update.
-(All substantive bundle code/tests/docs are already committed in `86a2fd2`…`8308354`.)
+**Dirty (uncommitted) right now — #2 durable reconcile budget (increments 1–4):**
+- Schema/migration: `microflows/db/schema/{tb_mf_operation,tb_mf_workflow_checkpoint}.sql` +
+  `microflows/db/migrations/0002_reconcile_budget.sql` (the `reconcile_*` budget columns).
+- SPs: `microflows/db/procs/sp_mf_workflow_reconcile_defer.sql` (forward),
+  `sp_mf_checkpoint_reconcile_defer.sql` (reverse); `microflows/db-tests/sp_operation_test.py` (127 checks).
+- Host: `microflows/packages/microflows/src/host.drift` (`reconcile_defer`/`checkpoint_reconcile_defer`
+  + the two outcome variants).
+- Runner: `microflows/runner/src/runner.drift` (`DispatchResult::Route404`, the two budget handlers,
+  `Outcome::Blocked(direction,reason)`, `_inspect_report` blocked render gated on `STATE_BLOCKED`,
+  strict `reconcile_budget` validation).
+- Stub/tests/docs: `microflows/participant-stub/src/app.drift` (route_404 fault),
+  `integration/coordinator-singular/test.py` (195 checks) + the two fixture CSVs,
+  `microflows/doc/microflows_design.md` + `microflows/examples/RUN_LOCAL.md` (404-budget docs),
+  `work/uflowsd/{NEXT_RELEASE_PLAN.md,RELEASE_ANNOUNCEMENT_DRAFT.md,PROGRESS.md}`.
 
-**Literal next action:** commit the four dirty files above (one cut: "microflows: bundle closeout —
-doc sweep + release-announcement draft"). Then the only remaining bundle work is **#2's durable
-bounded reconcile budget** (`404` stays retryable today; the budget is designed in NEXT_RELEASE_PLAN
-§B but not built — likely a coordinator-schema field). Hand the announcement draft to the cross-team
-reviewer before publishing.
+**Literal next action:** commit the #2 set (per the user's step-by-step cadence). The full bundle
+(`.mf` comments + #2–#5 + 200-harden) is now implemented + root-gate-green on 0.33.63. Hand the
+announcement draft to the cross-team reviewer before publishing.
 
 ---
 

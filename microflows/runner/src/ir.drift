@@ -34,6 +34,7 @@ export {
 	op_depth,
 	nonfinal_operations,
 	operation_names,
+	emit_mermaid,
 	OpResult,
 	StepOutcome,
 	advance,
@@ -795,6 +796,55 @@ pub fn operation_names(g: &IrGraph) nothrow -> Array<String> {
 		k = k + 1;
 	}
 	return move out;
+}
+
+// Emit the IR graph as a Mermaid `flowchart TD` (microflows-viz / `--emit-graph`). Node ids are the
+// stable graph node ids; operation/let/merge names + case match-consts are .mf identifiers/codes (safe
+// inside Mermaid labels). Pure + nothrow — a faithful structural view of the compiled plan.
+pub fn emit_mermaid(g: &IrGraph) nothrow -> String {
+	val order = _node_order_by_id(&g.nodes);
+	var out: String = "flowchart TD\n";
+	var k = 0;
+	while k < order.len {
+		match &g.nodes[order[k]] {
+			IrNode::NOperation(id, operation, input, next) => {
+				out = out + "  " + _dup(id) + "[\"" + _dup(operation) + "\"] --> " + _dup(next) + "\n";
+			},
+			IrNode::NLet(id, name, value, next) => {
+				out = out + "  " + _dup(id) + "([\"let " + _dup(name) + "\"]) --> " + _dup(next) + "\n";
+			},
+			IrNode::NIf(id, cond, then_node, else_node) => {
+				out = out + "  " + _dup(id) + "{\"if\"}\n";
+				out = out + "  " + _dup(id) + " -->|then| " + _dup(then_node) + "\n";
+				out = out + "  " + _dup(id) + " -->|else| " + _dup(else_node) + "\n";
+			},
+			IrNode::NCase(id, scrutinee, arms, default_node) => {
+				out = out + "  " + _dup(id) + "{\"case\"}\n";
+				var a = 0;
+				while a < arms.len {
+					out = out + "  " + _dup(id) + " -->|" + _dup(&arms[a].match_const) + "| " + _dup(&arms[a].target) + "\n";
+					a = a + 1;
+				}
+				out = out + "  " + _dup(id) + " -->|default| " + _dup(default_node) + "\n";
+			},
+			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
+				out = out + "  " + _dup(id) + "[\"loop\"] --> " + _dup(next) + "\n";
+			},
+			IrNode::NMerge(id, name, sources, next) => {
+				out = out + "  " + _dup(id) + "{{\"merge " + _dup(name) + "\"}} --> " + _dup(next) + "\n";
+			},
+			IrNode::NReturn(id, value) => {
+				out = out + "  " + _dup(id) + "([\"return\"]):::term\n";
+			},
+			IrNode::NFail(id, reason) => {
+				out = out + "  " + _dup(id) + "[\"fail\"]:::fail\n";
+			}
+		}
+		k = k + 1;
+	}
+	out = out + "  classDef fail stroke:#f85149,color:#fff;\n";
+	out = out + "  classDef term stroke:#3fb950;\n";
+	return out;
 }
 
 fn _node_canonical(n: &IrNode) nothrow -> String {

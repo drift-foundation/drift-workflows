@@ -284,6 +284,12 @@ implement StubApp {
 		if _fault_reject(&eff) or armed == "reject" {
 			return _json(400, _envelope_error("fault-rejected"));
 		}
+		// Route-404 fault (armed via /arm): 404 BEFORE Singular -> NO operation created. The participant
+		// has no record AND won't accept the PUT -> the runner's reconcile confirms route-unknown and
+		// advances the durable reconcile budget. Disarm (mode "") to let the op recover.
+		if armed == "route_404" {
+			return _json(404, _envelope_unknown());
+		}
 		// Out-of-band SOFT pending: 202 BEFORE Singular, so NO operation is created and the coordinator
 		// re-dispatches on resume (disarm first) and completes — models "received, not yet durably
 		// accepted; retry." (Distinct from input `_fault.respond_pending`, which leaves a Working op.)
@@ -414,6 +420,10 @@ implement StubApp {
 		val _rc = self.request_count.fetch_add(1, conc.MemoryOrder::SeqCst());
 		val op = rest.path_param(req, "operation").or_throw();
 		val op_id = rest.path_param(req, "operation_id").or_throw();
+		// Route-404 fault: GET 404 (no record), matching the PUT -> a persistent route-unknown.
+		if _armed_mode(&self.armed, &op) == "route_404" {
+			return _json(404, _envelope_unknown());
+		}
 		val key = _op_key(&op, &op_id);
 		match self.gateway.get().inspect(&key) {
 			singular.InspectOutcome::Terminal(tr, _) => { return _json(200, _envelope_terminal(&tr)); },
