@@ -59,6 +59,8 @@ export {
 	OperationRequestGetOutcome,
 	BeginReversalOutcome,
 	AuthoredFailOutcome,
+	ReconcileDeferOutcome,
+	CheckpointReconcileDeferOutcome,
 	ReverseRequestOutcome,
 	ReverseSettleOutcome,
 	ReverseBlockOutcome,
@@ -216,6 +218,37 @@ pub variant AuthoredFailOutcome {
 	FenceLost,
 	NotFound,
 	EventTimeSkew(defer_until: String)
+}
+
+// Outcome of sp_mf_workflow_reconcile_defer (#2, FORWARD route-404 budget). Within budget -> Deferred
+// (budget advanced); exhausted -> Blocked (blocked_resolution, direction forward, indeterminate). A
+// block needs a strictly-advancing event_ts (EventTimeSkew -> defer + retry).
+pub variant ReconcileDeferOutcome {
+	Deferred(attempts: Int),
+	Blocked(direction: String, reason: String),
+	EventTimeSkew(defer_until: String),
+	FenceLost,
+	NotFound,
+	OperationNotFound,
+	OperationConflict,
+	OperationNotRequested(status: Int)            // a settled op never route-404s
+}
+
+// Outcome of sp_mf_checkpoint_reconcile_defer (#2, REVERSE/compensation route-404 budget). Exhausted ->
+// Blocked via the reverse-block path (checkpoint resolution_required). AlreadyBlocked is the
+// lease-independent idempotent replay of a committed block.
+pub variant CheckpointReconcileDeferOutcome {
+	Deferred(attempts: Int),
+	Blocked(direction: String, reason: String),
+	AlreadyBlocked,
+	EventTimeSkew(defer_until: String),
+	FenceLost,
+	NotFound,
+	CheckpointNotFound,
+	NotRequested,                                 // no dispatched compensation binding
+	ReverseIdMismatch,
+	CheckpointNotActive(reversal_state: Int),
+	OutOfOrder(top_seq: Int)                       // not the top active checkpoint
 }
 
 // reverse_head: the authoritative top active checkpoint (the checkpoint stack,
@@ -468,6 +501,18 @@ pub interface MicroflowsHost {
 	fn defer_dispatch(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
 	                  db_now: &String, next_attempt_at: &String, event_ts: &String,
 	                  reason: &String) -> ReleaseOutcome;
+	// Advance the durable reconcile budget on a confirmed FORWARD route-404; within budget -> deferred,
+	// exhausted -> blocked_resolution (forward, indeterminate). Fenced + atomic.
+	fn reconcile_defer(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                   operation_seq: Int, operation_id: &Array<Byte>, db_now: &String,
+	                   next_attempt_at: &String, event_ts: &String,
+	                   max_elapsed_ms: Int, min_attempts: Int) -> ReconcileDeferOutcome;
+	// Advance the REVERSE (compensation) reconcile budget on a confirmed route-404; exhausted -> the
+	// reverse-block path (blocked_resolution, checkpoint resolution_required). Fenced + atomic.
+	fn checkpoint_reconcile_defer(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                              seq: Int, reverse_id: &Array<Byte>, db_now: &String,
+	                              next_attempt_at: &String, event_ts: &String,
+	                              max_elapsed_ms: Int, min_attempts: Int) -> CheckpointReconcileDeferOutcome;
 	// Persist an operation request + the suspended continuation, atomically,
 	// BEFORE dispatch. Fenced (fence-first). Idempotent by (workflow_id,
 	// operation_seq); command-identity-checked.
@@ -1109,6 +1154,99 @@ implement MicroflowsHost for HostImpl {
 			if outcome == "fence_lost" { return ReleaseOutcome::FenceLost(); }
 			if outcome == "not_found" { return ReleaseOutcome::NotFound(); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:defer_dispatch"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn reconcile_defer(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                       operation_seq: Int, operation_id: &Array<Byte>, db_now: &String,
+	                       next_attempt_at: &String, event_ts: &String,
+	                       max_elapsed_ms: Int, min_attempts: Int) -> ReconcileDeferOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("operation_id", operation_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
+		_validate_nonempty("db_now", db_now);
+		_validate_nonempty("next_attempt_at", next_attempt_at);
+		_validate_nonempty("event_ts", event_ts);
+		if max_elapsed_ms < 0 { throw HostException(kind = HostErrorKind::InvalidArg(field = "max_elapsed_ms")); }
+		if min_attempts < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "min_attempts")); }
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(operation_seq));
+			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
+			args.push(rpc.arg_string(_dup(db_now)));
+			args.push(rpc.arg_string(_dup(next_attempt_at)));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(rpc.arg_int(max_elapsed_ms));
+			args.push(rpc.arg_int(min_attempts));
+			val sp: String = "sp_mf_workflow_reconcile_defer";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "deferred" { return ReconcileDeferOutcome::Deferred(_doc_int_req(&doc, &"attempts", "reconcile-no-attempts")); }
+			if outcome == "blocked" { return ReconcileDeferOutcome::Blocked(_doc_str_req(&doc, &"direction", "reconcile-no-direction"), _doc_str_req(&doc, &"reason", "reconcile-no-reason")); }
+			if outcome == "event_time_skew" { return ReconcileDeferOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "reconcile-no-defer-until")); }
+			if outcome == "fence_lost" { return ReconcileDeferOutcome::FenceLost(); }
+			if outcome == "not_found" { return ReconcileDeferOutcome::NotFound(); }
+			if outcome == "operation_not_found" { return ReconcileDeferOutcome::OperationNotFound(); }
+			if outcome == "operation_conflict" { return ReconcileDeferOutcome::OperationConflict(); }
+			if outcome == "operation_not_requested" { return ReconcileDeferOutcome::OperationNotRequested(_doc_int_req(&doc, &"status", "reconcile-no-status")); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:reconcile_defer"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn checkpoint_reconcile_defer(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                                  seq: Int, reverse_id: &Array<Byte>, db_now: &String,
+	                                  next_attempt_at: &String, event_ts: &String,
+	                                  max_elapsed_ms: Int, min_attempts: Int) -> CheckpointReconcileDeferOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("reverse_id", reverse_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "seq")); }
+		_validate_nonempty("db_now", db_now);
+		_validate_nonempty("next_attempt_at", next_attempt_at);
+		_validate_nonempty("event_ts", event_ts);
+		if max_elapsed_ms < 0 { throw HostException(kind = HostErrorKind::InvalidArg(field = "max_elapsed_ms")); }
+		if min_attempts < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "min_attempts")); }
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(seq));
+			args.push(rpc.arg_bytes(_dup_bytes(reverse_id)));
+			args.push(rpc.arg_string(_dup(db_now)));
+			args.push(rpc.arg_string(_dup(next_attempt_at)));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(rpc.arg_int(max_elapsed_ms));
+			args.push(rpc.arg_int(min_attempts));
+			val sp: String = "sp_mf_checkpoint_reconcile_defer";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "deferred" { return CheckpointReconcileDeferOutcome::Deferred(_doc_int_req(&doc, &"attempts", "creconcile-no-attempts")); }
+			if outcome == "blocked" { return CheckpointReconcileDeferOutcome::Blocked(_doc_str_req(&doc, &"direction", "creconcile-no-direction"), _doc_str_req(&doc, &"reason", "creconcile-no-reason")); }
+			if outcome == "already_blocked" { return CheckpointReconcileDeferOutcome::AlreadyBlocked(); }
+			if outcome == "event_time_skew" { return CheckpointReconcileDeferOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "creconcile-no-defer-until")); }
+			if outcome == "fence_lost" { return CheckpointReconcileDeferOutcome::FenceLost(); }
+			if outcome == "not_found" { return CheckpointReconcileDeferOutcome::NotFound(); }
+			if outcome == "checkpoint_not_found" { return CheckpointReconcileDeferOutcome::CheckpointNotFound(); }
+			if outcome == "not_requested" { return CheckpointReconcileDeferOutcome::NotRequested(); }
+			if outcome == "reverse_id_mismatch" { return CheckpointReconcileDeferOutcome::ReverseIdMismatch(); }
+			if outcome == "checkpoint_not_active" { return CheckpointReconcileDeferOutcome::CheckpointNotActive(_doc_int_req(&doc, &"reversal_state", "creconcile-no-revstate")); }
+			if outcome == "out_of_order" { return CheckpointReconcileDeferOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "creconcile-no-topseq")); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:checkpoint_reconcile_defer"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
 			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
