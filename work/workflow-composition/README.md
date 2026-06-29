@@ -1,5 +1,9 @@
 # Workflow Composition — Charter
 
+> **`DESIGN.md` is the current source of truth** for the resolved design + open decisions (rev 2: internal
+> host API; a workflow call is an async **call operation**; a blocked child does **not** cascade up the call
+> tree). This charter records the original intent; where it differs, DESIGN.md wins.
+
 ## Short-Term Objective
 
 After the current microflows release is cut, design a first-class model where any workflow step can be another workflow. Compensating actions can also be workflows, but compensation is only one use case of the broader workflow-composition model.
@@ -42,7 +46,7 @@ Treat "call workflow" as a step kind with participant-shaped lifecycle semantics
 - map child `completed`, `failed`, or `blocked` into parent-authored control flow;
 - on parent reversal, invoke the declared child-compensation behavior.
 
-The key rule: the parent checkpoints "child workflow X reached outcome Y"; it does not absorb the child's internal checkpoints.
+The key rule: the parent checkpoints a **completed** child as one call operation (a *failed* child is a rejection that unwinds prior — not a checkpoint; see `DESIGN.md` §4); it never absorbs the child's internal checkpoints.
 
 ## Concrete Implementation Plan
 
@@ -87,7 +91,7 @@ To be defined with the detailed design. Expected minimum:
 
 ## Current Status And Next Action
 
-Status: scheduled for after the current microflows release cut.
+Status: **in active design** — the release is cut + announced; see `DESIGN.md` (rev 2) for the current detailed design + the gating open decisions.
 
 Next action: after handoff, discuss with K and turn this charter into a concrete design plan with syntax, durable state transitions, and test cases.
 
@@ -98,7 +102,7 @@ Next action: after handoff, discuss with K and turn this charter into a concrete
 - How does a parent express policy for child `blocked` vs child `failed`?
 - Is child compensation always "reverse the child", or can a parent declare a distinct compensating workflow?
 - How are child workflow ids derived when fan-out input comes from a prior operation result?
-- What operator-resolution path is needed for a blocked child inside a blocked parent?
+- ~~What operator-resolution path is needed for a blocked child inside a blocked parent?~~ **Resolved (DESIGN.md rev 2):** a blocked child does **not** block the parent — the parent stays forward with a pending call operation; only the child enters `blocked_resolution`.
 
 ## Relevant Review Findings
 
