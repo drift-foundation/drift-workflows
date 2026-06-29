@@ -1,8 +1,9 @@
-# DRAFT — NOT PUBLISHED — uflowsd / microflows next-release announcement
+# uflowsd / microflows — release announcement
 
-> Internal draft for cross-team review. Do not distribute. Covers the shipped pushcoin bundle work (the
-> `.mf` comment switch + #2–#5 + the `200`-result protocol hardening).
-> Verified on certified driftc 0.33.63 / ABI 18; full root `just test` green.
+> **Released + certified.** **microflows 0.4.0** · **uflowsd 0.2.0** (+ **singular 0.7.0**), built on
+> certified driftc 0.33.63 / ABI 18. This is the pushcoin bundle: the `.mf` comment switch + #2–#5 + the
+> `200`-result protocol hardening. Full root `just test` green. **Breaking** for participant services and
+> for consumers that parsed the old `reversed` outcome — see *Breaking changes* + *Migration*.
 
 ## TL;DR
 
@@ -102,6 +103,9 @@ services and for any consumer that parsed the old `reversed` outcome** — see *
 
 ## Verification
 
-- Certified driftc 0.33.63 / ABI 18. Root `just test` green: singular, microflows
-  (parser fixtures, e2e, stored-procedure regression), and the coordinator↔singular integration suite
-  (incl. the new result-branch / `fail` / `200`-protocol cases).
+- **Certified.** `singular 0.7.0` + `microflows 0.4.0` (packages) staged + certified through the Foundation
+  cert pool; `uflowsd 0.2.0` (app) built + signed, `drift verify-app` green. Versions live solely in the
+  root `drift/manifest.json` (component manifests are local-dev).
+- Built on certified **driftc 0.33.63 / ABI 18**. Root `just test` green: singular, microflows
+  (parser fixtures, e2e, **SP regression 127/127**), and the coordinator↔singular integration suite
+  **202/202** — incl. the result-branch / `fail` / `200`-protocol / `404`-budget cases.
