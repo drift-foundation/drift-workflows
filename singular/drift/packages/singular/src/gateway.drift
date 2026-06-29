@@ -52,6 +52,7 @@ export {
     SingularEvent,
     new_lease_token,
     WorkLease,
+    RecoveryLease,
     TerminalResult,
     StartOutcome,
     ResumeOutcome,
@@ -80,8 +81,9 @@ pub struct WorkLease {
     pub key: Array<Byte>,
     pub lease_token: Array<Byte>,            // 16 bytes, app-minted, Singular-accepted
     pub lease_expires_at: time.UtcTimestamp  // 0.5: typed lease deadline (the caller-approved expiry)
-    // checkpoint_json deferred to PR2 — only a resume/reclaim grant can produce a
-    // checkpoint, and PR1 grants only via start() (fresh, no checkpoint).
+    // WorkLease stays the minimal capability handle (key + token + expiry) for EVERY grant (start or
+    // reclaim). A reclaim's handed-over checkpoint is NOT carried here — it is returned out-of-band on
+    // ResumeOutcome::Granted(..., checkpoint_json), so there is no future WorkLease change to chase.
 }
 
 // The authoritative terminal result a caller delivers to Microflows. Payload-bearing
@@ -100,12 +102,26 @@ pub variant StartOutcome {
     Exists                      // row already present — caller falls through to resume()
 }
 
-// resume(): existing work only — never inserts. PR1 subset (Granted/Deferred land
-// in PR2/PR3).
+// A structured recovery request for resume()'s RECLAIM path (PR2): the fresh lease a worker proposes to
+// take over an EXPIRED working item. The owner is the gateway's own identity (like start()), so it is not
+// carried here. `event_time` is the claim time (= backend now) the SP judges expiry against; on a grant the
+// prior token is rotated out in favour of `lease_token`.
+pub struct RecoveryLease {
+    pub lease_meta_json: String,
+    pub event_time: time.UtcTimestamp,
+    pub lease_expires_at: time.UtcTimestamp,   // 0.5: absolute deadline, strictly after event_time
+    pub lease_token: Array<Byte>               // 16 bytes — the NEW token rotated in on a grant
+}
+
+// resume(): existing work only — never inserts. PR2 adds the RECLAIM grant. `recovery` NONE => read-only
+// (Active | Terminal | NotFound, the PR1 behaviour). `recovery` SOME on an EXPIRED working item => the prior
+// token is rotated out and a fresh attempt is Granted (handing over the persisted checkpoint); a still-live
+// lease is never stolen (=> Active). Deferred lands in PR3.
 pub variant ResumeOutcome {
-    Active(lease_expires_at: String),// WORKING under a lease — IN_PROGRESS, no spawn
+    Active(lease_expires_at: String),// WORKING under a (still-live) lease — IN_PROGRESS, no spawn
     Terminal(result: TerminalResult),// DONE / FAILED replay
-    NotFound                        // no row — protocol violation (should have start()ed)
+    NotFound,                        // no row — protocol violation (should have start()ed)
+    Granted(lease: WorkLease, recovery_attempt: Int, checkpoint_json: String)  // PR2 reclaim: fresh attempt + rotated token + handed-over checkpoint
 }
 
 // complete() and fail() share ONE actionable-state outcome (no "Duplicate"; the op is
@@ -311,10 +327,10 @@ pub interface SingularGateway {
     fn start(self: &Self, key: &Array<Byte>, item_meta: &String, lease_meta: &String,
              event_time: &time.UtcTimestamp, lease_expires_at: &time.UtcTimestamp,
              lease_token: &Array<Byte>) -> StartOutcome;
-    // resume: existing work only (never inserts). Active | Terminal | NotFound (PR1).
-    // PR1: resume(key) only — grants nothing, so no token/meta/timeout/max-recovery inputs
-    // (a structured recovery request returns in PR2).
-    fn resume(self: &Self, key: &Array<Byte>) -> ResumeOutcome;
+    // resume: existing work only (never inserts). `recovery` NONE => read-only (Active | Terminal |
+    // NotFound). `recovery` SOME on an EXPIRED working item => Granted (reclaim: fresh attempt + rotated
+    // token + handed-over checkpoint); a still-live lease is never stolen (=> Active). PR2.
+    fn resume(self: &Self, key: &Array<Byte>, recovery: &Optional<RecoveryLease>) -> ResumeOutcome;
     // Mutators carry the granted WorkLease (key + capability token) and a caller event_time that MUST
     // be strictly after the item's last recorded event (else EventTimeConflict).
     fn complete(self: &Self, lease: &WorkLease, event_time: &time.UtcTimestamp, response_json: &String) -> SettleOutcome;
@@ -806,14 +822,41 @@ implement SingularGateway for SingularImpl {
         }
     }
 
-    pub fn resume(self: &SingularImpl, key: &Array<Byte>) -> ResumeOutcome {
+    pub fn resume(self: &SingularImpl, key: &Array<Byte>, recovery: &Optional<RecoveryLease>) -> ResumeOutcome {
         _validate_key(key);
+        // Client-side guards on a recovery request (the SP is the authoritative backend guarantee), mirroring
+        // start(): a 16-byte token and a deadline strictly after the claim time. A read-only resume (None)
+        // validates nothing extra.
+        match recovery {
+            Optional::Some(r) => {
+                _validate_lease_token(&r.lease_token);
+                _validate_lease_expiry(&r.event_time, &r.lease_expires_at);
+            },
+            Optional::None => {}
+        }
         try {
             var lease = _acquire_lease(self);
             val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
             var args = rpc.new_args();
             args.push(rpc.arg_string(_dup(&self.identity.service_group)));
             args.push(rpc.arg_bytes(_dup_bytes(key)));
+            // Reclaim params (NULL => read-only resume). The owner is the gateway's own identity, like start().
+            match recovery {
+                Optional::Some(r) => {
+                    args.push(rpc.arg_bytes(_dup_bytes(&self.identity.lease_owner)));
+                    args.push(_meta_object_arg("lease_meta", &r.lease_meta_json));
+                    args.push(rpc.arg_string(_utc_to_db(&r.event_time)));
+                    args.push(rpc.arg_string(_utc_to_db(&r.lease_expires_at)));
+                    args.push(rpc.arg_bytes(_dup_bytes(&r.lease_token)));
+                },
+                Optional::None => {
+                    args.push(rpc.arg_null());
+                    args.push(rpc.arg_null());
+                    args.push(rpc.arg_null());
+                    args.push(rpc.arg_null());
+                    args.push(rpc.arg_null());
+                }
+            }
             val sp: String = "sp_singular_resume";
             val doc = _call_sp_doc(conn, &sp, move args);
             val outcome = _doc_outcome(&doc);
@@ -823,6 +866,26 @@ implement SingularGateway for SingularImpl {
                 return ResumeOutcome::Terminal(_terminal_from_doc(&doc));
             } else if outcome == "not_found" {
                 return ResumeOutcome::NotFound();
+            } else if outcome == "granted" {
+                // A grant only happens on the reclaim path (a recovery lease was supplied). Thread the
+                // caller's own validated token + approved absolute expiry into the WorkLease, plus the
+                // backend's recovery_attempt and the handed-over checkpoint document.
+                match recovery {
+                    Optional::Some(r) => {
+                        return ResumeOutcome::Granted(
+                            WorkLease(
+                                key = _dup_bytes(key),
+                                lease_token = _dup_bytes(&r.lease_token),
+                                lease_expires_at = _utc_copy(&r.lease_expires_at)
+                            ),
+                            _doc_int_req(&doc, &"recovery_attempt", "resume-no-recovery-attempt"),
+                            _doc_object_text_req(&doc, &"checkpoint")
+                        );
+                    },
+                    Optional::None => {
+                        throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "unexpected-grant-without-recovery"));
+                    }
+                }
             } else {
                 throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:resume"));
             }

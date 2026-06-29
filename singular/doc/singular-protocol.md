@@ -2,7 +2,7 @@
 
 **Status:** Normative specification — **target version**, with an explicit
 implementation-coverage table (§0.2). Sections marked **(PLANNED)** are not in
-the current reference implementation (Singular 0.4) and MUST NOT be relied on
+the current reference implementation (Singular 0.7.0) and MUST NOT be relied on
 until the coverage table lists them as implemented.
 
 **Scope:** the language-neutral idempotency + lease-coordination contract that
@@ -59,7 +59,7 @@ becomes authoritative, not whether the underlying effect ran once.
 
 ### 0.2 Implementation coverage
 
-| Feature | Singular 0.4 (reference) |
+| Feature | Singular 0.7.0 (reference) |
 |---|---|
 | key identity `(service_group, key)`; caller-assigned, stable | implemented |
 | `start` (brand-new, PK-serialized grant) | implemented |
@@ -71,19 +71,17 @@ becomes authoritative, not whether the underlying effect ran once.
 | terminal immutability + replay | implemented |
 | lease token fencing (capability-token model) | implemented |
 | history / audit trail | implemented |
-| **expired-lease reclaim** (resume grants a new attempt after expiry) | **REQUIRED — extend 0.4** |
+| **expired-lease reclaim** (resume grants a new attempt after expiry) | **implemented (0.7.0)** |
 | **`defer`** (working → deferred; durable scheduled re-acquisition) | **REQUIRED — extend 0.4** |
 | **input-identity conflict** (same key, different input → conflict) | **PLANNED** |
 | **monotonic fence value** (beyond token match) | **PLANNED** |
 | **canonical byte serialization of documents** | **PLANNED** |
 | **conformance suite / vectors** | **PLANNED (not yet authored)** |
 
-> **Reclaim is REQUIRED**, not optional: if a participant worker crashes
-> holding a lease, another worker MUST reclaim the same operation after expiry
-> with a new token — otherwise the operation is stuck `working` forever and a
-> Microflows poll never progresses. Singular 0.4 must be extended if it cannot
-> reclaim. (The first success + lost-ack spike uses only start/complete/inspect
-> and does not exercise reclaim; reclaim/defer scenarios follow once the
+> **Reclaim is REQUIRED**, not optional, and is **implemented as of 0.7.0**: if a participant worker
+> crashes holding a lease, another worker reclaims the same operation after expiry with a new token
+> (`resume` with a recovery lease → `Granted`, §6.6) — otherwise the operation would be stuck `working`
+> forever and a Microflows poll would never progress. (`defer` scenarios still follow once that
 > capability exists.)
 >
 > **Defer is NOT failure.** "Processor busy, check again in 5 min" is a
@@ -98,15 +96,16 @@ becomes authoritative, not whether the underlying effect ran once.
 > e.g. `done { "kind": "indeterminate", ... }`, and interprets that payload
 > itself (§ Appendix A). Singular sees only a terminal with an opaque document.
 
-### 0.3 Required extensions to Singular 0.4 (identify before relying on them)
+### 0.3 Remaining extensions beyond the 0.7.0 reference (identify before relying on them)
 
-The target protocol exceeds the current reference SPs. Each gap below MUST be
+The target protocol still exceeds the current reference SPs. Each gap below MUST be
 implemented (and conformance-tested) before any consumer relies on it; until
-then the stub/consumer compensates as noted.
+then the stub/consumer compensates as noted. (Reclaim is **no longer a gap** — it
+landed in 0.7.0; see §6.6.)
 
-| Gap | Current 0.4 | Required change | Stub/consumer workaround until then |
+| Gap | Current 0.7.0 | Required change | Stub/consumer workaround until then |
 |---|---|---|---|
-| **reclaim** | `resume` only observes (Active/Terminal/NotFound) | `resume`/`reclaim` on an expired lease grants a new attempt + rotated token, handing over persisted context (§6.6) | none — required for crash recovery; spike defers reclaim scenarios |
+| **reclaim** | ✅ **implemented (0.7.0)** — `resume` with a recovery lease on an expired item grants a new attempt + rotated token + handed-over checkpoint (§6.6) | done | n/a |
 | **defer / deferred state** | absent | new `deferred` state + `defer` op (§6.7); atomic lease release; due-time gating; idempotent by defer command id | none — required for participant "busy, later"; spike defers it |
 | **input-identity conflict** | `start` STORES `item_meta` but does NOT compare it; second start ⇒ `Exists` regardless of input | `start` compares canonical input identity; mismatch ⇒ `InputConflict` (§1.3) | **spike: the stub puts the canonical input hash in Singular's `item_meta` on start, reads the original back via `history`/`inspect` on `Exists`, and compares — no second store; returns 409 on mismatch** |
 | **terminal replay channel** | replay via `resume`/`inspect`; `start`→`Exists`; foreign-token settle→`TokenStale` (NOT the terminal doc) | unchanged mechanism is acceptable; §3 is normative about immutability, not about which call returns the document | consumer reads terminal outcome via `resume`/`inspect`, not via `start`/foreign `complete` |

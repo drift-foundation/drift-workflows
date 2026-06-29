@@ -1,9 +1,10 @@
-// Singular gateway e2e test suite (PR1) — runs against a real MariaDB instance.
+// Singular gateway e2e test suite (PR1 + PR2 reclaim) — runs against a real MariaDB instance.
 //
 // Exercises the start/resume capability-token model:
 //   - start(): brand-new work only; the PK insert is the serializer
 //     (Granted(Fresh) | Exists).
-//   - resume(): existing work only; never inserts (Active | Terminal | NotFound).
+//   - resume(): existing work only; never inserts. Read-only => Active | Terminal | NotFound; with a
+//     RecoveryLease on an EXPIRED working item => Granted (PR2 reclaim: rotated token + checkpoint).
 //   - complete/fail/extend_lease: fenced by the app-minted lease token; on a settled
 //     item the writer's token gets the authoritative result (complete/fail → Settled,
 //     extend_lease → Terminal), any other token → TokenStale; a missing key → NotFound
@@ -164,6 +165,8 @@ fn _inspect_working_expires(g: &arc.Arc<gw.SingularGateway>, key: &Array<Byte>) 
         default => { throw gw.SingularException(kind = gw.RuntimeErrorKind::BackendRejected(detail = "inspect-not-working")); }
     }
 }
+// PR2: a read-only resume passes no recovery lease (NONE). Scenarios that reclaim build a RecoveryLease(Some).
+fn _no_recovery() nothrow -> Optional<gw.RecoveryLease> { return Optional<gw.RecoveryLease>::None(); }
 
 // ============================================================
 // 1. start → complete → resume(terminal Done)
@@ -185,7 +188,7 @@ fn scenario_start_complete_resume() -> Int {
         gw.StartOutcome::Exists => {}
     }
 
-    match g.get().resume(&key) {
+    match g.get().resume(&key, &_no_recovery()) {
         gw.ResumeOutcome::Terminal(tr) => {
             match tr { gw.TerminalResult::Done(p) => { if p.byte_length() == 0 { return 106; } }, default => { return 105; } }
         },
@@ -210,7 +213,7 @@ fn scenario_start_fail_resume() -> Int {
     val ok2 = match fr { gw.SettleOutcome::Settled(_) => { true }, default => { false } };
     if !ok2 { return 202; }
 
-    match g.get().resume(&key) {
+    match g.get().resume(&key, &_no_recovery()) {
         gw.ResumeOutcome::Terminal(tr) => {
             match tr { gw.TerminalResult::Failed(e) => { if e.byte_length() == 0 { return 204; } }, default => { return 203; } }
         },
@@ -242,14 +245,14 @@ fn scenario_start_exists_resume_active() -> Int {
 
     // Resume while WORKING → Active (no second lease) — owner-independent, so both the
     // SAME identity (ga, different proposed token) ...
-    match ga.get().resume(&key) {
+    match ga.get().resume(&key, &_no_recovery()) {
         gw.ResumeOutcome::Active(_) => {},
         default => { return 303; }
     }
     // ... and a DIFFERENT worker identity (gb) report Active. (Active carries no owner;
     // ownership is descriptive, and the post-same_owner-removal behavior is identical.)
     val gb = _build_gw(&"w3b");
-    match gb.get().resume(&key) {
+    match gb.get().resume(&key, &_no_recovery()) {
         gw.ResumeOutcome::Active(_) => {},
         default => { return 304; }
     }
@@ -386,7 +389,7 @@ fn scenario_missing_key_notfound() -> Int {
     if !(match er { gw.ExtendLeaseOutcome::NotFound => { true }, default => { false } }) { return 803; }
 
     // resume on a missing key → NotFound.
-    match g.get().resume(&key) {
+    match g.get().resume(&key, &_no_recovery()) {
         gw.ResumeOutcome::NotFound => {},
         default => { return 804; }
     }
@@ -395,8 +398,8 @@ fn scenario_missing_key_notfound() -> Int {
 
 // ============================================================
 // 9. token validation: NULL/non-16-byte token rejected client-side on every
-//    token-carrying entrypoint (start/complete/fail/extend_lease — PR1 resume(key) is
-//    tokenless), plus strict JSON inputs on complete/fail; no row created/mutated.
+//    token-carrying entrypoint (start/complete/fail/extend_lease — a read-only resume passes no
+//    recovery lease, so it carries no token), plus strict JSON inputs on complete/fail; no row created/mutated.
 // ============================================================
 fn scenario_token_validation() -> Int {
     val g = _build_gw(&"w9");
@@ -881,6 +884,58 @@ fn scenario_event_time_conflict() -> Int {
     return 0;
 }
 
+// ============================================================
+// 18. PR2 expired-lease RECLAIM (coordinator crash-recovery, §4/§6.6): start → (crash) → lease expires →
+//     a NEW worker resumes WITH a recovery lease → Granted (rotated token + checkpoint) → the OLD token is
+//     fenced (TokenStale) → the NEW token drives the SAME key to terminal; read-only terminal replay still
+//     works. The whole dangerous window through the typed gateway.
+// ============================================================
+fn scenario_reclaim_expired() -> Int {
+    val g = _build_gw(&"w-reclaim");
+    val key = _key(&"pr2-reclaim-expired");
+    val tok1 = _tok(&"pr2-reclaim-tok1");
+    val lease1 = _must_start(&g, &key, &tok1);   // live lease over _ts(1).._exp(1)
+
+    // A NEW worker reclaims AFTER expiry: claim time _ts(100) is well past _exp(1) (base+31s).
+    val tok2 = _tok(&"pr2-reclaim-tok2");
+    val recovery = Optional<gw.RecoveryLease>::Some(gw.RecoveryLease(
+        lease_meta_json = "{}",
+        event_time = _ts(100),
+        lease_expires_at = _exp(100),
+        lease_token = tok2.clone()
+    ));
+    var lease2: gw.WorkLease = _lease_for(&key, tok2.clone());
+    var granted = false;
+    match g.get().resume(&key, &recovery) {
+        gw.ResumeOutcome::Granted(l, attempt, _) => {
+            if attempt != 1 { return 1801; }   // first reclaim -> recovery_attempt 1
+            lease2 = move l;
+            granted = true;
+        },
+        default => { return 1802; }
+    }
+    if !granted { return 1803; }
+
+    // The OLD attempt is fenced: complete() under lease1 (tok1, now rotated out) -> TokenStale.
+    match g.get().complete(&lease1, &_ts(101), &"{\"r\":\"old\"}") {
+        gw.SettleOutcome::TokenStale => {},
+        default => { return 1804; }
+    }
+
+    // The NEW attempt drives the SAME key to terminal (event_time strictly after the reclaim at _ts(100)).
+    match g.get().complete(&lease2, &_ts(102), &"{\"r\":\"new\"}") {
+        gw.SettleOutcome::Settled(_) => {},
+        default => { return 1805; }
+    }
+
+    // Read-only terminal replay is unaffected by the reclaim.
+    match g.get().resume(&key, &_no_recovery()) {
+        gw.ResumeOutcome::Terminal(_) => {},
+        default => { return 1806; }
+    }
+    return 0;
+}
+
 fn main() nothrow -> Int {
     con.println("01 start_complete_resume");
     val r01 = try scenario_start_complete_resume() catch { 199 };
@@ -930,6 +985,9 @@ fn main() nothrow -> Int {
     con.println("17 event_time_conflict");
     val r17 = try scenario_event_time_conflict() catch { 1799 };
     if r17 != 0 { return r17; }
+    con.println("18 reclaim_expired (PR2 crash-recovery)");
+    val r18 = try scenario_reclaim_expired() catch { 1899 };
+    if r18 != 0 { return r18; }
     con.println("all pass");
     return 0;
 }

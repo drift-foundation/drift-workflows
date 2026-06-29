@@ -33,6 +33,7 @@ export {
 
     // Result shapes (re-exports)
     WorkLease,
+    RecoveryLease,
     TerminalResult,
     StartOutcome,
     ResumeOutcome,
@@ -64,6 +65,7 @@ pub type RuntimeErrorKind = gw.RuntimeErrorKind;
 pub type SingularException = gw.SingularException;
 pub type SingularEvent = gw.SingularEvent;
 pub type WorkLease = gw.WorkLease;
+pub type RecoveryLease = gw.RecoveryLease;
 pub type TerminalResult = gw.TerminalResult;
 pub type StartOutcome = gw.StartOutcome;
 pub type ResumeOutcome = gw.ResumeOutcome;
