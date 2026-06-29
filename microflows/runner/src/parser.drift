@@ -11,6 +11,11 @@
 // IR — the parser still only LOWERS to config the IR executes + hashes. Branch/case selection comes
 // from a path selector over durable args, settled results, or locals.
 //
+// Composition slice 1a adds the `call <child>@<plan_version> { … } [compensation …]` step, lowered to a
+// new `call` graph node (IR `NCallWorkflow`). This is FRONTEND-ONLY: the node parses, validates, hashes,
+// and renders, but has no runtime — op-depth/registry build REJECTS a reachable call until slice 1b, and
+// `compensation` is build-rejected until slice 1c (`on failed` / `fan` are not parsed yet).
+//
 // Parse failures are STRUCTURED diagnostics — `ParseError` carries a stable kebab-case `code` + a
 // source position (byte_offset/line/column) + optional expected/found (mirroring std.source's and
 // drift-web's structured-error convention). `render_diagnostic` formats one for human CLI output
@@ -151,7 +156,14 @@ variant StmtKind {
 	KLoop(as_name: String, kind: String, source: json.JsonNode, elem: String, init: Optional<json.JsonNode>, body: json.JsonNode), // let <as> = map/filter/fold … -> NLoop; 2b-iii
 	KIf(cond: json.JsonNode, then_body: Array<Stmt>, else_body: Array<Stmt>, merge: Optional<MergeSpec>), // if … else … [merge …] — cond = lowered selector expr
 	KCase(scrut: json.JsonNode, arms: Array<SCaseArm>, default_body: Array<Stmt>, merge: Optional<CaseMergeSpec>), // case … [merge …] — scrut = lowered selector expr
-	KFail(reason: json.JsonNode)                                              // authored fail — terminal; reason = lowered String expr
+	KFail(reason: json.JsonNode),                                             // authored fail — terminal; reason = lowered String expr
+	KCall(bind: Optional<String>, child: String, plan_version: String, input: json.JsonNode, comp: Optional<CompRef>) // workflow call — `[let <bind> =] call <child>@<ver> { <input> } [compensation <wf>@<ver>]` (composition slice 1a)
+}
+// A parsed `compensation <wf>@<plan_version>` clause on a call (composition slice 1a). PARSED here but
+// the IR build REJECTS it until slice 1c — captured so the rejection can name the child + version.
+struct CompRef {
+	child: String,
+	plan_version: String
 }
 struct SCaseArm {
 	match_json: json.JsonNode,
@@ -511,6 +523,8 @@ fn _parse_stmt(c: &mut Cursor) -> Stmt {
 	if _str_eq(&kw, &"case") { return _parse_case(c, move id); }
 	if _str_eq(&kw, &"let") { return _parse_let(c, move id); }
 	if _str_eq(&kw, &"fail") { return _parse_fail(c, move id); }
+	if _str_eq(&kw, &"call") { return _parse_call(c, move id, Optional<String>::None()); }
+	if _str_eq(&kw, &"fan") { throw ParseError(code = "unsupported-in-release", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "fan", message = "`fan` (fan-out) is not in this release (composition slice 3)"); }
 	// op_step: `kw` is the operation name, followed by an INPUT EXPRESSION (a `{…}` const object,
 	// or `const`/`arg`/`local` — slice 2b-i). The runtime requires the op input to be an object;
 	// a non-object expression is caught by the build-time type check, not here.
@@ -566,12 +580,74 @@ fn _parse_let(c: &mut Cursor, var id: String) -> Stmt {
 	}
 	val w2 = _peek_ident(c);
 	if _is_loop_keyword(&w2) { return _parse_loop(c, move id, move bind); }
+	// workflow call: `let <bind> = call <child>@<ver> { … }` — <bind> aliases the child's RESULT (slice 1a)
+	if _str_eq(&w2, &"call") {
+		val _ = _read_ident(c);   // consume 'call'
+		return _parse_call(c, move id, Optional<String>::Some(move bind));
+	}
 	// named operation: `let <bind> = <op-name> <input-expr>`
 	val op = _read_ident(c);
 	val input = _parse_value_expr(c);
 	_res_bind(c, &bind, &id);   // record <bind> -> this op's node id (rejects a duplicate result name)
 	return Stmt(id = move id, kind = StmtKind::KNamedOp(bind = move bind, op = move op, input = move input));
 }
+
+// call_stmt := 'call' <child-ident> '@' <plan_version> <input-object> [ 'compensation' <wf-ident> '@' <plan_version> ]
+// The leading 'call' is already consumed by the caller. `bind` (Some when `let <x> = call …`) aliases the
+// child's RESULT downstream (`result <x>`), recorded in the symbol table AFTER the input/comp parse (so the
+// input cannot reference its own result — same discipline as a named op). Composition slice 1a: the grammar
+// PARSES `compensation` in full, but the IR build REJECTS it until slice 1c; `on failed` (slice 3) is
+// rejected here with a clear "not in this release".
+fn _parse_call(c: &mut Cursor, var id: String, var bind: Optional<String>) -> Stmt {
+	val child = _read_ident(c);
+	_expect(c, 64, &"'@'");   // '@'
+	val ver = _parse_plan_version(c);
+	_skip_ws(c);
+	if _eof(c) or cast<Int>(c.src.byte_at(c.pos)) != 123 {   // '{'
+		throw ParseError(code = "expected-call-input", byte_offset = c.pos, line = 0, column = 0, expected = "{", found = "", message = "`call` requires an input object `{ … }`");
+	}
+	val input = _parse_value_expr(c);
+	var comp: Optional<CompRef> = Optional<CompRef>::None();
+	if _accept_keyword(c, &"compensation") {
+		val cwf = _read_ident(c);
+		_expect(c, 64, &"'@'");
+		val cver = _parse_plan_version(c);
+		comp = Optional<CompRef>::Some(CompRef(child = move cwf, plan_version = move cver));
+	}
+	// `on failed { … }` is a slice-3 form — reject clearly rather than silently leaving it for the next stmt.
+	val nxt = _peek_ident(c);
+	if _str_eq(&nxt, &"on") {
+		throw ParseError(code = "unsupported-in-release", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "on", message = "`on failed` is not in this release (composition slice 3)");
+	}
+	match &bind {
+		Optional::Some(b) => { _res_bind(c, b, &id); },
+		Optional::None => {}
+	}
+	return Stmt(id = move id, kind = StmtKind::KCall(bind = move bind, child = move child, plan_version = move ver, input = move input, comp = move comp));
+}
+
+// plan_version := <uint> '.' <uint> '.' <uint> — a semantic version token (major.minor.patch). Leading
+// whitespace tolerated; each segment is one or more ASCII digits. (Composition slice 1a.)
+fn _parse_plan_version(c: &mut Cursor) -> String {
+	val maj = _read_uint_str(c);
+	_expect(c, 46, &"'.'");   // '.'
+	val min = _read_uint_str(c);
+	_expect(c, 46, &"'.'");   // '.'
+	val pat = _read_uint_str(c);
+	return maj + "." + min + "." + pat;
+}
+
+fn _read_uint_str(c: &mut Cursor) -> String {
+	_skip_ws(c);
+	if _eof(c) or !_is_digit_b(c.src.byte_at(c.pos)) {
+		throw ParseError(code = "expected-plan-version", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a semantic plan version (major.minor.patch)");
+	}
+	val start = c.pos;
+	while !_eof(c) and _is_digit_b(c.src.byte_at(c.pos)) { c.pos = c.pos + 1; }
+	return _slice(c, start, c.pos - start);
+}
+
+fn _is_digit_b(b: Byte) nothrow -> Bool { val v = cast<Int>(b); return v >= 48 and v <= 57; }
 
 fn _is_expr_keyword(w: &String) nothrow -> Bool {
 	return _str_eq(w, &"const") or _str_eq(w, &"arg") or _str_eq(w, &"local") or _str_eq(w, &"result");
@@ -953,6 +1029,7 @@ fn _require_merge_branch(c: &Cursor, body: &Array<Stmt>, which: &String) -> Void
 		StmtKind::KOp(_, _) => { single = true; },
 		StmtKind::KNamedOp(_, _, _) => { single = true; },
 		StmtKind::KLet(_, _) => { single = true; },
+		StmtKind::KCall(_, _, _, _, _) => { single = true; },
 		default => {}
 	}
 	if !single { throw ParseError(code = "merge-branch-not-single-exit", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "`merge` " + _dup(which) + "-branch must end in an operation or let (not nested if/case)"); }
@@ -1247,6 +1324,12 @@ fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 			// block is unreachable; the graph reachability check surfaces it.
 			out.push(_fail_node(&stmt.id, reason));
 		},
+		StmtKind::KCall(bind, child, plan_version, input, comp) => {
+			// A workflow call is one forward step (like a named op); the binder was only the parse-time
+			// result alias, so it is not carried into the node. Composition slice 1a.
+			val _ = bind;
+			out.push(_call_node(&stmt.id, child, plan_version, input, comp, succ));
+		},
 		StmtKind::KLoop(as_name, kind, source, elem, init, body) => {
 			out.push(_loop_node(&stmt.id, kind, source, elem, as_name, init, body, succ));
 		},
@@ -1432,6 +1515,30 @@ fn _fail_node(id: &String, reason_expr: &json.JsonNode) -> json.JsonNode {
 	o.set("kind", _jstr("fail"));
 	o.set("id", _jstr(_dup(id)));
 	o.set("reason", reason_expr.clone_deep());
+	return o.to_node();
+}
+
+// {"kind":"call","id","child","plan_version","input":<expr>,"next", "compensation":{"child","plan_version"}?}
+// The binder is NOT stored (like a named op, it is only the parse-time result alias → this node id;
+// downstream `result <bind>` resolves through the symbol table to this id). The `compensation` clause is
+// carried so the IR build can REJECT it until slice 1c (parse-but-reject). Composition slice 1a.
+fn _call_node(id: &String, child: &String, plan_version: &String, input: &json.JsonNode, comp: &Optional<CompRef>, next: &String) -> json.JsonNode {
+	var o = json.new_object();
+	o.set("kind", _jstr("call"));
+	o.set("id", _jstr(_dup(id)));
+	o.set("child", _jstr(_dup(child)));
+	o.set("plan_version", _jstr(_dup(plan_version)));
+	o.set("input", input.clone_deep());
+	o.set("next", _jstr(_dup(next)));
+	match comp {
+		Optional::Some(cr) => {
+			var co = json.new_object();
+			co.set("child", _jstr(_dup(&cr.child)));
+			co.set("plan_version", _jstr(_dup(&cr.plan_version)));
+			o.set("compensation", co.to_node());
+		},
+		Optional::None => {}
+	}
 	return o.to_node();
 }
 

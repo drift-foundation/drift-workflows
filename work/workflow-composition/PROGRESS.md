@@ -75,17 +75,48 @@ Overall feature:
 
 ## Verification
 
-None yet. No code changes are part of this effort.
+**Slice 1a frontend core — IMPLEMENTED + verified (registry-free part).**
+- `parser.drift`: `[let x =] call <child>@<plan_version> { <input> } [compensation <wf>@<plan_version>]`
+  parsed → `KCall` AST → lowered to a `call` graph node; `@<plan_version>` is a `maj.min.patch` token;
+  `on failed` / `fan` rejected as "not in this release".
+- `ir.drift`: `NCallWorkflow` node (+`CallComp`) — `parse_graph` branch, canonical (`W` tag, hashes the
+  compensation), mermaid, `_succs`/`_node_id`/`_check_node` arms, `advance` defensive-fault (no 1a runtime),
+  `EResult` may now reference a call node, and `validate_graph` **build-rejects `compensation`** until 1c.
+- Compiles clean (standalone `driftc` over `parser.drift`+`ir.drift`); a smoke driver passes (valid call ok;
+  compensation rejected; `on failed`/`fan`/bad-version/non-object-input all parse-rejected).
+- 7 new `--parse-check` fixtures + goldens under `runner/tests/fixtures/parser/check/` (`call_single`,
+  `call_bare`, `call_compensation_rejected`, `err_call_{on_failed,fan,bad_version,no_input}`).
+- **No regression:** a faithful standalone `_parse_check` replica reproduced all **88** existing check
+  goldens byte-for-byte. `ir_graph_test` passes. (Full runner binary + `run_parser_fixtures.py` gate can't
+  build locally — missing external deps; runs in CI.)
+
+**Remaining for 1a (manifest-backed — needs full build env, not testable locally):** child `name@version`
+registry resolution + input↔child-`arg` / downstream↔child-`return` contract match, and the **static
+recursion/cycle check** (registry enumerates each pinned plan's `NCallWorkflow` edges). These live in the
+`--manifest` path (`runner.drift`), the only place a multi-script workflow registry exists.
 
 ## Dirty Worktree
 
-The three work files (`README.md`, `PROGRESS.md`, `DESIGN.md`) are committed; the current dirty state is only
-`DESIGN.md` + `PROGRESS.md` (the review-pass design refinements). No code changes.
+The three work files are committed. Current dirty state:
+- **Docs:** `DESIGN.md` + `PROGRESS.md` (design refinements + this status).
+- **Code (slice 1a frontend core):** `microflows/runner/src/parser.drift`, `microflows/runner/src/ir.drift`.
+- **Tests:** 14 new files under `microflows/runner/tests/fixtures/parser/check/` — 7 `.mf` + 7 `.expected`
+  (`call_single`, `call_bare`, `call_compensation_rejected`, `err_call_{on_failed,fan,bad_version,no_input}`).
+
+A reachable `call` is **build-rejected** (op-depth gate) until 1b, so the frontend-only node can never reach
+the runtime fault; `--parse-check` still accepts calls. Verified: standalone `parser.drift`+`ir.drift` compile;
+smoke driver passes (incl. build-gate); 95 parser-check goldens reproduce (88 existing byte-for-byte + 7 new);
+`ir_graph_test` + `ir_exec_test` pass. Full runner binary + fixture gate need the CI build env (deps absent
+locally).
 
 ## Literal Next Action
 
-Design is settled. **Start slice 1a (frontend only — no DB, no runtime), in dependency order:** (1) grammar in
-`parser.drift` — `let x = call <child>@<plan_version> { … }` + parse-only `compensation`; (2) IR
-`NCallWorkflow` + lowering + child arg/return contract validation + **static cycle check** + mermaid, with
-**build-rejection of `compensation`** ("not until 1c"). Pure lowering/hashing parity, **zero DB**. Each stage
-lands with its own tests; then 1b (forward spine) and 1c (compensation) per the `DESIGN.md` checklists.
+**Slice 1a frontend core is implemented + locally verified** (parser + IR + 7 fixtures). Two ways forward:
+1. **Land the registry-free 1a frontend increment** — commit `parser.drift` + `ir.drift` + the 14 fixtures
+   (+ docs), run the full `just test` gate in a CI/full-build env, then continue.
+2. **Continue 1a in a full-build env** — implement the **manifest-backed** validation (task #3): child
+   `name@<plan_version>` registry resolution + input↔`arg`/downstream↔`return` contract match + the **static
+   recursion/cycle check** (enumerate each pinned plan's `NCallWorkflow` edges). This lives in the `--manifest`
+   path (`runner.drift`) and is **not buildable/testable in the current local env** (missing external deps).
+
+Then 1b (forward async-call spine) and 1c (compensation) per the `DESIGN.md` checklists.

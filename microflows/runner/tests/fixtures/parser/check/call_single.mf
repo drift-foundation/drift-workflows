@@ -1,0 +1,6 @@
+// composition slice 1a: a child-workflow call, result fed to a later call
+args { order_id: string }
+steps {
+  let a = call authorize@1.0.0 { order_id: arg order_id }
+  let c = call capture@2.1.0 { auth: result a }
+}

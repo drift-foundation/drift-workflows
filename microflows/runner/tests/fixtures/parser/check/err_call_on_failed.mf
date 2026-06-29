@@ -1,0 +1,3 @@
+steps {
+  call capture@1.0.0 { x: const 1 } on failed { fail "boom" }
+}

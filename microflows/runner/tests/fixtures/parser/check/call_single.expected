@@ -1,0 +1,7 @@
+{
+  "canonical": "G{2:n0;|W2:n0;9:authorize;5:1.0.0;o1;8:order_id;14:a[8:order_id;];2:n1;;W2:n1;7:capture;5:2.1.0;o1;4:auth;8:r2:n0;[];2:n2;;R2:n2;k4:null;;}",
+  "is_graph": true,
+  "status": "ok",
+  "type_check": "ok",
+  "validate": "ok"
+}

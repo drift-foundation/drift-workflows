@@ -1,0 +1,3 @@
+steps {
+  fan line in arg lines key line { call reserve@1.0.0 { sku: local line } }
+}

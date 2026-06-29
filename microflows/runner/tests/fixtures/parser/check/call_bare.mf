@@ -1,0 +1,4 @@
+// composition slice 1a: a bare workflow call (no binder)
+steps {
+  call notify@1.2.3 { msg: const "hi" }
+}

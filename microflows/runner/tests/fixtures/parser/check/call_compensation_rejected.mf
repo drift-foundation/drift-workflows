@@ -1,0 +1,4 @@
+// composition slice 1a: `compensation` PARSES but is build-rejected until slice 1c
+steps {
+  let c = call charge@1.0.0 { amount: const 100 } compensation refund@1.0.0
+}

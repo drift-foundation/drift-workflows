@@ -1,0 +1,9 @@
+{
+  "byte_offset": 44,
+  "code": "unsupported-in-release",
+  "column": 37,
+  "expected": "",
+  "found": "on",
+  "line": 2,
+  "status": "parse-error"
+}

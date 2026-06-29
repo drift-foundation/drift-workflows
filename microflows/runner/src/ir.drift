@@ -392,7 +392,14 @@ pub variant IrNode {
 	NLoop(id: String, kind: LoopKind, source: IrExpr, elem: String, acc: String, init: IrExpr, body: IrExpr, next: String),
 	NMerge(id: String, name: String, sources: Array<MergeArm>, next: String),  // phi: rejoin paths, bind `name`
 	NReturn(id: String, value: IrExpr),                                       // terminal: the workflow result
-	NFail(id: String, reason: IrExpr)                                         // terminal: authored fail -> reversal; reason is a String code
+	NFail(id: String, reason: IrExpr),                                        // terminal: authored fail -> reversal; reason is a String code
+	NCallWorkflow(id: String, child: String, plan_version: String, input: IrExpr, next: String, comp: Optional<CallComp>) // composition: a child-workflow call (one forward step); result bound to `id` (read via `result`). Slice 1a.
+}
+// A parsed `compensation <wf>@<plan_version>` binding on a call. Carried so the BUILD can REJECT it until
+// composition slice 1c (the compensation runtime); `child`/`plan_version` name the comp workflow's plan.
+pub struct CallComp {
+	pub child: String,
+	pub plan_version: String
 }
 
 pub struct IrGraph {
@@ -526,6 +533,30 @@ fn _parse_node(n: &json.JsonNode) -> IrNode {
 		val reason = _parse_expr_at(n, &"reason");
 		_reject_extra(nkeys, 3);   // kind, id, reason
 		return IrNode::NFail(id = move id, reason = move reason);
+	}
+	// call: a child-workflow call — one durable forward step (like an operation, but the participant is a
+	// pinned child workflow). `child`@`plan_version` is the child's plan identity; `input` is an IrExpr;
+	// the result binds to this node id (read downstream via `result`). Optional `compensation` names a
+	// comp workflow's plan — PARSED but BUILD-REJECTED until composition slice 1c (validate_graph). Slice 1a.
+	if _str_eq(&kind, &"call") {
+		val child = _req_str(n, &"child");
+		val plan_version = _req_str(n, &"plan_version");
+		val next = _req_str(n, &"next");
+		val input = _parse_expr_at(n, &"input");
+		var comp: Optional<CallComp> = Optional<CallComp>::None();
+		var allowed = 6;   // kind, id, child, plan_version, input, next
+		match n.get(&"compensation") {
+			Optional::Some(cn) => {
+				val cchild = _req_str(cn, &"child");
+				val cver = _req_str(cn, &"plan_version");
+				_reject_extra(_obj_len(cn), 2);   // child, plan_version
+				comp = Optional<CallComp>::Some(CallComp(child = move cchild, plan_version = move cver));
+				allowed = 7;   // + compensation
+			},
+			Optional::None => {}
+		}
+		_reject_extra(nkeys, allowed);
+		return IrNode::NCallWorkflow(id = move id, child = move child, plan_version = move plan_version, input = move input, next = move next, comp = move comp);
 	}
 	// Finite array expressions (map/filter/fold over a finite array source). The result binds to
 	// a downstream local named `as`; the body is a pure IrExpr over `elem` (+ the `as` accumulator
@@ -810,6 +841,9 @@ pub fn emit_mermaid(g: &IrGraph) nothrow -> String {
 			IrNode::NOperation(id, operation, input, next) => {
 				out = out + "  " + _dup(id) + "[\"" + _dup(operation) + "\"] --> " + _dup(next) + "\n";
 			},
+			IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => {
+				out = out + "  " + _dup(id) + "[\"call " + _dup(child) + "@" + _dup(plan_version) + "\"] --> " + _dup(next) + "\n";
+			},
 			IrNode::NLet(id, name, value, next) => {
 				out = out + "  " + _dup(id) + "([\"let " + _dup(name) + "\"]) --> " + _dup(next) + "\n";
 			},
@@ -851,6 +885,14 @@ fn _node_canonical(n: &IrNode) nothrow -> String {
 	match n {
 		IrNode::NOperation(id, operation, input, next) => {
 			return "P" + _lp(id) + _lp(operation) + _expr_canonical(input) + _lp(next);
+		},
+		IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => {
+			var s = "W" + _lp(id) + _lp(child) + _lp(plan_version) + _expr_canonical(input) + _lp(next);
+			match comp {
+				Optional::Some(cc) => { s = s + "K" + _lp(&cc.child) + _lp(&cc.plan_version); },
+				Optional::None => {}
+			}
+			return s;
 		},
 		IrNode::NLet(id, name, value, next) => {
 			return "L" + _lp(id) + _lp(name) + _expr_canonical(value) + _lp(next);
@@ -1021,7 +1063,8 @@ fn _node_id(n: &IrNode) nothrow -> String {
 		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { return _dup(id); },
 		IrNode::NMerge(id, name, sources, next) => { return _dup(id); },
 		IrNode::NReturn(id, value) => { return _dup(id); },
-		IrNode::NFail(id, reason) => { return _dup(id); }
+		IrNode::NFail(id, reason) => { return _dup(id); },
+		IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => { return _dup(id); }
 	}
 }
 
@@ -1104,6 +1147,12 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 						}
 					}
 				}
+			},
+			IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => {
+				// Composition slice 1a is FRONTEND ONLY — no runtime. A workflow call's dispatch/await/settle
+				// arrives in slice 1b; reaching it in the interpreter now is a defensive fault (parse-check /
+				// hashing never execute, so this is unreachable in 1a tests).
+				return StepOutcome::Fault(message = "workflow call execution arrives in composition slice 1b: " + _dup(id));
 			},
 			IrNode::NLet(id, name, value, next) => {
 				match _eval(g, value, &args_node, settled, &local_names, &local_vals) {
@@ -1436,6 +1485,22 @@ pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
 		Optional::None => {}
 	}
 
+	// composition slice 1a: a workflow `call` PARSES an optional `compensation`, but the compensation
+	// RUNTIME is slice 1c — reject it at build until then (parse-but-reject; never accept-and-ignore).
+	i = 0;
+	while i < nn {
+		match &g.nodes[i] {
+			IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => {
+				match comp {
+					Optional::Some(_) => { return Optional<String>::Some("workflow `compensation` is not available until composition slice 1c (call '" + _dup(child) + "@" + _dup(plan_version) + "')"); },
+					Optional::None => {}
+				}
+			},
+			default => {}
+		}
+		i = i + 1;
+	}
+
 	// per-node: expression ref checks + loop shape + NCase arm checks (all nodes reachable here).
 	i = 0;
 	while i < nn {
@@ -1496,6 +1561,7 @@ fn _find_node(g: &IrGraph, id: &String) nothrow -> Int {
 fn _succs(n: &IrNode, out: &mut Array<String>) nothrow -> Void {
 	match n {
 		IrNode::NOperation(id, operation, input, next) => { out.push(_dup(next)); },
+		IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => { out.push(_dup(next)); },
 		IrNode::NLet(id, name, value, next) => { out.push(_dup(next)); },
 		IrNode::NIf(id, cond, then_node, else_node) => { out.push(_dup(then_node)); out.push(_dup(else_node)); },
 		IrNode::NCase(id, scrutinee, arms, default_node) => {
@@ -1516,6 +1582,17 @@ fn _is_return(n: &IrNode) nothrow -> Bool {
 
 fn _is_fail(n: &IrNode) nothrow -> Bool {
 	match n { IrNode::NFail(id, reason) => { return true; }, default => { return false; } }
+}
+
+fn _is_call(n: &IrNode) nothrow -> Bool {
+	match n { IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => { return true; }, default => { return false; } }
+}
+
+// A `result <name>` reference must resolve to a node that settles a result keyed by its own node id:
+// a participant operation OR a child-workflow call (composition slice 1a). Shared by the general
+// EResult check and the merge-source EResult check so both treat call results like op results.
+fn _is_result_binding_node(n: &IrNode) nothrow -> Bool {
+	return _is_operation(n) or _is_call(n);
 }
 
 // True if an NFail node is reachable from `start` along control-flow successors (EXCLUDING `start`).
@@ -1710,6 +1787,7 @@ fn _check_node(g: &IrGraph, idx: Int) nothrow -> Optional<String> {
 	var no_locals: Array<String> = [];
 	match &g.nodes[idx] {
 		IrNode::NOperation(id, operation, input, next) => { return _check_expr(g, input, idx, &no_locals); },
+		IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => { return _check_expr(g, input, idx, &no_locals); },
 		IrNode::NLet(id, name, value, next) => { return _check_expr(g, value, idx, &no_locals); },
 		IrNode::NIf(id, cond, then_node, else_node) => { return _check_expr(g, cond, idx, &no_locals); },
 		IrNode::NCase(id, scrutinee, arms, default_node) => {
@@ -1835,7 +1913,7 @@ fn _check_merge_source(g: &IrGraph, e: &IrExpr, fidx: Int) nothrow -> Optional<S
 		IrExpr::EResult(node, path) => {
 			val t = _find_node(g, node);
 			if t < 0 { return Optional<String>::Some("merge source EResult references missing node: " + _dup(node)); }
-			if !_is_operation(&g.nodes[t]) { return Optional<String>::Some("merge source EResult must reference an NOperation: " + _dup(node)); }
+			if !_is_result_binding_node(&g.nodes[t]) { return Optional<String>::Some("merge source EResult must reference an NOperation or a workflow call: " + _dup(node)); }
 			if !_available_after(g, t, fidx) { return Optional<String>::Some("merge source EResult is not available at its predecessor: " + _dup(node)); }
 			return Optional<String>::None();
 		},
@@ -1934,6 +2012,17 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 						}
 					},
 					Optional::None => {}
+				}
+			},
+			IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => {
+				// Composition slice 1a has no child-workflow registry here, so the input is NOT matched
+				// against the child arg-type (that lands with manifest-backed validation in 1a). Still infer
+				// the input expr to catch a structurally-bad projection (like NReturn). The call's result
+				// type is unknown (no contract) -> `_op_result_type` returns None -> downstream `result`
+				// uses stay permissive.
+				match _infer_expr_type(g, input, arg_type, contracts, &lt_names, &lt_types) {
+					core.Result::Ok(_) => {},
+					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
 				}
 			},
 			IrNode::NIf(id, cond, then_node, else_node) => {
@@ -2550,7 +2639,9 @@ fn _check_expr(g: &IrGraph, e: &IrExpr, idx: Int, extra_locals: &Array<String>) 
 		IrExpr::EResult(node, path) => {
 			val t = _find_node(g, node);
 			if t < 0 { return Optional<String>::Some("EResult references missing node: " + _dup(node)); }
-			if !_is_operation(&g.nodes[t]) { return Optional<String>::Some("EResult must reference an NOperation: " + _dup(node)); }
+			// A `result <name>` ref resolves to a result-binding node: a participant operation OR a child
+			// workflow call (composition slice 1a) — both settle a result keyed by their node id.
+			if !_is_result_binding_node(&g.nodes[t]) { return Optional<String>::Some("EResult must reference an NOperation or a workflow call: " + _dup(node)); }
 			if t == idx { return Optional<String>::Some("EResult references its own node: " + _dup(node)); }
 			if !_dominates(g, t, idx) { return Optional<String>::Some("EResult references a non-prior operation: " + _dup(node)); }
 			return Optional<String>::None();
@@ -2628,6 +2719,14 @@ fn _node_depths(g: &IrGraph) nothrow -> core.Result<Array<Int>, IrError> {
 	while qh < queue.len {
 		val u = queue[qh];
 		qh = qh + 1;
+		// Composition slice 1a is FRONTEND-ONLY: a workflow `call` has no runtime (dispatch/await/settle land
+		// in 1b). op-depth is the BUILD gate (plan_length / nonfinal_operations / registry pin) and is NOT on
+		// the `--parse-check` path, so reject a reachable call HERE — a graph mixing `call` with a participant
+		// op would otherwise build (plan_length from the op) and reach the defensive runtime fault. Fail at
+		// build, not at runtime.
+		if _is_call(&g.nodes[u]) {
+			return core.Result<Array<Int>, IrError>::Err(IrError(message = "workflow call is not runnable until composition slice 1b (frontend-only in slice 1a)"));
+		}
 		var inc = 0;
 		if _is_operation(&g.nodes[u]) { inc = 1; }
 		val ud = depth[u] + inc;
