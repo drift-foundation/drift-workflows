@@ -1,7 +1,19 @@
-# Workflow Composition — Design Plan (rev 2: decision #1 resolved; K review rounds folded in)
+# Workflow Composition — Design Plan (rev 3: preflight re-slice 1a/1b/1c + app-boundary lens; K review rounds folded in)
 
 Concrete answers to the 7 charter questions. **Decision #1 (transport) is resolved → internal durable host
 API, async + awaited.** K's round-1 corrections (**[K1]…[K6]**) and round-2 findings are folded in.
+
+## Architecture principle — app-boundary lens (load-bearing)
+
+Composition concentrates complexity **inside the workflow service** (coordinator / runner / SPs). That is
+acceptable. What is **not** acceptable is letting it leak outward: **business apps, participants, and workflow
+authors must never handle** plan hashes / `content_hash`, parent/root links or `call_depth`, leases or fencing
+tokens, notify/poll or scheduling mechanics, child-id derivation, or checkpoint/reversal state. The **only**
+app-facing surfaces are: (1) the author writes `call child@<plan_version> { … }` (+ optional
+`compensation child@<plan_version>`, **parse-only in 1a → runtime in 1c**); (2) a compensation workflow (1c)
+receives `forward.input` / `forward.result` (the rest of the envelope is runner-internal correlation it may
+ignore). Every choice below is judged against this boundary — anything that would push an internal identifier
+or mechanic into app surface is a defect.
 
 ## Terminology (use consistently)
 
@@ -71,7 +83,8 @@ flow {
 }
 ```
 
-Per-call policy override (else defaults, §4); declared compensating workflow (§5); fan-out (§6):
+**Future-slice forms — NOT in slice 1a/1b** (shown for context): `on failed` (slice 3), `compensation`
+(**parse-only in 1a → runtime in 1c**, §5), `fan … key` (slice 3, §6):
 
 ```
   let cap    = call capture@1.0.0 { auth_id: result auth.auth_id } on failed { fail "capture_failed" }
@@ -122,6 +135,10 @@ A checkpoint exists to be undone; only *completed* children carry forward state 
 
 ## 5. Compensation — reverse-child (T1) vs compensating-workflow [K1]
 
+> **Slice note (preflight re-slice).** **Neither** compensation form runs before **slice 1c**. Slice 1b
+> reverses a completed-child checkpoint as a **no-op** (no-comp). §5 documents both forms for when 1c lands;
+> the form is **reconsidered at 1c** (compensating-workflow vs reverse-child/T1 — see Decision #2).
+
 Only a *completed* child is a parent checkpoint, so compensation applies only to completed children. The
 parent never absorbs the child's internal checkpoints:
 
@@ -148,8 +165,12 @@ parent never absorbs the child's internal checkpoints:
   change cannot replay a different compensation. **No reopen → no T1.** Simpler, and correct when undo ≠
   rewind.
 
-> **Decision #2 (K) — RESOLVED → slice plan.** Slice 1 ships **no-comp / compensating-workflow only** (no
-> reverse-child, no T1). Reverse-child + T1 (`completed(4)→reversing(2)`) is **slice 2**.
+> **Decision #2 (K) — RE-OPENED by preflight, RESOLVED → re-slice.** Slice 1 runtime is **NO-COMP ONLY** — a
+> completed-child checkpoint with no declared compensation is a reversal **no-op**. Compensation is **slice
+> 1c**, where the form is reconsidered: compensating-workflow is **not** obviously simpler than reverse-child/
+> T1 — it adds a *second* async-call-await/settle/recovery path (the comp child), arguably more surface than
+> T1's single fenced `completed→reversing` edge. Grammar PARSES `compensation` in 1a, but **build validation
+> rejects it** ("not in this release until slice 1c") — parse-but-reject, never accept-and-ignore.
 
 ---
 
@@ -200,8 +221,15 @@ A workflow call introduces a call **tree**; cycles must be impossible.
 
 The internal path replaces #2's route-404 budget with an explicit, **async** liveness policy — concretely:
 
-- **Durable child-link state** on the parent's **call operation** row: `child_workflow_id`, `child_status`
-  (`pending|completed|failed|blocked`), `first_requested_at`, `last_inspected_at`.
+- **Durable child-link state** in the **`tb_mf_call` sidecar** (1:1 with the call operation, §Durable state):
+  `child_workflow_id`, `child_status` (`pending|completed|failed|blocked`), `first_requested_at`,
+  `last_inspected_at`.
+- **Minimal inspectability (slice 1b).** Inspect surfaces, on the parent's call operation, the
+  `child_workflow_id` + last-observed `child_status`, so an operator can **follow A→B→C by hand**. This is the
+  *only* cross-tree affordance in slice 1 — **no blocked cascade**, no automatic ancestor rollup; the parent
+  row stays `forward`. `child_status` is a **display hint** (last poll/notify observation), never the value of
+  record — the child workflow row is authoritative. (Indefinite wait without a budget is safe *because* the
+  tree is now inspectable.)
 - **How the parent learns outcomes:** the **push is TERMINAL-ONLY** — on a terminal state the child marks
   the parent's call operation due + records the outcome (an SP write); the parent must *act* (settle/fail).
   A child's **`blocked` status is non-terminal and display-only**: it is surfaced by **scheduled inspection
@@ -223,177 +251,222 @@ The internal path replaces #2's route-404 budget with an explicit, **async** liv
 - **T1 — reverse-child reopen** [K1]: child `completed(4) → reversing(2)`, fenced; no-op if already
   reversing/reversed; **already-terminal-no-comp if failed** (round-2 #3). Only for the reverse-child default.
 - *(Round-1 "T2 parent-unblock" is removed — blocked does not cascade, so there is no parent block to undo.)*
-- **Notification SP** — **wake/stage-only**: child-terminal → mark parent call operation due + **stage** the
-  child terminal outcome in call-specific columns (the push side of the liveness policy). It **never** settles
-  the parent (`status`/`result_json`) or creates a checkpoint — the runner (via `call_inspect`) performs the
-  single authoritative settle/reversal.
+- **Notification SP** — **wake + status-hint ONLY**: child-terminal → pull the parent call operation due
+  (`next_attempt = now`, **monotonic — only earlier**) + write the `child_status` **hint** in `tb_mf_call`. It
+  does **NOT** stage the child's `return` as a value of record, never settles the parent
+  (`status`/`result_json`), never touches parent `state`/`lease`/`continuation`, and never creates a
+  checkpoint. At settle, **`call_inspect` reads the child's AUTHORITATIVE terminal result** from the child
+  workflow row — the runner is the single settle authority. **Correctness never depends on notify; the
+  scheduled poll is the floor** (a lost / duplicate / racy notify is always covered by poll). This removes the
+  parent/child divergence class and makes a future T1 reopen (1c/2) safe by construction.
 
 ## Durable state (sketch)
 
-Reuse `tb_mf_operation` + `tb_mf_workflow_checkpoint` for the call operation. **The op row keeps its existing
-invariants unchanged:** `operation_id = child_workflow_id` (the op-id IS the child id — idempotent reassert
-falls out of the existing `(operation_id, input_hash)` replay); **`operation_name = child_script_name`** (no prefix — `child_script_name` is already `varchar(128)`, so a
-`"call:"` prefix could overflow; the authoritative discriminator is **`call_kind = child_workflow`** on the
-op row, which the reverse/audit path reads before any compensation lookup, so a child call never mis-resolves
-against a same-named participant op). `sp_mf_operation_settle` copies `operation_name` into the checkpoint, so
-`forward.operation = child_script_name`. `input_json`/`input_hash` = the call input; `schema_version` stays
-the **call-operation** schema version — a fixed constant **`CALL_OPERATION_SCHEMA_VERSION = 1`** (we do
-**not** overload it with the child plan revision; `sp_mf_call_submit`'s idempotent replay checks it like any
-pinned `schema_version`); `status`/`result_json` keep the `ck_mf_operation_status_result`
-invariant — `requested(1)` while the child runs, `succeeded(2)` + `result_json = child return` **only** when
-the runner settles a *completed* child. Added columns: `call_kind` (`participant | child_workflow`),
-`child_workflow_id`, **child plan identity** `child_script_name` / `child_plan_version` / `child_content_hash`,
-`child_status`, the **compensation plan identity** `comp_script_name` / `comp_plan_version` /
-`comp_content_hash` (all NULL when no compensation — pinned exactly like the checkpoint's
-`reverse_operation_name`+`reverse_schema_version`, so a registry change can't replay a different
-compensation), and the child-terminal **stage** columns the notify SP writes (e.g. `child_return_json` /
-terminal status). The child workflow row gains `parent_workflow_id`, `parent_node_id`, `root_workflow_id`,
-`call_depth`. **Liveness / stuck-child budget columns are slice 2, not here.** Parent states stay 1–7; T1
-(slice 2) adds a `completed→reversing` edge. **No new parent state for "waiting on child" or "waiting on
-blocked descendant."**
+**Keep `tb_mf_operation` as the generic operation spine — do NOT widen it.** A call operation reuses the op
+row only for its **idempotency spine**: `operation_id = child_workflow_id` (the op-id IS the child id —
+idempotent reassert falls out of the existing `(operation_id, input_hash)` replay); `input_json`/`input_hash`
+= the call input; `operation_name = child_script_name` (no prefix — `child_script_name` is already
+`varchar(128)`; `sp_mf_operation_settle` copies it into the checkpoint, so `forward.operation =
+child_script_name`); `schema_version = CALL_OPERATION_SCHEMA_VERSION (=1)` (a fixed constant — **not** the
+child plan revision; `sp_mf_call_submit`'s idempotent replay checks it like any pinned `schema_version`);
+`status`/`result_json` keep the `ck_mf_operation_status_result` invariant — `requested(1)` while the child
+runs, `succeeded(2)` + `result_json = child return` **only** when the runner settles a *completed* child
+(reading the child's **AUTHORITATIVE** terminal result). The **only** column added to `tb_mf_operation` is the
+discriminator **`call_kind` (`participant | child_workflow`, default `participant`)** — the reverse/audit path
+keys on it, so a child call never mis-resolves against a same-named participant op.
+
+**All composition-specific state goes in a sidecar `tb_mf_call`** (PK `(workflow_id, operation_seq)`, 1:1 with
+the call operation, present **only** for `call_kind=child_workflow`) — so the hot, generic op table is not
+widened with ~9 mostly-NULL columns and the composition complexity stays contained:
+- **child plan identity** — `child_script_name` / `child_plan_version` / `child_content_hash`;
+- `child_workflow_id` (also the op-id; denormalized here so the sidecar is self-contained);
+- `child_status` **hint** (`pending|completed|failed|blocked`) + `first_requested_at` / `last_inspected_at` —
+  display/poll bookkeeping, **not** a value of record (the child workflow row is authoritative);
+- **compensation plan identity** — `comp_script_name` / `comp_plan_version` / `comp_content_hash` (NULL when
+  no compensation; pinned exactly like the checkpoint's `reverse_operation_name`+`reverse_schema_version`).
+  *(Written in 1a/1b for completeness; the compensation runtime that consumes it lands in 1c.)*
+- **No `child_return_json` value-of-record** — notify writes the `child_status` hint only; settle re-reads
+  child truth via `call_inspect`. This removes the parent/child divergence class.
+- **No liveness / stuck-child budget columns** — those are slice 2.
+
+The child workflow row (`tb_mf_workflow`) gains `parent_workflow_id`, `parent_node_id`, `root_workflow_id`,
+`call_depth` (NULL for top-level). Parent states stay 1–7; T1 (1c/2) adds a `completed→reversing` edge. **No
+new parent state for "waiting on child" or "waiting on blocked descendant."**
 
 ## Change surface
 
 parser (`call`/`fan … key`/`on`/`compensation`) · ir (`NCallWorkflow`, `NFanOut`, contract + durable-list +
-canonical-key validation; static cycle check) · host (in-process submit/inspect/reverse-child + the
-notification SP) · runner (dispatch=submit, await=notify/poll, settle, T1, recursion guard) · db (the columns
-+ ancestry + migration; T1 + notification SPs) · docs.
+canonical-key validation; static cycle check; **reject `compensation` until 1c**) · host (in-process
+submit/inspect + the wake/hint notification SP; comp/reverse in 1c) · runner (dispatch=submit, await=notify/
+poll, settle, recursion guard; **no-comp reversal = no-op** in 1b; comp/T1 in 1c) · db (**sidecar `tb_mf_call`**
++ `call_kind` discriminator + ancestry on `tb_mf_workflow` + migration; comp/T1 SPs in 1c) · docs.
 
-## Test plan (folds into implementation)
+## Test plan (per slice — each slice's checklist is the authoritative list)
 
-idempotent call across retry/resume · child as ordinary forward step · **terminal replay with no live child**
-· **T1** reverse-child exactly once + **failed child NOT re-compensated** [K2] · compensating-workflow mode ·
-**blocked child does NOT block the parent** (parent stays forward/pending; resolve child → parent proceeds)
-[K3] · **no blocked cascade** in A→B→C · **recursion guard** (cycle + depth → call failure) · fan-out stable
-keys + **duplicate-key rejection** [K6] · stuck-child budget → call failure (not block); blocked child does
-not trip it · root `just test` green.
+- **1a:** lowering/hashing parity · contract-mismatch rejection · static cycle rejection · `compensation`
+  build-rejected.
+- **1b:** idempotent call across retry/resume · child as ordinary forward step · **terminal replay with no
+  live child** · child-**failed** = unwind prior (**failed child NOT re-compensated** [K2]) · **blocked child
+  does NOT block the parent** + **no cascade** in A→B→C [K3] · **recursion guard** (cycle + depth → call
+  failure, legible reason) · inspectability (operator follows A→B→C) · notify hint-only (no early settle).
+- **1c:** compensating-workflow / reverse-child undoes a completed child **exactly once** · **T1** (if chosen)
+  reverse-child exactly once · recovery of an in-flight compensation.
+- **Slice 2:** stuck-child budget → call failure (not block); a blocked child does NOT trip it.
+- **Slice 3:** fan-out stable keys + **duplicate-key rejection** [K6] · `on failed`-as-data.
+- Every slice: root `just test` green.
 
 ## Decisions — resolved + slice assignments
 
 1. **[K4] Transport — RESOLVED: internal host API** (§0.1).
-2. **[K1] Compensation default + T1 — RESOLVED → slices.** Slice 1 = no-comp / compensating-workflow; slice 2
-   = reverse-child + T1.
-3. **Liveness — split.** The **await mechanism is DECIDED for slice 1: terminal push + poll fallback.** Slice
-   2 decides only the **stuck-child timeout / budget behavior** (default off → wait indefinitely; pause vs
-   exclude a blocked child; the exhaustion rule) and adds its columns. **No liveness-budget columns in slice
-   1.**
+2. **[K1] Compensation — RE-SLICED by preflight.** Slice 1 runtime is **NO-COMP only** (completed-child
+   checkpoint with no compensation → reversal no-op). Compensation is **slice 1c**, form reconsidered there
+   (compensating-workflow's second await engine vs reverse-child/T1's single fenced edge). 1a parses
+   `compensation` but **validation rejects** it until 1c.
+3. **Liveness — split.** The **await mechanism is DECIDED for slice 1b: terminal push + poll fallback.** The
+   **stuck-child timeout / budget** (default off → wait indefinitely; pause vs exclude a blocked child; the
+   exhaustion rule) is **slice 2, standalone** (decoupled from compensation). **No liveness-budget columns in
+   1a/1b.**
 4. **[K2] Failed-as-data — RESOLVED + sliced.** "not checkpointed / unwind prior / never re-compensate" is
    **slice 1**; the `on failed` typed union is **slice 3**.
 5. **Fan-out await — slice 3** (barrier-all vs policy; partial failure; comp order).
 6. **Recursion — RESOLVED:** ancestor **set** of plan-identity keys `(script_name, plan_version,
    content_hash)` + `max_call_depth` (root+depth-only bounds but can't *catch* a cycle). `max_call_depth`
    default is fixed at implementation.
-7. **Syntax keywords — RESOLVED** (`call` / `fan … key` / `on failed` / `compensation`; slice 1 parses only
-   `call` + `compensation`, rejecting the rest with a clear "not in this release").
+7. **Syntax keywords — RESOLVED** (`call` / `fan … key` / `on failed` / `compensation`; **slice 1a** parses
+   `call` + `compensation` (the rest → "not in this release") and **build-rejects `compensation`** until 1c —
+   parse-but-reject, never accept-and-ignore).
 
-## Slice plan (decided)
+## Slice plan (decided — re-sliced by preflight)
 
-> **Slice 1 boundary — explicit.** Slice 1 proves **workflow calls as async, awaited operations.**
-> **No inline child execution. No blocked cascade. No reverse-child reopen (T1).** Compensation in slice 1
-> is **no-comp / compensating-workflow only** (a *fresh* comp child via the forward envelope — never a
-> `completed→reversing` reopen).
+> **Boundaries — explicit.** **1a** is frontend-only (no DB, no runtime). **1b** proves the **forward**
+> async-call spine with **NO compensation runtime** (no-comp reversal = no-op) + minimal inspectability.
+> **1c** adds the compensation path (form reconsidered). No inline child execution and **no blocked cascade**,
+> anywhere.
 
-- **Slice 1 — async workflow-call spine, no T1.** Single (non-fan-out) `call`, internal host API,
-  async-awaited: identity → submit/reassert → await (terminal push + poll fallback) → settle + result
-  data-flow → *child-failed = rejection → unwind prior* → *child-blocked = parent stays forward, no cascade*
-  → recovery (replay-from-durable + idempotent reassert) → **recursion guard**. Compensation = **no-comp /
-  compensating-workflow** (fresh comp child, no reopen).
-- **Slice 2 — reverse-child + T1.** The `completed(4) → reversing(2)` reopen (fenced/idempotent;
-  `failed` → already-terminal-no-comp), reverse-child as a mode (then decide whether it's the default),
-  **plus the stuck-child liveness budget** (§Liveness).
-- **Slice 3 — fan-out + failure-as-data.** `NFanOut` (canonical keys + dedup, barrier await + comp order)
-  and `on failed`-as-data / the typed failure union.
+- **Slice 1a — frontend only (no DB/runtime).** Grammar (`call <child>@<plan_version>` + parse-only
+  `compensation`), IR `NCallWorkflow`, contract validation (child arg/return type match), **static
+  recursion/cycle check**, mermaid. **Build validation REJECTS `compensation`** ("not in this release until
+  1c") — parse, never accept-and-ignore. Pure lowering/hashing parity; **zero DB**. Unblocks everything
+  downstream.
+- **Slice 1b — forward async-call spine, NO compensation.** Sidecar `tb_mf_call` + `call_kind`; `call_submit`
+  (sibling of operation_request: spine + in-txn child create + ancestry walk + recursion guard) /
+  `call_inspect` (reads the child's **authoritative** terminal) / `child_terminal_notify` (wake + status-hint
+  only) / settle / recovery / recursion-guard. Child-failed = rejection → unwind prior; child-blocked = parent
+  stays forward, **no cascade**. **No-comp reversal = no-op.** **Minimal inspectability:** expose
+  `child_workflow_id` + last `child_status` so operators follow A→B→C by hand. Stuck-child budget **OFF**
+  (indefinite wait — safe because the tree is now inspectable).
+- **Slice 1c — compensation path.** Reconsider the form (compensating-workflow's *second await engine* vs
+  reverse-child/T1's single fenced `completed→reversing` edge), then ship one: comp-id + comp plan-identity
+  pinning + `comp_submit`, OR T1 + reverse-child; plus the comp/reverse **await + settle + recovery** path.
+  Lift the 1a parse-but-reject on `compensation`.
+- **Slice 2 — stuck-child liveness budget** (§Liveness): the configurable timeout that converts a wedged
+  child into a call failure (default off). Standalone, decoupled from compensation.
+- **Slice 3 — fan-out + failure-as-data.** `NFanOut` (canonical keys + dedup, barrier await + comp order) and
+  `on failed`-as-data / the typed failure union.
 
-## Slice 1 — build checklist (dependency order)
+## Build checklists (dependency order)
 
-Concrete enough to start. Each stage lands with its own tests (tests are part of the slice, not a pre-phase).
+Each stage lands with its own tests (tests are part of the slice, not a pre-phase).
 
-**1. Grammar — `parser.drift`**
-- [ ] Parse the step form `let <x> = call <child>@<plan_version> { <input-object> }` (also as a bare
-      statement). `@<plan_version>` is a **semantic version token** `major.minor.patch` (e.g. `1.0.0`).
-- [ ] Parse the optional `compensation <wf>@<plan_version>` clause on a call. **Do not** add `on failed` /
-      `fan` / `key` yet (slice 2/3) — leave them unparsed so they fail with a clear "not in this release".
+### Slice 1a — frontend only (no DB, no runtime)
+
+**Grammar — `parser.drift`**
+- [ ] Parse `let <x> = call <child>@<plan_version> { <input-object> }` (also as a bare statement).
+      `@<plan_version>` is a **semantic version token** `major.minor.patch` (e.g. `1.0.0`).
+- [ ] Parse the optional `compensation <wf>@<plan_version>` clause (parse only — runtime is 1c). **Do not**
+      add `on failed` / `fan` / `key` (slice 2/3) — leave them so they fail with a clear "not in this release".
 - [ ] AST: `CallStmt { binder?, child_name, child_plan_version, input_expr, compensation? }`.
 - [ ] Tests: parse fixtures (with/without `compensation`, with/without binder); malformed `call` rejected.
 
-**2. IR + validation — `ir.drift`**
+**IR + validation — `ir.drift`**
 - [ ] New node `NCallWorkflow { node_id, child_name, child_plan_version, input_expr, result_binder?, compensation_ref? }`;
       lower `CallStmt` → it.
 - [ ] Bind the child's declared **`return` type** (from the registry) to the binder; `result <x>.path`
       resolves against it (reuse the EResult typing path).
 - [ ] Validate at build: child `name@<plan_version>` resolves in the registry (exact-match → pinned
-      `content_hash`); **input matches child `arg`-type**, downstream uses match child `return`-type;
-      `compensation@<plan_version>` (if any) resolves and accepts the
-      `{forward:{workflow_id,operation,operation_id,schema_version,input,result}}` envelope; input expr
-      references only durable/in-scope values.
-- [ ] **Static recursion/cycle check** — reject a registry-derivable call cycle (child transitively calls
-      this workflow).
+      `content_hash`); **input matches child `arg`-type**, downstream uses match child `return`-type; input
+      expr references only durable/in-scope values.
+- [ ] **REJECT `compensation` at build** with a clear "workflow compensation not available until slice 1c"
+      (parse-but-reject — never accept-and-ignore). The `compensation@<plan_version>` resolution + envelope
+      acceptance check moves to 1c.
+- [ ] **Static recursion/cycle check** — reject a registry-derivable call cycle (child transitively calls this
+      workflow). *(Needs the registry to enumerate each pinned plan's `NCallWorkflow` edges — confirm this
+      capability exists or add it.)*
 - [ ] `emit_mermaid`: render `NCallWorkflow` as a node (e.g. `["call child@1.0.0"]`) so `--emit-graph` / viz work.
-- [ ] Tests: lowering fixtures; contract-mismatch + cycle rejection.
+- [ ] Tests: lowering fixtures; contract-mismatch + cycle rejection; `compensation` rejected.
 
-**3. Schema / SP / host — `db/` + `host.drift`**
+### Slice 1b — forward async-call spine (no compensation runtime)
+
+**Schema / SP / host — `db/` + `host.drift`**
 - [ ] Migration `0003_workflow_call.sql`:
-      - `tb_mf_operation`: `call_kind ENUM('participant','child_workflow')` (default `participant`),
-        `child_workflow_id`, **child plan identity** `child_script_name` / `child_plan_version` /
-        `child_content_hash`, `child_status`, the **compensation plan identity** `comp_script_name` /
-        `comp_plan_version` / `comp_content_hash` (NULL when no compensation), and the child-terminal **stage**
-        columns the notify SP writes (e.g. `child_return_json` + terminal status). `operation_id =
-        child_workflow_id`; `operation_name = child_script_name` (no prefix → no `varchar(128)` overflow;
-        **`call_kind`** is the discriminator the reverse/audit path reads — `sp_mf_operation_settle` copies it
-        into the checkpoint, so `forward.operation = child_script_name`); `schema_version =
-        CALL_OPERATION_SCHEMA_VERSION` (=1); **`status` / `result_json` keep their existing meaning +
-        `ck_mf_operation_status_result` invariant** — none overloaded with the child plan revision.
+      - `tb_mf_operation`: add **only** `call_kind ENUM('participant','child_workflow')` (default
+        `participant`). `operation_id = child_workflow_id`, `operation_name = child_script_name`,
+        `schema_version = CALL_OPERATION_SCHEMA_VERSION` (=1); `status`/`result_json` keep their existing
+        meaning + `ck_mf_operation_status_result` invariant (**none overloaded**).
+      - **Sidecar `tb_mf_call`** (PK `(workflow_id, operation_seq)`, FK → `tb_mf_operation`; rows only for
+        `call_kind=child_workflow`): `child_workflow_id`, child plan identity (`child_script_name` /
+        `child_plan_version` / `child_content_hash`), `child_status` **hint** + `first_requested_at` /
+        `last_inspected_at`, compensation plan identity (`comp_script_name` / `comp_plan_version` /
+        `comp_content_hash`, NULL). **No `child_return_json` value-of-record; no liveness-budget columns.**
       - `tb_mf_workflow`: `parent_workflow_id`, `parent_node_id`, `root_workflow_id`, `call_depth` (NULL for
-        top-level). (The recursion key reads `script_name` here + `plan_version` / `content_hash` from
-        `tb_mf_workflow_plan` — **no new workflow column**.) **No liveness-budget columns** (that's slice 2).
-- [ ] `sp_mf_call_submit` — a **sibling** of `sp_mf_operation_request` (same fenced spine: plan-order →
-      idempotent replay by `operation_id`+`input_hash` → insert op row (`call_kind=child_workflow`,
-      `schema_version=CALL_OPERATION_SCHEMA_VERSION`, status=1) → advance continuation → append event) that **additionally, in the SAME transaction,** inserts/**reasserts**
-      the child `tb_mf_workflow` (+`tb_mf_workflow_plan`) row under `child_workflow_id` with ancestry
-      (`parent_*`, `root_*`, `call_depth = parent+1`) and runs the recursion guard. **Idempotent** (existing
-      child → return current state). **Recursion guard:** reject if the child's plan-identity key
-      `(script_name, plan_version, content_hash)` is already in the ancestor set — **reconstructed by walking
-      `parent_workflow_id` links + joining `tb_mf_workflow_plan`, bounded by `call_depth`** (no denormalized
-      ancestor column) — OR `call_depth > max_call_depth` → a rejection outcome (drives parent failure). Does
-      **not** call `sp_mf_operation_request` (it can't compose the child-row insert + guard transactionally).
-- [ ] `sp_mf_call_inspect` — read child terminal/blocked status (+ the staged child return) for the parent's
-      reconcile.
-- [ ] `sp_mf_child_terminal_notify` — **wake/stage-only**: on child terminal, set `child_status` + **stage**
-      the child terminal outcome (e.g. `child_return_json`) in call-specific columns and mark the parent call
-      operation **due** (`next_attempt = now`). **Never** sets parent `status`/`result_json` or creates a
-      checkpoint — the runner (via `call_inspect`) performs the single authoritative settle/reversal; poll
-      backstops a missed notify.
-- [ ] `sp_mf_comp_submit` — on reversal of a completed-child checkpoint **with** a declared compensation,
-      start the comp child (id `…,"comp"`) with the full **`{forward:{workflow_id,operation,operation_id,
-      schema_version,input,result}}`** envelope (`forward.operation_id = child_workflow_id` correlates the
-      exact child execution), the comp workflow resolved + **pinned by its exact plan identity**
-      (`comp_script_name` / `comp_plan_version`
-      / `comp_content_hash`) — mirroring the checkpoint's `reverse_operation_name`+`reverse_schema_version`
-      pin, so a registry change can't replay a different compensation. Reuses the submit spine. **No
-      reverse-child SP, no `completed→reversing`.**
-- [ ] `host.drift`: typed wrappers `call_submit` / `call_inspect` / `comp_submit` + decoded outcome variants.
-- [ ] Tests: SP regression — submit idempotency, inspect, terminal-notify, recursion-guard rejection,
-      comp-submit.
+        top-level). (Recursion key reads `script_name` here + `plan_version` / `content_hash` from
+        `tb_mf_workflow_plan` — no new workflow column.)
+- [ ] `sp_mf_call_submit` — sibling of `sp_mf_operation_request` (same fenced spine: plan-order → idempotent
+      replay by `operation_id`+`input_hash` → insert op row (`call_kind=child_workflow`,
+      `schema_version=CALL_OPERATION_SCHEMA_VERSION`, status=1) + sidecar row → advance continuation → append
+      event) that **additionally, in the SAME transaction,** inserts/**reasserts** the child `tb_mf_workflow`
+      (+`tb_mf_workflow_plan`) row under `child_workflow_id` with ancestry (`parent_*`, `root_*`,
+      `call_depth = parent+1`) and runs the recursion guard. **Idempotent** (existing child → return current
+      state). **Recursion guard:** reject if the child's plan-identity key `(script_name, plan_version,
+      content_hash)` is already in the ancestor set — **reconstructed by walking `parent_workflow_id` links +
+      joining `tb_mf_workflow_plan`, bounded by `call_depth`** (no denormalized column) — OR `call_depth >
+      max_call_depth` → a rejection outcome with a **legible reason** (`call_cycle` / `max_call_depth`) that
+      drives parent failure. Does **not** call `sp_mf_operation_request`.
+- [ ] `sp_mf_call_inspect` — read the **child workflow row's AUTHORITATIVE** terminal/blocked status (the
+      sidecar `child_status` is only a hint) for the parent's reconcile; expose `child_workflow_id` +
+      `child_status` for operator inspect.
+- [ ] `sp_mf_child_terminal_notify` — **wake + status-hint ONLY**: on child terminal, set the sidecar
+      `child_status` hint + pull the parent call operation **due** (`next_attempt = now`, monotonic). **Never**
+      stages the child `return` as value-of-record, never sets parent `status`/`result_json`/`state`/`lease`,
+      never creates a checkpoint. The runner (via `call_inspect`) is the single settle authority; **poll is the
+      floor** (a missed / duplicate / racy notify is always covered by poll).
+- [ ] `host.drift`: typed wrappers `call_submit` / `call_inspect` + decoded outcome variants.
+- [ ] Tests: SP regression — submit idempotency, inspect (authoritative read), terminal-notify (hint only, no
+      settle), recursion-guard rejection with legible reason.
 
-**4. Runner — `runner.drift`**
+**Runner — `runner.drift`**
 - [ ] Dispatch `NCallWorkflow` → `call_submit` (create/reassert child); the call operation is pending.
-- [ ] Await on resume → `call_inspect`: **completed** → settle call op with the child `return` (checkpoint)
-      + continue; **failed** → rejection → reverse **prior** checkpoints (the failed call is **not**
-      checkpointed); **blocked** → leave call op pending, parent **stays forward** (schedule inspect / await
-      notify); **pending** → defer.
-- [ ] Reversal of a completed-child checkpoint: declared `compensation` → `comp_submit` + await comp terminal
-      (comp completed → `compensation_settled`; comp failed/blocked → reverse-block). **no-comp** → reversal
-      no-op for that checkpoint.
-- [ ] Recovery: adopt the durable `child_workflow_id` + settled result; idempotent reassert on re-dispatch.
-- [ ] Recursion-guard rejection from submit → handled as a call failure.
+- [ ] Await on resume → `call_inspect`: **completed** → settle call op with the child's **authoritative**
+      `return` (checkpoint) + continue; **failed** → rejection → reverse **prior** checkpoints (the failed call
+      is **not** checkpointed); **blocked** → leave call op pending, parent **stays forward** (schedule inspect
+      / await notify), **no cascade**; **pending** → defer (poll).
+- [ ] Reversal of a completed-child checkpoint with **no compensation** → **no-op** for that checkpoint. (The
+      compensation runtime is 1c; a declared `compensation` cannot reach the runner because 1a rejects it.)
+- [ ] Recovery: adopt the durable `child_workflow_id` + settled result; idempotent reassert on re-dispatch;
+      terminal replay needs **no live child**.
+- [ ] Recursion-guard rejection from submit → handled as a call failure with its legible reason.
 - [ ] Tests: integration (extend `coordinator-singular` or a new `composition` suite).
 
-**5. Docs / tests (acceptance)**
-- [ ] Docs: `microflows_design.md` (the workflow-call model + **slice-1 boundary**); `microflows_user_guide.md`
-      (`call` + `compensation` syntax); `CHANGELOG.md` (unreleased — workflow composition slice 1).
-- [ ] Integration acceptance (end-to-end, root gate): **completed** (result feeds a later parent step);
-      **failed** (unwind prior, failed child not re-compensated); **blocked** (parent stays forward; resolve
-      child → parent proceeds; **no cascade** in A→B→C); **recovery** (crash + replay, **no live child**);
-      **recursion guard** (cycle / depth → call failure → reversal); **compensating-workflow** (parent
-      reversal starts a fresh comp child exactly once).
+**Docs / acceptance (1b)**
+- [ ] Docs: `microflows_design.md` (the workflow-call model + **1a/1b/1c boundaries** + the app-boundary
+      lens); `microflows_user_guide.md` (`call` syntax; `compensation` "coming in 1c"); `CHANGELOG.md`.
+- [ ] Integration acceptance (root gate): **completed** (result feeds a later parent step); **failed** (unwind
+      prior, failed child not re-compensated); **blocked** (parent stays forward; resolve child → parent
+      proceeds; **no cascade** in A→B→C); **recovery** (crash + replay, **no live child**); **recursion guard**
+      (cycle / depth → call failure → reversal); **inspectability** (operator reads `child_workflow_id` +
+      `child_status` and follows A→B→C).
 - [ ] Root `just test` green.
+
+### Slice 1c — compensation path
+
+- [ ] **Decide the form** (compensating-workflow vs reverse-child/T1), recording the second-await-engine vs
+      single-fenced-edge trade-off.
+- [ ] Lift the 1a build-rejection of `compensation`; add `compensation@<plan_version>` resolution + the
+      `{forward:{workflow_id,operation,operation_id,schema_version,input,result}}` envelope-acceptance check.
+- [ ] Implement the chosen runtime: comp-id `H(…,"comp")` + comp plan-identity pinning + `sp_mf_comp_submit`
+      (fresh comp child via the forward envelope; `forward.operation_id = child_workflow_id` correlates the
+      exact child execution), OR `sp_mf_T1` reverse-child reopen (`completed(4)→reversing(2)`, fenced;
+      `failed` → already-terminal-no-comp); plus the comp/reverse **await + settle + recovery** path (comp
+      completed → `compensation_settled`; comp failed/blocked → reverse-block).
+- [ ] Acceptance: **compensating-workflow / reverse-child** (parent reversal undoes a completed child exactly
+      once; failed child never re-compensated); recovery of an in-flight compensation.

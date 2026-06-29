@@ -2,21 +2,25 @@
 
 ## Status
 
-Release is cut + announced. Design at `DESIGN.md` is at **rev 2** (K review rounds folded in). **Decision #1
+Release is cut + announced. Design at `DESIGN.md` is at **rev 3** (preflight re-slice + K review rounds folded
+in). **Decision #1
 (transport) RESOLVED → internal durable host API, async + awaited** — a workflow call is a pending **call
 operation**; the parent stays in normal forward execution, and a blocked child does **not** cascade up the
-call tree. **Decision #2 (slice plan) RESOLVED** — slice 1 ships the async call spine **without T1**.
-Terminology fixed (workflow call / child workflow / call operation; avoid "callback").
+call tree. **Decision #2 (slice plan) RE-SLICED by preflight** — 1a frontend-only, 1b forward spine (no
+compensation runtime), 1c compensation. Terminology fixed (workflow call / child workflow / call operation;
+avoid "callback").
 
-**Slice plan (decided):**
-- **Slice 1** — async workflow-call spine, **no T1**: no-comp / **compensating-workflow** compensation
-  (fresh comp child, no `completed→reversing` reopen). Boundary: workflow calls as async awaited operations —
-  **no inline child execution, no blocked cascade, no reverse-child reopen.**
-- **Slice 2** — **reverse-child + T1** `completed(4)→reversing(2)`, plus the **stuck-child liveness budget**.
-- **Slice 3** — **fan-out** + `on failed`-as-data / typed failure union.
+**Slice plan (re-sliced by preflight):**
+- **Slice 1a** — frontend only (no DB/runtime): grammar + IR `NCallWorkflow` + contract validation + **static
+  cycle check** + mermaid. Parses `compensation` but **build-rejects it until 1c** (never accept-and-ignore).
+- **Slice 1b** — forward async-call spine, **no compensation runtime**: sidecar `tb_mf_call` + `call_kind`;
+  `call_submit` / `call_inspect` (authoritative child read) / `child_terminal_notify` (wake + status-hint
+  only) / settle / recovery / recursion-guard. No-comp reversal = no-op. **Minimal inspectability**
+  (`child_workflow_id` + `child_status` so operators follow A→B→C). **No blocked cascade.**
+- **Slice 1c** — compensation path: reconsider compensating-workflow vs reverse-child/T1, then ship one.
+- **Slice 2** — stuck-child liveness budget (standalone). **Slice 3** — fan-out + `on failed`-as-data.
 
-The slice-1 **build checklist** (grammar → IR/validation → schema/SP/host → runner → docs/tests) is in
-`DESIGN.md` and is concrete enough to start implementation from.
+The per-slice **build checklists** (1a/1b/1c) are in `DESIGN.md`.
 
 **Design-review pass folded in (5 findings):** (1) the runtime **recursion guard** now keys on the
 **ancestor SET of plan-identity keys** `(script_name, plan_version, content_hash)` — child ids are freshly
@@ -38,16 +42,30 @@ overflow; **`call_kind`** is the discriminator; `sp_mf_operation_settle` copies 
 it is the compensation envelope's `forward.operation`). The call op's `schema_version` is a named constant
 **`CALL_OPERATION_SCHEMA_VERSION = 1`**, and the comp **`{forward:{…}}`** envelope carries the full
 correlation set (`workflow_id`, `operation`, **`operation_id = child_workflow_id`**, `schema_version`,
-`input`, `result`). Liveness is **split**: slice 1 ships terminal push + poll fallback; slice 2 decides only
-the stuck-child budget. (3) The compensation workflow is pinned by its **exact plan identity** (`comp_script_name`
+`input`, `result`). Liveness is **split**: slice 1b ships terminal push + poll fallback; the stuck-child
+budget is slice 2 (standalone). (3) The compensation workflow is pinned by its **exact plan identity** (`comp_script_name`
 / `comp_plan_version` / `comp_content_hash`), mirroring the checkpoint's `reverse_operation_name`+
 `reverse_schema_version` pin — not a loose `name@rev`. (4) The recursion ancestor set is **reconstructed by
 walking `parent_workflow_id` links + joining `tb_mf_workflow_plan`** (bounded by `call_depth`) — no
 denormalized ancestor column. (5) Doc title aligned with this index.
 
+**Preflight architecture review folded in (complexity-containment + reliability lens).** Five structural
+changes before any parser code: (1) **Re-sliced** to 1a (frontend) / 1b (forward spine) / 1c (compensation) —
+because compensating-workflow in slice 1 hid a *second* async-call-await/settle/recovery engine, not obviously
+simpler than reverse-child/T1. (2) **Slice 1 runtime is NO-COMP only**; 1a parses `compensation` but **build
+validation rejects it** until 1c (never accept-and-ignore). (3) **Minimal inspectability in 1b** — the parent
+call op exposes `child_workflow_id` + last `child_status` so operators follow A→B→C by hand (no blocked
+cascade). (4) **Notify is wake + status-hint ONLY** — no `child_return_json` value-of-record; `call_inspect`
+re-reads the child's authoritative terminal at settle; **poll is the floor**, correctness never depends on
+notify (also makes a future T1 reopen safe). (5) **Sidecar `tb_mf_call`** holds all composition state;
+`tb_mf_operation` gains only the `call_kind` discriminator (don't widen the hot op table). Also recorded: the
+**app-boundary lens** — the service may take the complexity, but business apps/participants/authors must never
+handle plan hashes, parent links, leases/fences, notify/poll mechanics, or checkpoint state.
+
 ## Current Scope
 
-Design complete (`DESIGN.md` rev 2); **slice 1 is the active build scope.** Overall feature:
+Design complete (`DESIGN.md`); **slice 1a (frontend only — no DB, no runtime) is the active build scope.**
+Overall feature:
 
 - any workflow step may be a child workflow;
 - child workflow owns its own durable state;
@@ -66,9 +84,8 @@ The three work files (`README.md`, `PROGRESS.md`, `DESIGN.md`) are committed; th
 
 ## Literal Next Action
 
-Design is settled enough to build. **Start slice 1 from the `DESIGN.md` build checklist, in dependency
-order:** (1) grammar (`call <child>@<plan_version> { … }` + optional `compensation`), (2) IR `NCallWorkflow` +
-contract/cycle validation, (3) schema `0003_workflow_call.sql` + SPs (`call_submit`/`call_inspect`/
-`child_terminal_notify`/`comp_submit`) + host wrappers, (4) runner dispatch/await/reverse, (5) docs +
-end-to-end acceptance (completed / failed / blocked-no-cascade / recovery / recursion-guard /
-compensating-workflow) with root `just test` green. Each stage lands with its own tests.
+Design is settled. **Start slice 1a (frontend only — no DB, no runtime), in dependency order:** (1) grammar in
+`parser.drift` — `let x = call <child>@<plan_version> { … }` + parse-only `compensation`; (2) IR
+`NCallWorkflow` + lowering + child arg/return contract validation + **static cycle check** + mermaid, with
+**build-rejection of `compensation`** ("not until 1c"). Pure lowering/hashing parity, **zero DB**. Each stage
+lands with its own tests; then 1b (forward spine) and 1c (compensation) per the `DESIGN.md` checklists.
