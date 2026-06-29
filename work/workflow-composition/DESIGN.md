@@ -237,10 +237,87 @@ not trip it · root `just test` green.
 6. Recursion: ancestor-set vs root+depth-only; `max_call_depth` default.
 7. Syntax keywords.
 
-## Recommended first slice (depends on #2)
+## Slice plan (decided)
 
-A single (non-fan-out) **workflow call**, internal host API, async-awaited, proving the spine — identity →
-submit → await (notify/poll) → settle → result data-flow → recovery → **recursion guard** — **plus one
-compensation mode.** **Agreed: that mode is no-comp / compensating-workflow** → slice 1 avoids **T1** and stays small (prove the
-async call spine first). **Reverse-child + T1 is a deliberate slice 2** (the `completed→reversing` reopen is
-a separate durable transition); the stuck-child budget and fan-out are also slice 2+.
+> **Slice 1 boundary — explicit.** Slice 1 proves **workflow calls as async, awaited operations.**
+> **No inline child execution. No blocked cascade. No reverse-child reopen (T1).** Compensation in slice 1
+> is **no-comp / compensating-workflow only** (a *fresh* comp child via the forward envelope — never a
+> `completed→reversing` reopen).
+
+- **Slice 1 — async workflow-call spine, no T1.** Single (non-fan-out) `call`, internal host API,
+  async-awaited: identity → submit/reassert → await (terminal push + poll fallback) → settle + result
+  data-flow → *child-failed = rejection → unwind prior* → *child-blocked = parent stays forward, no cascade*
+  → recovery (replay-from-durable + idempotent reassert) → **recursion guard**. Compensation = **no-comp /
+  compensating-workflow** (fresh comp child, no reopen).
+- **Slice 2 — reverse-child + T1.** The `completed(4) → reversing(2)` reopen (fenced/idempotent;
+  `failed` → already-terminal-no-comp), reverse-child as a mode (then decide whether it's the default),
+  **plus the stuck-child liveness budget** (§Liveness).
+- **Slice 3 — fan-out + failure-as-data.** `NFanOut` (canonical keys + dedup, barrier await + comp order)
+  and `on failed`-as-data / the typed failure union.
+
+## Slice 1 — build checklist (dependency order)
+
+Concrete enough to start. Each stage lands with its own tests (tests are part of the slice, not a pre-phase).
+
+**1. Grammar — `parser.drift`**
+- [ ] Parse the step form `let <x> = call <child>@<rev> { <input-object> }` (also as a bare statement).
+- [ ] Parse the optional `compensation <wf>@<rev>` clause on a call. **Do not** add `on failed` / `fan` /
+      `key` yet (slice 2/3) — leave them unparsed so they fail with a clear "not in this release".
+- [ ] AST: `CallStmt { binder?, child_name, child_rev, input_expr, compensation? }`.
+- [ ] Tests: parse fixtures (with/without `compensation`, with/without binder); malformed `call` rejected.
+
+**2. IR + validation — `ir.drift`**
+- [ ] New node `NCallWorkflow { node_id, child_name, child_rev, input_expr, result_binder?, compensation_ref? }`;
+      lower `CallStmt` → it.
+- [ ] Bind the child's declared **`return` type** (from the registry) to the binder; `result <x>.path`
+      resolves against it (reuse the EResult typing path).
+- [ ] Validate at build: child `name@rev` is registered; **input matches child `arg`-type**, downstream uses
+      match child `return`-type; `compensation@rev` (if any) is registered and accepts the
+      `{forward:{input,result}}` envelope; input expr references only durable/in-scope values.
+- [ ] **Static recursion/cycle check** — reject a registry-derivable call cycle (child transitively calls
+      this workflow).
+- [ ] `emit_mermaid`: render `NCallWorkflow` as a node (e.g. `["call child@1"]`) so `--emit-graph` / viz work.
+- [ ] Tests: lowering fixtures; contract-mismatch + cycle rejection.
+
+**3. Schema / SP / host — `db/` + `host.drift`**
+- [ ] Migration `0003_workflow_call.sql`:
+      - `tb_mf_operation`: `call_kind ENUM('participant','child_workflow')`, `child_workflow_id`,
+        `child_script` (name@rev), `child_status`, `compensation_workflow` (name@rev, NULL).
+      - `tb_mf_workflow`: `parent_workflow_id`, `parent_node_id`, `root_workflow_id`, `call_depth` (NULL for
+        top-level). **No liveness-budget columns** (that's slice 2).
+- [ ] `sp_mf_call_submit` — create/**reassert** the child under `child_workflow_id` with input + ancestry
+      (`parent_*`, `root_*`, `call_depth = parent+1`); **idempotent** (existing child → return current state).
+      **Recursion guard here:** reject if the id is an ancestor or `call_depth > max_call_depth` → a rejection
+      outcome (drives parent failure).
+- [ ] `sp_mf_call_inspect` — read child terminal/blocked status for the parent's reconcile.
+- [ ] `sp_mf_child_terminal_notify` — on child terminal, mark the parent call operation **due**
+      (`next_attempt = now`) + record the outcome (the push side; poll is the fallback).
+- [ ] `sp_mf_comp_submit` — on reversal of a completed-child checkpoint **with** a declared compensation,
+      start the comp child (id `…,"comp"`) with the forward envelope (reuses submit). **No reverse-child SP,
+      no `completed→reversing`.**
+- [ ] `host.drift`: typed wrappers `call_submit` / `call_inspect` / `comp_submit` + decoded outcome variants.
+- [ ] Tests: SP regression — submit idempotency, inspect, terminal-notify, recursion-guard rejection,
+      comp-submit.
+
+**4. Runner — `runner.drift`**
+- [ ] Dispatch `NCallWorkflow` → `call_submit` (create/reassert child); the call operation is pending.
+- [ ] Await on resume → `call_inspect`: **completed** → settle call op with the child `return` (checkpoint)
+      + continue; **failed** → rejection → reverse **prior** checkpoints (the failed call is **not**
+      checkpointed); **blocked** → leave call op pending, parent **stays forward** (schedule inspect / await
+      notify); **pending** → defer.
+- [ ] Reversal of a completed-child checkpoint: declared `compensation` → `comp_submit` + await comp terminal
+      (comp completed → `compensation_settled`; comp failed/blocked → reverse-block). **no-comp** → reversal
+      no-op for that checkpoint.
+- [ ] Recovery: adopt the durable `child_workflow_id` + settled result; idempotent reassert on re-dispatch.
+- [ ] Recursion-guard rejection from submit → handled as a call failure.
+- [ ] Tests: integration (extend `coordinator-singular` or a new `composition` suite).
+
+**5. Docs / tests (acceptance)**
+- [ ] Docs: `microflows_design.md` (the workflow-call model + **slice-1 boundary**); `microflows_user_guide.md`
+      (`call` + `compensation` syntax); `CHANGELOG.md` (unreleased — workflow composition slice 1).
+- [ ] Integration acceptance (end-to-end, root gate): **completed** (result feeds a later parent step);
+      **failed** (unwind prior, failed child not re-compensated); **blocked** (parent stays forward; resolve
+      child → parent proceeds; **no cascade** in A→B→C); **recovery** (crash + replay, **no live child**);
+      **recursion guard** (cycle / depth → call failure → reversal); **compensating-workflow** (parent
+      reversal starts a fresh comp child exactly once).
+- [ ] Root `just test` green.
