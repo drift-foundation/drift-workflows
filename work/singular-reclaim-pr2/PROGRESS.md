@@ -52,13 +52,25 @@ exhaustiveness break); added `scenario_reclaim_expired` (#18): start → expire 
 
 This makes the change LANDABLE: the SP's new arg count and the gateway's resume() call move together.
 
-## Step 4 — REMAINING (additive; not required for landability)
+## Step 4 — DONE + verified (participant-stub reclaim-on-PUT)
 
-`microflows/participant-stub/src/app.drift` does NOT currently call `resume()` (on `start→Exists` it does the
-input-hash comparison), so nothing there breaks. Adding the reclaim path: on `Exists` for an op whose lease
-has expired, build a `RecoveryLease` + `resume` to reclaim, rerun idempotently, replay the stored ledger
-receipt, `complete` with the rotated lease. Plus the bookkeeper ledger-stress harness case [8] to drive the
-SAME operation_id (not a fresh one) through recovery.
+`microflows/participant-stub/src/app.drift`: the `start→Exists` (same input) branch now **reclaims via
+`resume(key, RecoveryLease)`** instead of reporting 202 — Terminal→replay, **Active→202 (live lease never
+stolen)**, **Granted→rerun idempotently + complete under the rotated lease→200**, NotFound→500. Added a
+per-op **in-memory idempotency store** (the bookkeeper-ledger analog) so a reclaim rerun is **REPLAYED**
+(no re-execution → `exec_count` stays 1), a **`crash_after_commit` fault** (commit + hold lease Working +
+return 202 without completing), and an env-tunable **lease TTL** (`MICROFLOWS_STUB_LEASE_TTL_SECONDS`) for
+fast expiry tests. **Verified:** stub builds (DRIFT_PKG_ROOT=…/pkgs) and `tests/http/conformance.py` is
+**7/7** against the live DB, incl. `crash_after_commit_reclaim_on_put` (crash→expire→re-PUT→reclaim→complete,
+exactly-once `exec_count==1`).
+
+This is the microflows **reference** participant recovery; the bookkeeper applies the same pattern. Phase 7
+case [12] is then unblocked end-to-end by this + the spec'd uflowsd pending→re-dispatch
+(`work/uflowsd-pending-redispatch/`).
+
+### Files (step 4)
+- `microflows/participant-stub/src/app.drift` (idempotency store, crash fault, resume-reclaim branch, TTL env)
+- `microflows/participant-stub/tests/http/conformance.py` (`crash_after_commit_reclaim_on_put` + short-TTL spawn)
 
 ## Files touched (all verified by `just test` green)
 - `singular/db/procs/sp_singular_resume.sql` (reclaim rewrite)

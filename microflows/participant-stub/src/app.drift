@@ -8,12 +8,18 @@
 //   PUT /microflows/v1/operations/{operation}/{operation_id}
 //   GET /microflows/v1/operations/{operation}/{operation_id}
 //
-// First runnable slice (Singular 0.4: start / complete / inspect / history):
 //   PUT  -> Singular start():
-//             Granted -> run echo-transform, complete(), return 200 succeeded
+//             Granted -> run the operation body, complete(), return 200 succeeded
 //             Exists  -> compare canonical input hash held in Singular item_meta
-//                        (mismatch -> 409); else replay the terminal result
+//                        (mismatch -> 409); else RECLAIM via resume() (PR2):
+//                          Terminal      -> replay the stored terminal result
+//                          Active        -> 202 (live lease is NEVER stolen)
+//                          Granted       -> expired lease reclaimed: rerun the
+//                                           operation IDEMPOTENTLY (replayed, no
+//                                           re-execution) + complete() under the
+//                                           rotated token -> 200 succeeded
 //   GET  -> Singular inspect(): Terminal -> 200 | Working -> 202 | NotFound -> 404
+//           (read-only — GET never reclaims; PUT owns reclaim)
 //
 // Input-conflict (409) reuses Singular's item_meta as the single authority: the
 // canonical input hash is stored in item_meta on start() and read back via
@@ -37,6 +43,8 @@ import std.env as env;
 import web.rest as rest;
 import singular as singular;
 import std.time as time;
+import std.iter as iter;
+use trait iter.SinglePassIterator;
 
 const DEFAULT_PORT: Int = 8080;
 const LEASE_TIMEOUT_SECONDS: Int = 30;
@@ -64,7 +72,15 @@ struct StubApp {
 	// armed operation, the stub injects the mode ("reject" -> 400, "pending" -> 202) WITHOUT the
 	// business payload carrying any `_fault`. Lets the starter-kit examples stay pristine while the
 	// harness still drives compensation/pending paths. The test arms/disarms between scenarios.
-	armed: conc.Mutex<json.JsonNode>
+	armed: conc.Mutex<json.JsonNode>,
+	// Per-operation idempotency store (_replay_key(operation, operation_id) -> committed result_json) —
+	// the stub's analog of the bookkeeper's durable ledger, keyed by the SAME logical identity Singular
+	// uses, NOT bare operation_id. The body runs at most ONCE per (operation, operation_id) (APPLIED,
+	// exec_count++); a RERUN (e.g. on an expired-lease RECLAIM) returns the stored result (REPLAYED, NO
+	// exec_count++), so `exec_count` stays 1 across recovery — proving effectively-once execution through reclaim.
+	// (In-memory: a real participant uses a durable store; the stub's fault is in-process, so the store
+	// survives the simulated crash.)
+	applied: conc.Mutex<json.JsonNode>
 }
 
 // Arm (overwrite) the single out-of-band fault slot: { operation: mode }. mode "" disarms.
@@ -168,7 +184,8 @@ fn _run(config_path: String, port_cli: Optional<Int>, service_group_default: Str
 
 	val app = conc.arc(StubApp(gateway = move gateway, service_group = move service_group,
 	                           exec_count = conc.atomic_int(0), request_count = conc.atomic_int(0),
-	                           put_count = conc.atomic_int(0), armed = conc.mutex(json.new_object().to_node())));
+	                           put_count = conc.atomic_int(0), armed = conc.mutex(json.new_object().to_node()),
+	                           applied = conc.mutex(json.new_object().to_node())));
 
 	var ab = rest.new_app_builder();
 	rest.bind(ab, "0.0.0.0", port);
@@ -306,40 +323,30 @@ implement StubApp {
 		// claim_time + LEASE_TIMEOUT_SECONDS. The settle event_time (taken after the body runs + the
 		// start round-trip) is strictly later, satisfying Singular's monotonicity.
 		val claim_time = time.now_utc();
-		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(&claim_time) + LEASE_TIMEOUT_SECONDS * 1000000);
+		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(&claim_time) + _lease_ttl_seconds() * 1000000);
 		match self.gateway.get().start(&key, &item_meta, &"{}", &claim_time, &lease_expires, &token) {
 			singular.StartOutcome::Granted(lease) => {
-				// Fault injection: RESPOND-PENDING. Simulate accepted-but-not-terminal
-				// by returning 202 without completing. The lease drops, leaving the op
-				// permanently Working: there is NO reclaim or asynchronous-completion
-				// path yet, so this exercises only the runner's INITIAL pending
-				// deferral, not end-to-end pending recovery. No body execution, so
-				// exec_count is unchanged.
+				// Fault injection: RESPOND-PENDING. 202 BEFORE the body -> nothing committed, op left Working
+				// (no reclaim path exercised). exec_count unchanged.
 				if _fault_respond_pending(&eff) {
 					return _json(202, _envelope_pending());
 				}
-				// First submit: run the operation body EXACTLY ONCE.
-				val _prev = self.exec_count.fetch_add(1, conc.MemoryOrder::SeqCst());
-				// _fault.omit_result: the participant "succeeds" (200) but produces NO `result` — a
-				// protocol violation. Store a sentinel so BOTH the PUT response and a later GET reconcile
-				// envelope omit `result`, exercising the runner's participant_protocol_missing_result path.
-				// Protocol-violation faults store a sentinel so BOTH the PUT response and a later GET
-				// reconcile envelope reproduce it: omit_result -> no `result`; invalid_result -> a
-				// non-object `result`. Otherwise run the op body normally.
-				var result_json: String = "";
-				if _fault_omit_result(&eff) { result_json = "{\"__omit_result__\":true}"; }
-				else {
-					if _fault_invalid_result(&eff) { result_json = "{\"__invalid_result__\":true}"; }
-					else { result_json = _execute_op(op, &eff); }
+				// Run the body IDEMPOTENTLY keyed by operation_id (APPLIED: exec_count++ + result stored;
+				// a later rerun for the same id is REPLAYED with no re-execution). Handles the omit_result /
+				// invalid_result protocol-violation faults internally (stored so a replay reproduces them).
+				val result_json = self.run_idempotent(op_id, op, &eff);
+				// Fault injection: CRASH-AFTER-COMMIT. The side effect is committed (applied + lease Working),
+				// but we "crash" before complete -> return 202 WITHOUT completing. The lease expires and a
+				// later byte-identical PUT reclaims it (Exists branch). Models case [12].
+				if _fault_crash_after_commit(&eff) {
+					return _json(202, _envelope_pending());
 				}
 				val settle_time = time.now_utc();
 				match self.gateway.get().complete(&lease, &settle_time, &result_json) {
 					singular.SettleOutcome::Settled(tr) => {
-						// Fault injection: DROP-AFTER-COMMIT. The result is already
-						// durably committed above; sleeping past the client's PUT
-						// timeout makes the client experience a genuine uncertain
-						// outcome (timeout) — a real lost ack, not a discarded
-						// known response. The operation still executed exactly once.
+						// Fault injection: DROP-AFTER-COMMIT (lost ack). The result is already durably
+						// committed; sleeping past the client's PUT timeout yields a genuine uncertain
+						// outcome. Still executed exactly once.
 						val delay_ms = _fault_delay_after_commit_ms(&eff);
 						if delay_ms > 0 {
 							val _ = conc.sleep(conc.Duration(millis = delay_ms));
@@ -352,19 +359,37 @@ implement StubApp {
 				}
 			},
 			singular.StartOutcome::Exists => {
-				// Already exists: same id + different input -> 409. The bound input
-				// hash lives in Singular's item_meta (single authority), read back
-				// via history. A missing/corrupt record is NOT a conflict -> 500.
+				// Already exists: same id + different input -> 409. The bound input hash lives in Singular's
+				// item_meta (single authority), read back via history. A missing/corrupt record -> 500.
 				match self.read_original_hash(&key) {
 					Optional::Some(original_hash) => {
 						if original_hash != input_hash {
 							return _json(409, _envelope_error("input-conflict"));
 						}
-						// Same input: replay the terminal result (or report pending).
-						match self.gateway.get().inspect(&key) {
-							singular.InspectOutcome::Terminal(tr, _) => { return _json(200, _envelope_terminal(&tr)); },
-							singular.InspectOutcome::Working(_, _, _) => { return _json(202, _envelope_pending()); },
-							singular.InspectOutcome::NotFound => { return _json(500, _envelope_error("exists-but-not-found")); }
+						// Same input: RECLAIM-or-replay via Singular resume with a FRESH recovery lease
+						// (PR2). The byte-identical PUT is the recovery driver (GET stays read-only):
+						//   Terminal  -> replay the recorded result (200);
+						//   Active    -> the lease is still LIVE; never steal it -> 202 pending;
+						//   Granted   -> the lease EXPIRED; we reclaimed a fresh attempt (rotated token) ->
+						//                rerun idempotently (REPLAYED, no exec_count++) + complete under the
+						//                new lease -> 200. This is the crash-after-commit recovery.
+						val r_token = singular.new_lease_token();
+						val r_claim = time.now_utc();
+						val r_expires = time.utc_from_unix_micros(time.utc_unix_micros(&r_claim) + _lease_ttl_seconds() * 1000000);
+						val recovery = Optional<singular.RecoveryLease>::Some(singular.RecoveryLease(
+							lease_meta_json = "{}", event_time = r_claim, lease_expires_at = r_expires, lease_token = r_token));
+						match self.gateway.get().resume(&key, &recovery) {
+							singular.ResumeOutcome::Terminal(tr) => { return _json(200, _envelope_terminal(&tr)); },
+							singular.ResumeOutcome::Active(_) => { return _json(202, _envelope_pending()); },
+							singular.ResumeOutcome::Granted(rlease, _attempt, _ckpt) => {
+								val result_json = self.run_idempotent(op_id, op, &eff);
+								val settle_time = time.now_utc();
+								match self.gateway.get().complete(&rlease, &settle_time, &result_json) {
+									singular.SettleOutcome::Settled(tr) => { return _json(200, _envelope_terminal(&tr)); },
+									default => { return _json(500, _envelope_error("reclaim-complete-unexpected")); }
+								}
+							},
+							singular.ResumeOutcome::NotFound => { return _json(500, _envelope_error("exists-but-not-found")); }
 						}
 					},
 					Optional::None => {
@@ -456,6 +481,29 @@ implement StubApp {
 			core.Result::Err(_) => { return Optional<String>::None(); }
 		}
 	}
+
+	// Run the operation body IDEMPOTENTLY, keyed by the SAME logical identity Singular uses —
+	// (operation, operation_id), length-prefixed via _join — NOT bare operation_id, so two distinct
+	// operations that happen to share an operation_id can never falsely replay each other's result. The
+	// first call for a key is APPLIED — compute the result (incl. the omit_result / invalid_result
+	// protocol faults), count ONE execution, store it; any later call for the same key is REPLAYED —
+	// return the stored result with NO re-execution, so `exec_count` stays 1 across an expired-lease RECLAIM.
+	fn run_idempotent(self: &StubApp, op_id: &String, op: &String, eff: &json.JsonNode) -> String {
+		val store_key = _replay_key(op, op_id);
+		var g = conc.lock(&self.applied);
+		val slot = conc.mutex_guard_get_mut(&mut g);
+		match slot.get(&store_key) {
+			Optional::Some(prior) => { match prior.as_string() { Optional::Some(s) => { return move s; }, Optional::None => {} } },
+			Optional::None => {}
+		}
+		var result_json: String = "";
+		if _fault_omit_result(eff) { result_json = "{\"__omit_result__\":true}"; }
+		else { if _fault_invalid_result(eff) { result_json = "{\"__invalid_result__\":true}"; } else { result_json = _execute_op(op, eff); } }
+		val _prev = self.exec_count.fetch_add(1, conc.MemoryOrder::SeqCst());
+		val merged = _store_with(slot, &store_key, &result_json);
+		*slot = move merged;
+		return move result_json;
+	}
 }
 
 // ===== Operation logic =====
@@ -479,6 +527,55 @@ fn _fault_respond_pending(input: &json.JsonNode) nothrow -> Bool {
 		},
 		Optional::None => { return false; }
 	}
+}
+
+// Fault: CRASH-AFTER-COMMIT. The participant runs the body (commits its idempotent side effect, holding the
+// Singular lease WORKING) but then "crashes" before `complete()` — modeled by returning 202 WITHOUT
+// completing. The lease stays working and eventually EXPIRES, so a later byte-identical PUT reclaims it
+// (Singular `resume → Granted`), reruns idempotently (REPLAYED), and completes. This is the dangerous-window
+// recovery the bookkeeper Phase 7 case [12] exercises end-to-end. (Distinct from `respond_pending`, which
+// returns 202 BEFORE the body, committing nothing.)
+fn _fault_crash_after_commit(input: &json.JsonNode) nothrow -> Bool {
+	match input.get(&"_fault") {
+		Optional::Some(f) => {
+			match f.get(&"crash_after_commit") {
+				Optional::Some(n) => { match n.as_bool() { Optional::Some(v) => { return v; }, Optional::None => { return false; } } },
+				Optional::None => { return false; }
+			}
+		},
+		Optional::None => { return false; }
+	}
+}
+
+// The Singular lease TTL the stub grants on start/reclaim, in seconds. Env-overridable so recovery tests can
+// use a SHORT TTL (the reclaim only grants after the lease expires); default LEASE_TIMEOUT_SECONDS.
+fn _lease_ttl_seconds() nothrow -> Int {
+	match env.get("MICROFLOWS_STUB_LEASE_TTL_SECONDS") {
+		Optional::Some(v) => {
+			match json.parse_strict(&v) {
+				core.Result::Ok(n) => { match n.as_int() { Optional::Some(i) => { if i >= 1 { return i; } }, Optional::None => {} } },
+				core.Result::Err(_) => {}
+			}
+		},
+		Optional::None => {}
+	}
+	return LEASE_TIMEOUT_SECONDS;
+}
+
+// Return a fresh JSON object = `cur` (an object) plus `{key: value}` — read-modify-write for the in-memory
+// idempotency store (cur stays borrowed only for the copy; the caller then replaces the slot).
+fn _store_with(cur: &json.JsonNode, key: &String, value: &String) -> json.JsonNode {
+	var o = json.new_object();
+	var it = cur.entries();
+	var done = false;
+	while !done {
+		match it.next() {
+			Optional::Some(e) => { o.set(_dup(e.key), e.value.clone_deep()); },
+			Optional::None => { done = true; }
+		}
+	}
+	o.set(_dup(key), json.JsonNode::String(value = _dup(value)));
+	return o.to_node();
 }
 
 // Fault: the participant COMMITS and returns a conformant-looking 200 but WITHOUT `result` (a
@@ -883,6 +980,14 @@ fn _op_key(op: &String, op_id: &String) nothrow -> Array<Byte> {
 	val parts: Array<String> = ["key", _dup(op), _dup(op_id)];
 	val seed = _join(&parts);
 	return singular.uuid_v3_from_string(&seed);
+}
+
+// In-memory replay-store key over the SAME logical identity as the Singular key —
+// (operation, operation_id), length-prefixed via _join so it is collision-free.
+// A plain String (the ledger is a JSON-object map) rather than _op_key's UUID.
+fn _replay_key(op: &String, op_id: &String) nothrow -> String {
+	val parts: Array<String> = ["rk", _dup(op), _dup(op_id)];
+	return _join(&parts);
 }
 
 // Deterministic 16-byte capability token per operation (single-worker stub).

@@ -70,7 +70,7 @@ class Stub:
         return body["count"]
 
 
-def spawn_stub():
+def spawn_stub(lease_ttl=None):
     if not BIN.exists():
         sys.exit(f"error: stub binary not found at {BIN} — run `just build` first")
     port = _free_port()
@@ -94,8 +94,11 @@ def spawn_stub():
     cf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
     json.dump(cfg, cf)
     cf.close()
+    env = dict(os.environ)
+    if lease_ttl is not None:
+        env["MICROFLOWS_STUB_LEASE_TTL_SECONDS"] = str(lease_ttl)
     proc = subprocess.Popen([str(BIN), "--config", cf.name],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     base = f"http://127.0.0.1:{port}"
     deadline = time.time() + 15
     while time.time() < deadline:
@@ -172,6 +175,42 @@ def get_terminal_and_unknown(s):
     code, body = s.get("echo-transform", "op-g")
     assert code == 200 and body["result"]["sum"] == 10, (code, body)
     assert s.get("echo-transform", "op-missing")[0] == 404
+
+
+@case
+def crash_after_commit_reclaim_on_put(_shared):
+    # PR2 dangerous-window recovery (Phase 7 case [12]): the participant commits its side effect and
+    # "crashes" before complete(); after the Singular lease expires, a byte-identical PUT RECLAIMS the
+    # expired-working op (resume -> Granted, rotated token), reruns idempotently (REPLAYED), and completes —
+    # exactly-once. Uses its OWN stub with a SHORT lease TTL so the expiry is fast.
+    proc, base, cfg_path = spawn_stub(lease_ttl=1)
+    rs = Stub(base)
+    try:
+        body0 = {"values": [4, 5, 6], "_fault": {"crash_after_commit": True}}
+        # 1. First PUT: body commits (runs once), then "crash" before complete -> 202 (Working, not terminal).
+        code, body = rs.put("echo-transform", "op-crash", body0)
+        assert code == 202, f"crash-after-commit must return 202 (committed, not completed): {(code, body)}"
+        assert rs.exec_count() == 1, f"body should have run once: exec_count={rs.exec_count()}"
+        # 2. Pre-expiry it is Working (GET read-only -> 202), never terminal.
+        assert rs.get("echo-transform", "op-crash")[0] == 202, "op must be Working (not terminal) pre-expiry"
+        # 3. Wait for the lease (TTL=1s) to expire.
+        time.sleep(2.0)
+        # 4. Byte-identical re-PUT drives recovery: resume -> Granted -> rerun (REPLAYED) -> complete -> 200.
+        code, body = rs.put("echo-transform", "op-crash", body0)
+        assert code == 200 and body.get("state") == "succeeded", f"re-PUT must reclaim+complete: {(code, body)}"
+        assert body["result"]["sum"] == 15, body
+        # 5. EXACTLY-ONCE: the reclaim re-executed NOTHING (REPLAYED) -> exec_count stays 1.
+        assert rs.exec_count() == 1, f"reclaim must not re-execute: exec_count={rs.exec_count()}"
+        # 6. Now terminal on a read.
+        code, body = rs.get("echo-transform", "op-crash")
+        assert code == 200 and body["result"]["sum"] == 15, (code, body)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+        os.unlink(cfg_path)
 
 
 def main():
