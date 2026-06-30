@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS `tb_mf_operation` (
 	`reconcile_first_seen_at` datetime(6) NULL,
 	`reconcile_last_seen_at` datetime(6) NULL,
 	`reconcile_reason` varchar(64) NULL,
+	-- Durable pending->re-dispatch escalation timer for a participant that committed and crashed before
+	-- Singular.complete (Phase 7 case [12]). Advanced ONLY by sp_mf_operation_pending_defer on a CONFIRMED
+	-- participant pending (GET 202) of a RECOVERED dispatch. Keyed by (workflow_id, operation_seq) so resume
+	-- re-reads the same row and the epoch never resets. first_seen anchors the epoch once; last_at re-arms
+	-- after each escalation; count is the escalations issued (audit). NULL/0 until the first recovered 202.
+	`redispatch_first_seen_at` datetime(6) NULL,
+	`redispatch_last_at` datetime(6) NULL,
+	`redispatch_count` int NOT NULL DEFAULT 0,
 	PRIMARY KEY (`workflow_id`,`operation_seq`),
 	UNIQUE KEY `uq_mf_operation_opid` (`operation_id`),
 	CONSTRAINT `ck_mf_operation_status` CHECK (`status` IN (1,2)),

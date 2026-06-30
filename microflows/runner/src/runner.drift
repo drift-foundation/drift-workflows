@@ -883,10 +883,33 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// the lease) until the next poll, never throw while holding it; 400/409 ->
 	// definite rejection (abort, no poll/resubmit); transport/5xx -> reconcile. ---
 	var result_json: String = "";
-	match _classify_dispatch(&base_url, &eff_operation_name, &operation_id_hex, &eff_input_json) {
+	var eff_dr = _classify_dispatch(&base_url, &eff_operation_name, &operation_id_hex, &eff_input_json);
+	// A RECOVERED + CONFIRMED-pending op escalates via the durable re-dispatch timer (case [12]): the
+	// participant may have committed and crashed before complete, so escalate toward a byte-identical
+	// re-PUT (which the participant reclaims). The escalation may REPLACE eff_dr with the re-PUT's
+	// classification. A FRESH dispatch (or a PendingUncertain) never escalates.
+	// NOTE: the detection MUST match a BORROW (`&eff_dr`) — an owning `match eff_dr` MOVES the var, so the
+	// main `match eff_dr` below would then read a moved-from (empty-payload) value.
+	if recovered {
+		var observed = false;
+		match &eff_dr { DispatchResult::PendingObserved => { observed = true; }, default => {} }
+		if observed {
+			match _pending_redispatch_or_defer(host.get(), cfg, &workflow_id, fencing_token, OPERATION_SEQ, &operation_id, &base_url, &eff_operation_name, &operation_id_hex, &eff_input_json, admission) {
+				RedispatchStep::Done(r) => { eff_dr = DispatchResult::Done(move r); },
+				RedispatchStep::Reject(reason) => { eff_dr = DispatchResult::Rejected(move reason); },
+				RedispatchStep::Route404 => { eff_dr = DispatchResult::Route404(); },
+				RedispatchStep::Return(o) => { return o; }
+			}
+		}
+	}
+	match eff_dr {
 		DispatchResult::Done(r) => { result_json = move r; },
-		DispatchResult::Pending => {
-			// Not terminal yet: release the lease and become due again to re-poll.
+		DispatchResult::PendingObserved => {
+			// A FRESH confirmed pending: release the lease and become due again to re-poll.
+			return _defer_pending(host.get(), &workflow_id, fencing_token, admission);
+		},
+		DispatchResult::PendingUncertain => {
+			// Unreachable/uncertain: defer + re-poll, never escalate the timer.
 			return _defer_pending(host.get(), &workflow_id, fencing_token, admission);
 		},
 		DispatchResult::Rejected(reason) => {
@@ -1896,7 +1919,22 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 
 				// Dispatch through the generic dispatcher. A RECOVERED request (durable from a
 				// prior drive) reconciles GET-first; a FRESH request is PUT-first.
-				match _dispatch_or_reconcile(recovered, &base_url, &op_name, &operation_id_hex, &input_json) {
+				var eff_dr = _dispatch_or_reconcile(recovered, &base_url, &op_name, &operation_id_hex, &input_json);
+				// A RECOVERED + CONFIRMED-pending op escalates via the durable re-dispatch timer (case [12]);
+				// the escalation may REPLACE eff_dr with the byte-identical re-PUT's classification.
+				if recovered {
+					var observed = false;
+					match &eff_dr { DispatchResult::PendingObserved => { observed = true; }, default => {} }
+					if observed {
+						match _pending_redispatch_or_defer(host, cfg, workflow_id, fencing_token, seq, &operation_id, &base_url, &op_name, &operation_id_hex, &input_json, admission) {
+							RedispatchStep::Done(r) => { eff_dr = DispatchResult::Done(move r); },
+							RedispatchStep::Reject(reason) => { eff_dr = DispatchResult::Rejected(move reason); },
+							RedispatchStep::Route404 => { eff_dr = DispatchResult::Route404(); },
+							RedispatchStep::Return(o) => { return o; }
+						}
+					}
+				}
+				match eff_dr {
 					DispatchResult::Done(r) => {
 						// Finality PROBE: replay with the just-returned result. Completed -> this op is final; Fail /
 						// another operation -> CHECKPOINT it (a later fail/op can unwind it). The settle SP ANDs this
@@ -1947,7 +1985,10 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 							}
 						}
 					},
-					DispatchResult::Pending => {
+					DispatchResult::PendingObserved => {
+						return _defer_pending(host, workflow_id, fencing_token, admission);
+					},
+					DispatchResult::PendingUncertain => {
 						return _defer_pending(host, workflow_id, fencing_token, admission);
 					},
 					DispatchResult::Rejected(reason) => {
@@ -2092,10 +2133,15 @@ pub variant GetOutcome {
 }
 
 // The classified dispatch result fed back to the workflow loop:
-//   Done     -> a terminal result to settle
-//   Pending  -> not terminal (or unreachable); durably defer and re-poll later
-//   Rejected -> definite protocol rejection; abort
-pub variant DispatchResult { Done(result: String), Pending, Rejected(reason: String), Route404 }
+//   Done            -> a terminal result to settle
+//   PendingObserved -> a CONFIRMED participant pending (GET 202 / PUT 202). On a RECOVERED dispatch this
+//                      is the ONLY thing that feeds the durable pending->re-dispatch timer (case [12]);
+//                      a fresh dispatch just defers + re-polls.
+//   PendingUncertain-> transport failed / 5xx / unreachable: outcome unknown. Defer + re-poll, but NEVER
+//                      advance the timer (an unreachable participant must not be escalated toward a
+//                      reclaim it may not need).
+//   Rejected        -> definite protocol rejection; abort
+pub variant DispatchResult { Done(result: String), PendingObserved, PendingUncertain, Rejected(reason: String), Route404 }
 
 // A 200 carries a MANDATORY `result` (§3 / contract §4.5). A 200 body without one is a definite
 // PROTOCOL failure, not a runner fatal: classify it as a Rejected outcome so it flows through the
@@ -2163,7 +2209,7 @@ fn _classify_dispatch(base: &String, operation_name: &String, operation_id_hex: 
 	match _dispatch_put(base, operation_name, operation_id_hex, input_json, PUT_IO_TIMEOUT_MS) {
 		PutOutcome::Responded(status, body) => {
 			if status == 200 { return _classify_200_body(&body); }
-			if status == 202 { return DispatchResult::Pending(); }
+			if status == 202 { return DispatchResult::PendingObserved(); }
 			if status == 400 { return DispatchResult::Rejected("participant_invalid_request"); }
 			if status == 409 { return DispatchResult::Rejected("participant_identity_conflict"); }
 			return _reconcile(base, operation_name, operation_id_hex, input_json);
@@ -2209,6 +2255,22 @@ fn _get_op(base: &String, operation_name: &String, operation_id_hex: &String) no
 
 // Reconcile an uncertain outcome by GET on the stable operation id. Terminal ->
 // Done; 202/working or unreachable -> Pending (defer); 400/409 -> Rejected; a
+// ===== case [12]: durable pending->re-dispatch timer (confirmed participant pending) =====
+// Default escalation interval: ~a typical participant Singular lease TTL + margin. SHOULD be set >= the
+// deployment's participant lease TTL + margin (deployment.pending_redispatch_after_ms). 0 = escalate on
+// the first recovered poll (the test override). (App-team confirmation of this default vs the real lease
+// TTL is the one open item; the value is configurable + strictly validated regardless.)
+const PENDING_REDISPATCH_AFTER_MS_DEFAULT: Int = 60000;
+
+fn _pending_redispatch_after_ms(cfg: &json.JsonNode) nothrow -> Int {
+	var v = PENDING_REDISPATCH_AFTER_MS_DEFAULT;
+	match cfg.get(&"pending_redispatch_after_ms") {
+		Optional::Some(n) => { match n.as_int() { Optional::Some(x) => { if x >= 0 { v = x; } }, Optional::None => {} } },
+		Optional::None => {}
+	}
+	return v;
+}
+
 // ===== #2: durable reconcile budget (persistent route-404) =====
 const RECONCILE_MAX_ELAPSED_MS_DEFAULT: Int = 1800000;
 const RECONCILE_MIN_ATTEMPTS_DEFAULT: Int = 2;
@@ -2265,23 +2327,101 @@ fn _reconcile_budget_reverse(host: &mf.MicroflowsHost, cfg: &json.JsonNode, work
 	}
 }
 
+// The outcome of a recovered-pending escalation, folded back into the CALLING arm's own settle/reject
+// path (forward-settle, planned finality-probe, or reverse_settle all differ, so the helper returns a
+// classification rather than owning the settle):
+//   Done/Reject/Route404 -> a re-PUT happened; the caller maps this exactly like a fresh classification.
+//   Return               -> the escalation already resolved to a final Outcome (defer / fence / guardrail
+//                           / re-armed-pending); the caller just returns it.
+variant RedispatchStep { Done(result: String), Reject(reason: String), Route404, Return(outcome: Outcome) }
+
+// Shared FORWARD recovered-pending escalation (case [12]). Called ONLY on a RECOVERED PendingObserved
+// (a confirmed 202). Advances the durable timer: within the interval -> Defer (the SP already released
+// the lease + set next_attempt atomically -> report pending); interval elapsed -> Redispatch (lease
+// held) -> re-PUT byte-identically + classify. A re-PUT still-pending re-defers (the timer is re-armed,
+// so it escalates again next interval) — NEVER re-escalates in the same drive (no hot loop).
+fn _pending_redispatch_or_defer(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
+                                fencing_token: Int, operation_seq: Int, operation_id: &Array<Byte>,
+                                base: &String, operation_name: &String, operation_id_hex: &String,
+                                input_json: &String, admission: &AdmissionState) -> RedispatchStep {
+	// Admission (slice 2): while draining/stopped, do NOT escalate — release at now and report
+	// pending_restart so the drain converges (mirrors _defer_pending's first check).
+	if !_admission_accepting(admission) { return RedispatchStep::Return(_drain_release(host, workflow_id, fencing_token, admission)); }
+	val after_ms = _pending_redispatch_after_ms(cfg);
+	val clock = host.clock_read(PENDING_RETRY_SECONDS);
+	match host.operation_pending_defer(workflow_id, fencing_token, operation_seq, operation_id, &clock.now, &clock.deadline, &clock.now, after_ms) {
+		mf.OperationPendingDeferOutcome::Defer(_) => {
+			return RedispatchStep::Return(Outcome::Pending(reason = "operation_pending", defer_until = _dup(&clock.deadline)));
+		},
+		mf.OperationPendingDeferOutcome::Redispatch(_) => {
+			match _classify_dispatch(base, operation_name, operation_id_hex, input_json) {
+				DispatchResult::Done(r) => { return RedispatchStep::Done(move r); },
+				DispatchResult::Rejected(reason) => { return RedispatchStep::Reject(move reason); },
+				DispatchResult::Route404 => { return RedispatchStep::Route404(); },
+				DispatchResult::PendingObserved => { return RedispatchStep::Return(_defer_pending(host, workflow_id, fencing_token, admission)); },
+				DispatchResult::PendingUncertain => { return RedispatchStep::Return(_defer_pending(host, workflow_id, fencing_token, admission)); }
+			}
+		},
+		mf.OperationPendingDeferOutcome::FenceLost => { return RedispatchStep::Return(Outcome::Aborted(reason = "pending_fence_lost", code = 3)); },
+		mf.OperationPendingDeferOutcome::NotFound => { return RedispatchStep::Return(Outcome::Aborted(reason = "pending_workflow_not_found", code = 8)); },
+		mf.OperationPendingDeferOutcome::OperationNotFound => { return RedispatchStep::Return(_defer_dispatch(host, workflow_id, fencing_token, "pending_op_not_found", admission)); },
+		mf.OperationPendingDeferOutcome::OperationConflict => { return RedispatchStep::Return(_defer_dispatch(host, workflow_id, fencing_token, "pending_op_conflict", admission)); },
+		mf.OperationPendingDeferOutcome::OperationNotRequested(_) => { return RedispatchStep::Return(_defer_dispatch(host, workflow_id, fencing_token, "pending_op_not_requested", admission)); }
+	}
+}
+
+// Shared REVERSE (compensation) recovered-pending escalation (case [12]). Mirrors the forward helper, but
+// a fresh/re-armed pending defers via _defer_dispatch("compensation_pending") (the reverse arm's existing
+// pending behavior), and a Defer reports Outcome::Deferred (the SP released the lease atomically).
+fn _checkpoint_pending_redispatch_or_defer(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
+                                           fencing_token: Int, seq: Int, rev_id: &Array<Byte>,
+                                           base: &String, comp_op: &String, rev_id_hex: &String,
+                                           rev_input: &String, admission: &AdmissionState) -> RedispatchStep {
+	if !_admission_accepting(admission) { return RedispatchStep::Return(_drain_release(host, workflow_id, fencing_token, admission)); }
+	val after_ms = _pending_redispatch_after_ms(cfg);
+	val clock = host.clock_read(PENDING_RETRY_SECONDS);
+	match host.checkpoint_pending_defer(workflow_id, fencing_token, seq, rev_id, &clock.now, &clock.deadline, &clock.now, after_ms) {
+		mf.CheckpointPendingDeferOutcome::Defer(_) => {
+			return RedispatchStep::Return(Outcome::Deferred(reason = "compensation_pending", defer_until = _dup(&clock.deadline), code = 9));
+		},
+		mf.CheckpointPendingDeferOutcome::Redispatch(_) => {
+			match _classify_dispatch(base, comp_op, rev_id_hex, rev_input) {
+				DispatchResult::Done(r) => { return RedispatchStep::Done(move r); },
+				DispatchResult::Rejected(reason) => { return RedispatchStep::Reject(move reason); },
+				DispatchResult::Route404 => { return RedispatchStep::Route404(); },
+				DispatchResult::PendingObserved => { return RedispatchStep::Return(_defer_dispatch(host, workflow_id, fencing_token, "compensation_pending", admission)); },
+				DispatchResult::PendingUncertain => { return RedispatchStep::Return(_defer_dispatch(host, workflow_id, fencing_token, "compensation_pending", admission)); }
+			}
+		},
+		mf.CheckpointPendingDeferOutcome::FenceLost => { return RedispatchStep::Return(Outcome::ReverseAborted(reason = "pending_fence_lost", code = 7)); },
+		mf.CheckpointPendingDeferOutcome::NotFound => { return RedispatchStep::Return(Outcome::Aborted(reason = "pending_workflow_not_found", code = 8)); },
+		mf.CheckpointPendingDeferOutcome::CheckpointNotFound => { return RedispatchStep::Return(_defer_dispatch(host, workflow_id, fencing_token, "pending_checkpoint_not_found", admission)); },
+		mf.CheckpointPendingDeferOutcome::NotRequested => { return RedispatchStep::Return(_defer_dispatch(host, workflow_id, fencing_token, "pending_comp_not_requested", admission)); },
+		mf.CheckpointPendingDeferOutcome::ReverseIdMismatch => { return RedispatchStep::Return(_defer_dispatch(host, workflow_id, fencing_token, "pending_reverse_id_mismatch", admission)); },
+		mf.CheckpointPendingDeferOutcome::AlreadyBlocked => { return RedispatchStep::Return(Outcome::Blocked(direction = "reverse", reason = "participant_route_unknown")); },
+		mf.CheckpointPendingDeferOutcome::CheckpointNotActive(_) => { return RedispatchStep::Return(_defer_dispatch(host, workflow_id, fencing_token, "pending_checkpoint_not_active", admission)); },
+		mf.CheckpointPendingDeferOutcome::OutOfOrder(_) => { return RedispatchStep::Return(_defer_dispatch(host, workflow_id, fencing_token, "pending_out_of_order", admission)); }
+	}
+}
+
 // 404 means the participant has no record -> safe re-PUT the identical request
 // under the same id, then GET again (effectively-once replay).
 fn _reconcile(base: &String, operation_name: &String, operation_id_hex: &String, input_json: &String) -> DispatchResult {
 	match _get_op(base, operation_name, operation_id_hex) {
 		GetOutcome::Terminal(r) => { return DispatchResult::Done(move r); },
-		GetOutcome::Pending => { return DispatchResult::Pending(); },
+		GetOutcome::Pending => { return DispatchResult::PendingObserved(); },
 		GetOutcome::Rejected(reason) => { return DispatchResult::Rejected(move reason); },
 		GetOutcome::TransportFailed => {
-			// Unreachable/uncertain -> defer + retry later; never throw holding the lease.
-			return DispatchResult::Pending();
+			// Unreachable/uncertain -> defer + retry later; never throw holding the lease. NOT a confirmed
+			// pending -> PendingUncertain, so a recovered dispatch does not escalate the re-dispatch timer.
+			return DispatchResult::PendingUncertain();
 		},
 		GetOutcome::Unknown => {
 			// 404-reconcile: participant has no record -> resubmit identical PUT.
 			match _dispatch_put(base, operation_name, operation_id_hex, input_json, RECONCILE_IO_TIMEOUT_MS) {
 				PutOutcome::Responded(status, body) => {
 					if status == 200 { return _classify_200_body(&body); }
-					if status == 202 { return DispatchResult::Pending(); }
+					if status == 202 { return DispatchResult::PendingObserved(); }
 					if status == 400 { return DispatchResult::Rejected("participant_invalid_request"); }
 					if status == 409 { return DispatchResult::Rejected("participant_identity_conflict"); }
 					if status == 404 { return DispatchResult::Route404(); }
@@ -2299,8 +2439,10 @@ fn _reconcile_after_resubmit(base: &String, operation_name: &String, operation_i
 		GetOutcome::Rejected(reason) => { return DispatchResult::Rejected(move reason); },
 		// A 404 AFTER the resubmit confirms a persistent no-record / route-unknown -> advance the budget.
 		GetOutcome::Unknown => { return DispatchResult::Route404(); },
-		// Pending / unreachable -> defer + retry (transport uncertainty, not a route condition).
-		default => { return DispatchResult::Pending(); }
+		// A confirmed 202 is an observed pending (feeds the re-dispatch timer on recovery); 5xx/unreachable
+		// is uncertain (defer + retry, no timer advance).
+		GetOutcome::Pending => { return DispatchResult::PendingObserved(); },
+		default => { return DispatchResult::PendingUncertain(); }
 	}
 }
 
@@ -2607,7 +2749,23 @@ fn _dispatch_or_reconcile(recover: Bool, base: &String, operation_name: &String,
 fn _compensate(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>, fencing_token: Int,
                seq: Int, comp_op: &String, base: &String, rev_id: &Array<Byte>,
                rev_id_hex: &String, rev_input: &String, recover: Bool, admission: &AdmissionState) -> CompStep {
-	match _dispatch_or_reconcile(recover, base, comp_op, rev_id_hex, rev_input) {
+	var eff_dr = _dispatch_or_reconcile(recover, base, comp_op, rev_id_hex, rev_input);
+	// A RECOVERED + CONFIRMED-pending compensation escalates via the durable re-dispatch timer (case [12],
+	// reverse side): the participant may have committed the compensation and crashed before complete, so
+	// escalate toward a byte-identical reverse re-PUT. The escalation may REPLACE eff_dr.
+	if recover {
+		var observed = false;
+		match &eff_dr { DispatchResult::PendingObserved => { observed = true; }, default => {} }
+		if observed {
+			match _checkpoint_pending_redispatch_or_defer(host, cfg, workflow_id, fencing_token, seq, rev_id, base, comp_op, rev_id_hex, rev_input, admission) {
+				RedispatchStep::Done(r) => { eff_dr = DispatchResult::Done(move r); },
+				RedispatchStep::Reject(reason) => { eff_dr = DispatchResult::Rejected(move reason); },
+				RedispatchStep::Route404 => { eff_dr = DispatchResult::Route404(); },
+				RedispatchStep::Return(o) => { return CompStep::Terminal(o); }
+			}
+		}
+	}
+	match eff_dr {
 		DispatchResult::Done(result) => {
 			val ts = _now(host);
 			match host.reverse_settle(workflow_id, fencing_token, seq, rev_id, &result, &ts) {
@@ -2627,7 +2785,10 @@ fn _compensate(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arra
 				}
 			}
 		},
-		DispatchResult::Pending => {
+		DispatchResult::PendingObserved => {
+			return CompStep::Terminal(_defer_dispatch(host, workflow_id, fencing_token, "compensation_pending", admission));
+		},
+		DispatchResult::PendingUncertain => {
 			return CompStep::Terminal(_defer_dispatch(host, workflow_id, fencing_token, "compensation_pending", admission));
 		},
 		DispatchResult::Rejected(reason) => {
@@ -2849,6 +3010,22 @@ fn _validate_registry(cfg: &json.JsonNode) -> Void {
 	val ids = _validate_participants(cfg);
 	_validate_operations(cfg, &ids);
 	_validate_reconcile_budget(cfg);
+	_validate_pending_redispatch(cfg);
+}
+
+// If pending_redispatch_after_ms is present it is validated STRICTLY (fail-fast at registry build), like
+// reconcile_budget: a typo must not silently become the 60s default. Absent -> default. Must be an
+// integer >= 0 (0 = escalate on the first recovered poll; the test override). (case [12])
+fn _validate_pending_redispatch(cfg: &json.JsonNode) -> Void {
+	match cfg.get(&"pending_redispatch_after_ms") {
+		Optional::Some(n) => {
+			match n.as_int() {
+				Optional::Some(v) => { if v < 0 { throw RunnerError(message = "pending_redispatch_after_ms must be an integer >= 0"); } },
+				Optional::None => { throw RunnerError(message = "pending_redispatch_after_ms must be an integer"); }
+			}
+		},
+		Optional::None => {}
+	}
 }
 
 // If reconcile_budget is present it is validated STRICTLY (fail-fast at registry build), so a typo can't

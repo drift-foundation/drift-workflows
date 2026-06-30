@@ -57,6 +57,13 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow_checkpoint` (
 	`reconcile_first_seen_at` datetime(6) NULL,
 	`reconcile_last_seen_at` datetime(6) NULL,
 	`reconcile_reason` varchar(64) NULL,
+	-- Durable pending->re-dispatch escalation timer for a compensation whose participant committed and
+	-- crashed before Singular.complete (Phase 7 case [12], reverse side). Advanced ONLY by
+	-- sp_mf_checkpoint_pending_defer on a CONFIRMED participant pending of a RECOVERED reverse dispatch.
+	-- Keyed by (workflow_id, seq) so resume never resets it. Same discipline as the forward timer.
+	`redispatch_first_seen_at` datetime(6) NULL,
+	`redispatch_last_at` datetime(6) NULL,
+	`redispatch_count` int NOT NULL DEFAULT 0,
 	PRIMARY KEY (`workflow_id`,`seq`),
 	UNIQUE KEY `uq_mf_checkpoint_invocation` (`workflow_id`,`operation_id`),
 	CONSTRAINT `ck_mf_checkpoint_reversal_state` CHECK (`reversal_state` IN (1,2,3,4)),

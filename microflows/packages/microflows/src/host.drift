@@ -61,6 +61,8 @@ export {
 	AuthoredFailOutcome,
 	ReconcileDeferOutcome,
 	CheckpointReconcileDeferOutcome,
+	OperationPendingDeferOutcome,
+	CheckpointPendingDeferOutcome,
 	ReverseRequestOutcome,
 	ReverseSettleOutcome,
 	ReverseBlockOutcome,
@@ -247,6 +249,36 @@ pub variant CheckpointReconcileDeferOutcome {
 	CheckpointNotFound,
 	NotRequested,                                 // no dispatched compensation binding
 	ReverseIdMismatch,
+	CheckpointNotActive(reversal_state: Int),
+	OutOfOrder(top_seq: Int)                       // not the top active checkpoint
+}
+
+// Outcome of sp_mf_operation_pending_defer (case [12], FORWARD pending->re-dispatch timer). On a
+// CONFIRMED participant pending (GET 202) of a RECOVERED op: within the interval -> Defer (lease
+// released + next_attempt set atomically by the SP); interval elapsed -> Redispatch (timer re-armed,
+// lease KEPT so the runner re-PUTs byte-identically). Unlike the #2 budget there is no block.
+pub variant OperationPendingDeferOutcome {
+	Defer(redispatch_count: Int),
+	Redispatch(redispatch_count: Int),
+	FenceLost,
+	NotFound,
+	OperationNotFound,
+	OperationConflict,
+	OperationNotRequested(status: Int)            // a settled op never pends
+}
+
+// Outcome of sp_mf_checkpoint_pending_defer (case [12], REVERSE/compensation pending->re-dispatch
+// timer). Same Defer/Redispatch discipline as the forward SP; AlreadyBlocked is the lease-independent
+// idempotent replay of a checkpoint already blocked for resolution.
+pub variant CheckpointPendingDeferOutcome {
+	Defer(redispatch_count: Int),
+	Redispatch(redispatch_count: Int),
+	FenceLost,
+	NotFound,
+	CheckpointNotFound,
+	NotRequested,                                 // no dispatched compensation binding
+	ReverseIdMismatch,
+	AlreadyBlocked,
 	CheckpointNotActive(reversal_state: Int),
 	OutOfOrder(top_seq: Int)                       // not the top active checkpoint
 }
@@ -513,6 +545,19 @@ pub interface MicroflowsHost {
 	                              seq: Int, reverse_id: &Array<Byte>, db_now: &String,
 	                              next_attempt_at: &String, event_ts: &String,
 	                              max_elapsed_ms: Int, min_attempts: Int) -> CheckpointReconcileDeferOutcome;
+	// Advance the durable pending->re-dispatch timer on a confirmed FORWARD participant pending (GET 202)
+	// of a RECOVERED op; within interval -> Defer (lease released atomically), elapsed -> Redispatch
+	// (lease kept; runner re-PUTs byte-identically). Fenced + atomic. (case [12])
+	fn operation_pending_defer(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                           operation_seq: Int, operation_id: &Array<Byte>, db_now: &String,
+	                           next_attempt_at: &String, event_ts: &String,
+	                           after_ms: Int) -> OperationPendingDeferOutcome;
+	// Advance the REVERSE (compensation) pending->re-dispatch timer on a confirmed participant pending of
+	// a RECOVERED reverse dispatch; same Defer/Redispatch discipline. Fenced + atomic. (case [12])
+	fn checkpoint_pending_defer(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                            seq: Int, reverse_id: &Array<Byte>, db_now: &String,
+	                            next_attempt_at: &String, event_ts: &String,
+	                            after_ms: Int) -> CheckpointPendingDeferOutcome;
 	// Persist an operation request + the suspended continuation, atomically,
 	// BEFORE dispatch. Fenced (fence-first). Idempotent by (workflow_id,
 	// operation_seq); command-identity-checked.
@@ -1247,6 +1292,93 @@ implement MicroflowsHost for HostImpl {
 			if outcome == "checkpoint_not_active" { return CheckpointReconcileDeferOutcome::CheckpointNotActive(_doc_int_req(&doc, &"reversal_state", "creconcile-no-revstate")); }
 			if outcome == "out_of_order" { return CheckpointReconcileDeferOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "creconcile-no-topseq")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:checkpoint_reconcile_defer"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn operation_pending_defer(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                               operation_seq: Int, operation_id: &Array<Byte>, db_now: &String,
+	                               next_attempt_at: &String, event_ts: &String,
+	                               after_ms: Int) -> OperationPendingDeferOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("operation_id", operation_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
+		_validate_nonempty("db_now", db_now);
+		_validate_nonempty("next_attempt_at", next_attempt_at);
+		_validate_nonempty("event_ts", event_ts);
+		if after_ms < 0 { throw HostException(kind = HostErrorKind::InvalidArg(field = "after_ms")); }
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(operation_seq));
+			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
+			args.push(rpc.arg_string(_dup(db_now)));
+			args.push(rpc.arg_string(_dup(next_attempt_at)));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(rpc.arg_int(after_ms));
+			val sp: String = "sp_mf_operation_pending_defer";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "defer" { return OperationPendingDeferOutcome::Defer(_doc_int_req(&doc, &"redispatch_count", "pending-no-count")); }
+			if outcome == "redispatch" { return OperationPendingDeferOutcome::Redispatch(_doc_int_req(&doc, &"redispatch_count", "pending-no-count")); }
+			if outcome == "fence_lost" { return OperationPendingDeferOutcome::FenceLost(); }
+			if outcome == "not_found" { return OperationPendingDeferOutcome::NotFound(); }
+			if outcome == "operation_not_found" { return OperationPendingDeferOutcome::OperationNotFound(); }
+			if outcome == "operation_conflict" { return OperationPendingDeferOutcome::OperationConflict(); }
+			if outcome == "operation_not_requested" { return OperationPendingDeferOutcome::OperationNotRequested(_doc_int_req(&doc, &"status", "pending-no-status")); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_pending_defer"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn checkpoint_pending_defer(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                                seq: Int, reverse_id: &Array<Byte>, db_now: &String,
+	                                next_attempt_at: &String, event_ts: &String,
+	                                after_ms: Int) -> CheckpointPendingDeferOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		_validate_id16("reverse_id", reverse_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "seq")); }
+		_validate_nonempty("db_now", db_now);
+		_validate_nonempty("next_attempt_at", next_attempt_at);
+		_validate_nonempty("event_ts", event_ts);
+		if after_ms < 0 { throw HostException(kind = HostErrorKind::InvalidArg(field = "after_ms")); }
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(seq));
+			args.push(rpc.arg_bytes(_dup_bytes(reverse_id)));
+			args.push(rpc.arg_string(_dup(db_now)));
+			args.push(rpc.arg_string(_dup(next_attempt_at)));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(rpc.arg_int(after_ms));
+			val sp: String = "sp_mf_checkpoint_pending_defer";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "defer" { return CheckpointPendingDeferOutcome::Defer(_doc_int_req(&doc, &"redispatch_count", "cpending-no-count")); }
+			if outcome == "redispatch" { return CheckpointPendingDeferOutcome::Redispatch(_doc_int_req(&doc, &"redispatch_count", "cpending-no-count")); }
+			if outcome == "fence_lost" { return CheckpointPendingDeferOutcome::FenceLost(); }
+			if outcome == "not_found" { return CheckpointPendingDeferOutcome::NotFound(); }
+			if outcome == "checkpoint_not_found" { return CheckpointPendingDeferOutcome::CheckpointNotFound(); }
+			if outcome == "not_requested" { return CheckpointPendingDeferOutcome::NotRequested(); }
+			if outcome == "reverse_id_mismatch" { return CheckpointPendingDeferOutcome::ReverseIdMismatch(); }
+			if outcome == "already_blocked" { return CheckpointPendingDeferOutcome::AlreadyBlocked(); }
+			if outcome == "checkpoint_not_active" { return CheckpointPendingDeferOutcome::CheckpointNotActive(_doc_int_req(&doc, &"reversal_state", "cpending-no-revstate")); }
+			if outcome == "out_of_order" { return CheckpointPendingDeferOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "cpending-no-topseq")); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:checkpoint_pending_defer"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
 			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));

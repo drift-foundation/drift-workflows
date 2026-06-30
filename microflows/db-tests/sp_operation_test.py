@@ -840,6 +840,141 @@ def main():
     _, r = call(cur, "sp_mf_workflow_reconcile_defer", (wfn, EXEC, tokn, 1, opn, T(2), T(5), T(2), 1000, 2))
     check("reconcile_op_not_requested", r and r["outcome"] == "operation_not_requested", r)
 
+    # ===== case [12]: durable pending->re-dispatch timer — FORWARD =====
+    # A participant that committed and crashed before Singular.complete shows as a CONFIRMED pending
+    # (GET 202) forever. On a RECOVERED dispatch the timer escalates: DEFER within the interval, then
+    # REDISPATCH (keep the lease; the runner re-PUTs byte-identically) once elapsed >= after_ms. Unlike
+    # the #2 budget there is no block — it re-arms and escalates indefinitely. after_ms = 5000.
+    wfp = os.urandom(16)
+    opp = bytes.fromhex("00000000000000000000000000000f31")
+    call(cur, "sp_mf_workflow_create", (wfp, SCRIPT, 1, T(0), T(0), '{"pos":"op:1:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfp, EXEC, T(1), "2026-02-01 13:30:00.000000")); tokp = r["fencing_token"]
+    _seed_op(wfp, 1, opp, 1, None)
+    # poll1 (elapsed 0) -> defer; anchors the epoch at T(2), clears the lease, sets next_attempt, op stays requested.
+    _, r = call(cur, "sp_mf_operation_pending_defer", (wfp, EXEC, tokp, 1, opp, T(2), T(3), T(2), 5000))
+    check("pending_within_defers", r and r["outcome"] == "defer" and r["redispatch_count"] == 0 and r["appended"] == 1, r)
+    cur.execute("SELECT lease_owner, next_attempt_at FROM tb_mf_workflow WHERE workflow_id=%s", (wfp,))
+    _wf = cur.fetchone()
+    cur.execute("SELECT status, redispatch_first_seen_at FROM tb_mf_operation WHERE workflow_id=%s AND operation_seq=1", (wfp,))
+    _op = cur.fetchone()
+    check("pending_defer_atomic_release",
+          _wf[0] is None and "13:00:03" in str(_wf[1]) and _op[0] == 1 and "13:00:02" in str(_op[1]),
+          f"defer must, in one txn, clear lease + set next_attempt + anchor first_seen, op stays requested: wf={_wf} op={_op}")
+    # poll2 (elapsed 2000 < 5000) -> defer; the epoch is anchored ONCE (first_seen stays T(2), count stays 0).
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfp, EXEC, T(3), "2026-02-01 13:30:00.000000")); tokp = r["fencing_token"]
+    _, r = call(cur, "sp_mf_operation_pending_defer", (wfp, EXEC, tokp, 1, opp, T(4), T(5), T(4), 5000))
+    check("pending_within_defers_2", r and r["outcome"] == "defer" and r["redispatch_count"] == 0, r)
+    cur.execute("SELECT redispatch_first_seen_at FROM tb_mf_operation WHERE workflow_id=%s AND operation_seq=1", (wfp,))
+    check("pending_epoch_anchored_once", "13:00:02" in str(cur.fetchone()[0]), "first_seen must not reset across polls/resume")
+    # poll3 (elapsed exactly 5000 at the boundary) -> redispatch; advance count, re-arm last_at, KEEP the lease.
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfp, EXEC, T(7), "2026-02-01 13:30:00.000000")); tokp = r["fencing_token"]
+    _, r = call(cur, "sp_mf_operation_pending_defer", (wfp, EXEC, tokp, 1, opp, T(7), T(8), T(7), 5000))
+    check("pending_boundary_redispatches", r and r["outcome"] == "redispatch" and r["redispatch_count"] == 1, r)
+    cur.execute("SELECT lease_owner, redispatch_last_at, redispatch_count FROM tb_mf_workflow w "
+                "JOIN tb_mf_operation o ON o.workflow_id=w.workflow_id AND o.operation_seq=1 WHERE w.workflow_id=%s", (wfp,))
+    _rd = cur.fetchone()
+    check("pending_redispatch_holds_lease", _rd[0] == EXEC and "13:00:07" in str(_rd[1]) and _rd[2] == 1,
+          f"redispatch must KEEP the lease (runner re-PUTs under it) + re-arm last_at: {_rd}")
+    cur.execute("SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id=%s AND kind='pending_redispatch'", (wfp,))
+    check("pending_redispatch_event", cur.fetchone()[0] == 1, "a pending_redispatch audit event must be appended")
+    # poll4 (lease still held; elapsed from the re-armed last_at T(7) = 2000 < 5000) -> defer; count UNCHANGED on a defer.
+    _, r = call(cur, "sp_mf_operation_pending_defer", (wfp, EXEC, tokp, 1, opp, T(9), T(10), T(9), 5000))
+    check("pending_rearm_defers", r and r["outcome"] == "defer" and r["redispatch_count"] == 1, r)
+
+    # Guardrails (single calls on fresh forward workflows).
+    wfp_fl = os.urandom(16); opp_fl = bytes.fromhex("00000000000000000000000000000f32")
+    call(cur, "sp_mf_workflow_create", (wfp_fl, SCRIPT, 1, T(0), T(0), '{"pos":"op:1:dispatched"}', "{}"))
+    call(cur, "sp_mf_workflow_claim_by_id", (wfp_fl, EXEC, T(1), "2026-02-01 13:30:00.000000"))
+    _seed_op(wfp_fl, 1, opp_fl, 1, None)
+    _, r = call(cur, "sp_mf_operation_pending_defer", (wfp_fl, EXEC, 999999, 1, opp_fl, T(2), T(3), T(2), 5000))
+    check("pending_fence_lost", r and r["outcome"] == "fence_lost", r)
+
+    wfp_nf = os.urandom(16)
+    call(cur, "sp_mf_workflow_create", (wfp_nf, SCRIPT, 1, T(0), T(0), '{"pos":"op:1:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfp_nf, EXEC, T(1), "2026-02-01 13:30:00.000000")); tok_nf = r["fencing_token"]
+    _, r = call(cur, "sp_mf_operation_pending_defer", (wfp_nf, EXEC, tok_nf, 1, bytes.fromhex("00000000000000000000000000000f33"), T(2), T(3), T(2), 5000))
+    check("pending_op_not_found", r and r["outcome"] == "operation_not_found", r)
+
+    wfp_cf = os.urandom(16); opp_cf = bytes.fromhex("00000000000000000000000000000f34")
+    call(cur, "sp_mf_workflow_create", (wfp_cf, SCRIPT, 1, T(0), T(0), '{"pos":"op:1:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfp_cf, EXEC, T(1), "2026-02-01 13:30:00.000000")); tok_cf = r["fencing_token"]
+    _seed_op(wfp_cf, 1, opp_cf, 1, None)
+    _, r = call(cur, "sp_mf_operation_pending_defer", (wfp_cf, EXEC, tok_cf, 1, bytes.fromhex("0000000000000000000000000000ffff"), T(2), T(3), T(2), 5000))
+    check("pending_op_conflict", r and r["outcome"] == "operation_conflict", r)
+
+    wfp_nr = os.urandom(16); opp_nr = bytes.fromhex("00000000000000000000000000000f35")
+    call(cur, "sp_mf_workflow_create", (wfp_nr, SCRIPT, 1, T(0), T(0), '{"pos":"op:1:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfp_nr, EXEC, T(1), "2026-02-01 13:30:00.000000")); tok_nr = r["fencing_token"]
+    _seed_op(wfp_nr, 1, opp_nr, 2, '{"reserved":"x"}')
+    _, r = call(cur, "sp_mf_operation_pending_defer", (wfp_nr, EXEC, tok_nr, 1, opp_nr, T(2), T(3), T(2), 5000))
+    check("pending_op_not_requested", r and r["outcome"] == "operation_not_requested", r)
+
+    # Event-time skew: a non-advancing event_ts folds to NO event append, but the defer STILL releases the
+    # lease + sets next_attempt atomically (no partial state). after_ms large so it stays in the defer arm.
+    wfp_sk = os.urandom(16); opp_sk = bytes.fromhex("00000000000000000000000000000f36")
+    call(cur, "sp_mf_workflow_create", (wfp_sk, SCRIPT, 1, T(0), T(0), '{"pos":"op:1:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfp_sk, EXEC, T(1), "2026-02-01 13:30:00.000000")); tok_sk = r["fencing_token"]
+    _seed_op(wfp_sk, 1, opp_sk, 1, None)
+    call(cur, "sp_mf_operation_pending_defer", (wfp_sk, EXEC, tok_sk, 1, opp_sk, T(4), T(5), T(4), 5000))  # appends at T(4)
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfp_sk, EXEC, T(5), "2026-02-01 13:30:00.000000")); tok_sk = r["fencing_token"]
+    _, r = call(cur, "sp_mf_operation_pending_defer", (wfp_sk, EXEC, tok_sk, 1, opp_sk, T(6), T(7), T(4), 5000))  # event_ts T(4) <= current T(4)
+    check("pending_skew_no_append_still_defers", r and r["outcome"] == "defer" and r["appended"] == 0, r)
+    cur.execute("SELECT lease_owner, next_attempt_at FROM tb_mf_workflow WHERE workflow_id=%s", (wfp_sk,))
+    _sk = cur.fetchone()
+    check("pending_skew_atomic_release", _sk[0] is None and "13:00:07" in str(_sk[1]),
+          f"a skewed (no-event) defer must still release the lease + set next_attempt: {_sk}")
+
+    # ===== case [12]: durable pending->re-dispatch timer — REVERSE (compensation) =====
+    wfrp = os.urandom(16)
+    cprp = bytes.fromhex("00000000000000000000000000000f41")
+    failrp = bytes.fromhex("00000000000000000000000000000f42")
+    revrp = bytes.fromhex("00000000000000000000000000000f4a")
+    call(cur, "sp_mf_workflow_create", (wfrp, SCRIPT, 1, T(0), T(0), '{"pos":"op:2:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfrp, EXEC, T(1), "2026-02-01 13:30:00.000000")); tokrp = r["fencing_token"]
+    _seed_checkpoint(wfrp, 1, cprp, '{"reservation":"rp"}')
+    _seed_op(wfrp, 2, failrp, 1, None)
+    call(cur, "sp_mf_workflow_begin_reversal", (wfrp, EXEC, tokrp, 2, failrp, T(2), "forward_op_rejected"))
+    rev_req(wfrp, tokrp, 1, revrp, T(3))
+    # poll1 (elapsed 0) -> defer; state stays reversing(2), lease released.
+    _, r = call(cur, "sp_mf_checkpoint_pending_defer", (wfrp, EXEC, tokrp, 1, revrp, T(4), T(5), T(4), 5000))
+    check("reverse_pending_within_defers", r and r["outcome"] == "defer" and r["redispatch_count"] == 0, r)
+    # poll2 (elapsed 5000) -> redispatch; KEEP the lease, state stays reversing(2).
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfrp, EXEC, T(7), "2026-02-01 13:30:00.000000")); tokrp = r["fencing_token"]
+    _, r = call(cur, "sp_mf_checkpoint_pending_defer", (wfrp, EXEC, tokrp, 1, revrp, T(9), T(10), T(9), 5000))
+    check("reverse_pending_redispatches", r and r["outcome"] == "redispatch" and r["redispatch_count"] == 1, r)
+    cur.execute("SELECT lease_owner, state FROM tb_mf_workflow WHERE workflow_id=%s", (wfrp,))
+    check("reverse_pending_redispatch_holds_lease", cur.fetchone() == (EXEC, 2),
+          "reverse redispatch must KEEP the lease and stay reversing(2)")
+    # fence_lost (stale token; lease-independent identity/replay pass first, then the fence fails).
+    _, r = call(cur, "sp_mf_checkpoint_pending_defer", (wfrp, EXEC, 999999, 1, revrp, T(11), T(12), T(11), 5000))
+    check("reverse_pending_fence_lost", r and r["outcome"] == "fence_lost", r)
+    # id mismatch (the pinned reverse invocation id must match).
+    _, r = call(cur, "sp_mf_checkpoint_pending_defer", (wfrp, EXEC, tokrp, 1, bytes.fromhex("0000000000000000000000000000ffff"), T(11), T(12), T(11), 5000))
+    check("reverse_pending_id_mismatch", r and r["outcome"] == "reverse_id_mismatch", r)
+    # already-blocked is an idempotent no-op (resolution_required checkpoint).
+    cur.execute("UPDATE tb_mf_workflow_checkpoint SET reversal_state=3 WHERE workflow_id=%s AND seq=1", (wfrp,))
+    _, r = call(cur, "sp_mf_checkpoint_pending_defer", (wfrp, EXEC, tokrp, 1, revrp, T(11), T(12), T(11), 5000))
+    check("reverse_pending_already_blocked", r and r["outcome"] == "already_blocked", r)
+    # out_of_order: a pending on a non-TOP active checkpoint (a higher active seq exists).
+    wfoo = os.urandom(16)
+    cpoo = bytes.fromhex("00000000000000000000000000000f51")
+    failoo = bytes.fromhex("00000000000000000000000000000f52")
+    revoo = bytes.fromhex("00000000000000000000000000000f5a")
+    hioo = bytes.fromhex("00000000000000000000000000000f5c")
+    call(cur, "sp_mf_workflow_create", (wfoo, SCRIPT, 1, T(0), T(0), '{"pos":"op:2:dispatched"}', "{}"))
+    _, r = call(cur, "sp_mf_workflow_claim_by_id", (wfoo, EXEC, T(1), "2026-02-01 13:30:00.000000")); tokoo = r["fencing_token"]
+    _seed_checkpoint(wfoo, 1, cpoo, '{"reservation":"oo"}')
+    _seed_op(wfoo, 2, failoo, 1, None)
+    call(cur, "sp_mf_workflow_begin_reversal", (wfoo, EXEC, tokoo, 2, failoo, T(2), "forward_op_rejected"))
+    rev_req(wfoo, tokoo, 1, revoo, T(3))
+    _seed_checkpoint(wfoo, 2, hioo, '{"reservation":"hi"}')  # a HIGHER active checkpoint -> top active is seq 2
+    _, r = call(cur, "sp_mf_checkpoint_pending_defer", (wfoo, EXEC, tokoo, 1, revoo, T(4), T(5), T(4), 5000))
+    check("reverse_pending_out_of_order", r and r["outcome"] == "out_of_order" and r["top_seq"] == 2, r)
+
+    for t in ("tb_mf_workflow_args", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
+        for w in (wfp, wfp_fl, wfp_nf, wfp_cf, wfp_nr, wfp_sk, wfrp, wfoo):
+            cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (w,))
+
     for t in ("tb_mf_workflow_args", "tb_mf_workflow_checkpoint", "tb_mf_operation", "tb_mf_workflow_event", "tb_mf_workflow"):
         for w in (wfb, wfb2, wfr, wfs, wfn):
             cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (w,))
@@ -852,7 +987,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: if a check is accidentally deleted or bypassed, the
     # ran-count drifts from this manifest and the run FAILS (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 127
+    EXPECTED_CHECKS = 148
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

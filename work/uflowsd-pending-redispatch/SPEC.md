@@ -75,8 +75,12 @@ Migration `000N_pending_redispatch.sql`, columns added to BOTH tables (parallel 
   - **Reverse** (`sp_mf_checkpoint_pending_defer`): mirror the #2 **reverse** guardrails — workflow leased +
     `state=reversing(2)`; the **checkpoint exists**, is `requested/active` and the **TOP** active checkpoint,
     the **reverse invocation id matches** the pinned `reverse_invocation_id`; **already-blocked is an
-    idempotent no-op** (`resolution_required` → return without mutating); and **event-time skew**
-    (`arg_event_ts <= current_event_ts`) is rejected **before** any write.
+    idempotent no-op** (`resolution_required` → return without mutating).
+- **Event-time skew handling (both SPs):** unlike the #2 *block* path (which rejects a skewed terminal commit
+  before any write), pending defer/redispatch is **not** a terminal commit, so a non-increasing
+  `arg_event_ts` (`arg_event_ts <= current_event_ts`) **folds to `appended = 0`** — the audit event is
+  skipped, but the transition **still proceeds** (the defer still clears the lease + sets `next_attempt`; the
+  redispatch still advances/keeps-lease). This mirrors the #2 *within-budget defer* skew handling.
 - Anchor `redispatch_first_seen_at` if NULL; `elapsed = (db_now − COALESCE(redispatch_last_at,
   redispatch_first_seen_at))`. Time discipline: caller-supplied `db_now`/`event_ts`, never `NOW()`.
 - **`elapsed ≥ pending_redispatch_after_ms` → outcome `redispatch`:** advance the timer (`redispatch_last_at =

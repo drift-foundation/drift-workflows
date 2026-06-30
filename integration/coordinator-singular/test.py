@@ -3292,6 +3292,78 @@ def main():
               "checkpoint resolution_required(3)")
         _arm_fault(base, "release", "")
 
+        # ===== case [12]: crash-after-commit -> recovered pending -> durable re-dispatch reclaim =====
+        # A participant that COMMITS its effect then crashes BEFORE Singular.complete leaves the op Working
+        # (lease unexpired) -> GET answers 202 forever. Recovery is coordinator-driven via PUT: a RECOVERED
+        # CONFIRMED-pending op escalates the durable, fenced re-dispatch timer; once elapsed the runner
+        # re-PUTs byte-identically, the participant RECLAIMS its now-EXPIRED lease (Singular resume ->
+        # Granted), reruns idempotently (REPLAYED, no re-execution) and completes -> 200. Driven against a
+        # DEDICATED stub with a SHORT lease TTL (fast expiry) + a runner config that escalates on the first
+        # recovered poll (pending_redispatch_after_ms = 0), so the gate doesn't wait a real TTL.
+        port12 = _free_port()
+        base12 = f"http://127.0.0.1:{port12}"
+        stub12_cfg = {"port": port12, "service_group": f"{sg}-r12", "worker_id": "stub12-1", "singular": _mariadb_conn("singular")}
+        s12cf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(stub12_cfg, s12cf); s12cf.close()
+        rcfg12 = dict(runner_cfg)
+        rcfg12["pending_redispatch_after_ms"] = 0
+        rcfg12["participants"] = [
+            {"id": "ref",
+             "transport": {"kind": "http", "endpoints": [base12], "selection": "ordered_failover"},
+             "auth_profile": None},
+        ]
+        # A single-op PLAN (not the legacy single-op path): recovery is GET-first, so the recovered 202
+        # genuinely escalates the durable re-dispatch timer (the legacy path PUT-firsts and would reclaim
+        # before the timer is ever consulted). The crash fault rides in the plan step's input.
+        rcfg12["plan"] = [{"operation": "echo-transform",
+                           "input": {"values": [1, 2, 3], "_fault": {"crash_after_commit": True}}}]
+        r12cf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(rcfg12, r12cf); r12cf.close()
+        stub12 = subprocess.Popen([str(STUB_BIN), "--config", s12cf.name],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                  env={**os.environ, "MICROFLOWS_STUB_LEASE_TTL_SECONDS": "1"})
+        try:
+            d12 = time.time() + 15
+            while time.time() < d12:
+                if stub12.poll() is not None:
+                    sys.exit(f"stub12 exited early:\n{stub12.stdout.read() if stub12.stdout else ''}")
+                try:
+                    urllib.request.urlopen(f"{base12}/debug/exec-count", timeout=1); break
+                except Exception:
+                    time.sleep(0.2)
+            else:
+                stub12.terminate(); sys.exit("stub12 not ready")
+
+            wf12 = _wf_id()
+            # 1. FRESH submit (planned): the stub commits (exec++), holds the op Working, returns 202 -> a
+            #    FRESH confirmed pending durably DEFERS (a fresh dispatch NEVER escalates the timer).
+            code, body = run_runner(r12cf.name, wf12, arguments="{}")
+            check("c12_crash_after_commit_pending", code == 9 and body.get("workflow") == "pending", (code, body))
+            check("c12_committed_once", _exec_count(base12) == 1, f"exec after commit={_exec_count(base12)} (expected 1)")
+            p_before = _put_count(base12)
+
+            # 2. let the participant's Singular lease EXPIRE (TTL 1s), then RESUME by id. Now RECOVERED:
+            #    GET-first sees 202 -> escalate (after_ms 0) -> re-PUT -> the stub reclaims the EXPIRED lease,
+            #    reruns idempotently (REPLAYED) and completes -> 200.
+            time.sleep(2.0)
+            code, body = run_runner(r12cf.name, wf12)
+            check("c12_redispatch_reclaim_completes",
+                  code == 0 and body.get("workflow") == "completed" and body.get("result") == {"sum": 6}, (code, body))
+            # 3. the recovery was a real re-PUT (not a GET-poll): exactly one additional PUT was issued.
+            check("c12_redispatch_put_issued", _put_count(base12) == p_before + 1,
+                  f"put_count {p_before}->{_put_count(base12)} (expected +1 re-dispatch PUT)")
+            # 4. effectively-once THROUGH reclaim: the reclaim rerun REPLAYS the stored result -> the body
+            #    ran exactly once across the crash + recovery.
+            check("c12_effectively_once_through_reclaim", _exec_count(base12) == 1,
+                  f"exec after reclaim={_exec_count(base12)} (expected 1)")
+            # 5. the DURABLE re-dispatch timer advanced (audit/observability): redispatch_count >= 1.
+            rc12 = _mdb(f"SELECT redispatch_count FROM tb_mf_operation WHERE workflow_id = UNHEX('{wf12}') AND operation_seq = 1")
+            check("c12_redispatch_count_advanced", rc12 and int(rc12[0][0]) >= 1, f"redispatch_count={rc12}")
+        finally:
+            stub12.terminate()
+            try:
+                stub12.wait(timeout=5)
+            except Exception:
+                stub12.kill()
+
         # 5. terminal rerun with the participant DOWN: Microflows replays the LOCAL authoritative
         # result; no dependency on the participant. MUST be the LAST stub-using block — it terminates
         # the stub and never restarts it, so any check after this would hit a dead participant.
@@ -3339,7 +3411,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 202
+    EXPECTED_CHECKS = 208
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

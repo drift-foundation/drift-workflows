@@ -468,6 +468,42 @@ checkpoints are untouched, and the durable `participant_route_unknown` reason is
 carried in the `continuation` so inspect/replay renders the same
 `{"workflow":"blocked",...}` outcome.
 
+#### 5.1.1 PUT owns reclaim; GET stays read-only (crash-after-commit recovery)
+
+A participant that **commits its side effect and crashes before recording the
+terminal result** (e.g. Singular `complete`) leaves the operation *working* with
+an unexpired lease. Its `GET` then answers **202 pending** — correctly, since
+there is not yet a durable terminal result to return. Recovery of this case is
+**coordinator-driven via PUT**; the participant contract makes the asymmetry
+explicit:
+
+- **`PUT {operation_id}` with the same input is an idempotent reassert/reclaim**,
+  never a fresh execution. A **live-working** operation (lease unexpired) ⇒ the
+  PUT returns **202** and the live lease is **never stolen**. An
+  **expired-working** operation (lease expired ⇒ the prior worker is fenced) ⇒
+  the PUT **MUST reclaim** the operation (with Singular: `resume` granting a
+  fresh attempt + rotated token), **rerun the body idempotently** (replaying the
+  already-committed effect, not re-applying it), and **complete / replay** the
+  recorded result — returning **200**.
+- **`GET` is read-only and NEVER owns reclaim.** It returns terminal | pending |
+  unknown only; it never mutates the operation's lease or attempt state. A
+  crashed-mid-commit operation therefore stays 202 under `GET` until a `PUT`
+  reclaims it — so the coordinator must re-PUT, not poll forever.
+
+Because `GET` cannot make progress on a committed-but-uncompleted operation, the
+coordinator escalates a **recovered** operation that a `GET` reports as a
+**confirmed** pending (a 202 — *not* a 5xx/transport blip) toward a
+byte-identical re-PUT, bounded by a **durable, fenced re-dispatch timer** (per
+deployment: `pending_redispatch_after_ms`, default 60000 ms; SHOULD be ≥ the
+participant lease TTL + margin). The timer lives on the durable operation row
+(forward) / checkpoint row (reverse), keyed so a resume can **never** reset its
+epoch. Within the interval the workflow defers and re-polls; once elapsed it
+**re-PUTs under the held lease** — a live participant answers 202 (re-armed,
+escalates again next interval), an expired one reclaims → 200. Unlike the 404
+reconcile budget there is **no exhaustion/block**: a re-PUT is idempotent and
+safe, so this escalates indefinitely (a genuinely broken op fails *definitively*
+via the rerun's 400 → reversal; a slow-but-alive op keeps answering 202).
+
 ### 5.2 Properties
 
 ```text
