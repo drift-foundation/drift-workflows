@@ -344,10 +344,11 @@ poll, settle, recursion guard; **no-comp reversal = no-op** in 1b; comp/T1 in 1c
 > anywhere.
 
 - **Slice 1a — frontend only (no DB/runtime).** Grammar (`call <child>@<plan_version>` + parse-only
-  `compensation`), IR `NCallWorkflow`, contract validation (child arg/return type match), **static
-  recursion/cycle check**, mermaid. **Build validation REJECTS `compensation`** ("not in this release until
-  1c") — parse, never accept-and-ignore. Pure lowering/hashing parity; **zero DB**. Unblocks everything
-  downstream.
+  `compensation`), IR `NCallWorkflow` (structural lowering/validation/hashing/mermaid). **Build REJECTS
+  `compensation`** (until 1c) and a **reachable call** (op-depth gate, until 1b). Pure lowering/hashing
+  parity; **zero DB**. *(Registry-backed child contract resolution + static cycle check moved to **1b.0**;
+  workflow return contract is **1b.0a** — see those sub-slices. The `return <expr>` statement is recognized but
+  **parse-rejected (gated) until the return_type contract lands**.)*
 - **Slice 1b — forward async-call spine, NO compensation.** Sidecar `tb_mf_call` + `call_kind`; `call_submit`
   (sibling of operation_request: spine + in-txn child create + ancestry walk + recursion guard) /
   `call_inspect` (reads the child's **authoritative** terminal) / `child_terminal_notify` (wake + status-hint
@@ -397,7 +398,85 @@ Each stage lands with its own tests (tests are part of the slice, not a pre-phas
 
 ### Slice 1b — forward async-call spine (no compensation runtime)
 
-**Schema / SP / host — `db/` + `host.drift`**
+> **1b.0a — workflows are TYPED FUNCTIONS (decided; NOT frontend-only).** A workflow has a declared
+> **argument type** AND a declared **return type**, both part of **pinned plan identity / content_hash**.
+> A workflow result is the **explicit value returned**, never "last op result"; op results stay separate
+> internal durable facts. For 1b: returns are **object-only or unit** (`unit ⇒ {}`); a **non-unit** workflow
+> must have **every successful path end in an explicit `return <expr>`**; `return <expr>` type-checks against
+> the declared return type; `fail` is the unsuccessful terminal. **Contract shape (manifest-level, inline
+> types; named types later):** `{ "arguments": { "type": {…} }, "returns": { "type": {…} } }` — changing
+> either changes the plan hash.
+> **Storage decision (override of re-derive):** the evaluated workflow return is **stored durably** as the
+> workflow's terminal result (separate from per-op results). **Terminal replay reports from stored durable
+> state — NOT graph re-derivation** (preserve "terminal replay needs no registry/config rebuild"). The parent
+> `call_inspect` reads that **stored** child return and settles the parent call op with it (existing
+> object-result path). So 1b.0a needs: `returns.type` in config + content_hash · IR validation of explicit
+> `return` (object-only/unit) · **durable workflow-terminal-result storage** · terminal-replay from the stored
+> return · child-call result binding from the child's declared return type. **`return` stays parse-gated until
+> all of that lands.**
+>
+> **Atomicity (locked).** The terminal return MUST be written **atomically with completion** — never a
+> second write after `operation_settle` already marked the workflow `completed` (a crash would leave
+> `STATE_COMPLETED` with no return, and terminal replay would have nothing authoritative to render). The
+> **final settle transition writes all three facts in ONE fenced transaction:** (a) the final op result stays
+> in `tb_mf_operation.result_json`, (b) the workflow terminal return is written to the workflow-return store,
+> (c) state → `completed`. Implication: `sp_mf_operation_settle` (or its final-settle path) accepts
+> `workflow_return_json` when `is_final=1`; the runner's finality probe keeps the `Completed(result)` value
+> and passes it into that same SP call.
+>
+> **Hash compatibility (locked).** `absent returns` ≡ an explicit **unit** return type. A **unit** return
+> type contributes the **identity/empty suffix** to `content_hash` (so every existing workflow's hash is
+> unchanged); a **non-unit** return type contributes `ir.canonical(return_type)`. Non-unit return contracts
+> are thus part of plan identity while back-compat is preserved.
+>
+> **Unit normalization (locked).** Implicit `NReturn` is `const null` internally, but the external **unit
+> result is `{}`**: a unit workflow exposes `{}` as its workflow return; **implicit unit fall-through maps to
+> `{}`**; a **non-unit** workflow **rejects implicit unit fall-through** (every path must explicit-`return`);
+> an explicit `return <expr>` for a non-unit workflow must be an **object matching `return_type`**. If an
+> explicit unit return is ever allowed, prefer **only `return {}`** — never let `return null` become an
+> app-facing result.
+>
+> **1b.0a split (frontend gate + runtime) — NOT frontend-only.** *(Found by sanity-check: microflows
+> workflows can't return typed values yet — the implicit terminal is hard-coded `const null`, there is no
+> `return` statement — so there is nothing for a parent to bind. Fixed as an explicit declared contract,
+> never inferred from last-op/terminal state.)* Because a usable `return` needs durable storage (above), the
+> work splits:
+> - **1b.0a-frontend** (parser + IR, no DB): the `return <expr>` statement + the declared `return_type` in
+>   the plan contract (an **object type** or **unit**; default unit; sourced from the manifest
+>   `returns: { type: <type> }` for now — a `.mf` `returns` block can come later), folded into `content_hash`
+>   per the hash-compatibility rule. **IR validation:** an explicit `return` is **object-only** and
+>   type-checks against `return_type`. For a **non-unit** `return_type`, the build **rejects ANY successful
+>   path that reaches the implicit unit fall-through** — *every* successful exit must produce `return_type`
+>   via an explicit `return`. (This is **stricter** than "no reachable `return`": a graph that `return`s on
+>   one branch and falls through on another is rejected.) Unit lets a path fall through.
+> - **1b.0a-runtime** (schema + SP + runner): the durable workflow-terminal-return store + the **atomic final
+>   settle** + the runner finality probe passing `Completed(result)` into it + **terminal replay from the
+>   stored return**. This is the increment that **un-gates `return`**.
+> - **Parent binding (lands in 1b.0):** resolve `call child@plan_version` → the child's **declared**
+>   `return_type`; `result <call_id>.foo` is allowed **only if** the child return type has field `foo`;
+>   **unit** ⇒ all `result <call_id>.*` paths rejected.
+>
+> **Sub-slice order (decided).** 1b.0a (return contract) → **1b.0 = build-time registry validation gate** (no DB, no runtime):
+> resolve `call <child>@<plan_version>` against the manifest registry by **exact plan identity**; validate
+> the call input against the child's declared **arg/input** contract; **bind the child `return` type** so
+> `result <call_id>.path` validates downstream; **reject static call cycles at build**; keep `compensation`
+> rejected until 1c. **Only after 1b.0 passes** → **1b.1 = runtime spine** (`tb_mf_call`, `call_submit`,
+> `call_inspect`, `notify`, runner await/settle/recovery + the runtime recursion guard). Rationale:
+> runnable calls without build-time child-contract validation would push author/config mistakes (missing
+> child, wrong version, wrong input/return shape, obvious cycles) into durable execution — the exact
+> complexity leak we avoid. The runtime recursion guard stays (defense-in-depth for depth/ancestry +
+> registry/deploy edge cases) but does **not** replace static cycle rejection.
+>
+> **`max_call_depth` — default 16.** Config: `deployment.workflow_call.max_call_depth` (integer, **≥1**,
+> recommended hard cap **≤64**; omitted → **16**). Exceeded → fail the call with durable reason
+> `max_call_depth_exceeded`, following normal call-rejection semantics (§4 `failed`).
+>
+> **IR build-block inversion (1b.1 core, the inverse of 1a).** 1a made calls un-runnable two ways; 1b.1
+> undoes both and makes a call a first-class durable step: (a) `advance` gains `StepOutcome::NeedCall` and
+> emits it (a *settled* call → continue, like a settled op) instead of faulting; (b) `_node_depths` **counts**
+> a call as `depth+1` (so `plan_length` / plan-ordering / finality include calls) instead of rejecting it.
+
+**1b.1 — Schema / SP / host — `db/` + `host.drift`**
 - [ ] Migration `0003_workflow_call.sql`:
       - `tb_mf_operation`: add **only** `call_kind ENUM('participant','child_workflow')` (default
         `participant`). `operation_id = child_workflow_id`, `operation_name = child_script_name`,

@@ -64,14 +64,30 @@ handle plan hashes, parent links, leases/fences, notify/poll mechanics, or check
 
 ## Current Scope
 
-Design complete (`DESIGN.md`); **slice 1a (frontend only — no DB, no runtime) is the active build scope.**
-Overall feature:
+**Slice 1a is mainlined** (commit `62555a4`: `call` grammar → `NCallWorkflow` IR, structural validation,
+build-block of reachable calls + `compensation`). **Active scope: slice 1b — forward async-call spine, no
+compensation runtime.** Sub-order (decided): **1b.0a** (workflow return contract) → **1b.0** (registry
+validation gate) → **1b.1** (IR build-block inversion + schema/SP/host + runner) → **1b.2** (acceptance).
 
-- any workflow step may be a child workflow;
-- child workflow owns its own durable state;
-- parent treats the child call as one forward step/checkpoint with result data flow;
-- compensations may be workflows;
-- dynamic fan-out uses stable child workflow ids, not operation occurrence indexes.
+### 1b.0a status (in progress) — **workflows are typed functions** (decided)
+- **`return <expr>` statement added to the parser** but **PARSE-GATED** (rejected like `fan`/`on failed`)
+  until the full typed-return contract lands — the lowering (`KReturn`→`_return_value_node`) is kept dormant.
+  Gate fixture: `err_return_unsupported`. Parser gate 99/99.
+- **Decisions RESOLVED** (was the open storage question): **object-only or unit** workflow returns
+  (unit ⇒ `{}`); a **durable workflow-terminal-return store** holds the evaluated return **separate** from
+  per-op results; it is written **atomically with completion** (the final settle writes final-op result +
+  workflow return + `state=completed` in ONE fenced txn; `sp_mf_operation_settle` takes `workflow_return_json`
+  when `is_final=1`); **terminal replay reads the stored return — NOT graph re-derivation**; hash policy:
+  absent≡unit, unit = empty suffix (existing hashes unchanged), non-unit = `ir.canonical(return_type)`.
+- **Remaining to un-gate (the 1b.0a build plan, each gated):** (1) IR return-contract validation (object-only;
+  non-unit ⇒ every successful path explicit-`return`, reject implicit unit fall-through); (2) `returns.type`
+  in config + content_hash; (3) durable return store + atomic final settle (schema/SP); (4) runner finality
+  probe passes `Completed(result)` (today **discarded** at `runner.drift:~1773` — reports the last op result);
+  (5) terminal replay from the stored return; (6) child-call result binding (in 1b.0); then un-gate.
+
+Overall feature: any workflow step may be a child workflow; the child owns its durable state; the parent
+treats the call as one forward step/checkpoint with result data flow; compensations may be workflows (1c);
+fan-out uses stable child ids (slice 3).
 
 ## Verification
 

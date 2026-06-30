@@ -157,7 +157,8 @@ variant StmtKind {
 	KIf(cond: json.JsonNode, then_body: Array<Stmt>, else_body: Array<Stmt>, merge: Optional<MergeSpec>), // if … else … [merge …] — cond = lowered selector expr
 	KCase(scrut: json.JsonNode, arms: Array<SCaseArm>, default_body: Array<Stmt>, merge: Optional<CaseMergeSpec>), // case … [merge …] — scrut = lowered selector expr
 	KFail(reason: json.JsonNode),                                             // authored fail — terminal; reason = lowered String expr
-	KCall(bind: Optional<String>, child: String, plan_version: String, input: json.JsonNode, comp: Optional<CompRef>) // workflow call — `[let <bind> =] call <child>@<ver> { <input> } [compensation <wf>@<ver>]` (composition slice 1a)
+	KCall(bind: Optional<String>, child: String, plan_version: String, input: json.JsonNode, comp: Optional<CompRef>), // workflow call — `[let <bind> =] call <child>@<ver> { <input> } [compensation <wf>@<ver>]` (composition slice 1a)
+	KReturn(value: json.JsonNode)                                             // `return <expr>` — the value the workflow EXPORTS (composition 1b.0a); terminal. Validated vs the declared return_type.
 }
 // A parsed `compensation <wf>@<plan_version>` clause on a call (composition slice 1a). PARSED here but
 // the IR build REJECTS it until slice 1c — captured so the rejection can name the child + version.
@@ -524,6 +525,7 @@ fn _parse_stmt(c: &mut Cursor) -> Stmt {
 	if _str_eq(&kw, &"let") { return _parse_let(c, move id); }
 	if _str_eq(&kw, &"fail") { return _parse_fail(c, move id); }
 	if _str_eq(&kw, &"call") { return _parse_call(c, move id, Optional<String>::None()); }
+	if _str_eq(&kw, &"return") { return _parse_return(c, move id); }
 	if _str_eq(&kw, &"fan") { throw ParseError(code = "unsupported-in-release", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "fan", message = "`fan` (fan-out) is not in this release (composition slice 3)"); }
 	// op_step: `kw` is the operation name, followed by an INPUT EXPRESSION (a `{…}` const object,
 	// or `const`/`arg`/`local` — slice 2b-i). The runtime requires the op input to be an object;
@@ -546,6 +548,23 @@ fn _parse_stmt(c: &mut Cursor) -> Stmt {
 fn _parse_fail(c: &mut Cursor, var id: String) -> Stmt {
 	val reason = _parse_fail_reason(c);
 	return Stmt(id = move id, kind = StmtKind::KFail(reason = move reason));
+}
+
+// return_stmt := 'return' <expr> — the value the workflow EXPORTS to its caller (composition 1b.0a). A
+// TERMINAL statement (like `fail`): no successor; statements after it in the same block are unreachable.
+// `<expr>` is any value expression (const / arg / local / result / object / array).
+//
+// GATED until the return contract lands: `return` is recognized but PARSE-REJECTED here (throws
+// `unsupported-in-release`), because a usable `return` requires (a) a declared `return_type` it validates
+// against [1b.0a], (b) a durable + client-visible
+// workflow-return path in the runner [today the runner discards `advance`'s NReturn value and reports the last
+// op result], and (c) a resolved return value shape vs `tb_mf_operation` (object-only) storage. Shipping the
+// syntax without the contract would let free-form returns into durable execution. The lowering below
+// (`KReturn` → `_return_value_node`) is kept dormant for when the contract lands. `return` is a reserved
+// statement keyword (never an operation name).
+fn _parse_return(c: &mut Cursor, var id: String) -> Stmt {
+	val _ = id;
+	throw ParseError(code = "unsupported-in-release", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "return", message = "`return <expr>` (workflow return value) is not available until the return_type contract lands (composition 1b.0a)");
 }
 
 fn _parse_fail_reason(c: &mut Cursor) -> json.JsonNode {
@@ -1263,6 +1282,7 @@ fn _stmts_fall_through(stmts: &Array<Stmt>) nothrow -> Bool {
 fn _stmt_falls_through(s: &Stmt) nothrow -> Bool {
 	match &s.kind {
 		StmtKind::KFail(reason) => { return false; },
+		StmtKind::KReturn(value) => { return false; },   // terminal: an explicit `return` exports the value (no fall-through)
 		StmtKind::KIf(cond, then_body, else_body, merge) => {
 			match merge { Optional::Some(ms) => { return true; }, Optional::None => {} }
 			if else_body.len == 0 { return true; }   // no else: the false path falls through
@@ -1323,6 +1343,11 @@ fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 			// Terminal: NFail has no successor (`succ` ignored). Any statement after `fail` in the same
 			// block is unreachable; the graph reachability check surfaces it.
 			out.push(_fail_node(&stmt.id, reason));
+		},
+		StmtKind::KReturn(value) => {
+			// Terminal: an explicit `return <expr>` is an NReturn carrying the exported value (`succ`
+			// ignored). Same node kind as the implicit unit terminal, just a non-unit value. Composition 1b.0a.
+			out.push(_return_value_node(&stmt.id, value));
 		},
 		StmtKind::KCall(bind, child, plan_version, input, comp) => {
 			// A workflow call is one forward step (like a named op); the binder was only the parse-time
@@ -1559,6 +1584,17 @@ fn _return_node(id: &String) -> json.JsonNode {
 	var ce = json.new_object();
 	ce.set("const", json.JsonNode::Null());
 	o.set("value", ce.to_node());
+	return o.to_node();
+}
+
+// An explicit `return <expr>` node: the same `{"kind":"return","id","value"}` shape as the implicit unit
+// terminal, but carrying the parsed value EXPRESSION (already a {const:…}/{arg:…}/{local:…}/{result:…}/
+// {object:…}/{array:…} node). Composition 1b.0a.
+fn _return_value_node(id: &String, value: &json.JsonNode) -> json.JsonNode {
+	var o = json.new_object();
+	o.set("kind", _jstr("return"));
+	o.set("id", _jstr(_dup(id)));
+	o.set("value", value.clone_deep());
 	return o.to_node();
 }
 
