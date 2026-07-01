@@ -90,6 +90,30 @@ fn _vrc_accepts(text: &String, rt: &Optional<ir.IrType>) -> Bool {
 	match _vrc(text, rt) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
 }
 
+// 1b.0a (step 3 follow-up): parse a graph config, then run `type_check_graph` against a declared
+// `return_type` — pins the STRUCTURAL return-expression check (an explicit return VALUE'S SHAPE,
+// not just terminal-reachability, which `_vrc`/`validate_return_contract` above already owns).
+// arg_type is always the empty object (these fixtures never reference EArg).
+fn _tc_rt(text: &String, rt: &Optional<ir.IrType>) -> Optional<String> {
+	val at = ir.empty_object_type();
+	val no_contracts: Array<ir.OpContract> = [];
+	match json.parse_strict(text) {
+		core.Result::Ok(n) => {
+			match ir.parse_graph(&n) {
+				core.Result::Ok(g) => { return ir.type_check_graph(&g, &at, &no_contracts, rt); },
+				core.Result::Err(e) => { return Optional<String>::Some("parse-failed"); }
+			}
+		},
+		core.Result::Err(e) => { return Optional<String>::Some("json-failed"); }
+	}
+}
+fn _tc_rt_rejects(text: &String, rt: &Optional<ir.IrType>) -> Bool {
+	match _tc_rt(text, rt) { Optional::Some(m) => { return true; }, Optional::None => { return false; } }
+}
+fn _tc_rt_accepts(text: &String, rt: &Optional<ir.IrType>) -> Bool {
+	match _tc_rt(text, rt) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
+}
+
 // Parse an IR value type from its JSON encoding (for type-checker tests).
 fn _pt(text: &String) -> ir.IrType {
 	match json.parse_strict(text) {
@@ -98,7 +122,7 @@ fn _pt(text: &String) -> ir.IrType {
 	}
 }
 fn _tc_ok(g: &ir.IrGraph, at: &ir.IrType, cs: &Array<ir.OpContract>) nothrow -> Bool {
-	match ir.type_check_graph(g, at, cs) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
+	match ir.type_check_graph(g, at, cs, &Optional<ir.IrType>::None()) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
 }
 
 fn _seq(a: &String, b: &String) nothrow -> Bool {
@@ -890,6 +914,38 @@ fn scenario() -> Int {
 	if !_vrc_rejects(&g_ret_obj, &rt_scalar) { return 176; }
 	// unit: fall-through is allowed on any path (mixed graph accepted under unit).
 	if !_vrc_accepts(&g_if_mixed, &rt_unit) { return 177; }
+
+	// ===== composition 1b.0a (step 3 follow-up): STRUCTURAL return-expression check =====
+	// validate_return_contract (above) only checks TERMINAL SHAPE (is there an explicit return at
+	// all). Now that the workflow return is a public/durable field (step 3), a DECLARED (non-unit)
+	// return type's return VALUE's SHAPE must also be checked at build time — via type_check_graph,
+	// reusing the exact machinery an operation's input is checked against its contract with — not
+	// discovered later at the host/SP boundary (a scalar or wrong-shaped object would otherwise
+	// SIGNAL mid-settle instead of failing invalid_config at build).
+	val g_ret_scalar = "{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":5}}]}";
+	val rt_obj_x = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"x\",\"type\":{\"type\":\"int\"}}]}"));
+	// positive control: the returned object EXACTLY matches the declared shape -> accepted.
+	if !_tc_rt_accepts(&g_ret_obj, &rt_obj_x) { return 178; }
+	// UNIT (return_type=None) is DELIBERATELY NOT structurally constrained here — `type_check_graph`
+	// is the general-purpose graph type-checker, used by a large body of PRE-EXISTING tests that
+	// author arbitrary manual graphs (unrelated to 1b.0a) with `return <expr>` under no declared
+	// return type at all; constraining every such graph to a `{}`-shaped return here would reject
+	// that whole pre-existing surface (this was tried and reverted — it broke check 140's `gty1`,
+	// an NIf-condition-typecheck fixture that returns a plain int under `return_type=None`). The
+	// real "a unit workflow's PERSISTED/REPORTED answer is always `{}`" invariant is enforced by
+	// NORMALIZATION at the runner/settle boundary instead (`_workflow_return_for_settle` in
+	// runner.drift ignores the graph's return value entirely for a unit script) — so here, an
+	// explicit non-`{}` object return under unit is simply not rejected; the runner never
+	// consults it.
+	if !_tc_rt_accepts(&g_ret_obj, &rt_unit) { return 179; }
+	// non-unit object return type + a SCALAR return -> REJECTED.
+	if !_tc_rt_rejects(&g_ret_scalar, &rt_obj_x) { return 180; }
+	// non-unit object return type + WRONG object shape (declared empty, returned has extra field
+	// "x") -> REJECTED. (validate_return_contract accepts this same pairing at line 172/905 above —
+	// it only checks terminal shape; type_check_graph is what catches the field mismatch.)
+	if !_tc_rt_rejects(&g_ret_obj, &rt_obj) { return 181; }
+	// unit: the pure fall-through sentinel is still accepted (unchanged).
+	if !_tc_rt_accepts(&g_ret_null, &rt_unit) { return 182; }
 
 	return 0;
 }

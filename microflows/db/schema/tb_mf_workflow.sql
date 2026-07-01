@@ -84,6 +84,13 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow` (
 	-- the SAME client outcome deterministically (never recomputed locally). NULL on
 	-- non-failure terminals (completed). Width kept consistent with the SP/host plumbing.
 	`terminal_reason` varchar(190) NULL,
+	-- Durable workflow TERMINAL RETURN (1b.0a step 3) — the authoritative typed workflow
+	-- return, separate from any per-operation result (tb_mf_operation.result_json). Set
+	-- ATOMICALLY with completion by sp_mf_operation_settle's final-settle branch (the SAME
+	-- UPDATE that flips state->completed), never a second write. Unit workflows store the
+	-- literal `{}`; NULL on every non-completed state (see ck_mf_workflow_state_return).
+	-- Terminal replay reads this column directly — never re-derives from the graph.
+	`workflow_return_json` mediumtext NULL,
 	`created_at` datetime(6) NOT NULL,
 	`updated_at` datetime(6) NOT NULL,
 	PRIMARY KEY (`workflow_id`),
@@ -108,5 +115,15 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow` (
 	CONSTRAINT `ck_mf_workflow_lease_pair` CHECK (
 		(`lease_owner` IS NULL AND `lease_expires_at` IS NULL)
 		OR (`lease_owner` IS NOT NULL AND `lease_expires_at` IS NOT NULL)
+	),
+	-- (state, workflow_return_json) representability (mirror of the (state, disposition)/
+	-- (state, direction) checks above): completed carries a valid JSON-object return; every
+	-- other state carries none. No writer path sets this column outside the SAME statement
+	-- that also sets state=4, so this holds by construction — defense-in-depth, not a
+	-- constraint any real writer path depends on to avoid violating.
+	CONSTRAINT `ck_mf_workflow_state_return` CHECK (
+		(`state` = 4 AND `workflow_return_json` IS NOT NULL
+			AND json_valid(`workflow_return_json`) AND json_type(`workflow_return_json`) = 'OBJECT')
+		OR (`state` <> 4 AND `workflow_return_json` IS NULL)
 	)
 ) ENGINE=InnoDB;

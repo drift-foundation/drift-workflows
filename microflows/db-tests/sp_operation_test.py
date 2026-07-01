@@ -112,22 +112,43 @@ def main():
                  "echo-transform", 1, '{"values":[2]}', "h2", '{"pos":"d"}', ts(6), "{}"))
     check("request_stale_token_fence_lost", r and r["outcome"] == "fence_lost", r)
 
+    # 1b.0a step 3: arg_workflow_return_json validity is an ENTRY check (SIGNAL, like the
+    # other 9 entry checks — fires before any row lookup, so these use otherwise-valid args
+    # and never touch WF's still-unsettled op 1).
+    # final=1 with a NULL/missing return -> MfWorkflowReturnJsonInvalid.
+    ok, err = call(cur, "sp_mf_operation_settle",
+                   (WF, EXEC, token, 1, OPID, 1, '{"sum":1}', '{"sum":1}', None, '{"pos":"done"}', ts(7), "{}", 1))
+    check("settle_final_missing_return_signals", (not ok) and "MfWorkflowReturnJsonInvalid" in str(err), (ok, err))
+    # final=1 with a non-object return (JSON array) -> MfWorkflowReturnJsonInvalid.
+    ok, err = call(cur, "sp_mf_operation_settle",
+                   (WF, EXEC, token, 1, OPID, 1, '{"sum":1}', '{"sum":1}', "[1,2]", '{"pos":"done"}', ts(7), "{}", 1))
+    check("settle_final_non_object_return_signals", (not ok) and "MfWorkflowReturnJsonInvalid" in str(err), (ok, err))
+    # final=0 with a non-NULL return -> MfWorkflowReturnJsonUnexpected.
+    ok, err = call(cur, "sp_mf_operation_settle",
+                   (WF, EXEC, token, 1, OPID, 1, '{"sum":1}', '{"sum":1}', "{}", '{"pos":"done"}', ts(7), "{}", 0))
+    check("settle_nonfinal_smuggled_return_signals", (not ok) and "MfWorkflowReturnJsonUnexpected" in str(err), (ok, err))
+
     # Settle with the WRONG operation_id must conflict (never settle op 1 with
     # another operation's response).
     _, r = call(cur, "sp_mf_operation_settle",
-                (WF, EXEC, token, 1, WRONG_OPID, 1, '{"sum":1}', '{"sum":1}', '{"pos":"done"}', ts(7), "{}", 1))
+                (WF, EXEC, token, 1, WRONG_OPID, 1, '{"sum":1}', '{"sum":1}', "{}", '{"pos":"done"}', ts(7), "{}", 1))
     check("settle_wrong_opid_conflict", r and r["outcome"] == "operation_conflict", r)
 
     # Settle (correct id, final), then repeated settle is idempotent.
     _, r = call(cur, "sp_mf_operation_settle",
-                (WF, EXEC, token, 1, OPID, 1, '{"sum":1}', '{"sum":1}', '{"pos":"done"}', ts(8), "{}", 1))
+                (WF, EXEC, token, 1, OPID, 1, '{"sum":1}', '{"sum":1}', "{}", '{"pos":"done"}', ts(8), "{}", 1))
     check("settle", r and r["outcome"] == "settled" and r["result"] == {"sum": 1}, r)
 
     _, r = call(cur, "sp_mf_operation_settle",
-                (WF, EXEC, token, 1, OPID, 1, '{"sum":1}', '{"sum":1}', '{"pos":"done"}', ts(9), "{}", 1))
+                (WF, EXEC, token, 1, OPID, 1, '{"sum":1}', '{"sum":1}', "{}", '{"pos":"done"}', ts(9), "{}", 1))
     check("settle_idempotent", r and r["outcome"] == "already_settled" and r["result"] == {"sum": 1}, r)
 
-    # Final invariants: workflow completed (state 4, disp 1, lease cleared), op succeeded, checkpoint present.
+    # PRIMARY acceptance (1b.0a step 3): final settle stored workflow_return_json atomically
+    # with completion — read it back directly off tb_mf_workflow (mirrors what
+    # sp_mf_workflow_inspect exposes).
+    cur.execute("SELECT workflow_return_json FROM tb_mf_workflow WHERE workflow_id=%s", (WF,))
+    (wrj,) = cur.fetchone()
+    check("workflow_return_json_stored_atomically", wrj == "{}", wrj)
     cur.execute("SELECT state, current_disposition, lease_owner FROM tb_mf_workflow WHERE workflow_id=%s", (WF,))
     state, disp, owner = cur.fetchone()
     check("workflow_completed", state == 4 and disp == 1 and owner is None, (state, disp, owner))
@@ -146,6 +167,10 @@ def main():
     _, r = call(cur, "sp_mf_workflow_inspect", (WF, ts(10)))
     check("inspect_terminal", r and r["outcome"] == "found" and r["state"] == 4
           and r["is_terminal"] == 1 and r["leased"] == 0, r)
+    # PRIMARY acceptance (1b.0a step 3): terminal replay (sp_mf_workflow_inspect) reads the
+    # durable workflow_return_json — the SAME value stored atomically by the final settle
+    # above, read back with NO graph/config involved (never re-derived).
+    check("inspect_terminal_workflow_return", r and r.get("workflow_return_json") == {}, r)
     _, r = call(cur, "sp_mf_workflow_inspect", (absent, ts(10)))
     check("inspect_absent_not_found", r and r["outcome"] == "not_found", r)
 
@@ -158,6 +183,8 @@ def main():
     _, r = call(cur, "sp_mf_workflow_inspect", (wf2, ts(1)))
     check("inspect_active_leased", r and r["outcome"] == "found"
           and r["is_terminal"] == 0 and r["leased"] == 1, r)
+    # Not yet completed -> workflow_return_json is durably NULL (JSON null in the response).
+    check("inspect_active_no_workflow_return", r and r.get("workflow_return_json") is None, r)
     for t in ("tb_mf_workflow_args", "tb_mf_workflow_event", "tb_mf_workflow"):
         cur.execute(f"DELETE FROM {t} WHERE workflow_id = %s", (wf2,))
 
@@ -188,7 +215,7 @@ def main():
     check("request_skew_defer_until", r and r["outcome"] == "event_time_skew"
           and r["defer_until"] == "2026-02-01 13:00:07.000000", r)
     _, r = call(cur, "sp_mf_operation_settle",
-                (wf3, EXEC, tok3, 1, OPID3, 1, '{"sum":2}', '{"sum":2}', '{"pos":"done"}', T(2), "{}", 1))
+                (wf3, EXEC, tok3, 1, OPID3, 1, '{"sum":2}', '{"sum":2}', "{}", '{"pos":"done"}', T(2), "{}", 1))
     check("settle_skew_defer_until", r and r["outcome"] == "event_time_skew"
           and r["defer_until"] == "2026-02-01 13:00:07.000000", r)
 
@@ -373,19 +400,19 @@ def main():
     call(cur, "sp_mf_operation_request",
          (wf5, EXEC, tok5, 1, op5a, "reserve", 1, '{"reservation":"m1"}', "h1", '{"pos":"op:1:dispatched"}', T(2), "{}"))
     _, r = call(cur, "sp_mf_operation_settle",
-                (wf5, EXEC, tok5, 1, op5a, 1, '{"reserved":"m1"}', '{"reservation":"m1"}', '{"pos":"x"}', T(3), "{}", 1))
+                (wf5, EXEC, tok5, 1, op5a, 1, '{"reserved":"m1"}', '{"reservation":"m1"}', "{}", '{"pos":"x"}', T(3), "{}", 1))
     check("settle_finality_violation", r and r["outcome"] == "plan_violation" and r["reason"] == "finality_early", r)
     # A seq OUTSIDE the pinned plan (seq 3 of a 2-step plan) is rejected.
     _, r = call(cur, "sp_mf_operation_settle",
-                (wf5, EXEC, tok5, 3, op5a, 3, '{"reserved":"m1"}', '{"reservation":"m1"}', '{"pos":"x"}', T(3), "{}", 0))
+                (wf5, EXEC, tok5, 3, op5a, 3, '{"reserved":"m1"}', '{"reservation":"m1"}', None, '{"pos":"x"}', T(3), "{}", 0))
     check("settle_seq_out_of_range", r and r["outcome"] == "plan_violation" and r["reason"] == "seq_out_of_range", r)
     # A checkpoint_seq that does not map to the operation_seq is rejected.
     _, r = call(cur, "sp_mf_operation_settle",
-                (wf5, EXEC, tok5, 1, op5a, 2, '{"reserved":"m1"}', '{"reservation":"m1"}', '{"pos":"x"}', T(3), "{}", 0))
+                (wf5, EXEC, tok5, 1, op5a, 2, '{"reserved":"m1"}', '{"reservation":"m1"}', None, '{"pos":"x"}', T(3), "{}", 0))
     check("settle_checkpoint_mismatch", r and r["outcome"] == "plan_violation" and r["reason"] == "checkpoint_mismatch", r)
     # The correct INTERMEDIATE settle (is_final=0, checkpoint_seq=seq) for seq 1 succeeds.
     _, r = call(cur, "sp_mf_operation_settle",
-                (wf5, EXEC, tok5, 1, op5a, 1, '{"reserved":"m1"}', '{"reservation":"m1"}', '{"pos":"op:1:settled"}', T(3), "{}", 0))
+                (wf5, EXEC, tok5, 1, op5a, 1, '{"reserved":"m1"}', '{"reservation":"m1"}', None, '{"pos":"op:1:settled"}', T(3), "{}", 0))
     check("settle_intermediate", r and r["outcome"] == "settled", r)
     cur.execute("SELECT state, current_disposition, lease_owner, fencing_token FROM tb_mf_workflow WHERE workflow_id=%s", (wf5,))
     st, disp, owner, ftok = cur.fetchone()
@@ -400,8 +427,19 @@ def main():
                 (wf5, EXEC, tok5, 2, op5b, "reserve", 1, '{"reservation":"m2"}', "h2", '{"pos":"op:2:dispatched"}', T(4), "{}"))
     check("intermediate_next_request_same_token", r and r["outcome"] == "requested", r)
     _, r = call(cur, "sp_mf_operation_settle",
-                (wf5, EXEC, tok5, 2, op5b, 2, '{"reserved":"m2"}', '{"reservation":"m2"}', '{"pos":"complete"}', T(5), "{}", 1))
+                (wf5, EXEC, tok5, 2, op5b, 2, '{"reserved":"m2"}', '{"reservation":"m2"}', "{}", '{"pos":"complete"}', T(5), "{}", 1))
     check("settle_final", r and r["outcome"] == "settled", r)
+
+    # SECONDARY / resilience (1b.0a step 3): a lost-ack retry of the SAME final settle is
+    # idempotent (already_settled) and does NOT re-write workflow_return_json — even with a
+    # DIFFERENT value on the retry, the ORIGINALLY stored value is untouched (no second write).
+    _, r = call(cur, "sp_mf_operation_settle",
+                (wf5, EXEC, tok5, 2, op5b, 2, '{"reserved":"m2"}', '{"reservation":"m2"}', '{"different":true}', '{"pos":"complete"}', T(5), "{}", 1))
+    check("settle_final_retry_already_settled", r and r["outcome"] == "already_settled", r)
+    cur.execute("SELECT workflow_return_json FROM tb_mf_workflow WHERE workflow_id=%s", (wf5,))
+    (wrj5,) = cur.fetchone()
+    check("settle_final_retry_no_second_write", wrj5 == "{}", wrj5)
+
     cur.execute("SELECT state, current_disposition, lease_owner FROM tb_mf_workflow WHERE workflow_id=%s", (wf5,))
     st, disp, owner = cur.fetchone()
     cur.execute("SELECT COUNT(*) FROM tb_mf_workflow_checkpoint WHERE workflow_id=%s", (wf5,))
@@ -987,7 +1025,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: if a check is accidentally deleted or bypassed, the
     # ran-count drifts from this manifest and the run FAILS (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 148
+    EXPECTED_CHECKS = 156
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

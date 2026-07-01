@@ -142,7 +142,13 @@ pub struct WorkflowSnapshot {
 	pub is_terminal: Bool,
 	pub leased: Bool,                // an unexpired lease is held at db_now
 	pub continuation_json: String,
-	pub terminal_reason: String      // durable failure reason on a terminal failure (5/7); "" otherwise
+	pub terminal_reason: String,     // durable failure reason on a terminal failure (5/7); "" otherwise
+	// Durable workflow TERMINAL RETURN (1b.0a step 3) — the AUTHORITATIVE typed
+	// workflow return (separate from any per-operation result). `None` until
+	// completed (state=4); ALWAYS `Some` once completed (the schema guarantees a
+	// valid JSON-object value there). Read directly here — never re-derived from
+	// the graph.
+	pub workflow_return_json: Optional<String>
 }
 
 pub variant WorkflowInspectOutcome {
@@ -568,9 +574,14 @@ pub interface MicroflowsHost {
 	// Record a durable operation SUCCESS + Checkpoint + advanced continuation,
 	// completing the workflow, atomically. Fenced; identify-first; idempotent
 	// (AlreadySettled.result is authoritative).
+	// `workflow_return_json` (1b.0a step 3) is the workflow's AUTHORITATIVE typed
+	// return, separate from `result_json` (the per-operation result): `Some(json)`
+	// on a final settle (`is_final=true`), `None` on a non-final one — the SP
+	// requires exactly this (a JSON object iff final, SQL NULL otherwise).
 	fn operation_settle(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
 	                    operation_seq: Int, operation_id: &Array<Byte>, checkpoint_seq: Int,
-	                    result_json: &String, checkpoint_payload: &String, new_continuation: &String,
+	                    result_json: &String, checkpoint_payload: &String,
+	                    workflow_return_json: &Optional<String>, new_continuation: &String,
 	                    event_ts: &String, event_payload: &String, is_final: Bool) -> OperationSettleOutcome;
 	// Read the LOCAL authoritative operation result (participant-independent).
 	fn operation_result(self: &Self, workflow_id: &Array<Byte>, operation_seq: Int) -> OperationResultOutcome;
@@ -1442,7 +1453,8 @@ implement MicroflowsHost for HostImpl {
 
 	pub fn operation_settle(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
 	                        operation_seq: Int, operation_id: &Array<Byte>, checkpoint_seq: Int,
-	                        result_json: &String, checkpoint_payload: &String, new_continuation: &String,
+	                        result_json: &String, checkpoint_payload: &String,
+	                        workflow_return_json: &Optional<String>, new_continuation: &String,
 	                        event_ts: &String, event_payload: &String, is_final: Bool) -> OperationSettleOutcome {
 		_validate_id16("workflow_id", workflow_id);
 		_validate_id16("operation_id", operation_id);
@@ -1462,6 +1474,7 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_int(checkpoint_seq));
 			args.push(_json_object_arg("result_json", result_json));
 			args.push(_json_object_arg("checkpoint_payload", checkpoint_payload));
+			args.push(_json_object_or_null_arg("workflow_return_json", workflow_return_json));
 			args.push(_json_object_arg("continuation", new_continuation));
 			args.push(rpc.arg_string(_dup(event_ts)));
 			args.push(_meta_object_arg("event_payload", event_payload));
@@ -1547,7 +1560,8 @@ implement MicroflowsHost for HostImpl {
 					is_terminal = terminal != 0,
 					leased = leased != 0,
 					continuation_json = move continuation,
-					terminal_reason = _doc_str_opt(&doc, &"terminal_reason")
+					terminal_reason = _doc_str_opt(&doc, &"terminal_reason"),
+					workflow_return_json = _doc_object_text_opt(&doc, &"workflow_return_json")
 				));
 			}
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:inspect_workflow"));
@@ -2002,6 +2016,22 @@ fn _meta_object_arg(field: String, s: &String) -> rpc.RpcArg {
 	throw HostException(kind = HostErrorKind::InvalidJson(field = move field));
 }
 
+// A GENUINELY OPTIONAL JSON object document argument — unlike `_meta_object_arg`
+// (absent -> the empty document `{}`), `None` here means SQL NULL, not `{}` (1b.0a
+// step 3: `workflow_return_json` is required present-and-object on a final settle,
+// required NULL on a non-final one — the SP itself enforces which via arg_is_final,
+// so this helper only enforces object-shape when `Some`, never substituting a value).
+fn _json_object_or_null_arg(field: String, opt: &Optional<String>) -> rpc.RpcArg {
+	match opt {
+		Optional::None => { return rpc.arg_null(); },
+		Optional::Some(s) => {
+			if s.byte_length() == 0 { throw HostException(kind = HostErrorKind::InvalidJson(field = move field)); }
+			if _is_json_object(s) { return rpc.arg_string(_dup(s)); }
+			throw HostException(kind = HostErrorKind::InvalidJson(field = move field));
+		}
+	}
+}
+
 fn _dup(s: &String) nothrow -> String {
 	val n = s.byte_length();
 	var buf = io.buffer(n);
@@ -2188,6 +2218,23 @@ fn _doc_object_text_req(doc: &json.JsonNode, key: &String) -> String {
 			return json.encode_compact(n);
 		},
 		Optional::None => { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "doc-field-missing")); }
+	}
+}
+
+// Optional JSON-object document field: `None` when the key is missing or JSON null
+// (e.g. workflow_return_json before completion — `_doc_object_text_req`'s "" sentinel
+// trick doesn't work here since `{}` is itself a meaningful, distinct value from
+// "absent"). Present-but-non-object is still a backend contract violation.
+fn _doc_object_text_opt(doc: &json.JsonNode, key: &String) -> Optional<String> {
+	match doc.get(key) {
+		Optional::Some(n) => {
+			if n.is_null() { return Optional<String>::None(); }
+			var is_obj = false;
+			match n.as_object() { Optional::Some(_) => { is_obj = true; }, Optional::None => {} }
+			if !is_obj { throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "doc-field-not-object")); }
+			return Optional<String>::Some(json.encode_compact(n));
+		},
+		Optional::None => { return Optional<String>::None(); }
 	}
 }
 

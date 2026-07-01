@@ -126,8 +126,13 @@ fn _admission_label(a: &AdmissionState) nothrow -> String {
 // exit varies independently of the status (e.g. an `aborted` is 2 / 3 / 8 by cause). JSON shape and
 // exit codes are byte-compatible with the prior inline form (pinned by the integration suite).
 variant Outcome {
-	Completed(operation_id: String, result: String),       // exit 0
-	AlreadyTerminal(operation_id: String, result: String), // exit 0
+	// `result` is retained for compatibility/debugging ONLY — the last settled
+	// operation's raw result, unchanged meaning (1b.0a step 3). `workflow_return`
+	// is the AUTHORITATIVE typed workflow/function return (unit `{}` today, since
+	// `return` stays parse-gated; the real explicit value once un-gated) — this is
+	// what a caller/parent should trust as the workflow's answer.
+	Completed(operation_id: String, result: String, workflow_return: String),       // exit 0
+	AlreadyTerminal(operation_id: String, result: String, workflow_return: String), // exit 0
 	TerminalFailure(reason: String, compensated: Bool),    // exit 3: terminal failed; compensated = real unwind ran
 	ResolvedException,                                     // exit 0
 	TerminalState(state: Int),                             // exit 0
@@ -147,8 +152,8 @@ variant Outcome {
 
 fn _oc_render(o: &Outcome) nothrow -> String {
 	match o {
-		Outcome::Completed(operation_id, result) => { return "{\"workflow\":\"completed\",\"operation_id\":\"" + _dup(operation_id) + "\",\"result\":" + _dup(result) + "}"; },
-		Outcome::AlreadyTerminal(operation_id, result) => { return "{\"workflow\":\"already_terminal\",\"operation_id\":\"" + _dup(operation_id) + "\",\"result\":" + _dup(result) + "}"; },
+		Outcome::Completed(operation_id, result, workflow_return) => { return "{\"workflow\":\"completed\",\"operation_id\":\"" + _dup(operation_id) + "\",\"result\":" + _dup(result) + ",\"workflow_return\":" + _dup(workflow_return) + "}"; },
+		Outcome::AlreadyTerminal(operation_id, result, workflow_return) => { return "{\"workflow\":\"already_terminal\",\"operation_id\":\"" + _dup(operation_id) + "\",\"result\":" + _dup(result) + ",\"workflow_return\":" + _dup(workflow_return) + "}"; },
 		Outcome::TerminalFailure(reason, compensated) => {
 			if *compensated { return "{\"workflow\":\"failed\",\"reason\":\"" + _dup(reason) + "\",\"compensated\":true}"; }
 			return "{\"workflow\":\"failed\",\"reason\":\"" + _dup(reason) + "\",\"compensated\":false}";
@@ -178,8 +183,8 @@ fn _oc_render(o: &Outcome) nothrow -> String {
 
 fn _oc_exit(o: &Outcome) nothrow -> Int {
 	match o {
-		Outcome::Completed(operation_id, result) => { return 0; },
-		Outcome::AlreadyTerminal(operation_id, result) => { return 0; },
+		Outcome::Completed(operation_id, result, workflow_return) => { return 0; },
+		Outcome::AlreadyTerminal(operation_id, result, workflow_return) => { return 0; },
 		Outcome::TerminalFailure(reason, compensated) => { return 3; },
 		Outcome::ResolvedException() => { return 0; },
 		Outcome::TerminalState(state) => { return 0; },
@@ -550,7 +555,9 @@ fn _pc_typecheck(pw: &parser.ParsedWorkflow) -> String {
 				ocs.push(ir.OpContract(name = _dup(&pw.contracts[i].name), input_type = move inty, result_type = move outy));
 				i = i + 1;
 			}
-			match ir.type_check_graph(&g, &at, &ocs) { Optional::Some(_) => { return "reject"; }, Optional::None => { return "ok"; } }
+			// Source-level `.mf` workflows have no return-type concept yet (`returns`/`return` are
+			// still parse-gated at the source language), so this driver always checks against unit.
+			match ir.type_check_graph(&g, &at, &ocs, &Optional<ir.IrType>::None()) { Optional::Some(_) => { return "reject"; }, Optional::None => { return "ok"; } }
 		},
 		core.Result::Err(_) => { return "n/a"; }
 	}
@@ -929,8 +936,11 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// --- 6. persist success + checkpoint + advanced continuation (workflow done) ---
 	val t_settle = _now(host.get());
 	var final_result: String = result_json.clone();
+	// No graph/IR at all on this legacy single-op path (no NReturn is possible without a
+	// graph), and a single-op plan always settles final -> always unit (1b.0a step 3).
+	val workflow_return: Optional<String> = Optional<String>::Some(_dup(&"{}"));
 	match host.get().operation_settle(&workflow_id, fencing_token, OPERATION_SEQ, &operation_id, CHECKPOINT_SEQ,
-	                                  &result_json, &result_json, &"{\"pos\":\"complete\"}", &t_settle, &"{}", true) {
+	                                  &result_json, &result_json, &workflow_return, &"{\"pos\":\"complete\"}", &t_settle, &"{}", true) {
 		mf.OperationSettleOutcome::Settled(r) => { final_result = move r; },
 		mf.OperationSettleOutcome::AlreadySettled(r) => {
 			// Requirement 1: the stored result is AUTHORITATIVE.
@@ -947,7 +957,7 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 		}
 	}
 
-	return Outcome::Completed(operation_id = _dup(&operation_id_hex), result = _dup(&final_result));
+	return Outcome::Completed(operation_id = _dup(&operation_id_hex), result = _dup(&final_result), workflow_return = _dup(&"{}"));
 }
 
 // Thin wrapper: load the single `--config` and drive (the original CLI mode).
@@ -1379,7 +1389,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 	}
 	val ch_hex = _bytes_to_hex(&reg.revisions[ridx].content_hash);
-	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].graph, reg.revisions[ridx].plan_length, &ch_hex, admission);
+	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].graph, reg.revisions[ridx].plan_length, &ch_hex, &reg.revisions[ridx].return_type, admission);
 }
 
 // ===== ScriptRegistry build + lookup (v1: one configured generation per process) =====
@@ -1444,10 +1454,13 @@ fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
 			// Reject non-reversible graphs: every non-final operation must be compensable (mirrors
 			// the flat-plan rule, generalized over branches), so reversal can never strand.
 			_assert_reversible(cfg, &graph);
-			// TYPE-check the graph against the declared argument type + operation contracts. A type
-			// error is a config error (invalid_config / revision_unavailable), never a dispatch.
+			// TYPE-check the graph against the declared argument type + operation contracts +
+			// declared return type (1b.0a: also structurally validates every explicit `return`
+			// value's SHAPE against return_type — not just terminal-reachability, which
+			// validate_return_contract below still separately owns). A type error is a config
+			// error (invalid_config / revision_unavailable), never a dispatch.
 			val contracts = _op_contracts(cfg);
-			match ir.type_check_graph(&graph, &arg_type, &contracts) {
+			match ir.type_check_graph(&graph, &arg_type, &contracts, &return_type) {
 				Optional::Some(m) => { throw RunnerError(message = "graph type error: " + move m); },
 				Optional::None => {}
 			}
@@ -1820,10 +1833,15 @@ fn _lp(s: &String) nothrow -> String {
 // compensated, and with none (e.g. the FIRST operation rejected) it reaches a terminal `failed`
 // (compensated:false) immediately — never `blocked_resolution` for a definite forward rejection.
 fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
-                workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int, content_hash_hex: &String, admission: &AdmissionState) -> Outcome {
+                workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int, content_hash_hex: &String, return_type: &Optional<ir.IrType>, admission: &AdmissionState) -> Outcome {
 	val n = plan_length;
 	var final_result: String = "{}";
 	var last_op_id_hex: String = "";
+	// The workflow's AUTHORITATIVE typed return (1b.0a step 3), captured at the finality
+	// probe (below) before the final settle call, then read again here once replay confirms
+	// completion. Declared here (not inside the loop) because it is SET on one iteration and
+	// READ on a later one — same lifetime as final_result/last_op_id_hex.
+	var workflow_return: String = "{}";
 
 	// Durable arguments. A planned workflow ALWAYS has its arguments child — create_planned writes
 	// tb_mf_workflow_args atomically with the workflow. A MISSING args row is therefore
@@ -1853,10 +1871,14 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		guard = guard + 1;
 		match ir.advance(graph, &args, &settled) {
 			ir.StepOutcome::Completed(result) => {
-				// All operations settled. Report completion per the existing final-op result
-				// rules (the LAST settled op's result + its operation_id), NOT the graph's unit
-				// return value.
-				return Outcome::Completed(operation_id = _dup(&last_op_id_hex), result = _dup(&final_result));
+				// All operations settled. `result` (last-op-result, unchanged) per the existing
+				// final-op result rules; `workflow_return` (1b.0a step 3) was captured at the
+				// finality probe on an earlier iteration of THIS SAME call — `_run_forward` is
+				// only ever entered for a state=1 (forward) workflow, and the atomic final-settle
+				// UPDATE sets workflow_return_json and state=4 together, so this arm can never be
+				// reached without having just gone through the live probe+settle path for the
+				// final op in this call (never a stale/default value).
+				return Outcome::Completed(operation_id = _dup(&last_op_id_hex), result = _dup(&final_result), workflow_return = _dup(&workflow_return));
 			},
 			ir.StepOutcome::Fault(m) => {
 				// A validated graph should not Fault here. Treat defensively — never execute on a
@@ -2008,7 +2030,23 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						probe.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&r)));
 						var is_final = false;
 						match ir.advance(graph, &args, &probe) {
-							ir.StepOutcome::Completed(_) => { is_final = true; },
+							// This is the ONLY place the workflow's return value can be captured in time to
+							// hand it to operation_settle below (the probe re-runs `advance` with this op's
+							// about-to-be-persisted result BEFORE the real settle call). 1b.0a step 3: NORMALIZE
+							// here, at the runner/host boundary — never an IR-internal concern (type_check_graph
+							// deliberately does NOT structurally constrain a unit script's return expression,
+							// since it is the general-purpose graph type-checker shared by unrelated pre-existing
+							// tests). A UNIT script (`return_type` is `None`) is unconditionally `{}` — the
+							// graph's evaluated value is NEVER consulted, so an arbitrary explicit return under
+							// unit can never leak into the persisted/reported answer. A non-unit script maps
+							// only the implicit-fall-through sentinel (the literal `null`) to `{}`; any other
+							// value is used as-is (already build-time shape-checked by type_check_graph above).
+							ir.StepOutcome::Completed(result) => {
+								is_final = true;
+								var is_unit = false;
+								match return_type { Optional::None => { is_unit = true; }, Optional::Some(_) => {} }
+								if is_unit or _str_eq(&result, &"null") { workflow_return = "{}"; } else { workflow_return = _dup(&result); }
+							},
 							default => {}
 						}
 						// Checkpoint payload = the operation INPUT (what compensation needs to
@@ -2016,8 +2054,12 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						val t_settle = _now(host);
 						var cont_settle = "{\"pos\":\"complete\"}";
 						if !is_final { cont_settle = "{\"pos\":\"op:" + fmt.format_int(seq) + ":settled\",\"next_operation_seq\":" + fmt.format_int(seq + 1) + "}"; }
+						// workflow_return_json (1b.0a step 3): Some(...) iff final (the SP requires a JSON
+						// object exactly when arg_is_final=1), None otherwise (SP requires SQL NULL).
+						var settle_return: Optional<String> = Optional<String>::None();
+						if is_final { settle_return = Optional<String>::Some(_dup(&workflow_return)); }
 						match host.operation_settle(workflow_id, fencing_token, seq, &operation_id, seq,
-						                            &r, &input_json, &cont_settle, &t_settle, &"{}", is_final) {
+						                            &r, &input_json, &settle_return, &cont_settle, &t_settle, &"{}", is_final) {
 							mf.OperationSettleOutcome::Settled(res) => {
 								last_op_id_hex = _dup(&operation_id_hex);
 								settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
@@ -2563,11 +2605,26 @@ fn _inspect_report(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, operatio
 fn _report_terminal(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>,
                     snap: &mf.WorkflowSnapshot, operation_id_hex: &String, result_seq: Int) -> Outcome {
 	if snap.state_code == STATE_COMPLETED {
-		// The authoritative completed result is the LAST operation's (the plan may
-		// have run several); a single-op workflow's last seq is 1.
+		// The workflow's AUTHORITATIVE typed return (1b.0a step 3): read directly off the
+		// ALREADY-fetched snapshot (sp_mf_workflow_inspect), never re-derived from the graph.
+		// ck_mf_workflow_state_return guarantees a completed row always carries one; treat an
+		// unexpected None as durable-state corruption, same posture as the operation-side
+		// inconsistency checks below — never silently substitute a value.
+		var workflow_return: String = "";
+		var have_return = false;
+		match &snap.workflow_return_json {
+			Optional::Some(wr) => { workflow_return = _dup(wr); have_return = true; },
+			Optional::None => {}
+		}
+		if !have_return {
+			return Outcome::Error(reason = "completed_without_workflow_return");
+		}
+		// `result` stays compatibility/debugging-only (last op's result, unchanged meaning) —
+		// the authoritative completed result is the LAST operation's (the plan may have run
+		// several); a single-op workflow's last seq is 1.
 		match host.operation_result(workflow_id, result_seq) {
 			mf.OperationResultOutcome::Succeeded(r) => {
-				return Outcome::AlreadyTerminal(operation_id = _dup(operation_id_hex), result = move r);
+				return Outcome::AlreadyTerminal(operation_id = _dup(operation_id_hex), result = move r, workflow_return = move workflow_return);
 			},
 			mf.OperationResultOutcome::Requested => {
 				// COMPLETED but the operation has only a request, no settled result:
@@ -3640,8 +3697,8 @@ fn _service_reload(app: &ServiceApp) throws -> Bool {
 // the status is advisory for load balancers / clients; the document is authoritative.
 fn _outcome_http_status(o: &Outcome) nothrow -> Int {
 	match o {
-		Outcome::Completed(a, b) => { return 200; },
-		Outcome::AlreadyTerminal(a, b) => { return 200; },
+		Outcome::Completed(a, b, c) => { return 200; },
+		Outcome::AlreadyTerminal(a, b, c) => { return 200; },
 		Outcome::TerminalFailure(r, c) => { return 200; },
 		Outcome::ResolvedException() => { return 200; },
 		Outcome::TerminalState(s) => { return 200; },

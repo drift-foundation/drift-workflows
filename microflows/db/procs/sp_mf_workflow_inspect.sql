@@ -6,7 +6,8 @@ DELIMITER $$
 --
 -- Outcomes:
 --   found { state, execution_direction, current_disposition, is_terminal,
---           leased (1 if an unexpired lease is held at db_now), continuation }
+--           leased (1 if an unexpired lease is held at db_now), continuation,
+--           terminal_reason, workflow_return_json }
 --   not_found
 CREATE PROCEDURE `sp_mf_workflow_inspect`(
 	IN arg_workflow_id varbinary(16),
@@ -20,6 +21,7 @@ proc:BEGIN
 	DECLARE v_expires datetime(6);
 	DECLARE v_cont mediumtext;
 	DECLARE v_term_reason varchar(190) DEFAULT NULL;
+	DECLARE v_return mediumtext DEFAULT NULL;
 	DECLARE v_missing tinyint(1) DEFAULT 0;
 	DECLARE v_terminal tinyint(1) DEFAULT 0;
 	DECLARE v_leased tinyint(1) DEFAULT 0;
@@ -34,8 +36,10 @@ proc:BEGIN
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
 		SELECT `state`, `execution_direction`, `current_disposition`,
-		       `lease_owner`, `lease_expires_at`, `continuation`, `terminal_reason`
-		INTO v_state, v_dir, v_disp, v_owner, v_expires, v_cont, v_term_reason
+		       `lease_owner`, `lease_expires_at`, `continuation`, `terminal_reason`,
+		       `workflow_return_json`
+		INTO v_state, v_dir, v_disp, v_owner, v_expires, v_cont, v_term_reason,
+		     v_return
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id;
 	END;
@@ -59,7 +63,11 @@ proc:BEGIN
 		'leased', CAST(v_leased AS SIGNED),
 		'continuation', JSON_EXTRACT(v_cont, '$'),
 		-- Durable terminal reason (NULL on non-failure terminals); replay renders from THIS, never recomputed.
-		'terminal_reason', v_term_reason
+		'terminal_reason', v_term_reason,
+		-- Durable workflow TERMINAL RETURN (1b.0a step 3) — the authoritative typed workflow
+		-- return; NULL until completed (state=4), where ck_mf_workflow_state_return guarantees
+		-- a valid JSON-object value. Terminal replay reads THIS, never re-derives from the graph.
+		'workflow_return_json', JSON_EXTRACT(v_return, '$')
 	) AS result;
 END $$
 DELIMITER ;

@@ -1599,11 +1599,15 @@ fn _is_fail(n: &IrNode) nothrow -> Bool {
 // is EXEMPT — it neither needs to return nor satisfies the contract.
 //
 // UNIT (None) imposes no terminal constraint. This is a SEPARATE pass from `validate_graph` (which
-// carries no return type yet); 1b.0a's NEXT step sources `return_type` from config + folds it into
-// `content_hash` and calls this. Convention matches `validate_graph`: None = ok, Some(reason) =
-// rejected. NOTE: the per-expression structural type-check (the returned value matching the declared
-// object shape) is deferred to when `return` un-gates and produces real expressions; step 1 enforces
-// the terminal-shape contract (object-only/unit + explicit-return reachability) only.
+// carries no return type yet); `return_type` is sourced from config, folded into `content_hash`, and
+// this pass is called from `_registry_build`. Convention matches `validate_graph`: None = ok,
+// Some(reason) = rejected. NOTE: this function enforces the TERMINAL-SHAPE contract only
+// (object-only/unit + explicit-return reachability) — it does NOT check that an explicit return
+// VALUE'S shape matches `return_type`'s declared fields. That per-expression structural check now
+// lives in `type_check_graph` (below), for a NON-unit `return_type` only; see its `NReturn` arm.
+// (A unit `return_type`'s explicit return value is deliberately never structurally constrained there
+// either — see that function's comment for why, and how "unit's answer is always `{}`" is instead
+// enforced by runtime normalization in the runner.)
 pub fn validate_return_contract(g: &IrGraph, return_type: &Optional<IrType>) nothrow -> Optional<String> {
 	match return_type {
 		Optional::None => { return Optional<String>::None(); },                  // unit: fall-through allowed
@@ -2051,7 +2055,7 @@ fn _clone_infer(i: &InferType) nothrow -> InferType {
 // reached through a `let`) is checked by VALUE (`validate`), so an imprecise literal (e.g. an empty
 // array field) is still rejected against a declared type, not waved through. Call AFTER
 // `validate_graph` (assumes acyclic, refs resolve).
-pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpContract>) nothrow -> Optional<String> {
+pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpContract>, return_type: &Optional<IrType>) nothrow -> Optional<String> {
 	var order: Array<Int> = [];
 	match _topo_order(g) {
 		core.Result::Ok(o) => { order = move o; },
@@ -2155,10 +2159,48 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 				}
 			},
 			IrNode::NReturn(id, value) => {
-				// No declared return type; still infer to catch a structurally-bad projection.
+				// Always infer, even with no declared return type, to catch a structurally-bad
+				// projection.
 				match _infer_expr_type(g, value, arg_type, contracts, &lt_names, &lt_types) {
 					core.Result::Ok(_) => {},
 					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
+				}
+				// 1b.0a — the deferred STRUCTURAL return-expression check: for a DECLARED (non-unit)
+				// return type, an explicit return value must actually match the contract's SHAPE, not
+				// just avoid the unit fall-through sentinel (that reachability property is
+				// validate_return_contract's separate job). The unit sentinel itself (the literal
+				// `null` — implicit fall-through or an authored `return null`) is EXEMPT: for a
+				// non-unit contract validate_return_contract already gives it a clearer, dedicated
+				// rejection message.
+				//
+				// DELIBERATELY NOT enforced here when `return_type` is `None` (unit): `type_check_graph`
+				// is `ir.drift`'s general-purpose graph type-checker, used by a large body of
+				// PRE-EXISTING tests that author arbitrary manual graphs (branches/loops/merges/etc.)
+				// with `return <expr>` nodes that predate — and are unrelated to — the 1b.0a return-type
+				// feature; those graphs were never meant to imply "this script's declared type is unit,"
+				// only "no return type is being checked here." Constraining every `return_type=None`
+				// caller to a `{}`-shaped return here would reject that whole pre-existing test
+				// surface. The real "unit workflow's PERSISTED/REPORTED answer is always `{}`" invariant
+				// is enforced by NORMALIZATION at the runner/settle boundary instead — inline at the
+				// finality-probe capture site in `_run_forward` (`runner.drift`), which forces
+				// `workflow_return = "{}"` whenever the script's `return_type` is unit — the graph's
+				// return VALUE is simply never consulted for a unit script, so there is nothing to
+				// reject here.
+				if !_is_unit_return_value(value) {
+					match return_type {
+						// Non-unit: the value must match the declared object type EXACTLY — reuses the
+						// SAME machinery an operation's input is checked against its contract with
+						// (literal-by-VALUE via `validate`, or by inferred-type ASSIGNABILITY), so a
+						// scalar or a wrong-shaped object is rejected here, not silently persisted as
+						// `workflow_return_json` and only discovered later at the host/SP boundary.
+						Optional::Some(rt) => {
+							match _check_value_is(g, value, rt, arg_type, contracts, &lt_names, &lt_types) {
+								Optional::Some(m) => { return Optional<String>::Some("return value does not match the declared return type (" + m + "): " + _dup(id)); },
+								Optional::None => {}
+							}
+						},
+						Optional::None => {}
+					}
 				}
 			}
 		}

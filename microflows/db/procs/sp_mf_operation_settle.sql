@@ -20,6 +20,12 @@ DELIMITER $$
 --                       operation/checkpoint state), advance the continuation,
 --                       emit 'operation_settled'.
 -- A single-operation plan settles with is_final=1 (the original behavior).
+--
+-- 1b.0a step 3: on a final settle, arg_workflow_return_json is the workflow's
+-- AUTHORITATIVE typed return (durable, separate from arg_result_json — a later
+-- operation's raw result). Written in the SAME UPDATE that flips state->completed,
+-- so op result + workflow return + completed state land in one commit. NULL is
+-- required on a non-final settle (arg_is_final=0).
 CREATE PROCEDURE `sp_mf_operation_settle`(
 	IN arg_workflow_id varbinary(16),
 	IN arg_executor varbinary(16),
@@ -29,6 +35,12 @@ CREATE PROCEDURE `sp_mf_operation_settle`(
 	IN arg_checkpoint_seq int,
 	IN arg_result_json mediumtext,
 	IN arg_checkpoint_payload mediumtext,
+	-- The workflow's TERMINAL RETURN (1b.0a step 3, the authoritative typed workflow
+	-- return — separate from arg_result_json, the per-operation result). Required
+	-- (a JSON object) iff arg_is_final=1; MUST be SQL NULL when arg_is_final=0 (a
+	-- non-final settle must never smuggle a return value). Written atomically with
+	-- completion in the SAME final-settle UPDATE below — never a second write.
+	IN arg_workflow_return_json mediumtext,
 	IN arg_new_continuation mediumtext,
 	IN arg_event_ts datetime(6),
 	IN arg_event_payload mediumtext,
@@ -83,6 +95,16 @@ proc:BEGIN
 	END IF;
 	IF arg_is_final IS NULL OR arg_is_final NOT IN (0, 1) THEN
 		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfIsFinalInvalid';
+	END IF;
+	-- arg_workflow_return_json validity depends on arg_is_final (checked here, not
+	-- in a structured outcome below, matching every other entry check above): a
+	-- final settle requires a JSON-object return; a non-final settle requires NULL.
+	IF arg_is_final = 1 AND (arg_workflow_return_json IS NULL
+			OR JSON_VALID(arg_workflow_return_json) = 0 OR JSON_TYPE(arg_workflow_return_json) <> 'OBJECT') THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfWorkflowReturnJsonInvalid';
+	END IF;
+	IF arg_is_final = 0 AND arg_workflow_return_json IS NOT NULL THEN
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'MfWorkflowReturnJsonUnexpected';
 	END IF;
 
 	BEGIN
@@ -195,6 +217,10 @@ proc:BEGIN
 
 	IF arg_is_final = 1 THEN
 		-- Last operation: complete the workflow (forward -> completed), clear lease.
+		-- workflow_return_json is written in this SAME statement (never a second
+		-- write) — the final op result, the workflow return, and state=4 land
+		-- together in the one open transaction this proc call commits (host-owned;
+		-- see _finish_stmt_and_commit/rpc.commit).
 		UPDATE `tb_mf_workflow`
 		SET `continuation` = arg_new_continuation,
 		    `state` = 4,
@@ -203,6 +229,7 @@ proc:BEGIN
 		    `current_event_ts` = arg_event_ts,
 		    `lease_owner` = NULL,
 		    `lease_expires_at` = NULL,
+		    `workflow_return_json` = arg_workflow_return_json,
 		    `updated_at` = arg_event_ts
 		WHERE `workflow_id` = arg_workflow_id;
 

@@ -1116,9 +1116,11 @@ def main():
                                           returns=nonunit_rt), wf_fallthrough, arguments="{}")
         check("returns_nonunit_implicit_fallthrough_rejected",
               code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config", (code, body))
-        # A NON-UNIT return type with every successful path EXPLICITLY returning builds + runs fine
-        # (terminal-shape only — the deferred structural expr check does not yet enforce the value
-        # matches `nonunit_rt`'s declared fields).
+        # A NON-UNIT return type with every successful path EXPLICITLY returning builds + runs fine.
+        # `{"id": 1}` also happens to EXACTLY match `nonunit_rt`'s declared fields — since step 3's
+        # follow-up fix, this is now also structurally checked (via type_check_graph, not just
+        # terminal-shape); the reject cases (scalar return, wrong object shape) are pinned at the IR
+        # level in microflows/runner/tests/unit/ir_exec_test.drift (checks 178/180/181), not here.
         wf_explicit_return = _wf_id()
         code, body = run_runner(cfg_nonunit_returns, wf_explicit_return, arguments="{}")
         check("returns_nonunit_explicit_return_builds",
@@ -1137,6 +1139,59 @@ def main():
                                           returns_raw={"types": nonunit_rt}), wf_returns_unknown_key, arguments="{}")
         check("returns_wrapper_unknown_key_rejected",
               code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config", (code, body))
+
+        # ===== C5k. DURABLE WORKFLOW RETURN + ATOMIC FINAL SETTLE (1b.0a step 3) =====
+        # PRIMARY acceptance: final settle stores `workflow_return` atomically with completion;
+        # terminal replay (a resume with NO --arguments, on an already-completed workflow) reads
+        # it back from durable state (sp_mf_workflow_inspect) — never re-derives from the graph;
+        # live and replay JSON must match. `result` (last-op-result) is retained for
+        # compatibility/debugging only and is UNCHANGED by this step — it is NOT the thing to
+        # trust as the workflow's answer; `workflow_return` is.
+        wf_unit_return = _wf_id()
+        unit_return_cfg = plan_cfg([{"operation": "echo-transform", "input": {"values": [1, 2]}}])
+        code, body = run_runner(unit_return_cfg, wf_unit_return, arguments="{}")
+        check("workflow_return_unit_live_completed",
+              code == 0 and body.get("workflow") == "completed" and body.get("workflow_return") == {}, (code, body))
+        live_result_unit = body.get("result")
+        code, body = run_runner(unit_return_cfg, wf_unit_return)   # resume, no --arguments -> terminal replay
+        check("workflow_return_unit_replay_matches_live",
+              code == 0 and body.get("workflow") == "already_terminal"
+              and body.get("workflow_return") == {} and body.get("result") == live_result_unit, (code, body))
+
+        # Non-unit — testable NOW via the manual "graph" config (the graph-level `return` node is
+        # not parse-gated), without waiting for the `.mf` `return` statement to un-gate. A FRESH
+        # workflow id (not C5j's wf_explicit_return, already consumed there) driven through the
+        # SAME cfg_nonunit_returns graph, checked live then replayed.
+        wf_nonunit_return = _wf_id()
+        code, body = run_runner(cfg_nonunit_returns, wf_nonunit_return, arguments="{}")
+        check("workflow_return_nonunit_live_completed",
+              code == 0 and body.get("workflow") == "completed" and body.get("workflow_return") == {"id": 1}, (code, body))
+        live_result_nonunit = body.get("result")
+        code, body = run_runner(cfg_nonunit_returns, wf_nonunit_return)   # resume -> terminal replay
+        check("workflow_return_nonunit_replay_matches_live",
+              code == 0 and body.get("workflow") == "already_terminal"
+              and body.get("workflow_return") == {"id": 1} and body.get("result") == live_result_nonunit, (code, body))
+        # (The AlreadySettled lost-ack-retry resilience case — a SECONDARY edge case, not this
+        # primary path — is covered at the SP layer in microflows/db-tests/sp_operation_test.py,
+        # where the exact no-second-write invariant is asserted directly against the DB row.)
+
+        # Runtime NORMALIZATION (review-flagged gap, closed): a UNIT script (`returns` absent, i.e.
+        # `return_type=None`) that AUTHORS an explicit non-`{}` graph `return <expr>` must still
+        # persist/report `{}` — the runner never consults the graph's return value for a unit script.
+        # (An earlier fix attempt enforced "unit's explicit return must be {}" as a BUILD-TIME
+        # rejection inside `type_check_graph` instead; that broke unrelated PRE-EXISTING IR tests that
+        # author arbitrary manual graphs under no declared return type at all — e.g. an `NIf`
+        # type-check fixture returning a plain int — so it was reverted in favor of this runtime
+        # normalization. Pinned here end-to-end so "unit ⇒ {}" holds regardless of which mechanism
+        # enforces it.)
+        unit_normalize_graph = {"entry": "n0", "nodes": [
+            {"kind": "operation", "id": "n0", "operation": "echo-transform",
+             "input": {"const": {"values": [1]}}, "next": "n1"},
+            {"kind": "return", "id": "n1", "value": {"const": {"id": 99}}}]}
+        wf_unit_normalize = _wf_id()
+        code, body = run_runner(graph_cfg(unit_normalize_graph), wf_unit_normalize, arguments="{}")
+        check("workflow_return_unit_normalizes_explicit_graph_return",
+              code == 0 and body.get("workflow") == "completed" and body.get("workflow_return") == {}, (code, body))
 
         # ===== C6. MANUAL-IR CONTROL FLOW, slice 1: `if` =====
         # A directly-authored branch graph (the "graph" config key — no parser/DSL): if args.flag
@@ -3492,7 +3547,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 215
+    EXPECTED_CHECKS = 220
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")
