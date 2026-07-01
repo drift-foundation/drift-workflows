@@ -1,0 +1,7 @@
+{
+  "canonical": "G{2:n0;|P2:n0;6:charge;o1;6:amount;12:a[6:amount;];2:n1;;R2:n1;o1;9:charge_id;20:r2:n0;[9:charge_id;];;}",
+  "is_graph": true,
+  "status": "ok",
+  "type_check": "ok",
+  "validate": "ok"
+}

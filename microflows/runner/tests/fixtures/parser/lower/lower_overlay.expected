@@ -17,6 +17,7 @@
       ],
       "type": "object"
     },
+    "mf_source": true,
     "operations": [
       {
         "compensation": {

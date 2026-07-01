@@ -128,9 +128,10 @@ fn _admission_label(a: &AdmissionState) nothrow -> String {
 variant Outcome {
 	// `result` is retained for compatibility/debugging ONLY — the last settled
 	// operation's raw result, unchanged meaning (1b.0a step 3). `workflow_return`
-	// is the AUTHORITATIVE typed workflow/function return (unit `{}` today, since
-	// `return` stays parse-gated; the real explicit value once un-gated) — this is
-	// what a caller/parent should trust as the workflow's answer.
+	// is the AUTHORITATIVE typed workflow/function return — `{}` for a unit
+	// script, the real explicit `return <expr>` value for a declared non-unit
+	// `returns.type` (1b.0a step 6 un-gated the statement) — this is what a
+	// caller/parent should trust as the workflow's answer.
 	Completed(operation_id: String, result: String, workflow_return: String),       // exit 0
 	AlreadyTerminal(operation_id: String, result: String, workflow_return: String), // exit 0
 	TerminalFailure(reason: String, compensated: Bool),    // exit 3: terminal failed; compensated = real unwind ran
@@ -555,8 +556,13 @@ fn _pc_typecheck(pw: &parser.ParsedWorkflow) -> String {
 				ocs.push(ir.OpContract(name = _dup(&pw.contracts[i].name), input_type = move inty, result_type = move outy));
 				i = i + 1;
 			}
-			// Source-level `.mf` workflows have no return-type concept yet (`returns`/`return` are
-			// still parse-gated at the source language), so this driver always checks against unit.
+			// `returns.type` is manifest/config-sourced only — there is no `.mf`-level `returns`
+			// declaration syntax (1b.0a step 6 un-gated `return <expr>` itself, but deliberately did
+			// NOT add source syntax for declaring the type it returns). `--parse-check` has no
+			// wrapping config to source a `returns.type` from either, so this driver always checks
+			// against unit; the manifest/config path (`lower_source`/`--lower-source`) is where a
+			// real declared `returns.type` gets validated — see the `coordinator-singular` "C5l"
+			// integration tests.
 			match ir.type_check_graph(&g, &at, &ocs, &Optional<ir.IrType>::None()) { Optional::Some(_) => { return "reject"; }, Optional::None => { return "ok"; } }
 		},
 		core.Result::Err(_) => { return "n/a"; }
@@ -1475,6 +1481,19 @@ fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
 			match ir.validate_return_contract(&graph, &return_type) {
 				Optional::Some(m) => { throw RunnerError(message = "invalid workflow return contract: " + move m); },
 				Optional::None => {}
+			}
+			// 1b.0a step 6: `.mf` SOURCE-lowered configs get EXTRA build-time strictness a
+			// hand-authored manual "graph" config does not — an undeclared/unit return_type must
+			// not let an explicit non-null `return <expr>` silently become a no-op. Gated on the
+			// `mf_source` marker `parser.lower` stamps onto its emitted config (never present on a
+			// manual config), so the general-purpose manual-graph testing surface (ir_exec_test.drift,
+			// coordinator-singular's `graph_cfg()` helper, etc.) is completely unaffected and keeps
+			// the existing runtime `{}`-normalization compatibility behavior.
+			if _config_bool(cfg, &"mf_source", false) {
+				match ir.validate_source_unit_return(&graph, &return_type) {
+					Optional::Some(m) => { throw RunnerError(message = "invalid workflow return: " + move m); },
+					Optional::None => {}
+				}
 			}
 			val ch = _content_hash(cfg, &graph, &arg_type, &return_type);
 			revs.push(ScriptRevision(name = move name, version = move version,
@@ -3590,6 +3609,14 @@ fn _config_str(cfg: &json.JsonNode, key: &String, default_val: String) nothrow -
 		Optional::None => {}
 	}
 	return move default_val;
+}
+
+fn _config_bool(cfg: &json.JsonNode, key: &String, default_val: Bool) nothrow -> Bool {
+	match cfg.get(key) {
+		Optional::Some(n) => { match n.as_bool() { Optional::Some(b) => { return b; }, Optional::None => {} } },
+		Optional::None => {}
+	}
+	return default_val;
 }
 
 // ===== bytes / hex =====

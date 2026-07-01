@@ -554,17 +554,18 @@ fn _parse_fail(c: &mut Cursor, var id: String) -> Stmt {
 // TERMINAL statement (like `fail`): no successor; statements after it in the same block are unreachable.
 // `<expr>` is any value expression (const / arg / local / result / object / array).
 //
-// GATED until the return contract lands: `return` is recognized but PARSE-REJECTED here (throws
-// `unsupported-in-release`), because a usable `return` requires (a) a declared `return_type` it validates
-// against [1b.0a], (b) a durable + client-visible
-// workflow-return path in the runner [today the runner discards `advance`'s NReturn value and reports the last
-// op result], and (c) a resolved return value shape vs `tb_mf_operation` (object-only) storage. Shipping the
-// syntax without the contract would let free-form returns into durable execution. The lowering below
-// (`KReturn` → `_return_value_node`) is kept dormant for when the contract lands. `return` is a reserved
-// statement keyword (never an operation name).
+// UN-GATED (1b.0a step 6): the durable workflow-return store + atomic final settle + terminal replay
+// landed in step 3, and the per-expression structural check (an explicit return's VALUE matching the
+// declared `return_type`'s object shape) landed as a step-3 follow-up — both `_registry_build` steps
+// this lowering feeds. `return` is no longer parse-rejected; it lowers to `_return_value_node` exactly
+// like `fail` lowers to a terminal node. `<expr>` forces `_all_plain_ops` to treat the workflow as a
+// control-flow "graph" (a `KReturn` statement never matches the `KOp` arm), so `_merge` always emits a
+// real `NReturn(value=<expr>)` — never the flat-plan's auto-generated implicit-unit terminal — whenever
+// an explicit `return` appears anywhere in the source. `return` is a reserved statement keyword (never
+// an operation name).
 fn _parse_return(c: &mut Cursor, var id: String) -> Stmt {
-	val _ = id;
-	throw ParseError(code = "unsupported-in-release", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "return", message = "`return <expr>` (workflow return value) is not available until the return_type contract lands (composition 1b.0a)");
+	val value = _parse_value_expr(c);
+	return Stmt(id = move id, kind = StmtKind::KReturn(value = move value));
 }
 
 fn _parse_fail_reason(c: &mut Cursor) -> json.JsonNode {
@@ -1645,6 +1646,16 @@ fn _merge(base: &json.JsonNode, pw: &ParsedWorkflow) -> json.JsonNode {
 		Optional::Some(at) => { out.set("argument_type", at.clone_deep()); },
 		Optional::None => {}
 	}
+	// PROVENANCE marker (1b.0a step 6): this config was produced by `.mf` SOURCE lowering, not
+	// hand-authored as a raw "graph"/"plan" JSON config. `_registry_build` uses this to apply
+	// user-facing strictness that the general-purpose manual-graph testing surface must NOT get (a
+	// `.mf` author's explicit non-unit `return <expr>` under an undeclared/unit `returns.type` is a
+	// build error there, whereas a hand-authored manual "graph" config keeps the existing
+	// compatibility normalization to `{}` — see `_registry_build`'s `mf_source` check). Survives
+	// however many process boundaries the emitted config crosses afterward (e.g. `--lower-source`
+	// writing it to a file that a LATER, separate process runs) because it is baked into the config
+	// itself, not carried as caller context.
+	out.set("mf_source", json.JsonNode::Bool(true));
 	return out.to_node();
 }
 

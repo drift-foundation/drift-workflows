@@ -422,15 +422,25 @@ def main():
         plan_cfgs.append(f.name)
         return f.name
 
-    def lower_source(mf_text):
+    def lower_source(mf_text, returns=None):
         # Lower `.mf` SOURCE into a runnable config via the runner's OWN --lower-source frontend
-        # (base routing = runner_cfg; the parser emits "plan" + "argument_type" + operation
-        # contract overlays). Returns (returncode, config_path); config_path is None when lowering
-        # FAILS — so a malformed source surfaces as a nonzero exit AND no emitted config (no
-        # config to run => no possible dispatch).
+        # (base routing = runner_cfg, optionally overlaid with a declared `returns.type` — 1b.0a
+        # step 6: the return-type CONTRACT is manifest/config-sourced, not `.mf`-syntax-sourced, so
+        # this is how a `.mf` source's return value gets validated against a declared type; the
+        # parser emits "plan"/"graph" + "argument_type" + operation contract overlays and passes
+        # "returns" through UNCHANGED from the base). Returns (returncode, config_path);
+        # config_path is None when lowering FAILS — so a malformed source surfaces as a nonzero
+        # exit AND no emitted config (no config to run => no possible dispatch).
+        base_cfg_path = rcf.name
+        if returns is not None:
+            c = dict(runner_cfg)
+            c["returns"] = {} if returns == {} else {"type": returns}
+            bf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(c, bf); bf.close()
+            plan_cfgs.append(bf.name)
+            base_cfg_path = bf.name
         mff = tempfile.NamedTemporaryFile("w", suffix=".mf", delete=False); mff.write(mf_text); mff.close()
         plan_cfgs.append(mff.name)
-        cmd = [str(RUNNER_BIN), "--config", rcf.name, "--workflow-id", "0" * 32, "--lower-source", mff.name]
+        cmd = [str(RUNNER_BIN), "--config", base_cfg_path, "--workflow-id", "0" * 32, "--lower-source", mff.name]
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
         if out.returncode != 0:
             return out.returncode, None
@@ -443,11 +453,18 @@ def main():
         plan_cfgs.append(f.name)
         return out.returncode, f.name
 
-    def lower_source_stderr(mf_text):
+    def lower_source_stderr(mf_text, returns=None):
         # Like lower_source, but returns (returncode, stderr) — for asserting the diagnostic output.
+        base_cfg_path = rcf.name
+        if returns is not None:
+            c = dict(runner_cfg)
+            c["returns"] = {} if returns == {} else {"type": returns}
+            bf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(c, bf); bf.close()
+            plan_cfgs.append(bf.name)
+            base_cfg_path = bf.name
         mff = tempfile.NamedTemporaryFile("w", suffix=".mf", delete=False); mff.write(mf_text); mff.close()
         plan_cfgs.append(mff.name)
-        cmd = [str(RUNNER_BIN), "--config", rcf.name, "--workflow-id", "0" * 32, "--lower-source", mff.name]
+        cmd = [str(RUNNER_BIN), "--config", base_cfg_path, "--workflow-id", "0" * 32, "--lower-source", mff.name]
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
         return out.returncode, out.stderr
 
@@ -1079,8 +1096,8 @@ def main():
               len(h_sem) == 66 and h_sem != h_ko1, (h_sem, h_ko1))
 
         # C5j. WORKFLOW RETURN-TYPE contract (1b.0a step 2): `returns.type` config + content_hash
-        # plumbing. `return` itself stays parse-gated (source-language); this exercises the manual
-        # "graph" config path only, which is never gated.
+        # plumbing. Exercises the manual "graph" config path (predates `return`'s step-6 un-gating,
+        # which landed later — see "C5l" below for the `.mf` SOURCE-level equivalent coverage).
         nonunit_rt = {"type": "object", "fields": [{"name": "id", "type": {"type": "int"}}]}
         # ABSENT `returns` and an EXPLICIT-but-typeless `returns` block (`returns.type` absent) must
         # hash IDENTICALLY — `absent returns.type` IS unit, the locked hash-compat rule (existing
@@ -1158,10 +1175,10 @@ def main():
               code == 0 and body.get("workflow") == "already_terminal"
               and body.get("workflow_return") == {} and body.get("result") == live_result_unit, (code, body))
 
-        # Non-unit — testable NOW via the manual "graph" config (the graph-level `return` node is
-        # not parse-gated), without waiting for the `.mf` `return` statement to un-gate. A FRESH
-        # workflow id (not C5j's wf_explicit_return, already consumed there) driven through the
-        # SAME cfg_nonunit_returns graph, checked live then replayed.
+        # Non-unit — via the manual "graph" config (predates `return`'s step-6 un-gating; see "C5l"
+        # below for the `.mf` SOURCE-level equivalent). A FRESH workflow id (not C5j's
+        # wf_explicit_return, already consumed there) driven through the SAME cfg_nonunit_returns
+        # graph, checked live then replayed.
         wf_nonunit_return = _wf_id()
         code, body = run_runner(cfg_nonunit_returns, wf_nonunit_return, arguments="{}")
         check("workflow_return_nonunit_live_completed",
@@ -1192,6 +1209,94 @@ def main():
         code, body = run_runner(graph_cfg(unit_normalize_graph), wf_unit_normalize, arguments="{}")
         check("workflow_return_unit_normalizes_explicit_graph_return",
               code == 0 and body.get("workflow") == "completed" and body.get("workflow_return") == {}, (code, body))
+
+        # ===== C5l. `.mf` SOURCE `return <expr>` UN-GATED (1b.0a step 6) =====
+        # `return` is no longer parse-rejected in the textual frontend. `returns.type` stays
+        # manifest/config-sourced (no `.mf`-level `returns` syntax — DESIGN.md's own deferred
+        # choice); `lower_source`/`lower_source_stderr` now accept a `returns=` override so a
+        # `.mf` source's declared return type comes from the SAME place a manual graph's does.
+        # These exercise the manifest/config path end-to-end: parse -> lower -> _registry_build's
+        # full return-contract pipeline (validate_return_contract + type_check_graph's structural
+        # check + the NEW `.mf`-source-only unit strictness), not just parse/lower syntax.
+        mf_return_src = (
+            "args { values: [int] }\n"
+            "op echo-transform { input: { values: [int] } result: { sum: int } }\n"
+            "steps {\n"
+            "  let s = echo-transform { values: arg values }\n"
+            "  return { total: result s.sum }\n"
+            "}\n")
+
+        # C5l-1. Declared NON-UNIT returns.type + an explicit return matching it EXACTLY builds,
+        # runs, completes, and workflow_return matches the declared shape.
+        returns_total = {"type": "object", "fields": [{"name": "total", "type": {"type": "int"}}]}
+        lcode, cfgp = lower_source(mf_return_src, returns=returns_total)
+        wf_mf_ok = _wf_id()
+        rcode, body = (run_runner(cfgp, wf_mf_ok, arguments=json.dumps({"values": [3, 4]}))
+                       if cfgp else (lcode, {}))
+        check("mf_return_nonunit_matching_shape_completes",
+              lcode == 0 and cfgp is not None and rcode == 0 and body.get("workflow") == "completed"
+              and body.get("workflow_return") == {"total": 7}, (lcode, rcode, body))
+
+        # C5l-2. Declared NON-UNIT returns.type + an explicit return with the WRONG shape (a
+        # different field name than declared) is rejected at BUILD (the structural check in
+        # type_check_graph, generalized to any config including `.mf`-sourced ones) — never
+        # dispatched, never durable.
+        returns_amount = {"type": "object", "fields": [{"name": "amount", "type": {"type": "int"}}]}
+        lcode, stderr = lower_source_stderr(mf_return_src, returns=returns_amount)
+        check("mf_return_nonunit_wrong_shape_rejected",
+              lcode != 0 and "invalid lowered config" in stderr
+              and "return value does not match the declared return type" in stderr, (lcode, stderr))
+
+        # C5l-3. Declared NON-UNIT returns.type + an if/else where only ONE branch explicitly
+        # returns (the other implicitly falls through to unit) is rejected at BUILD
+        # (validate_return_contract's pre-existing "every successful path must explicitly
+        # return" rule) — now proven through `.mf` SOURCE lowering, not just a manual graph.
+        mf_return_fallthrough_src = (
+            "args { values: [int], flag: bool }\n"
+            "op echo-transform { input: { values: [int] } result: { sum: int } }\n"
+            "steps {\n"
+            "  if flag {\n"
+            "    let s = echo-transform { values: arg values }\n"
+            "    return { total: result s.sum }\n"
+            "  } else {\n"
+            "    echo-transform { values: arg values }\n"
+            "  }\n"
+            "}\n")
+        lcode, stderr = lower_source_stderr(mf_return_fallthrough_src, returns=returns_total)
+        check("mf_return_nonunit_fallthrough_path_rejected",
+              lcode != 0 and "invalid lowered config" in stderr
+              and "non-unit workflow has a successful path with no explicit `return`" in stderr,
+              (lcode, stderr))
+
+        # C5l-4. NO declared returns.type (unit/back-compat) + an EXPLICIT non-null `return` is a
+        # NEW build-time error for `.mf` SOURCE specifically (validate_source_unit_return, gated
+        # on the `mf_source` marker) — `.mf` is the user-facing surface, so a typo'd/premature
+        # `return { ... }` authored before a `returns.type` is declared must fail loudly, NOT
+        # silently normalize to `{}` the way a hand-authored manual "graph" config still does
+        # (contrast workflow_return_unit_normalizes_explicit_graph_return above).
+        lcode, stderr = lower_source_stderr(mf_return_src)   # no `returns` -> unit
+        check("mf_return_unit_explicit_nonnull_rejected",
+              lcode != 0 and "invalid lowered config" in stderr
+              and "workflow declares no return type (unit)" in stderr, (lcode, stderr))
+
+        # C5l-5. NO declared returns.type (unit) + an explicit `return const null` (the unit
+        # sentinel's spelled-out form) is STILL accepted — only a non-null explicit return is
+        # new-rejected; the unit-compatible spelling keeps working exactly like an implicit
+        # fall-through.
+        mf_return_null_src = (
+            "args { values: [int] }\n"
+            "op echo-transform { input: { values: [int] } result: { sum: int } }\n"
+            "steps {\n"
+            "  echo-transform { values: arg values }\n"
+            "  return const null\n"
+            "}\n")
+        lcode, cfgp = lower_source(mf_return_null_src)   # no `returns` -> unit
+        wf_mf_null = _wf_id()
+        rcode, body = (run_runner(cfgp, wf_mf_null, arguments=json.dumps({"values": [1]}))
+                       if cfgp else (lcode, {}))
+        check("mf_return_unit_explicit_null_accepted",
+              lcode == 0 and cfgp is not None and rcode == 0 and body.get("workflow") == "completed"
+              and body.get("workflow_return") == {}, (lcode, rcode, body))
 
         # ===== C6. MANUAL-IR CONTROL FLOW, slice 1: `if` =====
         # A directly-authored branch graph (the "graph" config key — no parser/DSL): if args.flag
@@ -3547,7 +3652,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 220
+    EXPECTED_CHECKS = 225
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

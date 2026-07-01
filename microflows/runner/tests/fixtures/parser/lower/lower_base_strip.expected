@@ -1,5 +1,6 @@
 {
   "config": {
+    "mf_source": true,
     "operations": [
       {
         "name": "reserve",

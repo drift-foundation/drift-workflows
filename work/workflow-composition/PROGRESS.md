@@ -70,9 +70,10 @@ compensation runtime.** Sub-order (decided): **1b.0a** (workflow return contract
 validation gate) → **1b.1** (IR build-block inversion + schema/SP/host + runner) → **1b.2** (acceptance).
 
 ### 1b.0a status (in progress) — **workflows are typed functions** (decided)
-- **`return <expr>` statement added to the parser** but **PARSE-GATED** (rejected like `fan`/`on failed`)
-  until the full typed-return contract lands — the lowering (`KReturn`→`_return_value_node`) is kept dormant.
-  Gate fixture: `err_return_unsupported`. Parser gate 99/99.
+- **`return <expr>` statement added to the parser and UN-GATED (step 6, DONE)** — see "Step 6 — DONE" below.
+  `_parse_return` lowers via `_return_value_node` like any other terminal statement; the parser fixture
+  corpus is 100/100 (the old gate fixture `err_return_unsupported` was removed and replaced with two
+  positive `return`-lowering fixtures).
 - **Decisions RESOLVED** (was the open storage question): **object-only or unit** workflow returns
   (unit ⇒ `{}`); a **durable workflow-terminal-return store** holds the evaluated return **separate** from
   per-op results; it is written **atomically with completion** (the final settle writes final-op result +
@@ -95,7 +96,7 @@ validation gate) → **1b.1** (IR build-block inversion + schema/SP/host + runne
   threads it into settle, and terminal replay (`sp_mf_workflow_inspect`) reads the stored
   `workflow_return_json` directly, never re-deriving from the graph — see "Step 3 — DONE" below for the
   full design + implementation record. `just test` (runner) green; SP-level `sp_operation_test.py` green
-  156/156; coordinator-singular integration green 220/220.
+  156/156; coordinator-singular integration green 225/225.
   **The per-expression structural check — DONE, moved forward (not deferred to step 6 after all):** a
   post-implementation review flagged that `workflow_return` being externally visible/durable made the
   deferred check load-bearing sooner than planned. For a NON-unit `return_type`, `type_check_graph` now
@@ -103,8 +104,13 @@ validation gate) → **1b.1** (IR build-block inversion + schema/SP/host + runne
   terminal-reachability) — a scalar or wrong-shaped object is `invalid_config` at build. For UNIT, the
   value is intentionally NOT structurally constrained there (see "Step 3 — DONE" → "Post-implementation
   review round" below for why an earlier attempt at that broke pre-existing tests); "unit ⇒ `{}`" is
-  instead enforced by runtime normalization. Remaining: **(6)** child-call result binding (in 1b.0) is
-  the only piece left before un-gate.
+  instead enforced by runtime normalization.
+  **Step 6 — DONE:** `return <expr>` is un-gated in the parser; `.mf` source (the user-facing surface)
+  additionally gets a build-time rejection of an explicit non-null `return` under an undeclared/unit
+  `returns.type` — see "Step 6 — DONE" below. Child-call result binding turned out to belong to **1b.0**
+  (it needs a cross-script registry to resolve `child@plan_version` before it can even ask the child's
+  return type), not step 6 — that + the rest of 1b.0 (input-contract validation, static cycle check) is
+  the only piece left before 1b.1.
 
 Overall feature: any workflow step may be a child workflow; the child owns its durable state; the parent
 treats the call as one forward step/checkpoint with result data flow; compensations may be workflows (1c);
@@ -137,9 +143,9 @@ testable locally** now (see *Current reality*); the earlier "not testable locall
 
 - **Slice 1a is mainlined** at commit `62555a4` (`call` grammar → `NCallWorkflow` IR + structural validation +
   build-block of reachable `call`/`compensation`); the registry-free frontend core is committed, not dirty.
-- **`return <expr>` is parse-gated** at commit `9195854` — the statement is recognized but `_parse_return`
-  throws `unsupported-in-release` (gate fixture `err_return_unsupported`); the `KReturn → NReturn` lowering is
-  kept dormant.
+- **`return <expr>` is UN-GATED (1b.0a step 6, DONE)** — `_parse_return` lowers via `_return_value_node` like
+  any other terminal statement; see "Step 6 — DONE" below for the full record (parser un-gating +
+  `.mf`-source-only unit strictness + `coordinator-singular` integration coverage, 225/225).
 - **Local runner + integration build is now available** with the correct package root:
   `DRIFT_TOOLCHAIN_ROOT=~/opt/drift/certified/current/toolchain DRIFT_PKG_ROOT=~/opt/drift/certified/current/pkgs`.
   The full runner binary builds from source and the coordinator↔singular integration gate runs locally — the
@@ -173,13 +179,16 @@ testable locally** now (see *Current reality*); the earlier "not testable locall
   `sp_mf_workflow_inspect` (never re-derived from the graph). `Outcome::Completed`/`Outcome::AlreadyTerminal`
   gained `workflow_return` (the AUTHORITATIVE typed return) alongside the unchanged, compatibility-only
   `result` (last op's result). `just test` (runner) green; `sp_operation_test.py` green 156/156;
-  `coordinator-singular` integration green 220/220 (5 new checks, live+replay match for both unit and
-  non-unit — non-unit tested now via the manual graph path, without un-gating `return` — plus a
+  `coordinator-singular` integration green 220/220 at the time (5 new checks, live+replay match for both
+  unit and non-unit — non-unit tested then via the manual graph path, without un-gating `return` — plus a
   unit-normalization check). A post-implementation review also moved the per-expression **structural**
   return-value check forward into `type_check_graph` (non-unit only — see "Post-implementation review
   round" under "Step 3 — DONE" below for why unit is handled by runtime normalization instead), so it is
-  DONE, not deferred. Full details + design record: "Step 3 — DONE" below. **Active scope: step 6**
-  (child-call result binding — the only piece left before `return` un-gates).
+  DONE, not deferred. Full details + design record: "Step 3 — DONE" below.
+- **Slice 1b.0a step 6 (un-gate `return <expr>`) is DONE + verified** — see "Step 6 — DONE" below.
+  `coordinator-singular` integration green **225/225** (220 + 5 new `.mf`-source return-contract checks).
+  **Active scope: 1b.0** (registry validation gate — call resolution, child input/return contract
+  validation, static cycle check; design pending review below).
 
 ## Step 1 — DONE (IR return-contract validation)
 
@@ -189,9 +198,11 @@ an **object** (else rejected — object-only); for a non-unit type **every succe
 explicit `return`** (value ≠ the implicit unit literal `null`) — an implicit unit fall-through on any
 successful path is rejected (stricter than "no reachable return"); **`fail` (NFail) is exempt** (a
 fail-only workflow is vacuously accepted). **Gate:** `ir_exec_test` base+asan `exit=0` (checks 170–177),
-`ir_graph_test` base `exit=0`; `return` parse-gate untouched. **Deferred (before un-gate):** the per-expression
-structural check that an explicit non-unit `return <expr>` is object-shaped / matches `return_type` — so do
-NOT describe object-only returns as *fully* validated until that lands.
+`ir_graph_test` base `exit=0`. **At the time this step landed**, the per-expression structural check (an
+explicit non-unit `return <expr>` actually being object-shaped / matching `return_type`) was still deferred,
+and `return` was still parse-gated — BOTH are since DONE: the structural check landed as a step-3 follow-up
+(see "Post-implementation review round" under "Step 3 — DONE"), and `return` is un-gated (see "Step 6 —
+DONE"). Object-only returns are now fully validated end-to-end.
 
 ## Step 2 — DONE (`returns.type` config + content_hash)
 
@@ -212,10 +223,10 @@ and stores it on `ScriptRevision`. `_content_hash` takes `return_type` and appen
 integration green — 215/215 (`EXPECTED_CHECKS` bumped 208→215 for 7 new checks:
 `returns_absent_hash_unchanged`, `returns_nonunit_changes_hash`, `returns_non_object_type_rejected`,
 `returns_nonunit_implicit_fallthrough_rejected`, `returns_nonunit_explicit_return_builds`,
-`returns_wrapper_non_object_rejected`, `returns_wrapper_unknown_key_rejected`). **Deferred
-(unchanged from step 1):** the per-expression structural check that an explicit non-unit `return <expr>`
-matches `return_type`'s declared fields — still terminal-shape only. **No parser un-gate, no
-runner/storage** (steps 3–6 untouched), as scoped.
+`returns_wrapper_non_object_rejected`, `returns_wrapper_unknown_key_rejected`). **At the time this step
+landed**, the per-expression structural check (unchanged from step 1's deferral) and the parser un-gate were
+still pending — BOTH are since DONE (structural check: step-3 follow-up; parser un-gate: "Step 6 — DONE"
+below). **No runner/storage** (steps 3–5 landed separately; see those sections), as scoped.
 
 ## Step 3 — DONE (durable workflow return store + atomic final settle)
 
@@ -720,10 +731,166 @@ since `.mf` `returns`/`return` are still parse-gated), and the `ir_exec_test.dri
 helpers (`_tc_ok` always unit; new `_tc_rt`/`_tc_rt_rejects`/`_tc_rt_accepts` for the return-type-aware
 cases).
 
-This narrows **step 6** to: child-call result binding (`result <call_id>.path` validated against the
-child's declared return type, per DESIGN.md's 1b.0 scope) — the non-unit structural VALUE check itself is
-now done, landed early rather than deferred.
+This narrows **step 6** to: un-gating `return <expr>` in the parser + the `.mf`-source-facing test surface —
+see "Step 6 — DONE" below. Child-call result binding turned out to belong to **1b.0** after all (DESIGN.md's
+own text: "Parent binding (lands in 1b.0)" — it needs a cross-script registry to resolve `child@plan_version`
+before it can even ask what the child's return type IS, which is exactly 1b.0's job, not step 6's).
 
-Then **step 6** (child-call result binding — now the only remaining piece, since the structural
-return-expression check landed here instead of being deferred) → un-gate `return`; then 1b.0 registry gate,
-1b.1 runtime spine, and 1c per the `DESIGN.md` checklists.
+## Step 6 — DONE (un-gate `return <expr>`; `.mf`-source unit strictness)
+
+**Scope, as confirmed with the user before implementation:** `returns.type` stays manifest/config-sourced —
+no new `.mf`-level `returns { }` syntax (DESIGN.md's own deferred choice: "a `.mf` `returns` block can come
+later"). Concretely: (1) un-gate `.mf` `return <expr>`; (2) parse-check fixtures prove syntax/lowering only;
+(3) contract validation (does the returned VALUE satisfy a declared `returns.type`) is tested through the
+manifest/config path, where `returns.type` actually exists; (4) a `.mf` workflow with no `returns.type` is
+unit/back-compat, but — UNLIKE the manual "graph" config path, which keeps step 3's compatibility
+normalization — `.mf` source is the user-facing surface: an explicit non-null `return` there without a
+declared return contract must be a build/config error, not silently normalized away.
+
+**Un-gating.** `parser.drift`'s `_parse_return` no longer throws `unsupported-in-release`; it calls the
+existing general-purpose `_parse_value_expr` and constructs a real `Stmt(kind = KReturn(value))`, exactly
+mirroring `_parse_fail`'s shape. The `KReturn` → `_return_value_node` lowering arm and the `_stmt_falls_through`
+arm were already written (kept dormant since slice-1a) and needed zero changes. `_all_plain_ops` (used to
+decide flat-"plan" vs control-flow-"graph" lowering) already treats any non-`KOp` statement as
+graph-forcing, so an explicit `return <expr>` anywhere in the source automatically lowers to a real
+`NReturn(value=<expr>)` inside a `"graph"` config — never the flat-plan's auto-generated implicit-unit
+terminal — with no changes needed to that dispatch logic either.
+
+**The `.mf`-source-only unit strictness (the new, non-dormant piece).** A hand-authored manual `"graph"` JSON
+config and a `.mf`-source-lowered config converge to the IDENTICAL `"graph"` shape by the time either reaches
+`_registry_build` — there is no structural way to tell them apart post-lowering. Since the user's requirement
+was asymmetric (manual graph keeps step 3's `{}`-normalization; `.mf` source gets build-time rejection
+instead), a PROVENANCE marker was needed. `parser.drift`'s `_merge` now stamps `"mf_source": true` onto every
+config it emits (content-hash-neutral — `_content_hash` never reads arbitrary top-level `cfg` keys, only
+`_graph_bindings`-scoped per-operation resolution). `ir.drift` gained `pub fn validate_source_unit_return(g)`:
+for a `return_type = None` config, walks every successful-path `NReturn` sink and rejects if its value is not
+the unit sentinel (`_is_unit_return_value` — the literal `null`, whether from implicit fall-through or an
+authored `return null`) — deliberately NOT reusing `_check_value_is`/`empty_object_type()` here, since the
+user's rule is stricter than "must be shaped like `{}`": even an explicit `return {}` under an undeclared
+contract is rejected, not just a non-`{}` value. `runner.drift`'s `_registry_build` calls this ONLY when
+`_config_bool(cfg, "mf_source", false)` is true — so `validate_return_contract`/`type_check_graph` (called
+UNCONDITIONALLY for every config) stay exactly as permissive as before, and the general-purpose manual-graph
+testing surface (`ir_exec_test.drift`, `coordinator-singular`'s `graph_cfg()` helper,
+`workflow_return_unit_normalizes_explicit_graph_return`) is untouched — it keeps the step-3 normalization
+compatibility behavior on purpose.
+
+**Fixtures.** `err_return_unsupported.mf`/`.expected` (whose entire point was proving the now-gone gate) was
+removed; two new `check/` fixtures (`return_bare`, `return_result_projection`) prove parse+lower+structural
+validate+type-check (always unit at this layer — `--parse-check` has no `returns.type` concept) for a plain
+object return and a named-operation result-projection return. The two existing `lower/` fixtures
+(`lower_base_strip`, `lower_overlay`) were reblessed to include the new `mf_source: true` key (no other
+diff) — `100/100` parser fixtures green (was 99: -1 removed, +2 added).
+
+**`coordinator-singular` integration ("C5l" section)** exercises the manifest/config path end-to-end
+(`lower_source`/`lower_source_stderr` extended with a `returns=` override, building a per-call base config
+instead of the shared one) — 5 new checks: non-unit `returns.type` + matching return completes with the
+correct `workflow_return`; non-unit + wrong-shaped return rejected at build (the step-3-follow-up structural
+check, proven via `.mf` source, not just manual graph); non-unit + an if/else where only one branch
+explicitly returns rejected at build (`validate_return_contract`'s pre-existing rule, likewise proven via
+`.mf` source); no declared `returns.type` + an explicit non-null return rejected at build (the NEW check);
+no declared `returns.type` + an explicit `return const null` still accepted. `EXPECTED_CHECKS` 220→225.
+
+**Bug caught by the FIRST integration run, fixed before landing**: `validate_source_unit_return`'s initial
+version took only `g: &IrGraph` and unconditionally rejected any explicit non-null return — it never checked
+whether `return_type` was actually `None` before rejecting, so a `.mf` script that DID declare a non-unit
+`returns.type` (with a correctly-matching explicit return) was wrongly rejected too
+(`mf_return_nonunit_matching_shape_completes` failed: lowering itself exited 3, "workflow declares no return
+type (unit)" — even though a `returns.type` WAS declared). Fixed by giving the function a
+`return_type: &Optional<IrType>` parameter and early-returning `None()` when it is `Some(_)` (the non-unit
+case already has its own, separate structural check in `type_check_graph` — this function is unit-only).
+Re-verified clean on the next run.
+
+**Verification**: full `just test` (runner) green — `ir_graph_test`/`ir_exec_test` base+asan (ir.drift gained
+a function but no existing logic changed), 100/100 parser fixtures, full binary build; `coordinator-singular`
+integration green, `EXPECTED_CHECKS` 220→225, **225/225** (after the fix above; the first attempt was 224/225).
+
+Then **1b.0 = build-time registry validation gate** (no DB, no runtime): resolve `call <child>@<plan_version>`
+against a manifest-scoped registry by exact plan identity; validate the call input against the child's
+declared arg/input contract; bind the child `return` type so `result <call_id>.path` validates downstream
+(unit ⇒ every path rejected); reject static call cycles at build. See the design section below (pending
+review) before implementation starts.
+
+## 1b.0 — build-time registry validation gate (DESIGN, pending review)
+
+**Scope, confirmed with the user before implementation.** Two rounds of clarification landed on:
+1. Layered build validation for a `call <child>@<plan_version>` node, in order: (a) resolve `child@plan_version`;
+   (b) validate the call's input against the child's declared arg/input type; (c) bind the child's declared
+   return type so downstream `result <call_id>.path` is meaningful; (d) reject static call cycles; (e)
+   `compensation`/`fan`/`on failed` stay rejected until 1c/slice 3 (already true, unaffected).
+2. **Executability stays gated through 1b.0.** Even after (a)–(d) all pass for every call in every script, a
+   graph with a reachable call is STILL rejected — not runnable until 1b.1 (the runtime spine). This is a
+   DELIBERATE decision: `ir.advance` has zero dispatch semantics for `NCallWorkflow` today (confirmed: nothing
+   in `runner.drift` even references `NCallWorkflow`), and building a stub/fault execution path now would be a
+   half-feature blurring the 1b.0/1b.1 slice boundary. 1b.0's value is a REFINED failure surface: a
+   malformed call fails for its PRECISE reason (unresolved target / bad input shape / bad result-path
+   projection / cycle) instead of today's one blanket message; a FULLY VALID call graph still fails, but with
+   an explicit, distinct "runtime lands in 1b.1" message — proving the validation itself ran and passed.
+   Tests must show BOTH kinds of rejection.
+
+**Current baseline this replaces**: `_assert_executable` (ir.drift, inside the op-depth walk) unconditionally
+rejects any reachable `NCallWorkflow` today with one message ("workflow call is not runnable until
+composition slice 1b"), regardless of well-formedness — this is slice 1a's frontier-only gate, and it runs
+for EVERY `_registry_build` caller (single-script CLI/service dispatch included), not just manifest mode.
+
+**Where cross-script resolution has to live.** A `call`'s target is ANOTHER script in the manifest — resolving
+it, checking its input/return contract, and detecting cycles all need visibility across every script in the
+manifest at once. Today `_registry_build(cfg)` builds exactly ONE script's `ScriptRevision` (arg_type,
+return_type, graph, content_hash, plan_length) with zero cross-script visibility, and `_load_manifest`
+computes each script's `ScriptRevision` via `_registry_build` but DISCARDS it into a leaner `ManifestScript`
+(name/version/cfg/content_hash_hex/plan_length) — there is no existing "the whole manifest's resolved
+scripts" structure to validate a call against. `_registry_resolve`/`_find_script`/`_find_script_nv` all
+resolve "which ONE script THIS invocation should run," never "what does script X's call to script Y resolve
+to" — confirmed zero existing cross-script call-resolution code in ir.drift or runner.drift.
+
+**Proposed two-pass shape, scoped narrowly to avoid touching `ManifestScript`'s existing (dispatch-selection)
+callers:**
+- **Pass 1 (per-script, order-independent, inside `_load_manifest`'s existing loop):** parse/lower each
+  script and compute its `ScriptRevision` as today, EXCEPT a new manifest-mode `_registry_build` variant
+  defers `_assert_executable`'s call-rejection (a call may be structurally reachable; don't reject yet — pass
+  2 needs every script's arg_type/return_type/graph to be known FIRST). Also collect, in a local (non-persisted,
+  not bolted onto the public `ManifestScript` struct) array: `{name, version, arg_type, return_type, graph}`
+  for every script — this is purely an ephemeral cross-check input, not new public API surface.
+- **Pass 2 (manifest-wide, after all scripts are known, still inside `_load_manifest`):** for every script's
+  graph, for every `NCallWorkflow(id, child, plan_version, input, ...)` node:
+  - Resolve `(child, plan_version)` by EXACT match against the pass-1 array. Unresolved → `invalid_config`,
+    "call target script/version not found in manifest: `<child>@<plan_version>`".
+  - Validate `input` against the resolved target's `arg_type` — reuses `_check_value_is`/`_infer_expr_type`,
+    the SAME machinery an operation's input is checked against `OpContract.input_type` with. Mismatch →
+    `invalid_config` with the same style of message `type_check_graph` already uses for operation inputs.
+  - For every `EResult(this_call_id, path)` reference anywhere in the CALLER's graph: if the resolved target's
+    `return_type` is `None` (unit) → reject (ANY path access on a unit-returning call is invalid — "unit ⇒ all
+    `result <call_id>.*` paths rejected", per DESIGN.md's own wording); if `Some(t)` → project `path` against
+    `t` (reuses `_project_type`, the same projection `_infer_expr_type`'s `EResult` arm already uses for typed
+    operation results) and reject on a shape mismatch.
+  - Cycle check: build a graph whose NODES are the distinct `(name, version)` pairs present in the manifest and
+    whose EDGES are each script's own call targets restricted to targets that ALSO exist in the manifest (a
+    call to a target NOT in the manifest is already caught as "unresolved" above — no need to double-count it
+    in the cycle graph). Adapt `_topo_order`'s existing Kahn's-algorithm cycle detection (today scoped to one
+    graph's node ids) to this cross-script node set; a cycle (including a direct self-call at the same version)
+    → `invalid_config`, "static call cycle detected" naming the path.
+  - If (a)-(d) all pass for every call in every script → THEN, for each script that has at least one reachable
+    call node, throw the distinct "runtime lands in 1b.1" rejection (replacing today's blanket message for
+    THIS validated-but-still-non-executable case specifically). A script with NO reachable call is completely
+    unaffected — same behavior as today.
+
+**Single-script (`--config`, no manifest) mode is unaffected on purpose.** A lone `--config` invocation has no
+sibling scripts to resolve `call` against; `_registry_build`'s EXISTING signature/behavior (today's blanket
+call-rejection via `_assert_executable`) stays exactly as-is for every non-manifest caller (single CLI/service
+dispatch, `ir_exec_test.drift`, `graph_cfg`/`plan_cfg`-based integration tests, etc.) — none of those
+currently author `call` nodes, so this is a zero-risk, zero-diff path for the entire existing test surface.
+The existing slice-1a parser fixtures (`call_single.mf` etc.) are similarly unaffected: `--parse-check`'s
+`_pc_validate`/`_pc_typecheck` call `ir.validate_graph`/`ir.type_check_graph` directly and never invoke
+`_assert_executable` at all, so they don't exercise this gate either way.
+
+**Testing shape**: multi-script MANIFEST fixtures (a new manifest-mode test surface, or extending whatever
+harness already drives `_load_manifest` — needs a quick look at how manifest-mode is currently tested, if at
+all, before implementation) proving, per the user's explicit ask: (1) each of the 4 validation failure modes
+fails for its OWN precise reason (unresolved target, bad input shape, bad result-path projection including the
+unit-reject-all-paths case, a 2-script and a self-loop cycle); (2) a fully well-formed multi-script call graph
+still fails, but with the distinct "1b.1 pending" message — proving validation ran and passed first.
+
+**Open items to confirm before coding** (smaller than the two already-resolved forks, flagging for
+completeness): the exact new-function names/signatures (`_registry_build_for_manifest` vs a boolean parameter
+on the existing `_registry_build`; a new `CallTarget`/cross-script-check struct name); whether `fan`/`on
+failed` need any NEW rejection tests here or are fully covered already by existing slice-1a fixtures (research
+should confirm before assuming no work is needed there).

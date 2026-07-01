@@ -1650,6 +1650,42 @@ fn _is_unit_return_value(e: &IrExpr) nothrow -> Bool {
 	}
 }
 
+// 1b.0a step 6: for `.mf` SOURCE-lowered configs specifically — NEVER for a hand-authored manual
+// "graph"/"plan" JSON config, which keeps the runtime's existing `{}`-normalization compatibility
+// behavior — an UNDECLARED (unit) `return_type` means every successful path's return value must be
+// the unit sentinel (the implicit fall-through, or an authored `return null`): an EXPLICIT non-null
+// `return <expr>` under an undeclared/unit contract is a BUILD ERROR, not silently accepted and
+// normalized away. `.mf` source is the user-facing surface; a typo'd/premature `return { ... }`
+// before the author has declared a `returns.type` must fail loudly at build, not silently become a
+// no-op. (Contrast `validate_return_contract`'s `Optional::None` arm, which stays fully permissive —
+// that function is called UNCONDITIONALLY for every config, including manual-graph ones, so it must
+// not gain this constraint; this is a SEPARATE, narrower check the caller applies only when the
+// config's `mf_source` marker is set — see runner.drift's `_registry_build`.)
+pub fn validate_source_unit_return(g: &IrGraph, return_type: &Optional<IrType>) nothrow -> Optional<String> {
+	// A DECLARED (non-unit) return_type already gets its own, separate structural check (the
+	// `type_check_graph` NReturn arm above) — this function is UNIT-only. Without this guard, a
+	// `.mf` script with a declared `returns.type` would get REJECTED for having exactly the
+	// explicit `return` it is supposed to have.
+	match return_type { Optional::Some(_) => { return Optional<String>::None(); }, Optional::None => {} }
+	var i = 0;
+	while i < g.nodes.len {
+		var succs: Array<String> = [];
+		_succs(&g.nodes[i], &mut succs);
+		if succs.len == 0 {
+			match &g.nodes[i] {
+				IrNode::NReturn(id, value) => {
+					if !_is_unit_return_value(value) {
+						return Optional<String>::Some("workflow declares no return type (unit); an explicit non-null `return` is a build error until a `returns.type` is declared: " + _dup(id));
+					}
+				},
+				default => {}   // NFail is the only other sink kind: unsuccessful terminal, exempt
+			}
+		}
+		i = i + 1;
+	}
+	return Optional<String>::None();
+}
+
 fn _is_call(n: &IrNode) nothrow -> Bool {
 	match n { IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => { return true; }, default => { return false; } }
 }

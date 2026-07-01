@@ -1,0 +1,8 @@
+// 1b.0a step 6: `return <expr>` is un-gated — a straight-line workflow whose steps end in an
+// explicit `return` of a const-object expression referencing a declared arg.
+args { id: int }
+op ping { input: {} }
+steps {
+  ping {}
+  return { id: arg id }
+}

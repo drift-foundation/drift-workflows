@@ -1,0 +1,8 @@
+// 1b.0a step 6: `return <expr>` where the value is an object literal with a `result <name>.path`
+// field — a NAMED operation's settled result projected into the workflow's export.
+args { amount: int }
+op charge { input: { amount: int } result: { charge_id: string } }
+steps {
+  let c = charge { amount: arg amount }
+  return { charge_id: result c.charge_id }
+}
