@@ -276,6 +276,7 @@ struct ScriptRevision {
 	version: String,             // immutable semver: major.minor.patch
 	graph: ir.IrGraph,           // the authoritative control-flow graph; drives forward execution
 	arg_type: ir.IrType,         // declared closed-object argument type (part of content_hash)
+	return_type: Optional<ir.IrType>,   // declared return type: None = unit (part of content_hash; 1b.0a)
 	content_hash: Array<Byte>,   // 33 bytes: scheme tag + SHA-256 over GRAPH identity
 	plan_length: Int             // number of NOperation nodes (== flat plan length)
 }
@@ -1427,6 +1428,9 @@ fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
 			// It ALWAYS participates in content_hash (the argument contract is part of the
 			// revision identity — never elided/conditional).
 			val arg_type = _arg_type(cfg);
+			// The script's declared return type (1b.0a): unit (None) or a closed-object type. Part of
+			// plan identity — folds into content_hash below — never elided/conditional.
+			val return_type = _return_type(cfg);
 			// VALIDATE the graph. A malformed graph -> RunnerError, surfaced by the existing build
 			// catches as invalid_config (submission, pre-claim) or revision_unavailable (resume,
 			// post-claim) — never executing an ill-formed graph.
@@ -1452,9 +1456,16 @@ fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
 			// input type is not cross-linked to the forward op's (types still fold into the content_hash via
 			// _content_hash). Call kept so the registry-build pipeline is unchanged.
 			_assert_compensation_types(cfg, &graph);
-			val ch = _content_hash(cfg, &graph, &arg_type);
+			// Return-CONTRACT validation (1b.0a step 1): a non-unit return_type must be an object (checked
+			// in _return_type already) and every successful sink must be an explicit `return` — an implicit
+			// unit fall-through on any successful path is a build-time RunnerError, never a dispatch.
+			match ir.validate_return_contract(&graph, &return_type) {
+				Optional::Some(m) => { throw RunnerError(message = "invalid workflow return contract: " + move m); },
+				Optional::None => {}
+			}
+			val ch = _content_hash(cfg, &graph, &arg_type, &return_type);
 			revs.push(ScriptRevision(name = move name, version = move version,
-			                         graph = move graph, arg_type = move arg_type,
+			                         graph = move graph, arg_type = move arg_type, return_type = move return_type,
 			                         content_hash = ch, plan_length = plan_length));
 		},
 		Optional::None => {}
@@ -1474,6 +1485,42 @@ fn _arg_type(cfg: &json.JsonNode) -> ir.IrType {
 			}
 		},
 		Optional::None => { return ir.empty_object_type(); }
+	}
+}
+
+// The script's declared RETURN type (1b.0a), from config `"returns": {"type": <type>}`. Absent
+// `returns`, or a `returns` object with `type` absent (i.e. exactly `{}`), is UNIT (`Optional::None`)
+// — the pre-composition default; a unit workflow's successful paths may fall through. A present
+// `returns.type` must be a closed-object type (object-only per the locked design decision). `returns`
+// itself must be a JSON OBJECT with EXACTLY its allowed key (`type`, or none for unit) — a non-object
+// wrapper (e.g. `"returns": "bad"`) or an unknown key (e.g. a typo'd `"types"`) is a RunnerError, not
+// silently treated as unit: a typo must not silently produce an unintended (absent) contract, mirroring
+// the unknown-key rejection every other type declaration in this file already enforces. A malformed
+// declaration OR a non-object return type also becomes a RunnerError (surfaced by the existing build
+// catch as invalid_config / revision_unavailable, never a dispatch).
+fn _return_type(cfg: &json.JsonNode) -> Optional<ir.IrType> {
+	match cfg.get(&"returns") {
+		Optional::Some(rn) => {
+			var nkeys = 0;
+			match rn.as_object() {
+				Optional::Some(o) => { nkeys = o.len(); },
+				Optional::None => { throw RunnerError(message = "'returns' must be an object"); }
+			}
+			match rn.get(&"type") {
+				Optional::Some(tn) => {
+					if nkeys != 1 { throw RunnerError(message = "'returns' has unknown key(s) (only 'type' is allowed)"); }
+					match ir.parse_object_type(tn) {
+						core.Result::Ok(ty) => { return Optional<ir.IrType>::Some(move ty); },
+						core.Result::Err(_) => { throw RunnerError(message = "invalid 'returns.type' (must be an object type or absent/unit)"); }
+					}
+				},
+				Optional::None => {
+					if nkeys != 0 { throw RunnerError(message = "'returns' has unknown key(s) (only 'type' is allowed)"); }
+					return Optional<ir.IrType>::None();
+				}
+			}
+		},
+		Optional::None => { return Optional<ir.IrType>::None(); }
 	}
 }
 
@@ -1575,11 +1622,12 @@ fn _validate_semver(version: &String) -> Void {
 //
 // The hashed material is the GRAPH IDENTITY: `graph_canonical` (graph shape — node ids, edges,
 // branch targets, loop bodies, per-op name + canonical input) ‖ the per-NOperation RESOLUTION
-// bindings (schema_version + participant + compensation) ‖ the declared argument TYPE. Key order
-// in input/arg JSON never affects it (everything is canonicalized), so identity tracks graph
-// SEMANTICS, not raw spelling.
-fn _content_hash(cfg: &json.JsonNode, graph: &ir.IrGraph, arg_type: &ir.IrType) -> Array<Byte> {
-	val canonical = ir.graph_canonical(graph) + _graph_bindings(cfg, graph) + ir.canonical(arg_type);
+// bindings (schema_version + participant + compensation) ‖ the declared argument TYPE ‖ the declared
+// RETURN type (1b.0a; absent/unit contributes nothing, so every pre-existing hash is unchanged — see
+// `_return_type_hash_suffix`). Key order in input/arg JSON never affects it (everything is
+// canonicalized), so identity tracks graph SEMANTICS, not raw spelling.
+fn _content_hash(cfg: &json.JsonNode, graph: &ir.IrGraph, arg_type: &ir.IrType, return_type: &Optional<ir.IrType>) -> Array<Byte> {
+	val canonical = ir.graph_canonical(graph) + _graph_bindings(cfg, graph) + ir.canonical(arg_type) + _return_type_hash_suffix(return_type);
 	val msg = _str_bytes(&canonical);
 	val digest = crypto.sha256(&msg);   // 32 bytes
 	var out: Array<Byte> = [];
@@ -1592,6 +1640,17 @@ fn _content_hash(cfg: &json.JsonNode, graph: &ir.IrGraph, arg_type: &ir.IrType) 
 	var i = 0;
 	while i < digest.len { out.push(digest[i]); i = i + 1; }
 	return move out;
+}
+
+// Hash-compat suffix for the declared return type (locked rule): absent/unit contributes an EMPTY
+// suffix — so every hash computed before 1b.0a, and every still-unit workflow, is byte-for-byte
+// unchanged — while a non-unit return type contributes its canonical encoding, making a return-type
+// change a plan-identity change (like the argument type already is).
+fn _return_type_hash_suffix(return_type: &Optional<ir.IrType>) nothrow -> String {
+	match return_type {
+		Optional::None => { return ""; },
+		Optional::Some(t) => { return ir.canonical(t); }
+	}
 }
 
 // Per-NOperation RESOLUTION bindings appended after `graph_canonical`: the RESOLVED operation

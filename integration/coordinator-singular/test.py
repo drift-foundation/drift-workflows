@@ -355,7 +355,7 @@ def main():
     # the single --operation path; resume re-reads the same plan + recovers per-seq
     # from durable state. Same registry as rcf, plus the ordered steps.
     plan_cfgs = []
-    def plan_cfg(steps, version=None, argument_type=None):
+    def plan_cfg(steps, version=None, argument_type=None, returns=None, returns_raw=None):
         c = dict(runner_cfg); c["plan"] = steps
         # The loaded plan generation's immutable semantic version (default 1.0.0). A
         # process loads ONE generation; resolution is EXACT-MATCH on (plan_version AND
@@ -367,21 +367,37 @@ def main():
         # the empty-object type {} (encoded as "O{}").
         if argument_type is not None:
             c["argument_type"] = argument_type
+        # The script's declared RETURN type (1b.0a): `{"returns": {"type": <type>}}`. Absent =>
+        # unit (identity content_hash suffix); a non-unit type is folded into content_hash.
+        if returns is not None:
+            # `returns={}` means an explicit but TYPELESS `returns` block — `returns.type` absent
+            # is unit, same as omitting `returns` entirely (hash-compat: absent returns.type ==
+            # unit). Any other value is wrapped as the declared `returns.type`.
+            c["returns"] = {} if returns == {} else {"type": returns}
+        # `returns_raw` bypasses the `{"type": ...}` wrapping entirely — for asserting the wrapper
+        # ITSELF is validated (non-object `returns`, unknown keys inside `returns`, etc).
+        if returns_raw is not None:
+            c["returns"] = returns_raw
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(c, f); f.close()
         plan_cfgs.append(f.name)
         return f.name
 
-    def graph_cfg(graph, argument_type=None):
+    def graph_cfg(graph, argument_type=None, returns=None):
         # Manual-IR control flow (slice 1): a directly-authored control-flow GRAPH (the "graph"
         # config key) instead of the flat "plan". Same registry; supports operation/if/let/return.
         c = dict(runner_cfg); c["graph"] = graph
         if argument_type is not None:
             c["argument_type"] = argument_type
+        if returns is not None:
+            # `returns={}` means an explicit but TYPELESS `returns` block — `returns.type` absent
+            # is unit, same as omitting `returns` entirely (hash-compat: absent returns.type ==
+            # unit). Any other value is wrapped as the declared `returns.type`.
+            c["returns"] = {} if returns == {} else {"type": returns}
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(c, f); f.close()
         plan_cfgs.append(f.name)
         return f.name
 
-    def typed_graph_cfg(graph, op_types, argument_type=None):
+    def typed_graph_cfg(graph, op_types, argument_type=None, returns=None):
         # Like graph_cfg, but OVERLAYS declared input_type/result_type onto named operations (a
         # per-test typed contract; the global registry stays untyped). op_types: {op: {input_type,
         # result_type}}. The declared types are type-checked at registry build and folded into the
@@ -397,6 +413,11 @@ def main():
         c["graph"] = graph
         if argument_type is not None:
             c["argument_type"] = argument_type
+        if returns is not None:
+            # `returns={}` means an explicit but TYPELESS `returns` block — `returns.type` absent
+            # is unit, same as omitting `returns` entirely (hash-compat: absent returns.type ==
+            # unit). Any other value is wrapped as the declared `returns.type`.
+            c["returns"] = {} if returns == {} else {"type": returns}
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); json.dump(c, f); f.close()
         plan_cfgs.append(f.name)
         return f.name
@@ -1056,6 +1077,66 @@ def main():
               len(h_ko1) == 66 and h_ko1 == h_ko2, (h_ko1, h_ko2))
         check("content_hash_changes_on_semantic_graph_change",
               len(h_sem) == 66 and h_sem != h_ko1, (h_sem, h_ko1))
+
+        # C5j. WORKFLOW RETURN-TYPE contract (1b.0a step 2): `returns.type` config + content_hash
+        # plumbing. `return` itself stays parse-gated (source-language); this exercises the manual
+        # "graph" config path only, which is never gated.
+        nonunit_rt = {"type": "object", "fields": [{"name": "id", "type": {"type": "int"}}]}
+        # ABSENT `returns` and an EXPLICIT-but-typeless `returns` block (`returns.type` absent) must
+        # hash IDENTICALLY — `absent returns.type` IS unit, the locked hash-compat rule (existing
+        # hashes stay byte-for-byte). NOTE: an object type with ZERO fields is NOT unit — it is still
+        # a declared non-unit object type (a distinct value from `Optional::None`), so it does not
+        # belong in this equivalence.
+        cfg_no_returns = plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}])
+        cfg_unit_returns = plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}], returns={})
+        h_no_returns, h_unit_returns = emit_content_hash(cfg_no_returns), emit_content_hash(cfg_unit_returns)
+        check("returns_absent_hash_unchanged",
+              len(h_no_returns) == 66 and h_no_returns == h_unit_returns, (h_no_returns, h_unit_returns))
+        # A NON-UNIT return type changes the hash relative to absent/unit. The graph needs a real
+        # operation (a fail-only/empty workflow is rejected as non-executable independent of the
+        # return contract), followed by an explicit non-unit `return`.
+        return_graph_ok = {"entry": "n0", "nodes": [
+            {"kind": "operation", "id": "n0", "operation": "echo-transform",
+             "input": {"const": {"values": [1]}}, "next": "n1"},
+            {"kind": "return", "id": "n1", "value": {"const": {"id": 1}}}]}
+        cfg_nonunit_returns = graph_cfg(return_graph_ok, returns=nonunit_rt)
+        h_nonunit_returns = emit_content_hash(cfg_nonunit_returns)
+        check("returns_nonunit_changes_hash",
+              len(h_nonunit_returns) == 66 and h_nonunit_returns != h_no_returns, (h_nonunit_returns, h_no_returns))
+        # A NON-OBJECT declared return type is rejected at build (object-only or unit).
+        wf_bad_rt = _wf_id()
+        code, body = run_runner(plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}],
+                                          returns={"type": "int"}), wf_bad_rt, arguments="{}")
+        check("returns_non_object_type_rejected",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config", (code, body))
+        # A NON-UNIT return type + an IMPLICIT unit fall-through (the flat-plan builder's default
+        # terminal) is rejected at build — every successful path must be an explicit `return`.
+        wf_fallthrough = _wf_id()
+        code, body = run_runner(plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}],
+                                          returns=nonunit_rt), wf_fallthrough, arguments="{}")
+        check("returns_nonunit_implicit_fallthrough_rejected",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config", (code, body))
+        # A NON-UNIT return type with every successful path EXPLICITLY returning builds + runs fine
+        # (terminal-shape only — the deferred structural expr check does not yet enforce the value
+        # matches `nonunit_rt`'s declared fields).
+        wf_explicit_return = _wf_id()
+        code, body = run_runner(cfg_nonunit_returns, wf_explicit_return, arguments="{}")
+        check("returns_nonunit_explicit_return_builds",
+              code == 0 and body.get("workflow") == "completed", (code, body))
+        # A non-OBJECT `returns` wrapper (not `returns.type` — the wrapper itself) is rejected, not
+        # silently treated as unit. A typo'd/unknown key inside `returns` (e.g. "types" for "type")
+        # is rejected too — same "typo must not silently produce an unintended contract" principle
+        # already enforced for every other type declaration in this file.
+        wf_returns_not_object = _wf_id()
+        code, body = run_runner(plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}],
+                                          returns_raw="bad"), wf_returns_not_object, arguments="{}")
+        check("returns_wrapper_non_object_rejected",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config", (code, body))
+        wf_returns_unknown_key = _wf_id()
+        code, body = run_runner(plan_cfg([{"operation": "echo-transform", "input": {"values": [1]}}],
+                                          returns_raw={"types": nonunit_rt}), wf_returns_unknown_key, arguments="{}")
+        check("returns_wrapper_unknown_key_rejected",
+              code == 2 and body.get("workflow") == "aborted" and body.get("reason") == "invalid_config", (code, body))
 
         # ===== C6. MANUAL-IR CONTROL FLOW, slice 1: `if` =====
         # A directly-authored branch graph (the "graph" config key — no parser/DSL): if args.flag
@@ -3411,7 +3492,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 208
+    EXPECTED_CHECKS = 215
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

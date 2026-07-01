@@ -82,13 +82,18 @@ validation gate) → **1b.1** (IR build-block inversion + schema/SP/host + runne
 - **1b.0a build plan (each gated):** **(1) IR return-contract validation — DONE** (`ir.validate_return_contract`;
   object-or-unit type check + non-unit ⇒ every successful sink is an explicit `return`, implicit unit
   fall-through rejected, `fail` exempt; `ir_exec_test` base+asan `exit=0`, `ir_graph_test` base `exit=0`).
-  **Deferred within step 1 (must land before un-gate):** the per-expression **structural** check that an
-  explicit non-unit `return <expr>` is object-shaped / matches `return_type` — step 1 enforces terminal-shape
-  only, so "object-only returns" are NOT yet fully validated. Remaining: (2) `returns.type` in config +
-  content_hash; (3) durable return store + atomic final settle (schema/SP); (4) runner finality probe passes
-  `Completed(result)` (today **discarded** at `runner.drift:~1773` — reports the last op result); (5) terminal
-  replay from the stored return; (6) child-call result binding (in 1b.0) + the deferred structural expr check;
-  then un-gate.
+  **(2) `returns.type` config + content_hash — DONE** (`ScriptRevision.return_type` + `_return_type(cfg)` +
+  `_content_hash` suffix + `validate_return_contract` wired into `_registry_build`; `_return_type` also
+  validates the `"returns"` wrapper itself — must be a JSON object with only the `type` key, else
+  `invalid_config` (a non-object wrapper or a typo'd key like `"types"` is rejected, not silently unit —
+  review-flagged and fixed same step); runner unit tests green; 7 new coordinator-singular integration
+  checks, 215/215 green).
+  **Deferred within steps 1–2 (must land before un-gate):** the per-expression **structural** check that an
+  explicit non-unit `return <expr>` is object-shaped / matches `return_type` — terminal-shape only so far, so
+  "object-only returns" are NOT yet fully validated. Remaining: (3) durable return store + atomic final settle
+  (schema/SP); (4) runner finality probe passes `Completed(result)` (today **discarded** at
+  `runner.drift:~1773` — reports the last op result); (5) terminal replay from the stored return; (6) child-call
+  result binding (in 1b.0) + the deferred structural expr check; then un-gate.
 
 Overall feature: any workflow step may be a child workflow; the child owns its durable state; the parent
 treats the call as one forward step/checkpoint with result data flow; compensations may be workflows (1c);
@@ -130,8 +135,27 @@ testable locally** now (see *Current reality*); the earlier "not testable locall
   earlier "not buildable/testable locally (missing deps)" caveat is **stale**.
 - **Slice 1b.0a step 1 (IR return-contract validation) is DONE + verified** — `ir.validate_return_contract`
   (object-or-unit + non-unit ⇒ explicit-`return` on every successful path; `fail` exempt); `ir_exec_test`
-  base+asan `exit=0`, `ir_graph_test` base `exit=0`; `return` parse-gate untouched. **Active scope: step 2**
-  (`returns.type` config + content_hash plumbing).
+  base+asan `exit=0`, `ir_graph_test` base `exit=0`; `return` parse-gate untouched.
+- **Slice 1b.0a step 2 (`returns.type` config + content_hash) is DONE + verified** — `ScriptRevision` gained
+  `return_type: Optional<ir.IrType>`; `_return_type(cfg)` reads `returns.type` (absent `returns`, or `returns`
+  present with `type` absent — i.e. exactly `{}` — ⇒ unit; present `type` ⇒ `ir.parse_object_type`,
+  object-only, else `RunnerError`); `_registry_build` computes it after `arg_type`, calls
+  `ir.validate_return_contract`, and folds it into `_content_hash` via `_return_type_hash_suffix` (unit ⇒
+  empty suffix, byte-identical to every pre-existing hash; non-unit ⇒ `ir.canonical(return_type)`).
+  **Wrapper strictness (review-flagged, fixed same step):** `_return_type` also requires `returns` itself
+  be a JSON object with EXACTLY its allowed key (`type`, or none for unit) — a non-object `"returns"` (e.g.
+  `"returns": "bad"`) or an unknown key inside it (e.g. a typo'd `"types"`) is a `RunnerError`
+  (`invalid_config`), never silently defaulted to unit; this mirrors the unknown-key rejection every other
+  type declaration in the file already enforces. `just test` (runner) green: `ir_graph_test`/`ir_exec_test`
+  base+asan, 99/99 parser fixtures, full binary build. `coordinator-singular` integration green: 215/215
+  (7 new checks — absent≡unit hash identity via an explicit-but-typeless `returns` block, non-unit changes
+  the hash, a non-object `returns.type` is `invalid_config`, non-unit + implicit fall-through is
+  `invalid_config`, a non-unit graph with every path explicit-`return`ing builds + runs, a non-object
+  `returns` wrapper is `invalid_config`, and an unknown key inside `returns` is `invalid_config`). Gotchas
+  for any future test author: an object type with **zero fields** is NOT unit — only an **absent**
+  `returns.type` (e.g. `{"returns": {}}`) is; and any return-only/fail-only graph is independently rejected
+  by the pre-existing `_assert_executable` ("must execute at least one operation") regardless of the return
+  contract. **Active scope: step 3** (durable return store + atomic final settle).
 
 ## Step 1 — DONE (IR return-contract validation)
 
@@ -145,29 +169,43 @@ fail-only workflow is vacuously accepted). **Gate:** `ir_exec_test` base+asan `e
 structural check that an explicit non-unit `return <expr>` is object-shaped / matches `return_type` — so do
 NOT describe object-only returns as *fully* validated until that lands.
 
-## Literal Next Action — 1b.0a step 2 (`returns.type` config + content_hash)
+## Step 2 — DONE (`returns.type` config + content_hash)
 
-Source the declared `return_type` from the manifest contract (`returns: { type: <type> }`, mirroring
-`arguments: { type }`), parse it via `ir.parse_type` (must be an object type or absent≡unit), and **fold it
-into `content_hash`** per the locked hash-compat rule: **absent ≡ unit ⇒ empty/identity suffix** (existing
-hashes unchanged), **non-unit ⇒ `ir.canonical(return_type)`**. Then call `validate_return_contract` from the
-build path with that type. Still **no parser un-gate, no runner/storage** (steps 3–6). Wording guard: this
-step adds the type to identity + wires the terminal-shape check — it does **not** add the deferred structural
-expression check.
+`ScriptRevision.return_type: Optional<ir.IrType>` (next to `arg_type`). `_return_type(cfg)` — parallel to
+`_arg_type(cfg)` — reads config `"returns": {"type": <type>}`: absent `returns`, or `returns` present but
+`returns.type` absent, ⇒ `Optional::None` (unit; the latter is the ONLY way to spell "explicit unit" — an
+object type with zero fields is a distinct, non-unit value); a present `returns.type` is parsed + required
+object via `ir.parse_object_type`, else `RunnerError`. `_return_type` ALSO requires the `returns` wrapper
+itself be a JSON object with exactly its allowed key (`type`, or none for unit) — a non-object `returns` or
+an unknown key inside it is `RunnerError`, never silently unit (review-flagged gap, fixed same step: a typo
+like `{"returns":{"types":...}}` must not silently produce an unintended absent-return contract).
+`_registry_build` computes `return_type` after `arg_type`, calls `ir.validate_return_contract(&graph,
+&return_type)` (a rejection ⇒ `RunnerError` ⇒ `invalid_config`/`revision_unavailable`, never a dispatch),
+and stores it on `ScriptRevision`. `_content_hash` takes `return_type` and appends
+`_return_type_hash_suffix` — empty for unit (every pre-existing hash byte-identical),
+`ir.canonical(return_type)` for non-unit. **Gate:** `just test` (runner) green — `ir_graph_test`/
+`ir_exec_test` base+asan `exit=0`, 99/99 parser fixtures, full binary builds; `coordinator-singular`
+integration green — 215/215 (`EXPECTED_CHECKS` bumped 208→215 for 7 new checks:
+`returns_absent_hash_unchanged`, `returns_nonunit_changes_hash`, `returns_non_object_type_rejected`,
+`returns_nonunit_implicit_fallthrough_rejected`, `returns_nonunit_explicit_return_builds`,
+`returns_wrapper_non_object_rejected`, `returns_wrapper_unknown_key_rejected`). **Deferred
+(unchanged from step 1):** the per-expression structural check that an explicit non-unit `return <expr>`
+matches `return_type`'s declared fields — still terminal-shape only. **No parser un-gate, no
+runner/storage** (steps 3–6 untouched), as scoped.
 
-Concrete touchpoints in `microflows/runner/src/runner.drift` for resume after restart:
-- Add `return_type: Optional<ir.IrType>` to `ScriptRevision` next to `arg_type`.
-- Add a helper parallel to `_arg_type(cfg)` that reads config `returns.type`:
-  absent `returns` or absent `returns.type` ⇒ `Optional::None` (unit); present type ⇒ `ir.parse_type`, then
-  require object type or reject with `RunnerError`.
-- In `_registry_build`, compute `return_type` after `arg_type`, call `ir.validate_return_contract(&graph,
-  &return_type)` after `ir.validate_graph` / type-check is otherwise ready, and store it in `ScriptRevision`.
-- Change `_content_hash(cfg, graph, arg_type)` to accept `return_type`; keep the existing bytes identical for
-  unit (`None`) by appending **nothing** for unit, and append `ir.canonical(return_type)` only for non-unit.
-- `_emit_content_hash` and manifest loading already go through `_registry_build`; add/adjust fixtures/tests
-  around those paths to prove absent/unit hashes stay unchanged and non-unit return type changes the hash.
-- Do not touch parser un-gating, durable storage, final settle, or terminal replay in this step.
+## Literal Next Action — 1b.0a step 3 (durable return store + atomic final settle)
 
-Then step 3 (durable return store + atomic final settle) → 4 (finality probe passes `Completed(result)`) →
-5 (terminal replay from stored return) → 6 (child-call result binding + the deferred structural expr check)
-→ un-gate `return`; then 1b.0 registry gate, 1b.1 runtime spine, and 1c per the `DESIGN.md` checklists.
+Per `DESIGN.md`'s locked atomicity decision: the workflow's evaluated return is stored durably, **separate**
+from per-op results, and written **atomically with completion** — the final settle transition writes, in ONE
+fenced transaction, (a) the final op result (unchanged, `tb_mf_operation.result_json`), (b) the workflow
+terminal return (new: a workflow-return store — schema/column not yet designed), and (c) `state=completed`.
+Implies `sp_mf_operation_settle` (or its final-settle path) grows a `workflow_return_json` parameter,
+accepted only when `is_final=1`. This step is schema/SP work (`microflows/db/schema`, `microflows/db/procs`)
+plus the runner call site that invokes final settle — no design has been drafted yet for the store's shape
+(new column on `tb_mf_workflow` vs. a new table); that is the first sub-decision to make before touching SQL.
+Do not touch parser un-gating in this step either — un-gating `return` still waits on steps 3–6 together.
+
+Then step 4 (runner finality probe passes `Completed(result)` into final settle instead of discarding it) →
+5 (terminal replay from stored return, not graph re-derivation) → 6 (child-call result binding + the
+deferred structural expr check) → un-gate `return`; then 1b.0 registry gate, 1b.1 runtime spine, and 1c per
+the `DESIGN.md` checklists.
