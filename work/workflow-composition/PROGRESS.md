@@ -79,11 +79,16 @@ validation gate) → **1b.1** (IR build-block inversion + schema/SP/host + runne
   workflow return + `state=completed` in ONE fenced txn; `sp_mf_operation_settle` takes `workflow_return_json`
   when `is_final=1`); **terminal replay reads the stored return — NOT graph re-derivation**; hash policy:
   absent≡unit, unit = empty suffix (existing hashes unchanged), non-unit = `ir.canonical(return_type)`.
-- **Remaining to un-gate (the 1b.0a build plan, each gated):** (1) IR return-contract validation (object-only;
-  non-unit ⇒ every successful path explicit-`return`, reject implicit unit fall-through); (2) `returns.type`
-  in config + content_hash; (3) durable return store + atomic final settle (schema/SP); (4) runner finality
-  probe passes `Completed(result)` (today **discarded** at `runner.drift:~1773` — reports the last op result);
-  (5) terminal replay from the stored return; (6) child-call result binding (in 1b.0); then un-gate.
+- **1b.0a build plan (each gated):** **(1) IR return-contract validation — DONE** (`ir.validate_return_contract`;
+  object-or-unit type check + non-unit ⇒ every successful sink is an explicit `return`, implicit unit
+  fall-through rejected, `fail` exempt; `ir_exec_test` base+asan `exit=0`, `ir_graph_test` base `exit=0`).
+  **Deferred within step 1 (must land before un-gate):** the per-expression **structural** check that an
+  explicit non-unit `return <expr>` is object-shaped / matches `return_type` — step 1 enforces terminal-shape
+  only, so "object-only returns" are NOT yet fully validated. Remaining: (2) `returns.type` in config +
+  content_hash; (3) durable return store + atomic final settle (schema/SP); (4) runner finality probe passes
+  `Completed(result)` (today **discarded** at `runner.drift:~1773` — reports the last op result); (5) terminal
+  replay from the stored return; (6) child-call result binding (in 1b.0) + the deferred structural expr check;
+  then un-gate.
 
 Overall feature: any workflow step may be a child workflow; the child owns its durable state; the parent
 treats the call as one forward step/checkpoint with result data flow; compensations may be workflows (1c);
@@ -103,36 +108,66 @@ fan-out uses stable child ids (slice 3).
 - 7 new `--parse-check` fixtures + goldens under `runner/tests/fixtures/parser/check/` (`call_single`,
   `call_bare`, `call_compensation_rejected`, `err_call_{on_failed,fan,bad_version,no_input}`).
 - **No regression:** a faithful standalone `_parse_check` replica reproduced all **88** existing check
-  goldens byte-for-byte. `ir_graph_test` passes. (Full runner binary + `run_parser_fixtures.py` gate can't
-  build locally — missing external deps; runs in CI.)
+  goldens byte-for-byte. `ir_graph_test` passes. The later refreshed environment note below supersedes the
+  old local-build caveat: runner + integration builds now run locally with the certified package root.
 
-**Remaining for 1a (manifest-backed — needs full build env, not testable locally):** child `name@version`
-registry resolution + input↔child-`arg` / downstream↔child-`return` contract match, and the **static
-recursion/cycle check** (registry enumerates each pinned plan's `NCallWorkflow` edges). These live in the
-`--manifest` path (`runner.drift`), the only place a multi-script workflow registry exists.
+**Manifest-backed validation — now slice 1b.0 (build-time registry gate), not a 1a remnant:** child
+`name@<plan_version>` registry resolution + input↔child-`arg` / downstream↔child-`return` contract match +
+the **static recursion/cycle check** (enumerate each pinned plan's `NCallWorkflow` edges). These live in the
+`--manifest` path (`runner.drift`) — the only place a multi-script registry exists — and are **buildable +
+testable locally** now (see *Current reality*); the earlier "not testable locally" caveat is retired.
 
-## Dirty Worktree
+## Current reality (refreshed)
 
-The three work files are committed. Current dirty state:
-- **Docs:** `DESIGN.md` + `PROGRESS.md` (design refinements + this status).
-- **Code (slice 1a frontend core):** `microflows/runner/src/parser.drift`, `microflows/runner/src/ir.drift`.
-- **Tests:** 14 new files under `microflows/runner/tests/fixtures/parser/check/` — 7 `.mf` + 7 `.expected`
-  (`call_single`, `call_bare`, `call_compensation_rejected`, `err_call_{on_failed,fan,bad_version,no_input}`).
+- **Slice 1a is mainlined** at commit `62555a4` (`call` grammar → `NCallWorkflow` IR + structural validation +
+  build-block of reachable `call`/`compensation`); the registry-free frontend core is committed, not dirty.
+- **`return <expr>` is parse-gated** at commit `9195854` — the statement is recognized but `_parse_return`
+  throws `unsupported-in-release` (gate fixture `err_return_unsupported`); the `KReturn → NReturn` lowering is
+  kept dormant.
+- **Local runner + integration build is now available** with the correct package root:
+  `DRIFT_TOOLCHAIN_ROOT=~/opt/drift/certified/current/toolchain DRIFT_PKG_ROOT=~/opt/drift/certified/current/pkgs`.
+  The full runner binary builds from source and the coordinator↔singular integration gate runs locally — the
+  earlier "not buildable/testable locally (missing deps)" caveat is **stale**.
+- **Slice 1b.0a step 1 (IR return-contract validation) is DONE + verified** — `ir.validate_return_contract`
+  (object-or-unit + non-unit ⇒ explicit-`return` on every successful path; `fail` exempt); `ir_exec_test`
+  base+asan `exit=0`, `ir_graph_test` base `exit=0`; `return` parse-gate untouched. **Active scope: step 2**
+  (`returns.type` config + content_hash plumbing).
 
-A reachable `call` is **build-rejected** (op-depth gate) until 1b, so the frontend-only node can never reach
-the runtime fault; `--parse-check` still accepts calls. Verified: standalone `parser.drift`+`ir.drift` compile;
-smoke driver passes (incl. build-gate); 95 parser-check goldens reproduce (88 existing byte-for-byte + 7 new);
-`ir_graph_test` + `ir_exec_test` pass. Full runner binary + fixture gate need the CI build env (deps absent
-locally).
+## Step 1 — DONE (IR return-contract validation)
 
-## Literal Next Action
+`ir.validate_return_contract(g, return_type: Optional<IrType>)` (standalone; not yet wired into
+`validate_graph`). Exact behavior: **unit** (`None`) accepts any terminal shape; a **non-unit** type must be
+an **object** (else rejected — object-only); for a non-unit type **every successful sink `NReturn` must be an
+explicit `return`** (value ≠ the implicit unit literal `null`) — an implicit unit fall-through on any
+successful path is rejected (stricter than "no reachable return"); **`fail` (NFail) is exempt** (a
+fail-only workflow is vacuously accepted). **Gate:** `ir_exec_test` base+asan `exit=0` (checks 170–177),
+`ir_graph_test` base `exit=0`; `return` parse-gate untouched. **Deferred (before un-gate):** the per-expression
+structural check that an explicit non-unit `return <expr>` is object-shaped / matches `return_type` — so do
+NOT describe object-only returns as *fully* validated until that lands.
 
-**Slice 1a frontend core is implemented + locally verified** (parser + IR + 7 fixtures). Two ways forward:
-1. **Land the registry-free 1a frontend increment** — commit `parser.drift` + `ir.drift` + the 14 fixtures
-   (+ docs), run the full `just test` gate in a CI/full-build env, then continue.
-2. **Continue 1a in a full-build env** — implement the **manifest-backed** validation (task #3): child
-   `name@<plan_version>` registry resolution + input↔`arg`/downstream↔`return` contract match + the **static
-   recursion/cycle check** (enumerate each pinned plan's `NCallWorkflow` edges). This lives in the `--manifest`
-   path (`runner.drift`) and is **not buildable/testable in the current local env** (missing external deps).
+## Literal Next Action — 1b.0a step 2 (`returns.type` config + content_hash)
 
-Then 1b (forward async-call spine) and 1c (compensation) per the `DESIGN.md` checklists.
+Source the declared `return_type` from the manifest contract (`returns: { type: <type> }`, mirroring
+`arguments: { type }`), parse it via `ir.parse_type` (must be an object type or absent≡unit), and **fold it
+into `content_hash`** per the locked hash-compat rule: **absent ≡ unit ⇒ empty/identity suffix** (existing
+hashes unchanged), **non-unit ⇒ `ir.canonical(return_type)`**. Then call `validate_return_contract` from the
+build path with that type. Still **no parser un-gate, no runner/storage** (steps 3–6). Wording guard: this
+step adds the type to identity + wires the terminal-shape check — it does **not** add the deferred structural
+expression check.
+
+Concrete touchpoints in `microflows/runner/src/runner.drift` for resume after restart:
+- Add `return_type: Optional<ir.IrType>` to `ScriptRevision` next to `arg_type`.
+- Add a helper parallel to `_arg_type(cfg)` that reads config `returns.type`:
+  absent `returns` or absent `returns.type` ⇒ `Optional::None` (unit); present type ⇒ `ir.parse_type`, then
+  require object type or reject with `RunnerError`.
+- In `_registry_build`, compute `return_type` after `arg_type`, call `ir.validate_return_contract(&graph,
+  &return_type)` after `ir.validate_graph` / type-check is otherwise ready, and store it in `ScriptRevision`.
+- Change `_content_hash(cfg, graph, arg_type)` to accept `return_type`; keep the existing bytes identical for
+  unit (`None`) by appending **nothing** for unit, and append `ir.canonical(return_type)` only for non-unit.
+- `_emit_content_hash` and manifest loading already go through `_registry_build`; add/adjust fixtures/tests
+  around those paths to prove absent/unit hashes stay unchanged and non-unit return type changes the hash.
+- Do not touch parser un-gating, durable storage, final settle, or terminal replay in this step.
+
+Then step 3 (durable return store + atomic final settle) → 4 (finality probe passes `Completed(result)`) →
+5 (terminal replay from stored return) → 6 (child-call result binding + the deferred structural expr check)
+→ un-gate `return`; then 1b.0 registry gate, 1b.1 runtime spine, and 1c per the `DESIGN.md` checklists.

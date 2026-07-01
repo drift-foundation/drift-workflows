@@ -1584,6 +1584,68 @@ fn _is_fail(n: &IrNode) nothrow -> Bool {
 	match n { IrNode::NFail(id, reason) => { return true; }, default => { return false; } }
 }
 
+// ----- composition 1b.0a (step 1): workflow return-contract validation -----
+//
+// A workflow is a TYPED FUNCTION with a declared return type that is either UNIT (`return_type` =
+// Optional::None — the pre-composition default; a successful path may fall through, and the unit
+// result is exposed externally as `{}`) or a NON-UNIT OBJECT type. The declaration is OBJECT-ONLY:
+// a non-unit `return_type` that is not an object type is rejected.
+//
+// For a NON-UNIT return type, EVERY successful terminal — a sink `NReturn` — must be an EXPLICIT
+// `return <expr>`, i.e. NOT the implicit unit fall-through (whose value is the canonical literal
+// `null`, produced by `flat_to_graph` or an authored `return null`). A successful sink that falls
+// through to unit is REJECTED — this is STRICTER than "no reachable return": a graph that returns on
+// one branch and falls through on another is rejected. `fail` (the unsuccessful terminal, `NFail`)
+// is EXEMPT — it neither needs to return nor satisfies the contract.
+//
+// UNIT (None) imposes no terminal constraint. This is a SEPARATE pass from `validate_graph` (which
+// carries no return type yet); 1b.0a's NEXT step sources `return_type` from config + folds it into
+// `content_hash` and calls this. Convention matches `validate_graph`: None = ok, Some(reason) =
+// rejected. NOTE: the per-expression structural type-check (the returned value matching the declared
+// object shape) is deferred to when `return` un-gates and produces real expressions; step 1 enforces
+// the terminal-shape contract (object-only/unit + explicit-return reachability) only.
+pub fn validate_return_contract(g: &IrGraph, return_type: &Optional<IrType>) nothrow -> Optional<String> {
+	match return_type {
+		Optional::None => { return Optional<String>::None(); },                  // unit: fall-through allowed
+		Optional::Some(t) => {
+			if !_is_object_type(t) {
+				return Optional<String>::Some("workflow return type must be an object type or unit");
+			}
+			var i = 0;
+			while i < g.nodes.len {
+				var succs: Array<String> = [];
+				_succs(&g.nodes[i], &mut succs);
+				if succs.len == 0 {
+					match &g.nodes[i] {
+						IrNode::NReturn(id, value) => {
+							if _is_unit_return_value(value) {
+								return Optional<String>::Some("non-unit workflow has a successful path with no explicit `return`: " + _dup(id));
+							}
+						},
+						default => {}   // NFail is the only other sink kind: unsuccessful terminal, exempt
+					}
+				}
+				i = i + 1;
+			}
+			return Optional<String>::None();
+		}
+	}
+}
+
+fn _is_object_type(t: &IrType) nothrow -> Bool {
+	match t { IrType::TObject(fields) => { return true; }, default => { return false; } }
+}
+
+// The implicit unit terminal: an `NReturn` whose value is the canonical literal `null` (what
+// `flat_to_graph` inserts on fall-through, and what an authored `return null` lowers to). Treated as
+// unit so `return null` can never become an app-facing non-unit result.
+fn _is_unit_return_value(e: &IrExpr) nothrow -> Bool {
+	match e {
+		IrExpr::EConst(canonical_json) => { return _str_eq(canonical_json, &"null"); },
+		default => { return false; }
+	}
+}
+
 fn _is_call(n: &IrNode) nothrow -> Bool {
 	match n { IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => { return true; }, default => { return false; } }
 }
