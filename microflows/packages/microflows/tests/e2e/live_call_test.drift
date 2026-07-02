@@ -1,0 +1,290 @@
+// Microflows host e2e — composition (1b.1) workflow-call host methods against a real MariaDB
+// instance. FOCUSED: proves the host-layer WIRING (arg marshaling, outcome decoding, SP name/
+// signature agreement) is correct — it does NOT re-prove the underlying stored-procedure LOGIC,
+// which already has 79 passing checks at the SP layer (db-tests/sp_call_test.py). Each host
+// method's happy path + 1-2 key decode branches are exercised here; exhaustive behavioral
+// coverage (recursion guard, replay/conflict matrices, reversal state machines) stays at the SP
+// layer and moves to the runner integration step for true end-to-end proof.
+//
+// Constructs a REAL reversing workflow with an ACTIVE call checkpoint via the actual host call
+// chain (create_planned -> claim -> call_submit -> operation_settle(intermediate) ->
+// operation_request -> begin_reversal -> claim_workflow) rather than a seed proc — this also
+// proves call_kind flows correctly end-to-end from sp_mf_call_submit's op-row write through
+// sp_mf_checkpoint_reverse_head's decode.
+//
+// TIME IS FABRICATED (§24.4): synthetic datetimes, no sleeps.
+// Prereqs: MariaDB 127.0.0.1:34214 root/rootpw, schema loaded (no test-only seed proc needed).
+
+module microflows.tests.e2e.live_call_test;
+
+import std.core as core;
+import std.core.arc as arc;
+import std.io as io;
+import std.json as json;
+import std.env as env;
+import std.uuid as uuid;
+import microflows.host as host;
+
+fn _env_or(key: String, dflt: String) nothrow -> String {
+	match env.get(key) {
+		Optional::Some(v) => { if v.byte_length() > 0 { return move v; } },
+		Optional::None => {}
+	}
+	return dflt;
+}
+
+fn _config_json() -> json.JsonNode {
+	val db_host = _env_or("DB_HOST", "127.0.0.1");
+	val port = _env_or("DB_PORT", "34214");
+	val user = _env_or("DB_USER", "root");
+	val pwd = _env_or("MDB_ROOT_PWD", "rootpw");
+	val text: String = "{\"backend\":\"mariadb\",\"host\":\"" + db_host + "\",\"port\":" + port + ",\"user\":\"" + user + "\",\"password\":\"" + pwd + "\",\"database\":\"microflows\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
+	return json.parse(&text).or_throw();
+}
+
+fn _ns() nothrow -> String {
+	match env.get("MICROFLOWS_E2E_NS") {
+		Optional::Some(v) => { if v.byte_length() > 0 { return move v; } },
+		Optional::None => {}
+	}
+	return "drift-test";
+}
+
+fn _concat(a: &String, b: &String) nothrow -> String {
+	val na = a.byte_length();
+	val nb = b.byte_length();
+	var buf = io.buffer(na + nb);
+	var i = 0;
+	while i < na { io.buffer_write(&mut buf, i, a.byte_at(i)); i = i + 1; }
+	var j = 0;
+	while j < nb { io.buffer_write(&mut buf, na + j, b.byte_at(j)); j = j + 1; }
+	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), na + nb);
+}
+
+fn _build_host(worker_name: &String) -> arc.Arc<host.MicroflowsHost> {
+	val cfg = _config_json();
+	val identity = host.identity_from_worker_name(worker_name);
+	var b = host.new_host_builder();
+	host.with_json(&mut b, &cfg);
+	host.with_identity(&mut b, move identity);
+	return host.build_host(move b).or_throw();
+}
+
+fn _wf_id(seed: &String) nothrow -> Array<Byte> {
+	val ns = _ns();
+	val combined = _concat(&ns, seed);
+	val u: uuid.Uuid = uuid.v3_from_string(&combined);
+	return uuid.to_bytes(&u);
+}
+
+fn _concat_bytes(a: &Array<Byte>, b: &Array<Byte>) nothrow -> Array<Byte> {
+	var out: Array<Byte> = Array<type Byte>::with_capacity(a.len + b.len);
+	var i = 0;
+	while i < a.len { out.push(a[i]); i = i + 1; }
+	var j = 0;
+	while j < b.len { out.push(b[j]); j = j + 1; }
+	return move out;
+}
+
+// A deterministic 33-byte content_hash pin (1 scheme byte + 32-byte digest), built entirely from
+// already-Byte-typed uuid.to_bytes() output (no integer-literal-to-Byte casting needed): two
+// derived 16-byte UUIDs concatenated (32 bytes) plus one more byte reused as the leading "scheme"
+// byte. Real content_hash bytes are opaque to these host methods, so any 33 deterministic bytes
+// are a valid test fixture.
+fn _hash33(seed: &String) nothrow -> Array<Byte> {
+	val head = _wf_id(seed);
+	val tail = _wf_id(&_concat(seed, &"-tail"));
+	val combined = _concat_bytes(&head, &tail);
+	var out: Array<Byte> = Array<type Byte>::with_capacity(33);
+	out.push(head[0]);
+	var i = 0;
+	while i < 32 { out.push(combined[i]); i = i + 1; }
+	return move out;
+}
+
+fn scenario_call() -> Int {
+	val h = _build_host(&"pd-call-w1");
+	val script = _ns();
+	// Distinct fixed hashes for the parent's own plan vs the child's, so a self-cycle can never
+	// accidentally trigger in this fixture.
+	val content_hash = _hash33(&"-call-plan-hash");
+	val child_hash = _hash33(&"-call-child-hash");
+
+	// --- call_inspect / call_hint_refresh NotFound on a genuinely absent call site ---
+	val wf_absent = _wf_id(&"-call-absent");
+	match h.get().call_inspect(&wf_absent, 1) {
+		host.CallInspectOutcome::NotFound => {},
+		default => { return 401; }
+	}
+	match h.get().call_hint_refresh(&wf_absent, 1, 4, &"2026-04-01 09:00:00.000000") {
+		host.CallHintRefreshOutcome::NotFound => {},
+		default => { return 402; }
+	}
+	match h.get().child_terminal_notify(&wf_absent, 2, &"2026-04-01 09:00:00.000000") {
+		host.ChildTerminalNotifyOutcome::NotFound => {},
+		default => { return 403; }
+	}
+
+	// --- wf: a 2-op planned parent (op1 = call, op2 = a participant op that will fail) ---
+	val wf = _wf_id(&"-call-wf");
+	val child = _wf_id(&"-call-child");
+	match h.get().create_planned(&wf, &script, &"1.0.0", &"2026-04-01 10:00:00.000000",
+		&"2026-04-01 10:00:00.000000", &"{\"pos\":\"start\"}", &"{}", &content_hash, 2, &"{}") {
+		host.CreatePlannedOutcome::Created(_) => {},
+		host.CreatePlannedOutcome::Exists(_) => {},
+		default => { return 404; }
+	}
+	var tok = 0;
+	match h.get().claim_workflow(&wf, &"2026-04-01 10:00:01.000000", &"2026-04-01 10:30:00.000000") {
+		host.ClaimByIdOutcome::Claimed(cw) => { tok = cw.fencing_token; },
+		default => { return 405; }
+	}
+
+	// --- call_submit: fresh -> Submitted. input_hash is HOST-COMPUTED from the canonicalized
+	// input (never caller-supplied) — no input_hash argument here at all. ---
+	var child_id_hex: String = "";
+	match h.get().call_submit(&wf, tok, 1, &child,
+		&"{\"amount\": 10}",
+		&"{\"pos\":\"after_call\"}", &"2026-04-01 10:00:02.000000", &"{}",
+		&child, &"call-child-script", &"2.0.0", &child_hash,
+		1, &"{\"pos\":\"child_start\"}", &"2026-04-01 10:00:02.000000", &"{}",
+		&"call_1", 16) {
+		host.CallSubmitOutcome::Submitted(idhex) => { child_id_hex = move idhex; },
+		default => { return 406; }
+	}
+	if child_id_hex.byte_length() != 32 { return 407; }
+
+	// --- call_submit: replay with a DIFFERENTLY-FORMATTED but semantically-identical input
+	// (no space after the colon this time, vs the fresh submit's "{\"amount\": 10}" above) ->
+	// AlreadySubmitted(same child). This is a genuine positive proof that the host canonicalizes
+	// before hashing/comparing — a byte-different-but-canonically-equal document must still
+	// replay as idempotent, not conflict. ---
+	match h.get().call_submit(&wf, tok, 1, &child,
+		&"{\"amount\":10}",
+		&"{\"pos\":\"after_call\"}", &"2026-04-01 10:00:02.000000", &"{}",
+		&child, &"call-child-script", &"2.0.0", &child_hash,
+		1, &"{\"pos\":\"child_start\"}", &"2026-04-01 10:00:02.000000", &"{}",
+		&"call_1", 16) {
+		host.CallSubmitOutcome::AlreadySubmitted(idhex) => { if idhex != child_id_hex { return 408; } },
+		default => { return 409; }
+	}
+
+	// --- call_submit: NotFound for an absent parent workflow ---
+	match h.get().call_submit(&wf_absent, 1, 1, &child,
+		&"{}", &"{\"pos\":\"x\"}", &"2026-04-01 10:00:03.000000", &"{}",
+		&child, &"x", &"1.0.0", &child_hash, 1, &"{}", &"2026-04-01 10:00:03.000000", &"{}",
+		&"call_1", 16) {
+		host.CallSubmitOutcome::NotFound => {},
+		default => { return 410; }
+	}
+
+	// --- call_inspect: Found, PENDING (child never advanced) ---
+	match h.get().call_inspect(&wf, 1) {
+		host.CallInspectOutcome::Found(cid, cstatus, state, direction, disp, terminal, term_reason, ret) => {
+			if cid != child_id_hex { return 411; }
+			if cstatus != 1 { return 412; }             // sidecar hint: 1=pending (just created)
+			if state != 1 { return 413; }                // child is forward
+			if direction != 1 { return 414; }
+			if disp != 0 { return 415; }
+			if terminal { return 416; }
+			if term_reason != "" { return 417; }
+			match ret { Optional::None => {}, Optional::Some(_) => { return 418; } }
+		},
+		default => { return 419; }
+	}
+
+	// --- call_hint_refresh: Refreshed, then verify via call_inspect the hint actually moved ---
+	match h.get().call_hint_refresh(&wf, 1, 4, &"2026-04-01 10:00:04.000000") {
+		host.CallHintRefreshOutcome::Refreshed => {},
+		default => { return 420; }
+	}
+	match h.get().call_inspect(&wf, 1) {
+		host.CallInspectOutcome::Found(_, cstatus, _, _, _, _, _, _) => { if cstatus != 4 { return 421; } },
+		default => { return 422; }
+	}
+
+	// --- child_terminal_notify: Notified, then verify the hint moved to 'completed' (2) AND the
+	// PARENT's own workflow row is untouched (still forward, unsettled) ---
+	match h.get().child_terminal_notify(&child, 2, &"2026-04-01 10:00:05.000000") {
+		host.ChildTerminalNotifyOutcome::Notified => {},
+		default => { return 423; }
+	}
+	match h.get().call_inspect(&wf, 1) {
+		host.CallInspectOutcome::Found(_, cstatus, _, _, _, _, _, _) => { if cstatus != 2 { return 424; } },
+		default => { return 425; }
+	}
+	match h.get().inspect_workflow(&wf, &"2026-04-01 10:00:06.000000") {
+		host.WorkflowInspectOutcome::Found(snap) => {
+			if snap.state_code != 1 { return 426; }       // parent still forward — notify never settles it
+			if snap.is_terminal { return 427; }
+		},
+		default => { return 428; }
+	}
+
+	// --- Settle the call op INTERMEDIATE (as if the runner just read the child's authoritative
+	// completed return via call_inspect) -> creates checkpoint #1 with call_kind=2 (from the op
+	// row call_submit wrote) ---
+	match h.get().operation_settle(&wf, tok, 1, &child, 1, &"{\"receipt_id\": 7}",
+		&"{\"receipt_id\": 7}", &Optional<String>::None(), &"{\"pos\":\"op2:dispatched\"}",
+		&"2026-04-01 10:00:07.000000", &"{}", false) {
+		host.OperationSettleOutcome::Settled(_) => {},
+		default => { return 429; }
+	}
+
+	// --- Request + reject op2, driving the parent into reversing(2) with checkpoint #1 (the
+	// call) as the sole ACTIVE checkpoint ---
+	val op2 = _wf_id(&"-call-op2");
+	match h.get().operation_request(&wf, tok, 2, &op2, &"decline-guard", 1, &"{}", &"h2",
+		&"{\"pos\":\"op:2:dispatched\"}", &"2026-04-01 10:00:08.000000", &"{}") {
+		host.OperationRequestOutcome::Requested(_) => {},
+		default => { return 430; }
+	}
+	// Failed(_) is the EMPTY-STACK special case (no checkpoint to unwind -> straight to
+	// terminal); we have an active checkpoint (the settled call op), so this correctly goes to
+	// Reversing(top_seq) instead — the top of the (single-entry) checkpoint stack is seq 1.
+	// begin_reversal RETAINS the lease (the same holder drives the reverse loop) — no re-claim
+	// needed; `tok` is still valid.
+	match h.get().begin_reversal(&wf, tok, 2, &op2, &"2026-04-01 10:00:09.000000", &"forward_op_rejected") {
+		host.BeginReversalOutcome::Reversing(top_seq) => { if top_seq != 1 { return 431; } },
+		default => { return 432; }
+	}
+	val tok2 = tok;
+
+	// --- reverse_head: Pending carries call_kind=2 end-to-end (op row -> checkpoint -> decode) ---
+	match h.get().reverse_head(&wf) {
+		host.ReverseHeadOutcome::Pending(seq, opname, _payload, call_kind) => {
+			if seq != 1 { return 444; }
+			if opname != "call-child-script" { return 445; }
+			if call_kind != 2 { return 446; }
+		},
+		default => { return 447; }
+	}
+
+	// --- checkpoint_reverse_noop: Reversed (sole checkpoint -> terminal) ---
+	match h.get().checkpoint_reverse_noop(&wf, tok2, 1, &"2026-04-01 10:00:11.000000") {
+		host.CheckpointReverseNoopOutcome::Reversed(_) => {},
+		default => { return 448; }
+	}
+	match h.get().reverse_head(&wf) {
+		host.ReverseHeadOutcome::NoneActive => {},
+		default => { return 449; }
+	}
+
+	// --- checkpoint_reverse_noop: NotFound for an absent workflow ---
+	match h.get().checkpoint_reverse_noop(&wf_absent, 1, 1, &"2026-04-01 10:00:12.000000") {
+		host.CheckpointReverseNoopOutcome::NotFound => {},
+		default => { return 450; }
+	}
+
+	return 0;
+}
+
+fn main() nothrow -> Int {
+	try {
+		val r = scenario_call();
+		if r != 0 { return r; }
+		return 0;
+	} catch unexpected {
+		return 9;
+	}
+}

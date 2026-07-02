@@ -3102,7 +3102,14 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				// worker until expiry.
 				return _defer_dispatch(host, workflow_id, fencing_token, "reverse_no_active_checkpoint", admission);
 			},
-			mf.ReverseHeadOutcome::Pending(seq, forward_operation_name, forward_payload) => {
+			mf.ReverseHeadOutcome::Pending(seq, forward_operation_name, forward_payload, _call_kind) => {
+				// _call_kind (composition, 1b.1): NOT branched on yet — that wiring
+				// (skip _compensation_for + call checkpoint_reverse_noop directly for
+				// call_kind=child_workflow) is explicit runner-runtime work, deferred
+				// to its own pass per work/workflow-composition/PROGRESS.md. This
+				// minimal fix only keeps this match exhaustive against the now-4-field
+				// ReverseHeadOutcome::Pending; behavior here is UNCHANGED (every
+				// checkpoint still goes through the existing participant-only path).
 				val rev_id = _reverse_id(workflow_canon_hex, seq);
 				val rev_id_hex = _bytes_to_hex(&rev_id);
 				var comp_op: String = "";

@@ -70,7 +70,12 @@ export {
 	CreatePlannedOutcome,
 	PinnedScript,
 	PlanGetOutcome,
-	ArgsGetOutcome
+	ArgsGetOutcome,
+	CallSubmitOutcome,
+	CallInspectOutcome,
+	CallHintRefreshOutcome,
+	ChildTerminalNotifyOutcome,
+	CheckpointReverseNoopOutcome
 };
 
 // ===== Identity =====
@@ -295,7 +300,11 @@ pub variant CheckpointPendingDeferOutcome {
 // pinned reverse binding to reconcile/redispatch against.
 pub variant ReverseHeadOutcome {
 	NoneActive,
-	Pending(seq: Int, forward_operation_name: String, forward_payload: String),
+	// call_kind (composition, 1b.1): 1=participant, 2=child_workflow — lets the runner branch to
+	// checkpoint_reverse_noop for a call checkpoint BEFORE ever looking up a compensation binding
+	// (a call checkpoint never has one). Only carried here (Pending) — a call checkpoint can never
+	// reach Dispatched, since nothing is ever dispatched for one.
+	Pending(seq: Int, forward_operation_name: String, forward_payload: String, call_kind: Int),
 	Dispatched(seq: Int, forward_operation_name: String, reverse_invocation_id: String,
 	           reverse_operation_name: String, reverse_schema_version: Int,
 	           reverse_input_json: String, reverse_input_hash: String)
@@ -344,6 +353,69 @@ pub variant ReverseBlockOutcome {
 	FenceLost,
 	NotFound,
 	EventTimeSkew(defer_until: String)
+}
+
+// --- Composition (1b.1): workflow-to-workflow calls ---
+
+// call_submit: sibling of operation_request — persists the parent's call-op row AND, in the
+// SAME transaction, creates the full planned-workflow bundle for the child (workflow + plan +
+// args + its own created event) + the tb_mf_call sidecar, running the read-only recursion guard.
+// CallConflict/CallRejected/PlanViolation mirror sp_mf_call_submit.sql's strict
+// validate-then-mutate phasing: every one of them is reached with ZERO writes issued.
+pub variant CallSubmitOutcome {
+	Submitted(child_workflow_id: String),
+	AlreadySubmitted(child_workflow_id: String),      // idempotent replay, full agreement
+	CallConflict,                                     // replay with a mismatched immutable field
+	CallRejected(reason: String),                     // recursion guard: call_cycle | max_call_depth_exceeded
+	PlanViolation(reason: String, plan_length: Int),   // seq_out_of_range | predecessor_incomplete
+	EventTimeSkew(defer_until: String),
+	FenceLost,
+	NotFound
+}
+
+// call_inspect: PURE read (no fence, no write) — the child workflow row's AUTHORITATIVE
+// state/return, plus the sidecar's (possibly-stale) child_status DISPLAY HINT. Never used to
+// settle/fail the parent's call op; that reads THIS outcome and drives operation_settle/
+// begin_reversal/operation_fail, the existing (unchanged) forward-settle machinery.
+pub variant CallInspectOutcome {
+	Found(child_workflow_id: String, child_status: Int, state: Int, execution_direction: Int,
+	      current_disposition: Int, is_terminal: Bool, terminal_reason: String,
+	      workflow_return_json: Optional<String>),
+	NotFound
+}
+
+// call_hint_refresh: explicitly BEST-EFFORT (no fence — a display hint, never a value of
+// record). Monotonic by time: a stale/out-of-order refresh is silently absorbed, never an error.
+pub variant CallHintRefreshOutcome {
+	Refreshed,
+	NotFound
+}
+
+// child_terminal_notify: WAKE + STATUS-HINT ONLY (§Liveness) — invoked from the CHILD's own
+// terminal-transition context, a SEPARATE call strictly AFTER that transaction has already
+// committed (never nested inside it). Best-effort, unfenced by design: correctness never depends
+// on it landing (call_inspect's poll is the floor).
+pub variant ChildTerminalNotifyOutcome {
+	Notified,
+	NotFound
+}
+
+// checkpoint_reverse_noop: the no-comp reversal mechanism a call checkpoint actually needs — the
+// SAME reversal_state 1->2 transition + descend-or-terminal logic as reverse_settle, but WITHOUT
+// ever requiring/touching a reverse_invocation_id (nothing is ever dispatched for a call
+// checkpoint). NotCallCheckpoint is a defensive guard: this outcome must never be reachable for a
+// participant checkpoint (that must go through reverse_request/dispatch/reverse_settle instead).
+pub variant CheckpointReverseNoopOutcome {
+	Reversed(terminal_reason: String),
+	Reversing(next_seq: Int),
+	AlreadyReversed,
+	OutOfOrder(top_seq: Int),
+	EventTimeSkew(defer_until: String),
+	FenceLost,
+	NotFound,
+	CheckpointNotFound,
+	CheckpointNotSettleable(reversal_state: Int),
+	NotCallCheckpoint
 }
 
 // The durable operation request — authoritative for recovery (a resuming worker
@@ -614,7 +686,34 @@ pub interface MicroflowsHost {
 	// Enter blocked_resolution when compensation cannot safely continue.
 	fn reverse_block(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
 	                 seq: Int, reverse_id: &Array<Byte>, disposition: Int, reason: &String,
-	                 event_ts: &String) -> ReverseBlockOutcome
+	                 event_ts: &String) -> ReverseBlockOutcome;
+	// --- Composition (1b.1): workflow-to-workflow calls ---
+	// Submit a workflow call: persist the parent's call op + create the full planned child
+	// bundle, atomically. input_json is the call's input, canonicalized here exactly as
+	// create_planned canonicalizes instance args (it becomes the child's own args).
+	// input_hash is DERIVED here from the SAME canonical bytes, never caller-supplied — this
+	// avoids the hidden invariant a separate caller-supplied hash would create (the caller
+	// would have to independently canonicalize identically to the host's own canonicalization).
+	fn call_submit(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	              operation_seq: Int, operation_id: &Array<Byte>,
+	              input_json: &String,
+	              new_continuation: &String, event_ts: &String, event_payload: &String,
+	              child_workflow_id: &Array<Byte>, child_script_name: &String,
+	              child_plan_version: &String, child_content_hash: &Array<Byte>,
+	              child_plan_length: Int, child_continuation: &String,
+	              child_next_attempt_at: &String, child_event_payload: &String,
+	              parent_node_id: &String, max_call_depth: Int) -> CallSubmitOutcome;
+	// PURE read of the child's authoritative state/return + the sidecar's display hint.
+	fn call_inspect(self: &Self, workflow_id: &Array<Byte>, operation_seq: Int) -> CallInspectOutcome;
+	// Best-effort, unfenced refresh of the sidecar's display-only child_status hint.
+	fn call_hint_refresh(self: &Self, workflow_id: &Array<Byte>, operation_seq: Int,
+	                     child_status: Int, event_ts: &String) -> CallHintRefreshOutcome;
+	// Wake + status-hint ONLY, on a child terminal — best-effort, unfenced, never settles the parent.
+	fn child_terminal_notify(self: &Self, child_workflow_id: &Array<Byte>, child_status: Int,
+	                         event_ts: &String) -> ChildTerminalNotifyOutcome;
+	// Reverse a call checkpoint as a no-op (no compensation was ever dispatched for it).
+	fn checkpoint_reverse_noop(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                          seq: Int, event_ts: &String) -> CheckpointReverseNoopOutcome
 }
 
 // ===== Builder =====
@@ -1758,7 +1857,8 @@ implement MicroflowsHost for HostImpl {
 				return ReverseHeadOutcome::Pending(
 					_doc_int_req(&doc, &"seq", "revhead-no-seq"),
 					_doc_str_req(&doc, &"operation_name", "revhead-no-opname"),
-					_doc_object_text_req(&doc, &"payload"));
+					_doc_object_text_req(&doc, &"payload"),
+					_doc_int_req(&doc, &"call_kind", "revhead-no-call-kind"));
 			}
 			if outcome == "dispatched" {
 				return ReverseHeadOutcome::Dispatched(
@@ -1909,6 +2009,202 @@ implement MicroflowsHost for HostImpl {
 			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
 		}
 	}
+
+	// --- Composition (1b.1): workflow-to-workflow calls ---
+
+	pub fn call_submit(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                   operation_seq: Int, operation_id: &Array<Byte>,
+	                   input_json: &String,
+	                   new_continuation: &String, event_ts: &String, event_payload: &String,
+	                   child_workflow_id: &Array<Byte>, child_script_name: &String,
+	                   child_plan_version: &String, child_content_hash: &Array<Byte>,
+	                   child_plan_length: Int, child_continuation: &String,
+	                   child_next_attempt_at: &String, child_event_payload: &String,
+	                   parent_node_id: &String, max_call_depth: Int) -> CallSubmitOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
+		_validate_id16("operation_id", operation_id);
+		_validate_nonempty("event_ts", event_ts);
+		_validate_id16("child_workflow_id", child_workflow_id);
+		_validate_nonempty("child_script_name", child_script_name);
+		_validate_nonempty("child_plan_version", child_plan_version);
+		if child_content_hash.len != 33 { throw HostException(kind = HostErrorKind::InvalidArg(field = "child_content_hash")); }
+		if child_plan_length < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "child_plan_length")); }
+		_validate_nonempty("child_next_attempt_at", child_next_attempt_at);
+		_validate_nonempty("parent_node_id", parent_node_id);
+		if max_call_depth < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "max_call_depth")); }
+		// Canonicalize the call's input at the command boundary — exactly like create_planned
+		// canonicalizes instance args (§Durable state): it becomes BOTH the call op's own
+		// input_json AND, verbatim, the child's tb_mf_workflow_args.args_canonical. Reusing
+		// _canonical_args as-is is correct here — the call's input literally BECOMES the
+		// child's instance arguments, the same document create_planned's own args_json is.
+		val input_canon = _canonical_args(input_json);
+		// input_hash is DERIVED from the SAME canonical string, not caller-supplied — matches
+		// runner.drift's own _input_hash exactly (canonical text -> UUIDv3 -> hex), so this
+		// stays consistent with how every other input_hash in the system is produced. Computing
+		// it from input_canon (not the caller's raw input_json) makes it structurally impossible
+		// for the hash to disagree with what's actually stored — no hidden "the caller must have
+		// canonicalized identically" invariant.
+		val input_hash = _canonical_input_hash(&input_canon);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(operation_seq));
+			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
+			args.push(_json_object_arg("input_json", &input_canon));
+			args.push(rpc.arg_string(_dup(&input_hash)));
+			args.push(_json_object_arg("new_continuation", new_continuation));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			args.push(_meta_object_arg("event_payload", event_payload));
+			args.push(rpc.arg_bytes(_dup_bytes(child_workflow_id)));
+			args.push(rpc.arg_string(_dup(child_script_name)));
+			args.push(rpc.arg_string(_dup(child_plan_version)));
+			args.push(rpc.arg_bytes(_dup_bytes(child_content_hash)));
+			args.push(rpc.arg_int(child_plan_length));
+			args.push(_json_object_arg("child_continuation", child_continuation));
+			args.push(rpc.arg_string(_dup(child_next_attempt_at)));
+			args.push(_meta_object_arg("child_event_payload", child_event_payload));
+			args.push(rpc.arg_string(_dup(parent_node_id)));
+			args.push(rpc.arg_int(max_call_depth));
+			val sp: String = "sp_mf_call_submit";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "submitted" { return CallSubmitOutcome::Submitted(_doc_str_req(&doc, &"child_workflow_id", "call-submit-no-child-id")); }
+			if outcome == "already_submitted" { return CallSubmitOutcome::AlreadySubmitted(_doc_str_req(&doc, &"child_workflow_id", "call-submit-no-child-id")); }
+			if outcome == "call_conflict" { return CallSubmitOutcome::CallConflict(); }
+			if outcome == "call_rejected" { return CallSubmitOutcome::CallRejected(_doc_str_req(&doc, &"reason", "call-submit-no-reason")); }
+			if outcome == "plan_violation" { return CallSubmitOutcome::PlanViolation(_doc_str_req(&doc, &"reason", "call-submit-no-plan-reason"), _doc_int_req(&doc, &"plan_length", "call-submit-no-plan-length")); }
+			if outcome == "event_time_skew" { return CallSubmitOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "call-submit-no-defer-until")); }
+			if outcome == "fence_lost" { return CallSubmitOutcome::FenceLost(); }
+			if outcome == "not_found" { return CallSubmitOutcome::NotFound(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:call_submit"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn call_inspect(self: &HostImpl, workflow_id: &Array<Byte>, operation_seq: Int) -> CallInspectOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_int(operation_seq));
+			val sp: String = "sp_mf_call_inspect";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "not_found" { return CallInspectOutcome::NotFound(); }
+			if outcome == "found" {
+				val child_status = _doc_int_req(&doc, &"child_status", "call-inspect-no-child-status");
+				val state = _doc_int_req(&doc, &"state", "call-inspect-no-state");
+				val direction = _doc_int_req(&doc, &"execution_direction", "call-inspect-no-direction");
+				val disp = _doc_int_req(&doc, &"current_disposition", "call-inspect-no-disposition");
+				val terminal = _doc_int_req(&doc, &"is_terminal", "call-inspect-no-terminal");
+				return CallInspectOutcome::Found(
+					_doc_str_req(&doc, &"child_workflow_id", "call-inspect-no-child-id"),
+					child_status, state, direction, disp, terminal != 0,
+					_doc_str_opt(&doc, &"terminal_reason"),
+					_doc_object_text_opt(&doc, &"workflow_return_json"));
+			}
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:call_inspect"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn call_hint_refresh(self: &HostImpl, workflow_id: &Array<Byte>, operation_seq: Int,
+	                         child_status: Int, event_ts: &String) -> CallHintRefreshOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
+		if child_status < 1 or child_status > 4 { throw HostException(kind = HostErrorKind::InvalidArg(field = "child_status")); }
+		_validate_nonempty("event_ts", event_ts);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_int(operation_seq));
+			args.push(rpc.arg_int(child_status));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			val sp: String = "sp_mf_call_hint_refresh";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "refreshed" { return CallHintRefreshOutcome::Refreshed(); }
+			if outcome == "not_found" { return CallHintRefreshOutcome::NotFound(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:call_hint_refresh"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn child_terminal_notify(self: &HostImpl, child_workflow_id: &Array<Byte>, child_status: Int,
+	                             event_ts: &String) -> ChildTerminalNotifyOutcome {
+		_validate_id16("child_workflow_id", child_workflow_id);
+		if child_status != 2 and child_status != 3 { throw HostException(kind = HostErrorKind::InvalidArg(field = "child_status")); }
+		_validate_nonempty("event_ts", event_ts);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(child_workflow_id)));
+			args.push(rpc.arg_int(child_status));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			val sp: String = "sp_mf_child_terminal_notify";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "notified" { return ChildTerminalNotifyOutcome::Notified(); }
+			if outcome == "not_found" { return ChildTerminalNotifyOutcome::NotFound(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:child_terminal_notify"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn checkpoint_reverse_noop(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                               seq: Int, event_ts: &String) -> CheckpointReverseNoopOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "seq")); }
+		_validate_nonempty("event_ts", event_ts);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(seq));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			val sp: String = "sp_mf_checkpoint_reverse_noop";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "reversed" { return CheckpointReverseNoopOutcome::Reversed(_doc_str_opt(&doc, &"terminal_reason")); }
+			if outcome == "reversing" { return CheckpointReverseNoopOutcome::Reversing(_doc_int_req(&doc, &"next_seq", "revnoop-no-next-seq")); }
+			if outcome == "already_reversed" { return CheckpointReverseNoopOutcome::AlreadyReversed(); }
+			if outcome == "out_of_order" { return CheckpointReverseNoopOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "revnoop-no-top")); }
+			if outcome == "event_time_skew" { return CheckpointReverseNoopOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "revnoop-no-defer-until")); }
+			if outcome == "fence_lost" { return CheckpointReverseNoopOutcome::FenceLost(); }
+			if outcome == "not_found" { return CheckpointReverseNoopOutcome::NotFound(); }
+			if outcome == "checkpoint_not_found" { return CheckpointReverseNoopOutcome::CheckpointNotFound(); }
+			if outcome == "checkpoint_not_settleable" { return CheckpointReverseNoopOutcome::CheckpointNotSettleable(_doc_int_req(&doc, &"reversal_state", "revnoop-no-cpstate")); }
+			if outcome == "not_call_checkpoint" { return CheckpointReverseNoopOutcome::NotCallCheckpoint(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:checkpoint_reverse_noop"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
 }
 
 // Parse a 'claimed' result document into a ClaimedWorkflow.
@@ -1990,6 +2286,16 @@ fn _canonical_args(args_json: &String) -> String {
 		},
 		core.Result::Err(_) => { throw HostException(kind = HostErrorKind::InvalidJson(field = "arguments")); }
 	}
+}
+
+// Deterministic input-identity hash over an ALREADY-CANONICAL string (ordered-key compact
+// JSON text, e.g. from _canonical_args) — matches runner.drift's own _input_hash exactly
+// (canonical text -> UUIDv3 -> lowercase hex), so every input_hash in the system is produced
+// the same way. Callers must pass an already-canonicalized string; this does not canonicalize.
+fn _canonical_input_hash(canonical: &String) nothrow -> String {
+	val u: uuid.Uuid = uuid.v3_from_string(canonical);
+	val bytes: Array<Byte> = uuid.to_bytes(&u);
+	return codec.hex_encode(&bytes);
 }
 
 // UTF-8 bytes of a String (for a binary RPC argument).

@@ -177,11 +177,14 @@ fn scenario_reversal() -> Int {
 		},
 		default => { return 332; }
 	}
-	// reverse_head Pending -> full forward identity + the complete payload document
+	// reverse_head Pending -> full forward identity + the complete payload document + call_kind
+	// (composition, 1b.1) — this fixture's checkpoint is a PARTICIPANT op ("reserve"), so
+	// call_kind must be 1.
 	match h.get().reverse_head(&wf2) {
-		host.ReverseHeadOutcome::Pending(seq, opname, payload) => {
+		host.ReverseHeadOutcome::Pending(seq, opname, payload, call_kind) => {
 			if seq != 1 { return 333; }
 			if opname != "reserve" { return 334; }
+			if call_kind != 1 { return 336; }
 			// EXACT shape + value: a parsed payload must canonicalize identically to
 			// the expected document (extra/wrong fields would change the encoding).
 			val pj = json.parse(&payload).or_throw();

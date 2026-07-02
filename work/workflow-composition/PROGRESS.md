@@ -1541,3 +1541,85 @@ pins this by proving a byte-different-but-semantically-equal JSON document is re
 `call_conflict`, not silently treated as `already_submitted`. (3) LOW — a stale comment in
 `sp_mf_child_terminal_notify` said "blocked (1, non-terminal)"; `child_status` code 1 is `pending`,
 `blocked` is 4 — comment corrected.
+
+## 1b.1 — host API wrappers (LANDED, green; runner-runtime wiring deliberately deferred)
+
+Implemented the typed `MicroflowsHost`/`HostImpl` wrappers for the SP surface that landed above:
+`call_submit`, `call_inspect`, `call_hint_refresh`, `child_terminal_notify`, `checkpoint_reverse_noop`,
+plus extending `ReverseHeadOutcome::Pending` with `call_kind` (both the variant and
+`HostImpl.reverse_head`'s decode). All in `microflows/packages/microflows/src/host.drift`, mirroring
+existing conventions exactly: `_call_sp_doc`/`_finish_stmt_and_commit`, `_doc_int_req`/`_doc_str_req`/
+`_doc_str_opt`/`_doc_object_text_opt` decode helpers, `ManagedError` -> `HostErrorKind::BackendUnavailable`,
+client-side arg validation mirroring each SP's own entry SIGNALs, and `_canonical_args` reused as-is to
+canonicalize the call's input before `call_submit` (the same function, and the same reasoning, `create_planned`
+already uses for its own `args_json` — the call's input literally becomes the child's instance arguments).
+`call_submit`'s outcome variants and their field shapes (`Submitted`/`AlreadySubmitted`/`CallConflict`/
+`CallRejected(reason)`/`PlanViolation(reason, plan_length)`/`EventTimeSkew(defer_until)`/`FenceLost`/
+`NotFound`) match the SP's JSON outcomes exactly, verified field-by-field against the SP source. `executor`
+is NOT a host-method parameter for `checkpoint_reverse_noop` (unlike the SP, which does take it) — read
+from `self.identity.executor_id` instead, matching every other fenced host method in this file; this is a
+deliberate deviation from a literal reading of the request's SP-shaped signature list, in favor of "mirror
+existing host conventions" (also explicitly requested).
+
+**Two real compile breaks found and fixed, both from the same root cause (`ReverseHeadOutcome::Pending`
+gaining a 4th field) reaching further than expected:**
+1. `microflows/packages/microflows/tests/e2e/live_reversal_test.drift`'s own `Pending(seq, opname,
+   payload)` match arm needed the new `call_kind` binder — fixed, asserting `call_kind == 1` since that
+   fixture's checkpoint is a participant op.
+2. `microflows/runner/src/runner.drift`'s `_run_reversal` (the actual PRODUCTION consumer of this host
+   method) has its own `Pending(...)` match arm — also broke. Fixed MINIMALLY: added the 4th binder
+   (`_call_kind`, underscore-prefixed, explicitly unused) with a comment stating the real branching (skip
+   `_compensation_for` + call `checkpoint_reverse_noop` for `call_kind=child_workflow`) is runner-runtime
+   work, deliberately deferred to its own pass — this fix only keeps the match exhaustive; `_run_reversal`'s
+   actual behavior is byte-for-byte unchanged (every checkpoint still goes through the existing
+   participant-only compensation path).
+
+**New focused e2e test**: `microflows/packages/microflows/tests/e2e/live_call_test.drift`, mirroring
+`live_reversal_test.drift`'s structure (same `_build_host`/`_wf_id`/synthetic-time conventions), wired into
+`microflows/tools/emit_test_plan.py`'s `LIVE_TESTS` list. Deliberately NOT exhaustive — the underlying SP
+logic already has 79 passing checks (`db-tests/sp_call_test.py`); this file instead proves the HOST-LAYER
+wiring (arg marshaling in the exact SP parameter order, outcome-string-to-variant decoding, SP name/
+signature agreement) by exercising every new method's happy path + 1-2 key branches, including a real
+end-to-end construction of a reversing workflow with an ACTIVE call checkpoint via the actual host call
+chain (`create_planned` -> `claim_workflow` -> `call_submit` -> `operation_settle`(intermediate) ->
+`operation_request` -> `begin_reversal` -> `reverse_head` -> `checkpoint_reverse_noop`) rather than a new
+seed proc — this incidentally also proves `call_kind` flows correctly end-to-end from `sp_mf_call_submit`'s
+op-row write through `sp_mf_checkpoint_reverse_head`'s decode. One implementation-time lesson worth
+recording: `begin_reversal` RETAINS the caller's lease when there's an active checkpoint to unwind (transitions
+to `Reversing`, not the empty-stack `Failed` case) — no re-claim is needed or possible immediately after
+(the lease is still held), a detail that cost two debugging round-trips against the live DB before landing.
+
+**Verification**: full `microflows` `just test` green — 25 unit/e2e jobs (0 failed, including the new
+`live_call_test` and the extended `live_reversal_test`), parser fixtures 100/100, manifest fixtures 8/8,
+`sp_operation_test.py` 156/156 (no regressions), `sp_call_test.py` 79/79, `JUST_EXIT=0`.
+
+**Deliberately out of scope for this pass** (per the user's explicit "hold before runner runtime wiring so
+we can review the host API shape and outcome decoding"): `NCallWorkflow` dispatch, `StepOutcome::NeedCall`,
+`_run_reversal`'s actual `call_kind` branch (currently a no-op placeholder, see above), and the post-commit
+`child_terminal_notify` call site. Review of this host-API pass comes first.
+
+**Host-API review found 2 gaps, both fixed:** (1) MEDIUM — `call_submit` canonicalized `input_json`
+internally but still took a separate caller-supplied `input_hash`, creating a hidden invariant (the caller
+had to independently canonicalize identically to the host's own canonicalization, or the hash would
+silently describe a different document than what actually got stored). Fixed by making the host COMPUTE
+`input_hash` itself from the canonical bytes it already produces — confirmed feasible with zero blast
+radius (`call_submit` has no callers yet anywhere in `runner.drift`, so the signature was free to change).
+Added `_canonical_input_hash` (new private helper in `host.drift`, right next to `_canonical_args`), which
+replicates `runner.drift`'s own `_input_hash` algorithm exactly (canonical text -> UUIDv3 -> lowercase hex,
+via `uuid.v3_from_string`/`uuid.to_bytes`/`codec.hex_encode` — all already imported in `host.drift`, no
+build-config change needed) — this keeps every `input_hash` in the system produced the same way, not just
+internally self-consistent within `call_submit`. Removed `input_hash` entirely from `call_submit`'s
+parameter list (both the `MicroflowsHost` interface declaration and the `HostImpl` method) and its
+`_validate_nonempty` check. (2) LOW — `live_call_test.drift`'s replay-test comment claimed the input was
+"already ordered-key compact," which was both inaccurate (it had a space after the colon) and, after fix
+(1), moot (there's no caller-supplied hash left to justify anymore). Turned this into an actual positive
+proof instead of a stale comment: the replay call now uses a DIFFERENTLY-formatted but semantically-
+identical JSON document (`{"amount":10}` vs the fresh submit's `{"amount": 10}`) and still asserts
+`AlreadySubmitted` with the same child id — a genuine end-to-end demonstration that the host canonicalizes
+before hashing/comparing, not an assertion resting on the input already happening to be canonical.
+
+**Re-verification**: `host.drift` + the updated `live_call_test.drift` both compile clean; the runner
+rebuilds clean (confirming zero callers were broken); full `microflows` `just test` re-run green — 25
+unit/e2e jobs (0 failed), parser fixtures 100/100, manifest fixtures 8/8, `sp_operation_test.py` 156/156,
+`sp_call_test.py` 79/79 (unaffected — only the host changed, the SP's own `arg_input_hash` parameter is
+untouched), `JUST_EXIT=0`.
