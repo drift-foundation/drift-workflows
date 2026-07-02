@@ -17,7 +17,12 @@ avoid "callback").
   `call_submit` / `call_inspect` (authoritative child read) / `child_terminal_notify` (wake + status-hint
   only) / settle / recovery / recursion-guard. No-comp reversal = no-op. **Minimal inspectability**
   (`child_workflow_id` + `child_status` so operators follow A→B→C). **No blocked cascade.**
-- **Slice 1c** — compensation path: reconsider compensating-workflow vs reverse-child/T1, then ship one.
+- **Slice 1c** — compensation path: **DECIDED** — reverse-child/T1 is the single MVP mechanism (child
+  `completed(4)→reversing(2)`, fenced, reopened by its own already-known `child_workflow_id`);
+  compensating-workflow (a separate compensation-workflow identity) is explicitly out of MVP, so no author
+  mode-selector is ever exposed. **Locked invariant:** a parent compensates the child call as **one
+  checkpoint**; the child workflow recursively owns its own unwind and the parent never enumerates or invokes
+  child-internal compensations directly.
 - **Slice 2** — stuck-child liveness budget (standalone). **Slice 3** — fan-out + `on failed`-as-data.
 
 The per-slice **build checklists** (1a/1b/1c) are in `DESIGN.md`.
@@ -43,9 +48,10 @@ it is the compensation envelope's `forward.operation`). The call op's `schema_ve
 **`CALL_OPERATION_SCHEMA_VERSION = 1`**, and the comp **`{forward:{…}}`** envelope carries the full
 correlation set (`workflow_id`, `operation`, **`operation_id = child_workflow_id`**, `schema_version`,
 `input`, `result`). Liveness is **split**: slice 1b ships terminal push + poll fallback; the stuck-child
-budget is slice 2 (standalone). (3) The compensation workflow is pinned by its **exact plan identity** (`comp_script_name`
-/ `comp_plan_version` / `comp_content_hash`), mirroring the checkpoint's `reverse_operation_name`+
-`reverse_schema_version` pin — not a loose `name@rev`. (4) The recursion ancestor set is **reconstructed by
+budget is slice 2 (standalone). (3) *(SUPERSEDED — see the 1b.1 SP/schema plan's round-2 finding #3 below:
+1c's T1 mechanism reopens the child by its own `child_workflow_id`, no separate compensation-workflow
+identity is ever pinned, so `tb_mf_call` carries none of `comp_script_name`/`comp_plan_version`/
+`comp_content_hash`.)* (4) The recursion ancestor set is **reconstructed by
 walking `parent_workflow_id` links + joining `tb_mf_workflow_plan`** (bounded by `call_depth`) — no
 denormalized ancestor column. (5) Doc title aligned with this index.
 
@@ -1060,3 +1066,383 @@ field updated to state the new per-script `returns` requirement for real users f
 
 **Verification (re-run after the regression fix)**: `coordinator-singular` integration green, **225/225**,
 0 FAILs — including all 6 previously-failing `manifest_*` checks now passing.
+
+## 1b.1 — runtime spine for workflow calls (SP/SCHEMA PLAN, pending review — round 5)
+
+Scope per the user's suggested slice: (1) durable call sidecar/schema; (2) SP/host surface
+(`call_submit`/`call_inspect`/`child_terminal_notify`); (3) runner runtime for `NCallWorkflow`; (4) recursion
+protection; (5) acceptance tests. This section covers ONLY (1)+(2) — the SP/schema plan the user explicitly
+asked to review before any code, "because this is the first durable/runtime composition slice and we want
+the transaction boundaries clean." (3)-(5) get their own design pass once this lands.
+
+**Everything below is already fully specified in DESIGN.md's own 1b.1 checklist and the "5 findings" +
+"second review round" sections of this file (lines 25-63) — this section is a CONFIRMATION/SYNTHESIS pass
+against the CURRENT schema/SP code (verified fresh, not from memory), not a new design. Flagging any place
+current code diverges from what DESIGN.md assumed.
+
+**Round-1 review found 5 real gaps in the FIRST draft of this plan, all confirmed against the actual
+reversal/inspect code (not assumed) and folded in below**: (1) HIGH — the existing reversal machinery
+CANNOT actually no-op a call checkpoint (verified: `reverse_head`'s `Pending` outcome carries no
+`call_kind`; the runner unconditionally calls `_compensation_for` on any pending checkpoint, and a call
+checkpoint — which never has a compensation binding, since 1a rejects `compensation` at build — falls into
+the EXISTING `no_compensation_binding` → indefinite-defer path, never actually reversing; separately,
+`reverse_settle` hard-requires a persisted `reverse_invocation_id`, which a call checkpoint — never
+dispatched — can never have). This needed a genuinely NEW mechanism, not just documentation; see "Reversing
+a call checkpoint" below. (2) HIGH/MEDIUM — the first draft self-contradicted, calling `call_inspect`
+"READ-ONLY" and then describing a write; fixed by making it a PURE read and moving hint-refresh elsewhere.
+(3) MEDIUM — the sidecar's `comp_*` columns encoded a specific (compensating-workflow) shape; removed
+entirely (see round-2 finding #3 below for the sharper reason: they were unneeded even under the model 1c
+HAS already picked). (4) MEDIUM — `call_submit`'s idempotent-replay path needed to verify immutable-field
+agreement, not just presence, mirroring `operation_conflict`'s existing pattern. (5) LOW — a missing
+`CHECK(call_kind IN (1,2))`. A sequencing note on `child_terminal_notify`'s commit boundary (post-commit,
+never nested in the child's own transaction) is folded in too.
+
+**Round-2 review found 3 more gaps**: (1) HIGH — `call_submit` was missing the child's `tb_mf_workflow_args`
+write entirely; a child created without it is not actually resumable through the normal planned-workflow
+path (confirmed: `sp_mf_workflow_create_planned` writes this row in the same transaction as the workflow+plan
+rows today, and `args_get`'s own doc comment states resume reads it as authoritative). Fixed — see
+`sp_mf_call_submit` below, both the write and the idempotent-replay comparison. (2) MEDIUM — the "SPs" heading
+still said "three new procedures, zero changes to existing ones", which had gone stale once round-1's fixes
+landed (5 new SPs, plus `reverse_head` extended) — heading corrected. (3) MEDIUM — DESIGN.md itself (not just
+this file) still described the sidecar carrying `comp_script_name`/`comp_plan_version`/`comp_content_hash`
+(lines 288, 492-493) — stale relative to the round-1 #3 removal here. On inspection this is actually a
+STRONGER case than "1c hasn't decided yet": DESIGN.md's own §Recursive-compensation-invariant (lines 140-177)
+already resolved 1c to a SINGLE MVP mechanism — T1, reverse-child reopen (`completed(4)→reversing(2)` on the
+CHILD'S OWN row, fenced) — and "compensating-workflow" (the only model that would ever need a SEPARATE
+compensation-workflow identity to pin) is explicitly "not in MVP". So the sidecar never needed comp_*
+columns even under the plan as originally conceived; DESIGN.md updated to match (see below).
+
+**Round-3 review found 2 more gaps, one architectural**: (1) HIGH — `call_submit` still didn't write the
+child's initial `tb_mf_workflow_event` (`kind='created'`) row, even after round-2 added the args write;
+confirmed `sp_mf_workflow_create_planned` writes workflow + plan + args + this SAME created event as all
+four parts of one transaction, and a child is a normal planned workflow instance, so it needs the identical
+trail. Fixed. (2) HIGH, architectural — the recursion/depth guard was described as running "before any write
+commits," which is the wrong boundary: the host commits unconditionally after reading the proc's result
+document, with no way to distinguish a structured rejection from a success, so a guard that ran AFTER some
+inserts had already been issued would let a rejected call's PARTIAL rows persist durably. Fixed by
+restructuring `sp_mf_call_submit` into a strict validate-then-mutate shape — fence check → existing-row
+idempotent check → recursion guard, ALL read-only and ALL completing before the first write statement of
+any kind — matching the "validate first, mutate last, never interleaved" pattern every other SP in this
+codebase already follows. See the rewritten `sp_mf_call_submit` section below.
+
+**Round-4 review found 2 more gaps**: (1) HIGH — even after round-3's fixes, `call_submit`'s host signature
+still didn't carry enough to actually create a valid planned child: verified against
+`sp_mf_workflow_create_planned`'s own full parameter list, it's missing `plan_length` (needed for
+`tb_mf_workflow_plan.plan_length` — nothing to write there without it), `continuation` (the child's own
+fresh starting position — NOT the parent's), `next_attempt_at` (the child's initial scheduling field —
+without it the child cannot become claimable at all), and its own `event_payload` for the child's `created`
+event (distinct from the parent's `call_submitted` payload). Added `child_plan_length` /
+`child_continuation` / `child_next_attempt_at` / `child_event_payload` to the host signature and threaded
+them through the write-phase description. (2) LOW/MEDIUM — `tb_mf_call.child_workflow_id` had a UNIQUE key
+but no structural FK to `tb_mf_workflow(workflow_id)`; added one, matching
+`tb_mf_workflow_plan`/`tb_mf_workflow_args`'s own FK-to-`tb_mf_workflow` pattern (the child is created in
+the SAME transaction, before the sidecar row, so "cannot point at a missing child" can be structural, not
+just something the procedure happens to preserve).
+
+### Schema
+
+**`tb_mf_operation`** — add exactly one column, nothing else (keep the hot table narrow):
+```sql
+ALTER TABLE tb_mf_operation ADD COLUMN call_kind TINYINT NOT NULL DEFAULT 1 AFTER schema_version;
+-- 1 = participant (existing/default, every current row), 2 = child_workflow.
+ALTER TABLE tb_mf_operation ADD CONSTRAINT ck_mf_operation_call_kind CHECK (call_kind IN (1,2));
+-- (round-1 finding #5) — matches this table's existing defensive-enum convention
+-- (ck_mf_operation_status already does exactly this for `status`).
+```
+`operation_id`, `status`, `result_json` keep their EXACT existing meaning and `ck_mf_operation_status_result`
+invariant, verified unchanged in the current schema — for `call_kind=2`: `operation_id = child_workflow_id`,
+`operation_name = child_script_name`, `schema_version = CALL_OPERATION_SCHEMA_VERSION` (a new named
+constant = 1, analogous to a participant's schema_version but for the call itself), `result_json` becomes
+the child's `workflow_return_json` once settled (see "Settling a call op" below) — NOT a new shape, the
+SAME JSON-object-or-null-with-status invariant already enforced.
+
+**New sidecar `tb_mf_call`** (1:1 with a `call_kind=2` operation row; verified NO existing table of this
+name):
+```sql
+CREATE TABLE tb_mf_call (
+	workflow_id varbinary(16) NOT NULL,
+	operation_seq int NOT NULL,
+	child_workflow_id varbinary(16) NOT NULL,
+	child_script_name varchar(128) NOT NULL,
+	child_plan_version varchar(32) NOT NULL,
+	child_content_hash varbinary(33) NOT NULL,
+	-- Display hint only (§Liveness) — the CHILD workflow row is authoritative; call_inspect re-reads it.
+	-- Refreshed ONLY by child_terminal_notify (terminal case) and the separate best-effort
+	-- sp_mf_call_hint_refresh (non-terminal case) — NEVER by call_inspect itself (round-1 finding #2).
+	child_status tinyint NOT NULL DEFAULT 1,  -- 1=pending 2=completed 3=failed 4=blocked
+	first_requested_at datetime(6) NOT NULL,
+	last_inspected_at datetime(6) NULL,
+	PRIMARY KEY (workflow_id, operation_seq),
+	UNIQUE KEY uq_mf_call_child (child_workflow_id),
+	CONSTRAINT ck_mf_call_status CHECK (child_status IN (1,2,3,4)),
+	CONSTRAINT fk_mf_call_operation FOREIGN KEY (workflow_id, operation_seq)
+		REFERENCES tb_mf_operation (workflow_id, operation_seq),
+	-- (round-4 finding #2) — the child is created in the SAME transaction as this row (by
+	-- sp_mf_call_submit's own write phase, child row before sidecar row), so "cannot point at a
+	-- missing child" can be structural, not just preserved by the procedure — matching
+	-- tb_mf_workflow_plan's and tb_mf_workflow_args' own FK-to-tb_mf_workflow pattern.
+	CONSTRAINT fk_mf_call_child FOREIGN KEY (child_workflow_id) REFERENCES tb_mf_workflow (workflow_id)
+);
+```
+No `child_return_json` column (confirmed decision: notify is wake/hint-only, never a value-of-record) and
+no liveness-budget columns (confirmed: stuck-child budget is slice 2, standalone). **Round-1 finding #3
+(sharpened by round-2 finding #3):** also no `comp_script_name`/`comp_plan_version`/`comp_content_hash` —
+these are not merely premature, they are UNNEEDED under the model 1c has actually decided on. DESIGN.md's
+own §Recursive-compensation-invariant already resolves 1c to a single MVP mechanism: T1 (reverse-child
+reopen, `completed(4)→reversing(2)` on the CHILD'S OWN workflow row, fenced, driven by the
+`child_workflow_id` already in this very sidecar). Compensating-workflow — the only model that would ever
+need a SEPARATE compensation-workflow identity pinned here — is explicitly out of MVP. So these 3 columns
+were dead weight even under the plan as originally conceived, not just "speculative about an undecided
+design"; 1b.1 has no compensation runtime at all (compensation stays build-rejected), and 1c's T1 mechanism
+needs nothing more than the `child_workflow_id` this sidecar already carries.
+
+**`tb_mf_workflow`** — add 4 ancestry columns, all NULL for a top-level (non-child) workflow:
+```sql
+ALTER TABLE tb_mf_workflow
+	ADD COLUMN parent_workflow_id varbinary(16) NULL AFTER workflow_return_json,
+	ADD COLUMN parent_node_id varchar(64) NULL AFTER parent_workflow_id,
+	ADD COLUMN root_workflow_id varbinary(16) NULL AFTER parent_node_id,
+	ADD COLUMN call_depth int NULL AFTER root_workflow_id,
+	ADD CONSTRAINT ck_mf_workflow_ancestry CHECK (
+		(parent_workflow_id IS NULL AND parent_node_id IS NULL AND root_workflow_id IS NULL AND call_depth IS NULL)
+		OR (parent_workflow_id IS NOT NULL AND parent_node_id IS NOT NULL AND root_workflow_id IS NOT NULL AND call_depth IS NOT NULL AND call_depth >= 1)
+	);
+```
+Confirmed: `plan_version`/`content_hash` already live on `tb_mf_workflow_plan` (PK `workflow_id`) — the
+recursion-guard ancestor key needs NO new column beyond these 4; the walk joins `tb_mf_workflow_plan` per
+ancestor as it goes.
+
+**Migration**: next free number is `0005_workflow_call.sql` (`0001`-`0004` exist; `0004_workflow_return.sql`
+is the cleanest 3-step ADD-COLUMN → BACKFILL → ADD-CONSTRAINT template — this migration needs the SAME
+shape for the ancestry-columns CHECK, but NO backfill (every existing row is top-level: all 4 new columns
+NULL satisfies the new constraint's first branch with zero data changes) plus a plain ADD-COLUMN + CHECK for
+`tb_mf_operation.call_kind` (round-1 finding #5) and a plain CREATE TABLE for `tb_mf_call` (a new table needs
+no migration at all for a fresh install, but the migration file still creates it for an already-deployed
+schema, per every prior migration's own convention).
+
+### SPs — five new procedures + one existing SP extended (round-2 finding #2: the prior heading understated
+this — "zero changes to existing ones" was wrong, `sp_mf_checkpoint_reverse_head`'s output shape changes)
+
+New: `sp_mf_call_submit`, `sp_mf_call_inspect`, `sp_mf_call_hint_refresh`, `sp_mf_child_terminal_notify`,
+`sp_mf_checkpoint_reverse_noop`. Extended: `sp_mf_checkpoint_reverse_head`'s `Pending` outcome (+ the host
+`ReverseHeadOutcome::Pending` variant) gains `call_kind`, per "Reversing a call checkpoint" below. Settling/
+failing a call op FORWARD still reuses `sp_mf_operation_settle`/`operation_fail`/`begin_reversal` completely
+UNCHANGED (that specific claim was accurate and stays true) — it is only the reversal-side + inspect/notify
+surface that is new/changed.
+
+**`sp_mf_call_submit`** — sibling of `sp_mf_operation_request`. **Round-3 finding #2 (HIGH) restructures this
+SP's phasing entirely: strict validate-then-mutate, matching every other SP in this codebase, no exceptions.**
+The earlier description said the recursion guard runs "before any write commits" — which is the WRONG
+boundary. The host's `_finish_stmt_and_commit` calls `rpc.commit()` unconditionally after reading the proc's
+result document, regardless of what the `outcome` string says; it has no way to know a structured
+`call_rejected` outcome means "please roll back instead." So if the guard ran AFTER some inserts had already
+been issued (op row, child workflow row, ...) and then returned a structured rejection via `SELECT` +
+`LEAVE proc` (not a `SIGNAL`), the host would still commit those partial rows — a definite-failure outcome
+would durably persist a half-created child. The only correct fix is architectural: **every check that can
+possibly reject must run to completion, using ONLY reads, before the FIRST write statement of any kind is
+issued** — exactly the shape `sp_mf_operation_settle`/`sp_mf_workflow_create_planned`/
+`sp_mf_checkpoint_reverse_settle` already use (a sequence of SELECT-based structured-outcome checks, each
+ending in `LEAVE proc` on failure, and only once every one of them has passed does the procedure reach its
+single, uninterruptible write phase — never checks and writes interleaved).
+
+Concretely, in order:
+1. **Fence check** (read-only, same lease/owner/token pattern every other SP uses) → `fence_lost` on failure.
+2. **Existing-row check** (read-only): does `(workflow_id, operation_seq)` already have an op row? If yes,
+   this is a replay — compare the EXISTING row's + sidecar's + args row's immutable fields against what's
+   being resubmitted (see "Idempotent replay" below) and `LEAVE proc` with either `already_submitted` or
+   `call_conflict`. **No recursion guard re-walk on replay** — it already passed once, and nothing is being
+   freshly created.
+3. **Recursion guard** (read-only, ONLY reached on a genuinely fresh submit, never on replay): walk
+   `parent_workflow_id` links from the PARENT upward (bounded by `parent's call_depth`, so at most
+   `max_call_depth` hops), joining `tb_mf_workflow_plan` at each ancestor for its `(script_name @
+   tb_mf_workflow, plan_version, content_hash @ tb_mf_workflow_plan)` triple; if the CHILD's own resolved
+   plan identity (already known to the runner from 1b.0's build-time resolution, passed as an SP arg)
+   matches ANY ancestor's triple → reject `call_cycle`; if `call_depth > max_call_depth` (config-supplied,
+   default 16) → reject `max_call_depth_exceeded`. Both rejections are a structured outcome (JSON `{outcome:
+   'call_rejected', reason: 'call_cycle'|'max_call_depth_exceeded'}`) — NOT a SIGNAL (matches 1b.0's finding
+   #5: entry-validation-shaped failures are SIGNALs, this is a LOGIC-LEVEL/data-dependent rejection, same
+   category as `plan_violation`/`fence_lost`) — and, critically, is still reached with **zero writes issued
+   so far**, so `LEAVE proc` here needs no rollback: there is nothing to roll back. The runner turns this
+   into a normal call failure (§4 `failed`) — same reversal path as any other definite forward rejection, no
+   new failure surface.
+4. **Only now, with every possible rejection already ruled out, the single write phase**: insert the
+   `tb_mf_operation` row (`call_kind=2`, `schema_version=CALL_OPERATION_SCHEMA_VERSION`, `status=1`); insert
+   the child `tb_mf_workflow` row under `child_workflow_id` with ancestry
+   (`parent_workflow_id`/`parent_node_id`/`root_workflow_id`/`call_depth = parent's call_depth + 1`, or 1 if
+   parent is top-level), `continuation = arg_child_continuation` (its OWN fresh starting position, not the
+   parent's), and `next_attempt_at = arg_child_next_attempt_at`; insert the child `tb_mf_workflow_plan` row
+   using `arg_child_plan_length` (round-4 finding #1 — verified against `sp_mf_workflow_create_planned`'s own
+   full parameter list: `plan_length`/`continuation`/`next_attempt_at` are all REQUIRED inputs there, and
+   `sp_mf_call_submit` needs the identical three to populate the identical two rows — without them there is
+   no value to write into `tb_mf_workflow_plan.plan_length`, no starting position for the child's first
+   forward step, and no way to make the child claimable at all); insert the child's `tb_mf_workflow_args` row
+   (round-2 finding #1 — the call's `input`, canonicalized by the runner exactly as `create_planned`
+   canonicalizes instance args, becomes the child's canonical args — confirmed necessary via `args_get`'s own
+   doc comment: resume reads this table as authoritative, never CLI/submission input; a child without it
+   would not be resumable/drivable after any lease-expiry/crash recovery); insert the child's initial
+   `tb_mf_workflow_event` row, **kind='created'**, using `arg_child_event_payload` (round-3 finding #1,
+   round-4 finding #1 clarifies the payload — confirmed via `sp_mf_workflow_create_planned`'s own body: it
+   writes workflow + plan + args + this SAME `created` event, all four, in one transaction; a child is a
+   normal planned workflow instance and needs the identical trail, not a subset of it, with its OWN event
+   payload — NOT the parent's `call_submitted` payload, a distinct audit document); insert the `tb_mf_call`
+   sidecar row; advance the PARENT's continuation; append the PARENT's own `call_submitted` event (using
+   `arg_event_payload`, the separate parent-side payload). All of this is one `rpc.commit()` boundary
+   (mirroring every other SP's "everything in one open transaction, one explicit commit" pattern) — but by
+   construction, nothing between step 4's first write and its last can produce a structured rejection
+   outcome; the only way this phase doesn't complete is a genuine DB-level failure (a different class from a
+   validated business rejection), which is not this design's concern.
+
+**Idempotent replay (round-1 finding #4 — must verify agreement, not just presence; round-2 finding #1 adds
+the args row to what's compared)**: on the existing-row check (step 2 above) finding a prior op row, the SP
+must verify the EXISTING row's immutable identity fields actually MATCH what's being resubmitted, not just
+assume a match because the row exists: `operation_id` (mirrors `sp_mf_operation_settle`'s existing
+`operation_conflict` check — "the supplied operation_id MUST match the stored one"), the sidecar's
+`child_script_name`/`child_plan_version`/`child_content_hash` (these COULD legitimately differ across
+attempts if e.g. the manifest was redeployed with a different `plan_version` between the original submit
+and a retry), `input_hash`, `call_kind`, and the child's `tb_mf_workflow_args.args_canonical`, compared
+byte-for-byte — mirroring `sp_mf_workflow_create_planned`'s own existing conflict check exactly
+(`v_args_missing = 1 OR NOT (v_args <=> arg_args)` → `workflow_conflict`, confirmed verbatim in that SP's
+body). On full agreement → `already_submitted` (idempotent, no new child spawned, no duplicate
+recursion-guard walk, no duplicate writes of any kind). On ANY mismatch → a NEW structured outcome
+`call_conflict` (mirroring `operation_conflict`'s existing shape/severity exactly — a real inconsistency,
+never silently treated as "already submitted").
+
+**`sp_mf_call_inspect`** — **round-1 finding #2 fix: PURE read, zero writes, no exceptions.** The first draft
+self-contradicted (called it "READ-ONLY" then described a hint-refresh write). Adopting the reviewer's
+stated preference exactly: this SP matches `sp_mf_workflow_inspect`'s existing shape byte-for-byte in kind
+(no fence check, no write, no commit-relevant side effect, period). Given `(workflow_id, operation_seq)`,
+joins `tb_mf_call` → the CHILD's `tb_mf_workflow` row (by `child_workflow_id`) and returns the child's
+AUTHORITATIVE `state`/`workflow_return_json`/`terminal_reason`, plus `child_workflow_id` + the sidecar's
+OWN (possibly-stale) `child_status` hint for the operator-inspect surface — it reads the hint, it does not
+write it.
+
+**`sp_mf_call_hint_refresh`** (NEW, small, split out of the old call_inspect design per finding #2) —
+explicitly best-effort, matching `child_status`'s own "display hint, never value-of-record" nature (per
+DESIGN.md's §Liveness): `UPDATE tb_mf_call SET child_status = ?, last_inspected_at = ? WHERE workflow_id = ?
+AND operation_seq = ?`, guarding `last_inspected_at` from moving backward (mirrors `next_attempt_at`'s own
+"never move backward" discipline in `child_terminal_notify` below). No fence check (a hint write, not a
+correctness-affecting one). The runner may call this opportunistically after any `call_inspect` poll that
+observes a NON-terminal state worth refreshing the hint for (in particular `blocked`, since
+`child_terminal_notify` is terminal-only and would never otherwise update the hint for a merely-blocked
+child) — its failure or staleness has zero correctness impact, by construction.
+
+**`sp_mf_child_terminal_notify`** — WRITE-ONLY to two things: `tb_mf_call.child_status`
+(the terminal hint) and the PARENT `tb_mf_workflow.next_attempt_at` (pulled due, monotonic — never moved
+backward). Explicitly does NOT touch `tb_mf_operation`, does NOT touch checkpoints, does NOT touch the
+parent's `status`/`result_json`/`state`/`lease`. Confirmed this matches DESIGN.md's explicit "wake +
+status-hint ONLY" framing exactly — this SP is allowed to be lossy/racy/duplicate-safe without any settle
+consequence, since `call_inspect` (called by the runner's own poll, which is always eventually scheduled
+regardless of notify) is the actual settle trigger. **Sequencing note (raised alongside the 5 findings):**
+this SP must be invoked as a SEPARATE call AFTER the child's own terminal-settle transaction has ALREADY
+committed — never nested inside that same transaction. The child's own settle/reversal commit locks only
+the CHILD's own `tb_mf_workflow` row; reaching into the PARENT's `tb_mf_call`/`tb_mf_workflow` rows in that
+SAME transaction would lock two DIFFERENT workflows' rows in one transaction, an unproven cross-workflow
+lock-ordering risk this system has never needed before (every existing publication fences + commits exactly
+one workflow's rows per transaction). Since `call_inspect`/poll is the correctness floor regardless, notify
+is safe to be strictly post-commit and best-effort — a missed, duplicated, or delayed notify changes
+nothing except how soon the parent wakes up.
+
+**Settling a call op FORWARD reuses `sp_mf_operation_settle`/`operation_fail`/`begin_reversal` UNCHANGED —
+zero new SP code for this.** Confirmed via the current `sp_mf_operation_settle.sql` body: it is entirely
+generic over `operation_name`/`operation_id`/`result_json` already (it never branches on any call-specific
+concept), and it already copies `operation_name` into the checkpoint row (so a call op's checkpoint
+`operation_name` = the child's script name automatically, becoming "the compensation envelope's
+`forward.operation`" per DESIGN.md's finding — ready for 1c with no changes needed now). The runner, on
+finding (via `call_inspect`) that the child is `completed`, calls the EXISTING host `operation_settle` with
+`result_json` = the child's `workflow_return_json` — the call op's "remote result" IS the child's typed
+return, verbatim, no transformation. On finding the child `failed`, the runner calls the EXISTING
+`begin_reversal` (or `operation_fail` → the existing blocked_resolution path, whichever the child's specific
+failure shape maps to) exactly as it would for a real participant's definite rejection. This is the concrete
+payoff of the "`operation_id = child_workflow_id`, `schema_version`/`status`/`result_json` keep their
+existing meaning" decision — it means settling/failing a call op FORWARD adds ZERO new lines to the busiest,
+most safety-critical existing SP.
+
+**Reversing a call checkpoint (round-1 finding #1 — HIGH, a genuinely NEW mechanism, not just documentation)**:
+verified this is a real gap, not a documentation omission. Once a call op is settled forward (checkpointed
+via the unchanged `sp_mf_operation_settle` path above), a LATER parent step failing puts the parent into
+reversal — and the EXISTING reversal machinery cannot currently no-op that checkpoint:
+- `sp_mf_checkpoint_reverse_head`'s `Pending` outcome carries only `(seq, operation_name, payload)` — no
+  `call_kind` — so the runner's `_run_reversal` cannot distinguish a call checkpoint from a participant one
+  BEFORE it acts.
+- `_run_reversal` unconditionally calls `_compensation_for(cfg, operation_name)` on any `Pending` checkpoint;
+  a call checkpoint (no compensation binding — 1a rejects `compensation` at build) hits the EXISTING `None`
+  arm, which durably defers with reason `no_compensation_binding` and loops forever — it does NOT no-op, it
+  never makes progress, indefinitely.
+- `sp_mf_checkpoint_reverse_settle` hard-requires a persisted, matching `reverse_invocation_id` before it
+  will transition `reversal_state` 1→2 (`not_requested` otherwise) — and a call checkpoint's
+  `reverse_invocation_id` can never be set, because nothing is ever dispatched for it (`reverse_request` is
+  only called immediately before a real compensation dispatch). The existing 3-step
+  `reverse_request`→dispatch→`reverse_settle` flow is structurally incapable of ever marking a
+  never-dispatched checkpoint reversed.
+
+**Fix — two small, targeted additions:**
+1. Extend `sp_mf_checkpoint_reverse_head`'s `Pending` outcome (and the `ReverseHeadOutcome::Pending` host
+   variant) to ALSO return `call_kind` — a single-column join to `tb_mf_operation` by `(workflow_id, seq =
+   operation_seq)`, giving the runner the information it needs BEFORE it ever calls `_compensation_for`.
+2. NEW SP `sp_mf_checkpoint_reverse_noop` — fenced (same lease/owner/token check as `reverse_settle`),
+   takes `(workflow_id, executor, fencing_token, seq, event_ts, event_payload)` — deliberately NO
+   `reverse_invocation_id`/`reverse_operation_name`/`reverse_schema_version`/`reverse_input_*` parameters,
+   since none of that ever applies. Verifies (a) the checkpoint is the current reverse-order top (mirrors
+   `reverse_settle`'s existing `out_of_order` check), (b) `reversal_state = 1` (active) — idempotent
+   `already_reversed` on retry, matching `reverse_settle`'s own idempotency shape, (c) defensively, that the
+   checkpoint's operation is ACTUALLY `call_kind = child_workflow` (reject `not_call_checkpoint` otherwise —
+   this SP must never be reachable for a participant checkpoint). On success: the SAME `reversal_state = 1
+   → 2` transition `reverse_settle` performs, `reversed_at = arg_event_ts`, an audit event appended (e.g.
+   `call_checkpoint_noop_reversed`) — but WITHOUT ever touching the `reverse_invocation_id`/`reverse_*`
+   columns, which stay NULL throughout (satisfying `ck_mf_checkpoint_reverse_binding`'s existing all-NULL
+   branch — this is a legitimate "never dispatched, still reversed" case that constraint already allows for).
+3. Runner's `_run_reversal`, on `Pending(seq, operation_name, payload, call_kind)`: if `call_kind =
+   child_workflow`, call the new `checkpoint_reverse_noop` host method DIRECTLY (skip `_compensation_for`
+   entirely) and loop back to `reverse_head` to continue descending — exactly mirroring how a successful
+   `reverse_settle` today continues the same loop. If `call_kind = participant` (existing default), the
+   EXISTING `_compensation_for` → dispatch → `reverse_settle` flow is completely unchanged. (This is item-3
+   runner-runtime work, listed here because it's the direct consequence of the schema/SP change and needs
+   to land in the same slice — the schema addition is meaningless without it.)
+
+### Host API (new, mirroring the confirmed `_call_sp_doc`/`_finish_stmt_and_commit`/`rpc.commit()` pattern
+`operation_settle`/`operation_request` already use — same one-`rpc.commit()`-per-call shape, no new
+transaction primitive needed):
+- `call_submit(workflow_id, fencing_token, operation_seq, operation_id, child_workflow_id, child_script_name,
+  child_plan_version, child_content_hash, child_plan_length, child_continuation, child_next_attempt_at,
+  child_event_payload, input_json, parent ancestry fields, event_ts, event_payload) -> CallSubmitOutcome`
+  (`Submitted`/`AlreadySubmitted`/`CallConflict`/`CallRejected(reason)`/`FenceLost`/... mirroring
+  `OperationRequestOutcome`'s existing variant shape, plus `CallConflict` for round-1 finding #4).
+  **Round-4 finding #1 (HIGH) — the signature was missing the fields needed to actually create a valid
+  planned child.** Verified against `sp_mf_workflow_create_planned`'s own full parameter list: besides
+  identity (`workflow_id`/`script_name`/`plan_version`/`content_hash`, already present) and `args` (already
+  added in round-2), it ALSO takes `arg_plan_length`, `arg_continuation`, `arg_next_attempt_at`, and its OWN
+  `arg_event_payload` (the created event's payload — a separate document from whatever audit payload the
+  CALLING context uses) — without these, the SP has no value to populate `tb_mf_workflow_plan.plan_length`
+  with, no starting `continuation` for the child's first forward step, and no `next_attempt_at` to make the
+  child claimable at all. Added: `child_plan_length` (the child plan's own length, already known to the
+  runner from 1b.0's build-time resolution of the child, same as `child_content_hash`/`child_plan_version`);
+  `child_continuation` (the child's starting continuation — its fresh initial position, JSON object, NOT
+  reused from the parent's own continuation); `child_next_attempt_at` (when the child becomes claimable —
+  ordinarily the same clock reading the runner already took for this dispatch, i.e. "now"); `child_event_payload`
+  (the child's OWN `created` event payload, distinct from `event_payload`, which remains the PARENT's
+  `call_submitted` audit payload). `event_ts` stays a SINGLE shared clock reading used for both the parent's
+  and the child's timestamps in this one command — mirrors `sp_mf_workflow_create_planned`'s own single
+  `arg_event_ts` covering workflow/plan/args `created_at` AND the created event's `event_ts` together; no
+  separate `child_event_ts` is needed.
+  `input_json` is DOUBLE-duty (round-2 finding #1): it is both the call operation's `input_json` AND, in the
+  SAME call, canonicalized into the child's `tb_mf_workflow_args.args_canonical` — one caller-supplied value,
+  two rows, one transaction; `CallConflict` now also covers an args-byte mismatch on replay.
+- `call_inspect(workflow_id, operation_seq) -> CallInspectOutcome` — PURE read (finding #2): child's
+  authoritative state/return + `child_workflow_id` + the sidecar's (possibly-stale) `child_status` hint.
+- `call_hint_refresh(workflow_id, operation_seq, child_status, event_ts) -> Void` (NEW, split out of the
+  old call_inspect design per finding #2) — explicitly best-effort, no outcome variants worth modeling
+  (failure here has zero correctness impact by construction).
+- `checkpoint_reverse_noop(workflow_id, fencing_token, seq, event_ts, event_payload) -> CheckpointReverseNoopOutcome`
+  (NEW, finding #1) — mirrors `ReverseSettleOutcome`'s existing variant shape (`Reversed`/`AlreadyReversed`/
+  `OutOfOrder`/`FenceLost`/...), plus `NotCallCheckpoint` for the defensive `call_kind` guard.
+- `child_terminal_notify(child_workflow_id, event_ts) -> Void`/`NotifyOutcome` — **sequencing resolved**:
+  invoked as a SEPARATE call strictly AFTER the child's own terminal-settle transaction has already
+  committed, never nested inside it (see the sequencing note under `sp_mf_child_terminal_notify` above);
+  fire-and-forget, best-effort, since `call_inspect`/poll is the correctness floor regardless.
+
+### Open items for the runner-runtime pass (item 3, NOT part of this SP/schema plan)
+The exact `NeedCall`/`advance()` IR-side wiring (DESIGN.md already specifies `StepOutcome::NeedCall` +
+`_node_depths` counting a call as `depth+1` — both currently absent from `ir.drift`, confirmed), the
+`_run_reversal` branch consuming the new `call_kind` field (sketched above but not yet code), and the exact
+runner call site that triggers `child_terminal_notify` post-commit are deferred to the runner-runtime design
+pass once this SP/schema plan is signed off.
