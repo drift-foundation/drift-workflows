@@ -1,0 +1,4 @@
+{
+  "returncode": 2,
+  "stderr_contains": "runner: invalid manifest: workflow_call.max_call_depth must be an integer"
+}

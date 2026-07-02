@@ -1,0 +1,25 @@
+{
+  "deployment": {
+    "worker_id": "w",
+    "workflow_call": {
+      "max_call_depth": 0
+    },
+    "db": {
+      "host": "127.0.0.1",
+      "port": 34214,
+      "user": "root",
+      "password": "",
+      "database": "microflows"
+    },
+    "participants": [],
+    "operations": []
+  },
+  "scripts": [
+    {
+      "name": "solo",
+      "version": "1.0.0",
+      "path": "solo.mf",
+      "returns": {}
+    }
+  ]
+}

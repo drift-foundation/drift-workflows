@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mfinspect"
+version = "0.1.0"
+description = "Read-only workflow/call-tree state dump for Microflows composition (1b.1)."
+authors = [
+	{ name = "PushCoin" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+	"PyMySQL>=1.1.0,<2.0"
+]
+
+[project.scripts]
+mfinspect = "mfinspect.mfinspect:main"

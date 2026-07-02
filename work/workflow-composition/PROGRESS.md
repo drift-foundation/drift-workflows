@@ -24,11 +24,12 @@ avoid "callback").
   checkpoint**; the child workflow recursively owns its own unwind and the parent never enumerates or invokes
   child-internal compensations directly.
 - **Slice 2** — stuck-child liveness budget (standalone). **Slice 3** — fan-out + `on failed`-as-data.
-- **Tooling item (queued, separate)** — `mfinspect`, a Python read-only flow inspector/dump tool. Default
-  placement is after the composition slices, unless K needs it sooner to debug 1b/1c integration. It should
-  dump workflow/call-operation/checkpoint/event state by `workflow_id`, script/plan/time range, or `.mf`
-  source selection; render both stable JSON and a human parent→child tree; and never claim, resume, notify,
-  unblock, or mutate timers.
+- **Tooling item — `mfinspect`, a Python read-only flow inspector/dump tool — LANDED** (pulled forward ahead
+  of 1c, not deferred to after the composition slices: see "`mfinspect` first, then 1c compensation" below).
+  `inspect <workflow_id>` dumps the full workflow/call-operation/checkpoint/event state (recursing into
+  children); `list --script NAME --since TS --until TS` searches by script/plan/time range. JSON output only
+  (a human parent→child tree render is a later slice); never claims, resumes, notifies, unblocks, or mutates
+  timers.
 
 The per-slice **build checklists** (1a/1b/1c) are in `DESIGN.md`.
 
@@ -76,11 +77,21 @@ handle plan hashes, parent links, leases/fences, notify/poll mechanics, or check
 ## Current Scope
 
 **Slice 1a is mainlined** (commit `62555a4`: `call` grammar → `NCallWorkflow` IR, structural validation,
-build-block of reachable calls + `compensation`). **Active scope: slice 1b — forward async-call spine, no
-compensation runtime.** Sub-order (decided): **1b.0a** (workflow return contract) → **1b.0** (registry
-validation gate) → **1b.1** (IR build-block inversion + schema/SP/host + runner) → **1b.2** (acceptance).
+build-block of reachable calls + `compensation`). **Slice 1b is COMPLETE and green**: **1b.0a** (workflow
+return contract), **1b.0** (registry validation gate), and **1b.1** (IR build-block inversion + schema/SP/host
++ runner-runtime wiring, including the full 3-round team review pass — terminal-notify/hint-refresh wiring,
+`max_call_depth` strict validation with golden fixture coverage, and the `catch{}` → typed `BestEffort`
+errors-as-values restructuring) are all landed and confirmed green end to end (unit+e2e, parser/manifest
+fixtures, SP regressions, and a genuine runner-level DB-backed composition integration suite — see "1b.1
+review round" and "Post-BestEffort-rewrite review" below). **1b.2** (acceptance) is folded into that same
+verification pass; no separate acceptance step was needed.
 
-### 1b.0a status (in progress) — **workflows are typed functions** (decided)
+**`mfinspect` first slice is LANDED** (tooling/debugging aid, not a composition slice — packaged as a
+mariachi-style zipapp at `microflows/tools/mfinspect/`) — see "`mfinspect` first, then 1c compensation" at
+the bottom of this file for scope, status, and the carried-forward 1c observability/correlation requirement.
+**Active next step: slice 1c — compensation.**
+
+### 1b.0a — DONE — **workflows are typed functions** (decided)
 - **`return <expr>` statement added to the parser and UN-GATED (step 6, DONE)** — see "Step 6 — DONE" below.
   `_parse_return` lowers via `_return_value_node` like any other terminal statement; the parser fixture
   corpus is 100/100 (the old gate fixture `err_return_unsupported` was removed and replaced with two
@@ -1869,3 +1880,54 @@ consequence carefully before deciding on a fix:
 fixes, no behavior change), zero `FAIL` lines anywhere, exit 0. Both findings resolved. No inline
 try/catch remains anywhere in the 1b.1 runner/host changes; every failure mode is either a typed,
 loggable `BestEffort` result or an honestly-documented boundary. This remains a review checkpoint.
+
+## Follow-up: manifest fixtures pinning `max_call_depth` validation
+
+Per team follow-up, added 3 `runner/tests/fixtures/manifest/` fixtures so the strict
+`_validate_workflow_call` validator (Finding #2 above) has golden regression coverage, not just
+implementation:
+- `gate_workflow_call_not_object` — `deployment.workflow_call` is a string, not an object.
+- `gate_workflow_call_max_depth_not_int` — `max_call_depth` is a string, not an integer.
+- `gate_workflow_call_max_depth_too_low` — `max_call_depth` is `0` (must be >= 1).
+
+All 3 use a trivial op-free single-script manifest (`args {} steps { return {} }`) — safe because
+`_validate_registry` (which calls `_validate_workflow_call`) runs strictly before `_registry_build`
+(where the separate "at least one operation" check lives), so these fixtures are rejected by the
+intended gate specifically, never by an unrelated one. `manifest-fixtures` count: 8/8 -> 11/11, all
+green in the full suite (parser-fixtures 100/100, drift-test-run 25/25, sp_operation 156/156,
+sp_call 79/79, call_integration 21/21, exit 0). No pre-existing golden was touched.
+
+## `mfinspect` first, then 1c compensation (DECIDED)
+
+**Decision:** build `mfinspect`'s first slice (a small, read-only debugging tool — see `work/mfinspect/`)
+before starting 1c compensation runtime work. Motivated by 1b.1's own "blocked descendants don't cascade"
+design decision creating a real debugging blind spot for workflow trees — the team will need this tool
+immediately while writing 1c's own reversal-across-a-tree integration tests, so building it first avoids
+falling back to hand SQL during that work. **LANDED**: two actions — `inspect <workflow_id>` (exact-instance
+mode, full recursive JSON tree: workflow row, plan pin + args, operation rows with `call_kind`, call sidecar
+rows with `child_workflow_id`/`child_status`, checkpoint stack, full event history, recursing into children to
+a bounded `--max-depth`) and `list --script NAME --since TS --until TS [--plan-version V] [--state S]`
+(search/discovery mode, bare JSON array of workflow summaries — required script + bounded time range rules
+out an accidental full-table scan); read-only only — no claim/resume/notify/unblock/timer mutation. Packaged
+as a self-contained zipapp (mariachi-style, not driftc's PEX/scie packaging) at
+`microflows/tools/mfinspect/mfinspect`, source in `microflows/tools/mfinspect/src/mfinspect/`. Live
+implementation record: `work/mfinspect/README.md` / `work/mfinspect/Progress.md`.
+
+### 1c observability/correlation requirement (carry forward regardless of landing order)
+
+Even with `mfinspect` landing first, 1c compensation still needs this captured before implementation begins:
+- **Durable workflow events** (`tb_mf_workflow_event`) provide the big-picture timeline and stable
+  identifiers — what happened, in what order, to which workflow.
+- **Service logs** (`mfrunner`/`uflowsd`'s own emitted lines — e.g. the `_log_best_effort` diagnostics added
+  in the 1b.1 review round) provide detailed execution evidence — what a specific call/attempt actually did,
+  including transient/best-effort failures that never become a durable event.
+- **The two must be connectable by stable correlation IDs** — a durable event row and a log line describing
+  the same underlying action must share identifiers a human (or `mfinspect`) can join on.
+
+Minimum fields to carry/emit wherever applicable, so this join is always possible without a later redesign:
+`workflow_id`, `operation_seq`, `operation_id`, `operation_name`, `checkpoint_seq` (`tb_mf_workflow_checkpoint.seq`),
+`child_workflow_id`, `parent_workflow_id`, event `kind` + timestamp/`event_seq`, and a service-local request id
+(for correlating a single dispatch attempt's log lines, distinct from the durable `operation_id`/checkpoint
+identity). This is a requirement to design 1c's logging/event shape around, not a mandate to build log
+ingestion now — `mfinspect`'s first slice deliberately does not ingest logs (DB-only), but its JSON output
+preserves every one of these fields so a later log-correlation pass has something to join against.
