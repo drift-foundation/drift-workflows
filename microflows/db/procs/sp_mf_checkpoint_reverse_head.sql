@@ -8,10 +8,11 @@ DELIMITER $$
 --   none_active  — no active checkpoints (the unwind is complete)
 --   pending      — top active checkpoint not yet dispatched: returns the forward
 --                  identity (operation name + result payload) + call_kind (composition,
---                  1b.1 — so the caller can branch to sp_mf_checkpoint_reverse_noop for a
---                  call_kind=2 checkpoint BEFORE ever looking up a compensation binding,
---                  since a call checkpoint never has one) so the caller can derive +
---                  persist the reverse binding (reverse_request) first for a participant one
+--                  1b.1 — so the caller can branch to sp_mf_checkpoint_reverse_child_reopen
+--                  ("T1") + sp_mf_checkpoint_reverse_child_settle (1c) for a call_kind=2
+--                  checkpoint BEFORE ever looking up a compensation binding, since a call
+--                  checkpoint never has one) so the caller can derive + persist the reverse
+--                  binding (reverse_request) first for a participant one
 --   dispatched   — a compensation was already dispatched: returns the DURABLE
 --                  pinned binding (reverse contract + input identity + invocation
 --                  id) so the caller reconciles/redispatches against THAT contract,

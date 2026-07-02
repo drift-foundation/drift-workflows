@@ -1998,3 +1998,81 @@ confirmed OK, SP names confirmed (`sp_mf_checkpoint_reverse_child_reopen`/`_chil
 finding #1, `sp_mf_checkpoint_reverse_noop` is now retired outright (removed, not kept as an unreachable
 alias) rather than renamed-with-identical-body as v1 proposed. **No open questions remain from this
 round; no implementation code has been written.** Still a review checkpoint pending acceptance of v2.
+
+## 1c implementation, gated increment 1: DB/SP layer — LANDED, green
+
+v2 accepted. Implementing in gated increments per direction: DB/SP layer first, verified in isolation,
+before touching host/runner.
+
+- **`sp_mf_checkpoint_reverse_child_reopen`** (`db/procs/`) and **`sp_mf_checkpoint_reverse_child_settle`**
+  landed per the v2 spec. `sp_mf_checkpoint_reverse_noop` retired (file removed; its one comment
+  reference in `sp_mf_checkpoint_reverse_head.sql` updated to point at the new pair).
+- **Two real bugs found and fixed while implementing** (spec-level reasoning was right; two
+  low-level SQL details the spec didn't anticipate):
+  1. A `SELECT ... FOR UPDATE` used to lock the parent's checkpoint row in `_child_reopen` had no
+     `INTO` clause — in MariaDB this produces a *visible* result set, which became the first thing
+     the calling client read instead of the procedure's final `JSON_OBJECT` result. Fixed by
+     selecting into a throwaway variable, matching every other lock-only read in this codebase.
+  2. `_child_reopen`'s write didn't clear the child's `workflow_return_json`, so the reopen tripped
+     `ck_mf_workflow_state_return` (that column must be NULL for every state other than
+     `completed(4)`, and the child is no longer completed once reopened). Fixed by explicitly
+     nulling it in the same UPDATE — this wasn't called out in the v2 spec's write-block listing and
+     is now added there implicitly via the shipped SQL's own comment.
+  - Also confirmed (not a bug): `JSON_OBJECT(...)` with an uncast SP-local `int` variable renders
+    that field as a JSON *string*, not a number — pre-existing behavior already present in
+    `sp_mf_workflow_begin_reversal`'s and the participant path's own `compensation_requested` event,
+    not something introduced here. Test assertions written against the numeric form initially failed
+    and were corrected to expect the string form, matching the established (if slightly surprising)
+    convention rather than "fixing" the SPs to be inconsistent with already-shipped code.
+- **SP regression suite (`db-tests/sp_call_test.py`) extended and green: 125/125** (was 79; the 9
+  old `reverse_noop`-specific checks were replaced, not just removed, by more thorough coverage).
+  Every item on the requested list is covered: fresh reopen writes exactly one parent event
+  (`compensation_requested`) and one child event (`compensation_requested_by_parent`), with full
+  field assertions on both, plus confirmation the parent's own `state`/`continuation` are untouched;
+  idempotent reopen replay appends zero new events on either side and leaves the child row
+  byte-identical; dual event-time-skew is tested in BOTH directions (parent's clock ahead, and
+  separately the child's clock ahead) with no mutation in either case; settle refuses a child in
+  `reversing(2)`/`blocked_resolution(3)` (→ `child_not_terminal`, expected/non-error) and
+  `completed(4)`/`failed(7)` (→ `child_not_compensated`, diagnostic) — each case also asserts the
+  parent's checkpoint is left untouched; settle accepts `reversed(5)` and `resolved_exception(6)`
+  identically, reaching the parent's own `reversed(5)` terminal with a `compensation_settled` event;
+  descend/out-of-order mechanics across two checkpoints are re-verified against the new settle SP
+  (unchanged from the retired `noop`'s own mechanics). Also added (beyond the requested list, to
+  directly exercise a correctness detail introduced in this SP): an out-of-order regression for
+  `_child_reopen` itself, since its idempotency check is keyed on *child* state rather than
+  *checkpoint* state (unlike settle), meaning its top-of-stack lookup can legitimately be NULL and
+  needed its own NULL-safe comparison — this test pins that directly.
+- `db-tests/sp_operation_test.py` re-run as a sanity check (unrelated SP family): unaffected, still
+  156/156.
+
+**Known, deliberate temporary state — not a regression to chase down:** the full `microflows just
+test` gate is NOT green right now. `host.drift`'s `checkpoint_reverse_noop` wrapper,
+`runner.drift`'s `_run_reversal` call_kind==2 branch, `packages/microflows/tests/e2e/
+live_call_test.drift`, and `db-tests/call_integration_test.py`'s `checkpoint_noop` scenario all
+still reference the now-removed SP by name — they will fail with "PROCEDURE does not exist" until
+the host-wrapper and runner-wiring increments land. This is expected and matches the phase boundary
+("SP regression coverage before touching host/runner"); the gate for *this* increment is
+`sp_call_test.py`, which is green. Next: host wrappers, then runner wiring, then the nested A→B→C
+integration tests.
+
+### Post-increment-1 review: 1 High + 1 Medium, both fixed
+
+1. **[High] `_child_settle` could incorrectly settle a checkpoint whose child was still
+   `forward(1)`.** The state check enumerated the REJECTED states as `(2,3)` then `(4,7)`, letting
+   `1` fall through to the write phase as if the child had compensated — since `1` should be
+   structurally impossible for a real call checkpoint's child (always `completed(4)` at
+   checkpoint-creation time), nothing in the existing test suite exercised it. Fixed by requiring
+   `v_child_state IN (5, 6)` explicitly (`NOT IN (5,6)` → diagnostic `child_not_compensated`) instead
+   of enumerating every state that should be rejected — closes the gap for `1` and any other
+   unanticipated value in one change, not just the one the reviewer found. Added
+   `settle_refuses_forward` (child state=1) to `sp_call_test.py`, asserting both the checkpoint and
+   the parent's own state are left untouched.
+2. **[Medium] The settle event was missing the correlation fields the design promises.** Both
+   `compensation_settled` payload branches (terminal `reversed` and descending `reversing`) carried
+   only `seq` + `terminal`/`next_seq` — `child_workflow_id` (available in-SP as `v_child_id`) was
+   missing entirely, unlike the reopen ("T1") event, which already carries it. Fixed by adding
+   `child_workflow_id` + `child_state` to both payload branches. Extended the existing
+   `settle_accepts_reversed`/`settle_accepts_resolved_exception`/`settle_descends` tests with
+   correlation-field assertions rather than adding new ones, since the scenarios already existed.
+
+`sp_call_test.py`: **131/131** (was 125). `sp_operation_test.py` re-confirmed unaffected: 156/156.
