@@ -1368,7 +1368,7 @@ routing is a later refinement — starting there is guessing). Each script is a 
 
 ### 14.2 Load = compile + validate the entire declared set (fail-fast)
 
-`microflows-runner --manifest <file>` loads the manifest and, for **every** declared script, reads the
+`mfrunner --manifest <file>` loads the manifest and, for **every** declared script, reads the
 `.mf`, lowers it over the deployment (`parser.lower`), and builds+validates the revision
 (`_registry_build`: graph parse + structural validation + type-check + compensation + content_hash).
 **Startup fails** (`{"workflow":"aborted","reason":"invalid_manifest"}`, exit 2) if any script is

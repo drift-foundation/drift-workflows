@@ -75,6 +75,7 @@ export {
 	CallInspectOutcome,
 	CallHintRefreshOutcome,
 	ChildTerminalNotifyOutcome,
+	BestEffort,
 	CheckpointReverseNoopOutcome
 };
 
@@ -400,6 +401,46 @@ pub variant ChildTerminalNotifyOutcome {
 	NotFound
 }
 
+// Result for the *_best_effort wrappers (child_terminal_notify_best_effort,
+// call_hint_refresh_best_effort): Ok means the underlying call completed (Notified/Refreshed OR the
+// harmless SkippedNotFound — e.g. this workflow isn't referenced as anyone's child — both are a clean
+// outcome, never distinguished further since neither affects caller correctness). Every OTHER variant
+// mirrors one HostErrorKind case (see _kind_to_best_effort) for the failure modes the *_core function
+// classifies DIRECTLY (its own entry-shape checks + its own `managed:ManagedError` handling) — this is
+// NOT full fidelity for every conceivable failure: a HostException thrown by the shared SP-call
+// plumbing further down (_call_sp_doc and friends — see _call_hint_refresh_core's own comment) still
+// escapes as a genuinely-unclassifiable exception and lands in UnexpectedDefect instead. A caller MUST
+// NEVER treat any non-Ok/SkippedNotFound variant here as a reason to change its own workflow outcome
+// — these calls are advisory by design (poll/call_inspect is always the correctness floor); this type
+// exists purely so the failure is CLASSIFIED (as far as is achievable) and LOGGABLE, never dropped.
+pub variant BestEffort {
+	Ok,
+	SkippedNotFound,
+	InvalidId(field: String, actual_len: Int),
+	InvalidArg(field: String),
+	InvalidJson(field: String),
+	BackendUnavailable(detail: String),
+	BackendTimeout(detail: String),
+	BackendRejected(detail: String),
+	InvalidResponse(detail: String),
+	UnexpectedDefect(detail: String)
+}
+
+// Shared HostErrorKind -> BestEffort mapping for every *_best_effort wrapper — a straight 1:1
+// rename (BackendResponseInvalid -> InvalidResponse for brevity; every other case keeps its name
+// and fields verbatim), kept as ONE function so the mapping can never drift between wrappers.
+fn _kind_to_best_effort(kind: HostErrorKind) nothrow -> BestEffort {
+	return match kind {
+		HostErrorKind::InvalidId(field, actual_len) => { BestEffort::InvalidId(field = field, actual_len = actual_len) },
+		HostErrorKind::InvalidArg(field) => { BestEffort::InvalidArg(field = field) },
+		HostErrorKind::InvalidJson(field) => { BestEffort::InvalidJson(field = field) },
+		HostErrorKind::BackendUnavailable(detail) => { BestEffort::BackendUnavailable(detail = detail) },
+		HostErrorKind::BackendTimeout(detail) => { BestEffort::BackendTimeout(detail = detail) },
+		HostErrorKind::BackendRejected(detail) => { BestEffort::BackendRejected(detail = detail) },
+		HostErrorKind::BackendResponseInvalid(detail) => { BestEffort::InvalidResponse(detail = detail) }
+	};
+}
+
 // checkpoint_reverse_noop: the no-comp reversal mechanism a call checkpoint actually needs — the
 // SAME reversal_state 1->2 transition + descend-or-terminal logic as reverse_settle, but WITHOUT
 // ever requiring/touching a reverse_invocation_id (nothing is ever dispatched for a call
@@ -711,6 +752,22 @@ pub interface MicroflowsHost {
 	// Wake + status-hint ONLY, on a child terminal — best-effort, unfenced, never settles the parent.
 	fn child_terminal_notify(self: &Self, child_workflow_id: &Array<Byte>, child_status: Int,
 	                         event_ts: &String) -> ChildTerminalNotifyOutcome;
+	// NOTHROW best-effort wrapper around child_terminal_notify: the underlying HostErrorKind is
+	// recovered as a plain value (errors-as-values — see _child_terminal_notify_core) and CLASSIFIED
+	// into a typed BestEffort for its own entry-shape/backend checks, never silently swallowed by a
+	// caller-side catch-all. A HostException escaping from the shared SP-call plumbing further down
+	// (see _child_terminal_notify_core's own comment) is NOT re-classified — it lands in
+	// BestEffort::UnexpectedDefect, still fully diagnosable via its captured envelope, just not a
+	// specific HostErrorKind. A caller that must not let this change its own workflow outcome (1b.1's
+	// runner, on every terminal transition) gets a typed, loggable result either way, instead of an
+	// exception to either propagate (wrong — this is advisory) or blindly swallow (wrong — hides real
+	// defects).
+	fn child_terminal_notify_best_effort(self: &Self, child_workflow_id: &Array<Byte>, child_status: Int,
+	                                     event_ts: &String) nothrow -> BestEffort;
+	// NOTHROW best-effort wrapper around call_hint_refresh — same rationale as
+	// child_terminal_notify_best_effort above.
+	fn call_hint_refresh_best_effort(self: &Self, workflow_id: &Array<Byte>, operation_seq: Int,
+	                                 child_status: Int, event_ts: &String) nothrow -> BestEffort;
 	// Reverse a call checkpoint as a no-op (no compensation was ever dispatched for it).
 	fn checkpoint_reverse_noop(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
 	                          seq: Int, event_ts: &String) -> CheckpointReverseNoopOutcome
@@ -2123,51 +2180,62 @@ implement MicroflowsHost for HostImpl {
 
 	pub fn call_hint_refresh(self: &HostImpl, workflow_id: &Array<Byte>, operation_seq: Int,
 	                         child_status: Int, event_ts: &String) -> CallHintRefreshOutcome {
-		_validate_id16("workflow_id", workflow_id);
-		if operation_seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "operation_seq")); }
-		if child_status < 1 or child_status > 4 { throw HostException(kind = HostErrorKind::InvalidArg(field = "child_status")); }
-		_validate_nonempty("event_ts", event_ts);
-		try {
-			var lease = _acquire_conn(self);
-			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
-			var args = rpc.new_args();
-			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_int(operation_seq));
-			args.push(rpc.arg_int(child_status));
-			args.push(rpc.arg_string(_dup(event_ts)));
-			val sp: String = "sp_mf_call_hint_refresh";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "refreshed" { return CallHintRefreshOutcome::Refreshed(); }
-			if outcome == "not_found" { return CallHintRefreshOutcome::NotFound(); }
-			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:call_hint_refresh"));
-		} catch managed:ManagedError(e) {
-			val tag_owned: String = e.tag;
-			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		match _call_hint_refresh_core(self, workflow_id, operation_seq, child_status, event_ts) {
+			core.Result::Ok(v) => { return v; },
+			core.Result::Err(kind) => { throw HostException(kind = move kind); }
 		}
 	}
 
 	pub fn child_terminal_notify(self: &HostImpl, child_workflow_id: &Array<Byte>, child_status: Int,
 	                             event_ts: &String) -> ChildTerminalNotifyOutcome {
-		_validate_id16("child_workflow_id", child_workflow_id);
-		if child_status != 2 and child_status != 3 { throw HostException(kind = HostErrorKind::InvalidArg(field = "child_status")); }
-		_validate_nonempty("event_ts", event_ts);
+		match _child_terminal_notify_core(self, child_workflow_id, child_status, event_ts) {
+			core.Result::Ok(v) => { return v; },
+			core.Result::Err(kind) => { throw HostException(kind = move kind); }
+		}
+	}
+
+	// NOTHROW best-effort wrapper: maps _child_terminal_notify_core's Result DIRECTLY into a typed
+	// BestEffort value — no catch, no swallowed detail, for every failure mode the core classifies
+	// itself. The outer bound `catch e` covers a genuinely-unanticipated escape (a HostException thrown
+	// by the shared SP-call plumbing the core calls into, or any other non-ManagedError throw) — never
+	// used for the core's own well-classified Err path, which is handled entirely by the match above
+	// it. See _call_hint_refresh_core's comment for exactly what is and isn't covered by that Err path.
+	pub fn child_terminal_notify_best_effort(self: &HostImpl, child_workflow_id: &Array<Byte>, child_status: Int,
+	                                         event_ts: &String) nothrow -> BestEffort {
 		try {
-			var lease = _acquire_conn(self);
-			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
-			var args = rpc.new_args();
-			args.push(rpc.arg_bytes(_dup_bytes(child_workflow_id)));
-			args.push(rpc.arg_int(child_status));
-			args.push(rpc.arg_string(_dup(event_ts)));
-			val sp: String = "sp_mf_child_terminal_notify";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "notified" { return ChildTerminalNotifyOutcome::Notified(); }
-			if outcome == "not_found" { return ChildTerminalNotifyOutcome::NotFound(); }
-			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:child_terminal_notify"));
-		} catch managed:ManagedError(e) {
-			val tag_owned: String = e.tag;
-			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+			match _child_terminal_notify_core(self, child_workflow_id, child_status, event_ts) {
+				core.Result::Ok(v) => {
+					match v {
+						ChildTerminalNotifyOutcome::Notified() => { return BestEffort::Ok(); },
+						ChildTerminalNotifyOutcome::NotFound() => { return BestEffort::SkippedNotFound(); }
+					}
+				},
+				core.Result::Err(kind) => { return _kind_to_best_effort(kind); }
+			}
+		} catch e {
+			// A GENUINELY unanticipated escape (not the core's own well-classified Err path, which
+			// never reaches here) — bound, not swallowed: e.encode_compact() carries the full
+			// diagnostic envelope, per effective-drift.md's "bind it as `catch e` and record/report
+			// it" guidance for a hard catch-all boundary.
+			return BestEffort::UnexpectedDefect(detail = "child_terminal_notify:" + e.encode_compact());
+		}
+	}
+
+	// NOTHROW best-effort wrapper — same rationale as child_terminal_notify_best_effort above.
+	pub fn call_hint_refresh_best_effort(self: &HostImpl, workflow_id: &Array<Byte>, operation_seq: Int,
+	                                     child_status: Int, event_ts: &String) nothrow -> BestEffort {
+		try {
+			match _call_hint_refresh_core(self, workflow_id, operation_seq, child_status, event_ts) {
+				core.Result::Ok(v) => {
+					match v {
+						CallHintRefreshOutcome::Refreshed() => { return BestEffort::Ok(); },
+						CallHintRefreshOutcome::NotFound() => { return BestEffort::SkippedNotFound(); }
+					}
+				},
+				core.Result::Err(kind) => { return _kind_to_best_effort(kind); }
+			}
+		} catch e {
+			return BestEffort::UnexpectedDefect(detail = "call_hint_refresh:" + e.encode_compact());
 		}
 	}
 
@@ -2204,6 +2272,79 @@ implement MicroflowsHost for HostImpl {
 			val tag_owned: String = e.tag;
 			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
 		}
+	}
+}
+
+// PRIVATE core (errors-as-values): the entry-shape checks + this function's OWN `managed:ManagedError`
+// handling around the SP call return Err(HostErrorKind) as a PLAIN VALUE, never a thrown HostException
+// — HostException's `kind` field cannot be PROJECTED through a typed catch in this toolchain release
+// (E_TYPED_CATCH_FIELD_UNSUPPORTED_TYPE: only scalar Int/Uint/Bool/Float/String fields are supported;
+// `kind: HostErrorKind` is a nested variant). Matching on a normally-RETURNED HostErrorKind value has
+// no such restriction, so the best-effort wrapper below recovers FULL classification for every failure
+// mode THIS function decides directly.
+//
+// NOT covered (be honest about the boundary, not "full-fidelity" for every possible failure): the SP
+// plumbing this function CALLS INTO (`_call_sp_doc` / `_read_result_doc` / `_finish_stmt_and_commit` /
+// `_doc_str_req` / `_doc_outcome`, etc.) throws `HostException` DIRECTLY in several places of its own
+// (a malformed response document, a post-exec commit failure, an unreadable result row — see their own
+// bodies). Those are NOT caught here (doing so would hit the exact same unprojectable-field limitation,
+// with no way to recover which HostErrorKind they already constructed at their own throw site) — they
+// propagate straight through this function untouched. The throwing public method below is UNCHANGED by
+// that (it was always throws-capable and re-raises the original HostException exactly as before this
+// core/wrapper split existed). The best-effort wrapper's own outer bound `catch e` is what actually
+// absorbs that case, and it can only fold it into `BestEffort::UnexpectedDefect` — logged with the full
+// diagnostic envelope (`e.encode_compact()`), but genuinely NOT re-classified into the specific
+// HostErrorKind the plumbing already knew. Closing that gap for real would mean converting the shared
+// SP-call plumbing itself to return `Result` instead of throwing — a change with much wider blast radius
+// (every host method uses it), out of scope here.
+fn _call_hint_refresh_core(impl_: &HostImpl, workflow_id: &Array<Byte>, operation_seq: Int,
+                           child_status: Int, event_ts: &String) -> core.Result<CallHintRefreshOutcome, HostErrorKind> {
+	if workflow_id.len != 16 { return core.Result<CallHintRefreshOutcome, HostErrorKind>::Err(HostErrorKind::InvalidId(field = "workflow_id", actual_len = workflow_id.len)); }
+	if operation_seq < 1 { return core.Result<CallHintRefreshOutcome, HostErrorKind>::Err(HostErrorKind::InvalidArg(field = "operation_seq")); }
+	if child_status < 1 or child_status > 4 { return core.Result<CallHintRefreshOutcome, HostErrorKind>::Err(HostErrorKind::InvalidArg(field = "child_status")); }
+	if event_ts.byte_length() == 0 { return core.Result<CallHintRefreshOutcome, HostErrorKind>::Err(HostErrorKind::InvalidArg(field = "event_ts")); }
+	try {
+		var lease = _acquire_conn(impl_);
+		val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+		var args = rpc.new_args();
+		args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+		args.push(rpc.arg_int(operation_seq));
+		args.push(rpc.arg_int(child_status));
+		args.push(rpc.arg_string(_dup(event_ts)));
+		val sp: String = "sp_mf_call_hint_refresh";
+		val doc = _call_sp_doc(conn, &sp, move args);
+		val outcome = _doc_outcome(&doc);
+		if outcome == "refreshed" { return core.Result<CallHintRefreshOutcome, HostErrorKind>::Ok(CallHintRefreshOutcome::Refreshed()); }
+		if outcome == "not_found" { return core.Result<CallHintRefreshOutcome, HostErrorKind>::Ok(CallHintRefreshOutcome::NotFound()); }
+		return core.Result<CallHintRefreshOutcome, HostErrorKind>::Err(HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:call_hint_refresh"));
+	} catch managed:ManagedError(e) {
+		val tag_owned: String = e.tag;
+		return core.Result<CallHintRefreshOutcome, HostErrorKind>::Err(HostErrorKind::BackendUnavailable(detail = move tag_owned));
+	}
+}
+
+// PRIVATE core for child_terminal_notify — same rationale as _call_hint_refresh_core above.
+fn _child_terminal_notify_core(impl_: &HostImpl, child_workflow_id: &Array<Byte>, child_status: Int,
+                               event_ts: &String) -> core.Result<ChildTerminalNotifyOutcome, HostErrorKind> {
+	if child_workflow_id.len != 16 { return core.Result<ChildTerminalNotifyOutcome, HostErrorKind>::Err(HostErrorKind::InvalidId(field = "child_workflow_id", actual_len = child_workflow_id.len)); }
+	if child_status != 2 and child_status != 3 { return core.Result<ChildTerminalNotifyOutcome, HostErrorKind>::Err(HostErrorKind::InvalidArg(field = "child_status")); }
+	if event_ts.byte_length() == 0 { return core.Result<ChildTerminalNotifyOutcome, HostErrorKind>::Err(HostErrorKind::InvalidArg(field = "event_ts")); }
+	try {
+		var lease = _acquire_conn(impl_);
+		val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+		var args = rpc.new_args();
+		args.push(rpc.arg_bytes(_dup_bytes(child_workflow_id)));
+		args.push(rpc.arg_int(child_status));
+		args.push(rpc.arg_string(_dup(event_ts)));
+		val sp: String = "sp_mf_child_terminal_notify";
+		val doc = _call_sp_doc(conn, &sp, move args);
+		val outcome = _doc_outcome(&doc);
+		if outcome == "notified" { return core.Result<ChildTerminalNotifyOutcome, HostErrorKind>::Ok(ChildTerminalNotifyOutcome::Notified()); }
+		if outcome == "not_found" { return core.Result<ChildTerminalNotifyOutcome, HostErrorKind>::Ok(ChildTerminalNotifyOutcome::NotFound()); }
+		return core.Result<ChildTerminalNotifyOutcome, HostErrorKind>::Err(HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:child_terminal_notify"));
+	} catch managed:ManagedError(e) {
+		val tag_owned: String = e.tag;
+		return core.Result<ChildTerminalNotifyOutcome, HostErrorKind>::Err(HostErrorKind::BackendUnavailable(detail = move tag_owned));
 	}
 }
 

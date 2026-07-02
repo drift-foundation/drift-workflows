@@ -48,7 +48,7 @@ instead of shelling around the CLI.
 ### 3a. ScriptRegistry packaging / manifest (one-shot CLI) — ✅ LANDED (2026-06-19)
 App teams deploy **named, pinned, validated workflow revisions** instead of ad-hoc lowered configs. A
 deployment **manifest** (`{ "deployment": {db, participants, operations}, "scripts": [{name, version,
-path}] }`) declares named `.mf` scripts over a shared deployment. `microflows-runner --manifest <file>`
+path}] }`) declares named `.mf` scripts over a shared deployment. `mfrunner --manifest <file>`
 **compiles+validates EVERY declared script at startup** (lower over the deployment → build → validate)
 and **fails fast** on any missing/unreadable/invalid script or duplicate name (`invalid_manifest`). A
 SUBMISSION names a script (`--script <name>`); creation **pins its resolved identity** (script name,

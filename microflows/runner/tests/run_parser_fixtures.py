@@ -3,15 +3,15 @@
 
 Replaces the old compiled-in `tests/unit/parser_test.drift` (which inlined ~60 `.mf` scenarios as
 Drift string literals into ONE driftc translation unit, costing multiple GB / minutes to BUILD). The
-scenarios are now data files under `tests/fixtures/parser/`; the already-built `microflows-runner`
+scenarios are now data files under `tests/fixtures/parser/`; the already-built `mfrunner`
 binary reads them at runtime (kilobytes of RAM, milliseconds each):
 
-  check/<name>.mf  -> `microflows-runner --parse-check <f>`  : canonical JSON outcome on stdout
-  lower/<name>.mf  -> `microflows-runner --lower-source <f> --config <base>` : merged config / diagnostic
+  check/<name>.mf  -> `mfrunner --parse-check <f>`  : canonical JSON outcome on stdout
+  lower/<name>.mf  -> `mfrunner --lower-source <f> --config <base>` : merged config / diagnostic
 
 Each fixture has a committed golden `<name>.expected` (JSON). A run compares; `--update` regenerates
 (bless from the currently-passing parser). Usage:
-  run_parser_fixtures.py --bin <microflows-runner> [--root <fixtures>] [--update]
+  run_parser_fixtures.py --bin <mfrunner> [--root <fixtures>] [--update]
 """
 import argparse, json, os, subprocess, sys
 
@@ -110,7 +110,7 @@ def run(root, bin_path, update):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", default=os.environ.get("MF_RUNNER_BIN", ""), help="microflows-runner binary")
+    ap.add_argument("--bin", default=os.environ.get("MF_RUNNER_BIN", ""), help="mfrunner binary")
     ap.add_argument("--root", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "parser"))
     ap.add_argument("--update", action="store_true", help="(re)generate goldens from the binary")
     a = ap.parse_args()

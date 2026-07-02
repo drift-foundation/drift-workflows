@@ -10,7 +10,7 @@ application will use: submit a named script, resume pending work, inspect outcom
 ## 0. Prerequisites
 
 - The certified toolchain (driftc 0.33.53 / abi 18) and a built `uflowsd` binary
-  (`microflows/runner` builds artifacts `microflows-runner` and `uflowsd`).
+  (`microflows/runner` builds artifacts `mfrunner` and `uflowsd`).
 - A MariaDB with the Microflows schema loaded, and your participant services reachable.
 - Edit `manifest.json`: set `deployment.db.*` to your database and each participant's
   `transport.endpoints` to your services. (For a pure local smoke test, point all three logical

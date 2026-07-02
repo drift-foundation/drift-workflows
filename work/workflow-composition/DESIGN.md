@@ -25,6 +25,25 @@ or mechanic into app surface is a defect.
 - **callback workflow** — **avoid** (implies event-handler / out-of-band notification semantics). A workflow
   call is **async but awaited**, not a callback.
 
+## Operational tooling — `mfinspect` (queued separately)
+
+Composition makes the durable tree inspectable, but nested calls still need an operator-facing dump tool.
+Queue a separate **read-only** Python tool named `mfinspect` after the core composition slices unless K needs
+it sooner for 1b/1c integration debugging.
+
+Minimum target surface:
+- `mfinspect --workflow-id <hex>`
+- `mfinspect --script <name> --plan-version <version> --since <ts> --until <ts>`
+- `mfinspect --mf <path> --since <ts> --until <ts>`
+
+It reads the database as the source of truth and dumps: workflow row/state/direction/disposition/lease/next
+attempt/terminal reason/workflow return; plan identity; args; operations by seq (participant vs
+child-workflow call, ids, status, input/result, hashes, reconcile/redispatch counters); call sidecar links
+(`child_workflow_id`, child status, ancestry/root/depth); checkpoints/reversal state; and workflow events in
+the selected time range. Output should support stable JSON for tests plus a human tree view such as
+`parent -> child -> grandchild`. It must **never** mutate: no claim, resume, notify, unblock, timer reset, or
+state transition. This is operator/test observability only, not part of the runner state machine.
+
 ---
 
 ## 0. The model — a workflow call is an async *internal* operation

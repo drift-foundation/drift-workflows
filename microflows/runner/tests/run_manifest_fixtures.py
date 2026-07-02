@@ -6,18 +6,21 @@ Each fixture is a directory under tests/fixtures/manifest/<name>/ containing:
   run.json        -- {"script": <name to submit>, "arguments": {...}}
   *.mf            -- the scripts the manifest references (relative paths)
 
-`microflows-runner --manifest manifest.json --workflow-id <fixed> --script <run.script>
---arguments <run.arguments>` is run entirely DB-free for every fixture here: 1b.0's validation
-(_load_manifest) always runs BEFORE any DB connection is attempted, so a rejection at ANY gate
-(unresolved call target, bad input shape, bad result-path type, a static cycle, or the final
-"static validation passed but runtime not implemented until 1b.1" gate) surfaces with zero DB/stub
-setup. A fixture whose manifest is fully well-formed with NO reachable call would need a live DB to
-actually dispatch — none of the fixtures here do (a reachable call always triggers the 1b.1-pending
-rejection), so this suite stays DB-free by construction.
+`mfrunner --manifest manifest.json --workflow-id <fixed> --script <run.script>
+--arguments <run.arguments>` is run entirely DB-CONNECTION-FREE for every fixture here: 1b.0's
+validation (_load_manifest) always runs BEFORE any DB connection is attempted, so a rejection at
+ANY build-time gate (unresolved call target, bad input shape, bad result-path type, a static cycle)
+surfaces with zero DB/stub setup. Since 1b.1 (runtime call dispatch), a manifest whose ONLY defect is
+"has a reachable call" is legitimately runnable and is NO LONGER rejected at build time — those two
+fixtures (`gates1_4_ok`, `gate6_call_only_executable_step`) instead point `deployment.db.host` at a
+deliberately-unresolvable hostname (`db.invalid`, mirroring the participant's own `ref.invalid`), so
+they still exercise ONLY the build-time gates (proving validation passed) while staying live-DB-free
+— the runner's own top-level `catch unexpected` reports a fatal DB-connection failure before any
+dispatch is attempted, a distinct and stable outcome from every OTHER (build-time-rejected) fixture.
 
-Golden format (<name>.expected, JSON): {"returncode": N, "stderr_contains": "<substring>"} — the
-runner always exits nonzero for a manifest containing a reachable call (1b.0 keeps them
-non-runnable), so every fixture here is a rejection case, distinguished by ITS OWN precise message.
+Golden format (<name>.expected, JSON): {"returncode": N, "stderr_contains": "<substring>"} — every
+fixture here exits nonzero, either from a precise build-time rejection message or (for the two
+call-only fixtures) the generic fatal-DB-connection message.
 """
 import argparse, json, os, subprocess, sys
 
@@ -67,7 +70,7 @@ def run(root, bin_path, update):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", default=os.environ.get("MF_RUNNER_BIN", ""), help="microflows-runner binary")
+    ap.add_argument("--bin", default=os.environ.get("MF_RUNNER_BIN", ""), help="mfrunner binary")
     ap.add_argument("--root", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "manifest"))
     ap.add_argument("--update", action="store_true", help="(re)generate goldens from the binary")
     a = ap.parse_args()

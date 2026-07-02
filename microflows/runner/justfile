@@ -26,7 +26,7 @@ build:
 	"$DC" --target-word-bits 64 --trust-store drift/trust.json --package-root "{{_pkg-root}}" \
 	  $DEPS --entry "microflows.runner::main" \
 	  ../packages/microflows/src/*.drift src/*.drift \
-	  -o "{{BIN_DIR}}/microflows-runner"
+	  -o "{{BIN_DIR}}/mfrunner"
 
 # Unit tests for runner-owned modules.
 #  - The V1 control-flow graph IR (types + canonical hashing + flat-plan builder + validation +
@@ -55,11 +55,11 @@ test:
 	done
 	# parser/IR frontend: build the runner binary once, then golden-diff the .mf fixture corpus.
 	just build
-	python3 tests/run_parser_fixtures.py --bin "{{BIN_DIR}}/microflows-runner"
+	python3 tests/run_parser_fixtures.py --bin "{{BIN_DIR}}/mfrunner"
 	echo "[runner] parser fixtures ok"
 	# 1b.0: build-time registry validation gate for workflow calls — multi-script manifest fixtures,
 	# entirely DB-free (a rejection at any gate happens before _load_manifest ever tries to connect).
-	python3 tests/run_manifest_fixtures.py --bin "{{BIN_DIR}}/microflows-runner"
+	python3 tests/run_manifest_fixtures.py --bin "{{BIN_DIR}}/mfrunner"
 	echo "[runner] manifest fixtures ok"
 
 # Compiler-regression canary — NOT on the daily/cert gate (`just test` data-drives the same coverage).

@@ -2,7 +2,8 @@
   "deployment": {
     "worker_id": "w",
     "db": {
-      "host": "127.0.0.1",
+      "backend": "mariadb",
+      "host": "db.invalid",
       "port": 34214,
       "user": "root",
       "password": "",

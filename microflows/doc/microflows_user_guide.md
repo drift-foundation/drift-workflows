@@ -35,7 +35,7 @@ You combine them once, at deploy time, with the runner's `--lower-source`
 frontend, which produces a single **runnable config**:
 
 ```bash
-microflows-runner --config deploy.json --lower-source workflow.mf > runnable.json
+mfrunner --config deploy.json --lower-source workflow.mf > runnable.json
 ```
 
 `--lower-source` parses the `.mf`, type-checks it, validates the merged graph,
@@ -91,16 +91,16 @@ Lower, then submit an instance:
 
 ```bash
 # 1. Produce the runnable config.
-microflows-runner --config deploy.json --lower-source reserve.mf > runnable.json
+mfrunner --config deploy.json --lower-source reserve.mf > runnable.json
 
 # 2. Submit a new instance (a 32-hex workflow id you choose; --arguments = SUBMIT).
-microflows-runner --config runnable.json \
+mfrunner --config runnable.json \
   --workflow-id 00000000000000000000000000000001 \
   --arguments '{"request":{"reservation":"order-42"}}'
 # -> prints a status line, e.g. {"workflow":"completed"}
 
 # 3. RESUME the same instance later (omit --arguments -> drive from durable state).
-microflows-runner --config runnable.json \
+mfrunner --config runnable.json \
   --workflow-id 00000000000000000000000000000001
 ```
 
@@ -388,7 +388,7 @@ The runnable config has a stable **`content_hash`** over the graph + bindings +
 argument type + contracts. Print it with:
 
 ```bash
-microflows-runner --config runnable.json --emit-content-hash
+mfrunner --config runnable.json --emit-content-hash
 ```
 
 A running instance is pinned to its `content_hash`; a resume requires an exact
@@ -501,18 +501,18 @@ before integrating.
 ## 10. Command reference
 
 ```text
-microflows-runner --config <base.json> --lower-source <wf.mf>
+mfrunner --config <base.json> --lower-source <wf.mf>
     Lower a .mf to a runnable config on stdout (DB-free). Fails on any parse/
     type/validation error. No dispatch.
 
-microflows-runner --config <runnable.json> --emit-content-hash
+mfrunner --config <runnable.json> --emit-content-hash
     Print the revision's content_hash (hex). DB-free.
 
-microflows-runner --config <runnable.json> --workflow-id <32-hex> --arguments <json>
+mfrunner --config <runnable.json> --workflow-id <32-hex> --arguments <json>
     SUBMIT a new instance (validate args, freeze, drive forward). Re-asserting
     with different args for the same id -> workflow_conflict.
 
-microflows-runner --config <runnable.json> --workflow-id <32-hex>
+mfrunner --config <runnable.json> --workflow-id <32-hex>
     RESUME (omit --arguments): drive the instance from durable state.
 ```
 

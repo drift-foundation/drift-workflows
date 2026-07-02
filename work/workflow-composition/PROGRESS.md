@@ -24,6 +24,11 @@ avoid "callback").
   checkpoint**; the child workflow recursively owns its own unwind and the parent never enumerates or invokes
   child-internal compensations directly.
 - **Slice 2** — stuck-child liveness budget (standalone). **Slice 3** — fan-out + `on failed`-as-data.
+- **Tooling item (queued, separate)** — `mfinspect`, a Python read-only flow inspector/dump tool. Default
+  placement is after the composition slices, unless K needs it sooner to debug 1b/1c integration. It should
+  dump workflow/call-operation/checkpoint/event state by `workflow_id`, script/plan/time range, or `.mf`
+  source selection; render both stable JSON and a human parent→child tree; and never claim, resume, notify,
+  unblock, or mutate timers.
 
 The per-slice **build checklists** (1a/1b/1c) are in `DESIGN.md`.
 
@@ -1623,3 +1628,244 @@ rebuilds clean (confirming zero callers were broken); full `microflows` `just te
 unit/e2e jobs (0 failed), parser fixtures 100/100, manifest fixtures 8/8, `sp_operation_test.py` 156/156,
 `sp_call_test.py` 79/79 (unaffected — only the host changed, the SP's own `arg_input_hash` parameter is
 untouched), `JUST_EXIT=0`.
+
+## 1b.1 — runner-runtime wiring (DESIGN, proceeding directly to implementation)
+
+Scope per the user's concrete 5-item request: (1) `NCallWorkflow` dispatch replacing the "not implemented
+until 1b.1" gate, (2) await-the-child settle/reversal/defer branching, (3) recovery/replay idempotency,
+(4) `_run_reversal`'s `call_kind` branch to `checkpoint_reverse_noop`, (5) integration coverage. No separate
+review gate was requested this time (unlike the host-wrappers step) — this section records the design for
+the record, matching established practice, then implementation proceeds directly.
+
+**`advance()` / `StepOutcome`**: add `NeedCall(node_id, child, plan_version, input_json)`, mirroring
+`NeedOperation`'s exact shape. `NCallWorkflow`'s new `advance()` arm mirrors `NOperation`'s arm exactly
+(confirmed via direct read, ir.drift:1144-1154): `_find_settled` first (already-settled -> continue past
+via `next`), else evaluate `input: IrExpr` and return `NeedCall`. `_node_depths`/`op_depth` already treat a
+call as one forward step when `allow_calls=true` (confirmed unchanged) — no IR-graph-shape changes needed
+beyond the new `StepOutcome` case.
+
+**Registry threading (the one real architectural decision)**: confirmed via direct research that
+`_run_forward` (runner.drift:2001) has ZERO visibility into sibling scripts — only its own `cfg`/`graph`/
+`plan_length`/`content_hash_hex`. `ManifestSet.scripts` (`Array<ManifestScript>`, each carrying `name`/
+`version`/`content_hash_hex`/`plan_length` — exactly what's needed to resolve a call's `(child,
+plan_version)` target) is held resident only up at `_drive_manifest_request` and is discarded before
+`_run_core`/`_run_planned`/`_run_forward` are entered, on both service and CLI-manifest paths, and never
+exists on the legacy `_run_cfg` path. Chose to THREAD a new `call_scripts: &Array<ManifestScript>`
+parameter through `_run_core` -> `_run_planned` -> `_run_forward` (sourced from `_drive_manifest_request`'s
+`ms.scripts` at its 3 call sites; `_run_cfg` passes an empty array — the legacy path can never reach a
+`NeedCall` in practice, since `allow_calls=false` there rejects any reachable call at build time already).
+Rejected alternative: resolving the child pre-`_run_forward` — awkward because `_run_forward`'s single-pass
+loop discovers `NeedOperation`/`NeedCall` outcomes incrementally, one `ir.advance` step at a time, not known
+up front.
+
+**`NeedCall` handling in `_run_forward`** — deliberately SIMPLER than `NeedOperation`'s dispatch (no
+GET-first/PUT-first reconciliation, no pending-redispatch-escalation-timer machinery): `sp_mf_call_submit`
+is already fully idempotent at the DB layer with no external non-idempotent side effect being risked (unlike
+a real participant HTTP PUT), so `call_submit` is called UNCONDITIONALLY every pass (fresh: `Submitted`;
+replay: `AlreadySubmitted`) — no separate "recovered" branch needed. Order: (1) `host.operation_result` check
+for already-`Succeeded` (adopt + `continue`, same top-of-arm pattern as `NeedOperation`); (2) resolve the
+child via `_find_script_nv(call_scripts, &child, &plan_version)` (`call_target_unavailable` defer if absent
+— defensive, build-time validation should already prevent this); (3) derive `child_workflow_id` via a NEW
+domain-separated helper `_child_workflow_id_node` (mirrors `_operation_id_node`'s `"mf-op;"`-tagged seed,
+using `"mf-call;"` instead — disjoint id space); (4) read `max_call_depth` from the CALLING script's own
+`cfg` (simple read-with-default, `deployment.workflow_call.max_call_depth`, default 16 — `cfg` already
+carries every deployment-level key via `_deployment_for`'s pass-through, confirmed, so no new parameter is
+needed for this); (5) `host.call_submit(...)` with the child's fresh continuation (`{"pos":"start"}`, same
+literal `create_planned`'s own submission path uses) and `next_attempt_at` = the same clock reading as
+`event_ts` (child immediately claimable, mirrors `create_planned`'s own `t_create` reuse); (6) on
+`Submitted`/`AlreadySubmitted`, immediately `host.call_inspect(...)`: non-terminal -> `_defer_pending` (the
+SAME helper `NeedOperation`'s `PendingObserved` uses — "no block cascade" falls out naturally, since this is
+just an ordinary defer/retry-later, never a state transition on the parent); terminal+`state==COMPLETED` ->
+settle the call op with the child's `workflow_return_json`, replicating `NeedOperation`'s Done-arm
+finality-probe + `operation_settle` call exactly (checkpoint payload = the call's own input, matching the
+participant-op convention of "payload is the op's own input" even though a no-op reversal never consults
+it); terminal+anything else (reversed/failed/resolved_exception) -> `_begin_reversal_unwind` (the SAME
+helper `NeedOperation`'s `Rejected` arm uses) — "child failed = call rejection = normal reversal trigger,"
+no new failure surface. `call_submit`'s own `CallRejected(reason)` (the recursion guard) routes through the
+SAME `_begin_reversal_unwind` path — a rejected call is a rejected call, regardless of whether the rejection
+came from the recursion guard or from the child's own failure.
+
+**Recovery/replay**: falls out of the above by construction — a resumed drive re-enters the SAME `NeedCall`
+arm, `call_submit` replays as `AlreadySubmitted` (idempotent, same identities every time — there is no
+"differently recreate on resume" code path to accidentally diverge, unlike `NeedOperation`'s fresh-vs-
+recovered branching), and `call_inspect` simply re-reads current child state. No second child is ever
+created because `child_workflow_id`'s derivation is a pure function of (workflow, content_hash, node_id) —
+identical on every replay.
+
+**`_run_reversal`'s `call_kind` branch**: the `Pending(seq, forward_operation_name, forward_payload,
+call_kind)` arm branches BEFORE calling `_compensation_for` — `call_kind=2` (child_workflow) calls
+`host.checkpoint_reverse_noop` directly (skipping the compensation-binding lookup a call checkpoint never
+has) and loops back to `reverse_head` (the existing `while true` structure already re-reads it); `call_kind=1`
+(participant) is the EXISTING unchanged path. This is the exact wiring `PROGRESS.md`'s earlier SP/schema
+design record already specified (§"Reversing a call checkpoint") — implementing it here fully resolves that
+long-standing placeholder (the `_call_kind` binder has been present-but-unused since the SP/schema pass).
+
+**`_validate_manifest_calls`'s "not implemented until 1b.1" throw is removed** — its entire purpose was
+exactly that guard; now that runtime dispatch exists, a manifest with call edges is not a build-time error.
+
+**Integration coverage** (new suite or extension of `coordinator-singular`, per the user's 5 scenarios):
+child completes -> parent consumes result; child fails -> parent reversal; child blocked -> parent stays
+deferred (not blocked); replay/recovery creates no second child; a call checkpoint reverses as a no-op.
+
+## 1b.1 — implementation LANDED, integration coverage green (21/21)
+
+Binary renamed `microflows-runner` -> `mfrunner` (user decision — kept "runner" despite the earlier
+ambiguity concern, over the `mfstep` alternative; scope limited to the runner package itself: build
+output, `cli.parser`/logger self-description, the two existing test harnesses — `drift/lock.json`'s
+package/artifact identity and references outside `microflows/runner/` were deliberately left untouched).
+
+**`Outcome::Pending` carrier (team-approved design)**: added `child_workflow_id: String` (empty/omitted
+for every non-call cause, rendered only when non-empty — same discipline as `Deferred`/`Blocked`).
+`_defer_pending` was parameterized with `child_workflow_id_hex: &String` rather than bypassed, so the
+existing release/lease/admission-gate semantics are provably unchanged for all 6 pre-existing call sites
+(pass `""`); only the `NeedCall` non-terminal-child arm passes the value `call_inspect` already returned.
+
+**Two real bugs found and fixed while building the integration test** (both pre-existing/adjacent to
+this change, not deep NeedCall logic bugs):
+1. `_run_planned`'s OWN two internal `_registry_build(cfg, false)` calls (submission + claimed/resume
+   branches) hardcoded `allow_calls=false` — a leftover from when a call was NEVER runnable regardless
+   of context. Fixed to `_registry_build(cfg, call_scripts.len > 0)`: manifest mode (call_scripts
+   non-empty) now allows calls at this build-time re-check too; the legacy `--config` single-script path
+   (call_scripts always empty there) correctly keeps rejecting a reachable call at build time, since it
+   has no sibling registry to resolve against.
+2. Test-manifest bug (not a runner bug): `deployment.db.backend` is a REQUIRED field (`build_host`'s
+   `_read_required_string(node, &"backend")`) that neither my new test manifests nor the pre-existing
+   `gate6_call_only_executable_step`/`gates1_4_ok` fixtures included — all three were fixed to add
+   `"backend": "mariadb"`. This is why `gate6`/`gates1_4_ok`'s blessed "runner: fatal" golden was correct
+   for the wrong reason previously assumed (missing key, not literally DNS/connect failure to
+   `db.invalid` — same observable outcome, now accurately caused).
+
+**`call_integration_test.py`** (new, `microflows/db-tests/`): drives the actual compiled `mfrunner`
+binary via subprocess against a live DB + an in-process stub HTTP participant (stdlib `http.server`,
+always 200 `{"result":{}}`, per `uflowsd_participant_contract.md` §4.1 — needed because even a
+fail-only/call-only-without-a-participant-op child graph is still rejected at build time, "at least one
+operation" — plan_length=0 is not runnable). Uses the carrier pattern throughout: `child_workflow_id`
+is read from each `Pending` response's own JSON, never queried from `tb_mf_call` for flow control — DB
+reads are assertion-only (row-count, `tb_mf_workflow.state`). 21/21 checks across the 5 scenarios pass.
+Wired into `justfile`'s `_test-sp` (runs after `sp_call_test.py`, needs the `mfrunner` binary the
+top-level `test` recipe already built via `cd runner && just test` before the DB lock is taken).
+
+**Full `microflows` `just test` re-run: green.** `parser-fixtures` 100/100, `manifest-fixtures` 8/8,
+`drift-test-run` 25 ok/0 failed (fresh schema load, including `tb_mf_call`), `sp_operation` regression
+156/156, `sp_call` regression 79/79, `call_integration` regression 21/21 (new), zero `FAIL` lines
+anywhere, exit 0.
+
+**1b.1 is now fully landed**: schema/SPs, host API, and runner-runtime wiring (dispatch, await, recovery,
+call-checkpoint reversal) all implemented and green end to end, including a genuine runner-level
+integration suite exercising the compiled binary against a live DB — not just SP/host-layer coverage.
+Deliberately still out of scope (per DESIGN.md/PROGRESS.md's own slice boundaries): `mfinspect` (queued,
+separate observability tool, not pulled forward), any 1c compensation-runtime work beyond the no-op call
+reversal already covered here.
+
+## 1b.1 review round: 3 findings, all fixed
+
+**(1) Terminal push / hint refresh were built (host.drift) but never wired into the runner** — a real gap
+against DESIGN.md's "terminal push + poll fallback." Two wiring points added:
+- `child_terminal_notify`: fires from `_run_core`'s 3 `_run_planned` call sites, right after each returns
+  a terminal `Outcome` (any of `Completed`/`AlreadyTerminal`/`TerminalFailure`/`ResolvedException`/a
+  terminal `TerminalState`) — matching `ChildTerminalNotifyOutcome`'s own doc comment ("invoked from the
+  CHILD's own terminal-transition context, a SEPARATE call strictly AFTER that transaction has already
+  committed"). Safe to call unconditionally on every terminal outcome (not just calls) since a workflow
+  that isn't anyone's child gets a harmless `NotFound` — no ancestry check needed first.
+- `call_hint_refresh`: fires from `_run_forward`'s `NeedCall` arm when `call_inspect` observes the child
+  is non-terminal AND specifically `state == STATE_BLOCKED` — refreshing the sidecar's display hint to
+  `CHILD_STATUS_BLOCKED` before deferring, per DESIGN.md's "in particular `blocked`."
+- New `child_status` constants (`CHILD_STATUS_COMPLETED/FAILED/BLOCKED`) added, distinct from the
+  workflow `STATE_*` codes (same-looking small integers, different enum/purpose — a footgun avoided by
+  naming, not just convention).
+
+**(2) `deployment.workflow_call.max_call_depth` silently defaulted on malformed config** — a typo in a
+recursion-safety knob must fail loudly, not silently fall back to the default. Added
+`_validate_workflow_call(cfg)` (same strict pattern as `_validate_reconcile_budget`/
+`_validate_pending_redispatch`: object shape + integer ≥ 1, `RunnerError` on violation), wired into
+`_validate_registry` — runs at every build-time validation point (manifest load, submission, resume).
+
+**(3) Binary rename left user-facing docs stale** — swept `microflows-runner` → `mfrunner` across pure
+documentation (`microflows_user_guide.md`, `RUN_LOCAL.md`, `roadmap.md`, `microflows_design.md`,
+`uflowsd_participant_contract.md`, `microflows-viz/README.md`, `work/uflowsd/RELEASE_ANNOUNCEMENT_DRAFT.md`).
+Deliberately LEFT alone: `CHANGELOG.md`'s two mentions (describing past releases 0.5.0/0.2.0, where the
+binary genuinely was named `microflows-runner` — a historical record, not staleness); this file's own
+history above (accurately describes the rename decision as it happened); `integration/coordinator-singular/`
+(a separate component with *functional*, not just prose, references — its own justfile/tools actually
+invoke the binary by name; changing it needs verification against that suite, which is out of scope for
+this pass and wasn't part of the original "runner package only" rename decision).
+
+**Follow-on architecture change while fixing (1): no more `catch {}` anywhere in runner.drift or
+host.drift.** The first attempt used a blind `try { ... } catch {}` around the two best-effort host calls
+— correctly flagged as too broad (hides host/SP contract bugs, not just expected backend hiccups).
+Landed on an errors-as-values restructuring in `host.drift`:
+- `_call_hint_refresh_core`/`_child_terminal_notify_core` (new, private, free functions — NOT interface
+  methods, matching `_acquire_conn`'s own placement convention) hold the shared validate+SP-call+
+  `managed:ManagedError`-catch logic, returning `core.Result<Outcome, HostErrorKind>` as a **plain
+  value**, never a thrown `HostException`. This sidesteps a genuine toolchain limitation hit along the
+  way: `HostException`'s `kind: HostErrorKind` field cannot be projected through a typed catch in this
+  driftc release (`E_TYPED_CATCH_FIELD_UNSUPPORTED_TYPE` — only scalar Int/Uint/Bool/Float/String fields
+  are supported; confirmed against the certified `drift-lang-spec.md`/`effective-drift.md` docs, which
+  independently prescribe exactly this pattern: "use `match` when the function is `nothrow` and should
+  stay that way").
+- The existing throwing `call_hint_refresh`/`child_terminal_notify` now just `match` the core's Result and
+  `throw HostException(kind = move kind)` on Err (external behavior unchanged, verified by the unchanged
+  SP/host test counts below).
+- New `nothrow` `call_hint_refresh_best_effort`/`child_terminal_notify_best_effort` `match` the SAME core
+  Result directly — no catch of `HostException` needed at all — mapping every `HostErrorKind` variant 1:1
+  into a new exported `BestEffort` variant (`Ok`, `SkippedNotFound`, plus one arm per `HostErrorKind`
+  case, renaming only `BackendResponseInvalid`→`InvalidResponse` for brevity) via a shared
+  `_kind_to_best_effort` mapper. A genuinely-unanticipated escape from the core (not its own well-
+  classified Err path) is caught via a **bound** `catch e` (not `catch unexpected`/`catch {}`) and folded
+  into `BestEffort::UnexpectedDefect(detail = e.encode_compact())` — full diagnostic envelope, per
+  effective-drift.md's "bind it as `catch e` and record/report it" guidance for a hard catch-all boundary.
+- `runner.drift`'s two call sites now call the `_best_effort` methods directly (no try/catch at all) and
+  route the result through a new shared `_log_best_effort` sink — `Ok`/`SkippedNotFound` log nothing,
+  every other variant is logged with the specific operation name + workflow hex, grep-able, never
+  silently dropped. Correctness is untouched either way: these calls were already advisory-only.
+
+**Full `microflows just test` re-run: green.** `parser-fixtures` 100/100, `manifest-fixtures` 8/8,
+`drift-test-run` 25 ok/0 failed (including `live_call_test`, unaffected by the terminal-notify/
+hint-refresh wiring), `sp_operation` regression 156/156, `sp_call` regression 79/79,
+`call_integration` regression 21/21 (unchanged counts — the notify/hint-refresh wiring is
+best-effort by design and doesn't alter any of the 5 scenarios' assertions), zero `FAIL` lines
+anywhere, exit 0. All 3 review findings resolved; the `catch {}` → `BestEffort` architecture change
+is a genuine improvement, not just a fix. This remains a review checkpoint.
+
+## Post-BestEffort-rewrite review: 2 more findings, both fixed
+
+**(1) Low/style — the remaining `_now(host)` catch (advisory timestamp read) was still an inline
+`try { ... } catch e { ... }` at each call site**, correct in behavior (no logging needed — an
+advisory latency hint's clock-read failure has no operator action to prompt) but looked like
+leftover swallowing rather than a deliberate policy. Extracted `_advisory_now(host) nothrow ->
+Optional<String>`, documented as an explicit policy ("clock-read failure means we EXPLICITLY skip
+the advisory wake/hint... no logging on the None path is a deliberate choice, not an oversight").
+Both call sites now `match Optional::Some(t)/None` — zero inline try/catch left anywhere.
+
+**(2) Medium — the `_call_hint_refresh_core`/`_child_terminal_notify_core` comments overstated the
+guarantee.** They claimed "full-fidelity classification... without ever catching HostException at
+all," but the shared SP-call plumbing those core functions call into (`_call_sp_doc`/
+`_read_result_doc`/`_finish_stmt_and_commit`/`_doc_str_req`, etc.) throws `HostException` DIRECTLY
+in several places of its own (malformed response document, post-exec commit failure, unreadable
+result row) — confirmed by reading their bodies. Those throws are NOT caught by the core's own
+`managed:ManagedError` handler (different type) and propagate straight through. Traced the actual
+consequence carefully before deciding on a fix:
+- **The throwing public methods (`call_hint_refresh`/`child_terminal_notify`) are UNCHANGED** — the
+  original `HostException` (with its original, specific `kind`) propagates through the
+  core→match→throw chain exactly as it did before the core/wrapper split existed. No regression.
+- **The best-effort wrappers genuinely DO lose granularity** for this specific escape path — their
+  outer bound `catch e` can only fold it into `BestEffort::UnexpectedDefect` (still fully
+  diagnosable via `e.encode_compact()`, just not the specific `HostErrorKind` the plumbing already
+  constructed at its own throw site) — because recovering that `kind` would require projecting a
+  non-scalar field from an ALREADY-CAUGHT `HostException`, the exact same toolchain limitation that
+  motivated the errors-as-values restructuring in the first place. There is no way around it short
+  of converting the shared SP-call plumbing itself (used by every host method) to return `Result`
+  instead of throwing — correctly judged out of proportion for this finding.
+- Fixed by REWRITING the comments to state the real boundary honestly (what the core classifies
+  directly vs. what still escapes as `UnexpectedDefect`, and why), not by attempting the deeper
+  refactor. Also found and removed a stale, duplicate leftover comment block on the `BestEffort`
+  variant (an orphaned fragment from an earlier draft describing the old `BestEffortOutcome::
+  Failed(reason: String)` shape that had already been replaced) — a genuine cleanup, not just a
+  wording fix.
+
+**Full `microflows just test` re-run: green.** `parser-fixtures` 100/100, `manifest-fixtures` 8/8,
+`drift-test-run` 25 ok/0 failed, `sp_operation` regression 156/156, `sp_call` regression 79/79,
+`call_integration` regression 21/21 (unchanged counts — both findings this round were style/comment
+fixes, no behavior change), zero `FAIL` lines anywhere, exit 0. Both findings resolved. No inline
+try/catch remains anywhere in the 1b.1 runner/host changes; every failure mode is either a typed,
+loggable `BestEffort` result or an honestly-documented boundary. This remains a review checkpoint.

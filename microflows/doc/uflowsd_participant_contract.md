@@ -153,7 +153,7 @@ steps {
 
 Full `.mf` grammar (args, `let`, `if`/`case`/`merge`, `map`/`filter`/`fold` loops, object/array construction)
 is in `microflows_design.md §12.6` and `microflows_user_guide.md`. Inspect a compiled plan without a DB via
-`microflows-runner --lower-source <file.mf>` (merged config to stdout) or `--parse-check <file.mf>`
+`mfrunner --lower-source <file.mf>` (merged config to stdout) or `--parse-check <file.mf>`
 (canonical parse outcome). (`runner.drift:308-309`.)
 
 ---

@@ -68,6 +68,8 @@ const PENDING_RETRY_SECONDS: Int = 1;
 const DISPATCH_DEFER_SECONDS: Int = 5;
 const PUT_IO_TIMEOUT_MS: Int = 3000;
 const RECONCILE_IO_TIMEOUT_MS: Int = 8000;
+// Default max call-chain depth (1b.1), overridable via deployment.workflow_call.max_call_depth.
+const DEFAULT_MAX_CALL_DEPTH: Int = 16;
 
 // ===== Admission control (slice 2: draining / reload / graceful shutdown) =====
 //
@@ -138,7 +140,11 @@ variant Outcome {
 	ResolvedException,                                     // exit 0
 	TerminalState(state: Int),                             // exit 0
 	Active(reason: String),                                // exit 4
-	Pending(reason: String, defer_until: String),          // exit 9
+	// child_workflow_id: "" -> omitted (every non-call pending cause); non-empty (1b.1) -> the child a
+	// call-wait is deferred on, so an operator can inspect exactly what the parent is waiting for
+	// without querying internal tables. Sourced from call_inspect's own already-fetched return value —
+	// never a new lookup.
+	Pending(reason: String, defer_until: String, child_workflow_id: String), // exit 9
 	PendingRestart(reason: String),                        // exit 11
 	Refused(reason: String),                               // exit 10
 	Error(reason: String),                                 // exit 10
@@ -162,7 +168,10 @@ fn _oc_render(o: &Outcome) nothrow -> String {
 		Outcome::ResolvedException() => { return "{\"workflow\":\"resolved_exception\"}"; },
 		Outcome::TerminalState(state) => { return "{\"workflow\":\"terminal\",\"state\":" + fmt.format_int(state) + "}"; },
 		Outcome::Active(reason) => { return "{\"workflow\":\"active\",\"reason\":\"" + _dup(reason) + "\"}"; },
-		Outcome::Pending(reason, defer_until) => { return "{\"workflow\":\"pending\",\"reason\":\"" + _dup(reason) + "\",\"defer_until\":\"" + _dup(defer_until) + "\"}"; },
+		Outcome::Pending(reason, defer_until, child_workflow_id) => {
+			if child_workflow_id.byte_length() == 0 { return "{\"workflow\":\"pending\",\"reason\":\"" + _dup(reason) + "\",\"defer_until\":\"" + _dup(defer_until) + "\"}"; }
+			return "{\"workflow\":\"pending\",\"reason\":\"" + _dup(reason) + "\",\"defer_until\":\"" + _dup(defer_until) + "\",\"child_workflow_id\":\"" + _dup(child_workflow_id) + "\"}";
+		},
 		Outcome::PendingRestart(reason) => { return "{\"workflow\":\"pending_restart\",\"reason\":\"" + _dup(reason) + "\"}"; },
 		Outcome::Refused(reason) => { return "{\"workflow\":\"refused\",\"reason\":\"" + _dup(reason) + "\"}"; },
 		Outcome::Error(reason) => { return "{\"workflow\":\"error\",\"reason\":\"" + _dup(reason) + "\"}"; },
@@ -190,7 +199,7 @@ fn _oc_exit(o: &Outcome) nothrow -> Int {
 		Outcome::ResolvedException() => { return 0; },
 		Outcome::TerminalState(state) => { return 0; },
 		Outcome::Active(reason) => { return 4; },
-		Outcome::Pending(reason, defer_until) => { return 9; },
+		Outcome::Pending(reason, defer_until, child_workflow_id) => { return 9; },
 		Outcome::PendingRestart(reason) => { return ADMISSION_PENDING_RESTART_EXIT; },
 		Outcome::Refused(reason) => { return ADMISSION_REFUSED_EXIT; },
 		Outcome::Error(reason) => { return 10; },
@@ -236,6 +245,13 @@ const STATE_COMPLETED: Int = 4;
 const STATE_REVERSED: Int = 5;
 const STATE_FAILED: Int = 7;
 const STATE_RESOLVED_EXCEPTION: Int = 6;
+
+// tb_mf_call.child_status codes (1b.1) — a coarse DISPLAY HINT, a DISTINCT enum from the workflow
+// state codes above (e.g. child_status=4/"blocked" corresponds to workflow state=3/STATE_BLOCKED —
+// numerically different codes for a different purpose, never interchange them).
+const CHILD_STATUS_COMPLETED: Int = 2;
+const CHILD_STATUS_FAILED: Int = 3;
+const CHILD_STATUS_BLOCKED: Int = 4;
 
 pub error RunnerError { message: String }
 
@@ -310,7 +326,7 @@ variant CompStep {
 }
 
 fn main(argv: Array<String>) nothrow -> Int {
-	var p = cli.parser("microflows-runner", "0.1.0", "Microflows coordinator runner (first slice)");
+	var p = cli.parser("mfrunner", "0.1.0", "Microflows coordinator runner (first slice)");
 	val _ = p.option_string("config", "c", "FILE", "JSON config: db + participants + operations registries (or use --manifest)", false);
 	val _ = p.option_string("workflow-id", "w", "HEX", "32-hex-char workflow id", false);
 	val _ = p.option_string("operation", "o", "NAME", "operation to submit (required ONLY for a fresh LEGACY workflow; a resume uses the durable request)", false);
@@ -614,7 +630,7 @@ fn _log_parse_diagnostic(e: &parser.ParseError) nothrow -> Void {
 	cfgb.sink(log.stderr_sink());
 	cfgb.min_level(log.Level::Info());
 	cfgb.formatter(log.FormatterKind::JsonIso8601());
-	val logger = log.create_logger("microflows-runner", cfgb.build());
+	val logger = log.create_logger("mfrunner", cfgb.build());
 	logger.error("lower-source-parse-error", {
 		"code": _dup(&e.code),
 		"byte_offset": fmt.format_int(e.byte_offset),
@@ -659,7 +675,58 @@ fn _run_cfg(cfg: &json.JsonNode, workflow_hex: &String,
 	mf.with_json(&mut b, &db_sub);
 	mf.with_identity(&mut b, move identity);
 	val host = _build_host(move b);
-	return _run_core(&host, cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+	// Legacy single-config mode has no sibling manifest — a reachable `call` node is already a
+	// build-time reject here (allow_calls=false), so this is never consulted; empty is the correct sentinel.
+	val no_call_scripts: Array<ManifestScript> = [];
+	return _run_core(&host, cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, &no_call_scripts, admission);
+}
+
+// Best-effort wake for the PARENT of a just-terminated workflow (1b.1 terminal push): fires AFTER
+// this workflow's own terminal transition has already committed (a separate host call, never nested
+// in that transaction). A workflow that isn't actually referenced as anyone's child gets a harmless
+// NotFound — so this is safe to call unconditionally on every terminal outcome, never needing to know
+// in advance whether this workflow has a parent. Never throws: a backend hiccup here must not turn a
+// successful terminal outcome into a crash — poll (the existing call_inspect defer/retry loop) is
+// always the floor, this is purely a latency optimization.
+fn _notify_terminal_if_child(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, outcome: &Outcome) nothrow -> Void {
+	var status: Int = 0;
+	match outcome {
+		Outcome::Completed(operation_id, result, workflow_return) => { status = CHILD_STATUS_COMPLETED; },
+		Outcome::AlreadyTerminal(operation_id, result, workflow_return) => { status = CHILD_STATUS_COMPLETED; },
+		Outcome::TerminalFailure(reason, compensated) => { status = CHILD_STATUS_FAILED; },
+		Outcome::ResolvedException() => { status = CHILD_STATUS_FAILED; },
+		Outcome::TerminalState(state) => {
+			if *state == STATE_COMPLETED { status = CHILD_STATUS_COMPLETED; }
+			else if *state == STATE_REVERSED or *state == STATE_FAILED or *state == STATE_RESOLVED_EXCEPTION { status = CHILD_STATUS_FAILED; }
+		},
+		default => {}
+	}
+	if status == 0 { return; }
+	match _advisory_now(host) {
+		Optional::Some(t) => {
+			_log_best_effort("child_terminal_notify", &_bytes_to_hex(workflow_id), host.child_terminal_notify_best_effort(workflow_id, status, &t));
+		},
+		Optional::None => {}
+	}
+}
+
+// Shared diagnostic sink for the *_best_effort host calls (1b.1): Ok/SkippedNotFound are the two
+// non-failure shapes and log nothing; every OTHER variant is a CLASSIFIED failure — logged with the
+// specific operation name + workflow so it is grep-able, never silently dropped. Never affects the
+// caller's own workflow outcome — these calls are advisory by design (poll is always the floor).
+fn _log_best_effort(op: String, workflow_hex: &String, r: mf.BestEffort) nothrow -> Void {
+	match r {
+		mf.BestEffort::Ok() => {},
+		mf.BestEffort::SkippedNotFound() => {},
+		mf.BestEffort::InvalidId(field, actual_len) => { console.eprintln(op + " best-effort failed: invalid_id field=" + field + " workflow=" + _dup(workflow_hex)); },
+		mf.BestEffort::InvalidArg(field) => { console.eprintln(op + " best-effort failed: invalid_arg field=" + field + " workflow=" + _dup(workflow_hex)); },
+		mf.BestEffort::InvalidJson(field) => { console.eprintln(op + " best-effort failed: invalid_json field=" + field + " workflow=" + _dup(workflow_hex)); },
+		mf.BestEffort::BackendUnavailable(detail) => { console.eprintln(op + " best-effort failed: backend_unavailable " + detail + " workflow=" + _dup(workflow_hex)); },
+		mf.BestEffort::BackendTimeout(detail) => { console.eprintln(op + " best-effort failed: backend_timeout " + detail + " workflow=" + _dup(workflow_hex)); },
+		mf.BestEffort::BackendRejected(detail) => { console.eprintln(op + " best-effort failed: backend_rejected " + detail + " workflow=" + _dup(workflow_hex)); },
+		mf.BestEffort::InvalidResponse(detail) => { console.eprintln(op + " best-effort failed: invalid_response " + detail + " workflow=" + _dup(workflow_hex)); },
+		mf.BestEffort::UnexpectedDefect(detail) => { console.eprintln(op + " best-effort failed: unexpected_defect " + detail + " workflow=" + _dup(workflow_hex)); }
+	}
 }
 
 // The drive core, given an already-built (shared) host. Reused by the CLI (`_run_cfg`) and the
@@ -668,7 +735,7 @@ fn _run_cfg(cfg: &json.JsonNode, workflow_hex: &String,
 // state) stays registry- and config-independent.
 fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_hex: &String,
         operation_name: &String, input_json: &String,
-        arguments_json: &String, has_arguments: Bool, admission: &AdmissionState) throws -> Outcome {
+        arguments_json: &String, has_arguments: Bool, call_scripts: &Array<ManifestScript>, admission: &AdmissionState) throws -> Outcome {
 	val workflow_id = _hex_to_bytes(workflow_hex);
 	// Derive the operation id from the CANONICAL lowercase hex of the decoded
 	// workflow bytes (not the supplied hex spelling), so upper/lower spellings
@@ -707,13 +774,17 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	if pin.present {
 		// Existing planned workflow: resume, or REASSERT if this is a submission (so a reused
 		// id with changed arguments surfaces workflow_conflict instead of silently resuming).
-		return _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, is_submission, arguments_json, admission);
+		val oc = _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, is_submission, arguments_json, call_scripts, admission);
+		_notify_terminal_if_child(host.get(), &workflow_id, &oc);
+		return oc;
 	}
 	if is_submission {
 		// Fresh planned SUBMISSION: requires a planned config — a flat "plan" OR a manual-IR
 		// "graph" (the legacy single-op path takes --operation, not --arguments).
 		if _is_planned_config(cfg) {
-			return _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, true, arguments_json, admission);
+			val oc = _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, true, arguments_json, call_scripts, admission);
+			_notify_terminal_if_child(host.get(), &workflow_id, &oc);
+			return oc;
 		}
 		return Outcome::Aborted(reason = "arguments_require_planned_config", code = 2);
 	}
@@ -721,7 +792,9 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// "graph") => a resume of a planned workflow (which, absent a pin, claim resolves to
 	// not_found); otherwise the legacy single-op path below.
 	if _is_planned_config(cfg) {
-		return _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, false, arguments_json, admission);
+		val oc = _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, false, arguments_json, call_scripts, admission);
+		_notify_terminal_if_child(host.get(), &workflow_id, &oc);
+		return oc;
 	}
 
 	// Legacy single-op path: validate the registry now (it routes the single dispatch).
@@ -920,11 +993,11 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 		DispatchResult::Done(r) => { result_json = move r; },
 		DispatchResult::PendingObserved => {
 			// A FRESH confirmed pending: release the lease and become due again to re-poll.
-			return _defer_pending(host.get(), &workflow_id, fencing_token, admission);
+			return _defer_pending(host.get(), &workflow_id, fencing_token, &"", admission);
 		},
 		DispatchResult::PendingUncertain => {
 			// Unreachable/uncertain: defer + re-poll, never escalate the timer.
-			return _defer_pending(host.get(), &workflow_id, fencing_token, admission);
+			return _defer_pending(host.get(), &workflow_id, fencing_token, &"", admission);
 		},
 		DispatchResult::Rejected(reason) => {
 			// Definite rejection is NON-RETRYABLE: persist the failure (forward ->
@@ -1134,14 +1207,14 @@ fn _load_manifest(manifest_path: &String) throws -> ManifestSet {
 	return ManifestSet(deployment = move deployment, scripts = move scripts);
 }
 
-// 1b.0: build-time registry validation gate — resolves `call <child>@<plan_version>` against the
+// 1b.0/1b.1: build-time registry validation gate — resolves `call <child>@<plan_version>` against the
 // manifest's OTHER scripts by EXACT (name, version) match, validates the call's input against the
 // resolved callee's declared arg_type, binds the callee's declared return_type so downstream
 // `result <call_id>.path` type-checks against it (unit -> reject any path access), and rejects a
-// static call cycle across the whole manifest. Throws the PRECISE reason on the FIRST failure
-// found — never falls through to the generic "not runnable" message for a malformed call. ONLY once
-// ALL of that passes does a script with a reachable call get the FINAL, distinct "not implemented
-// until 1b.1" rejection, proving static validation ran and passed rather than being skipped.
+// static call cycle across the whole manifest. Throws the PRECISE reason on the FIRST failure found —
+// never falls through to a generic message for a malformed call. Once ALL of that passes, a script
+// with a reachable call is a legitimately runnable manifest (runtime dispatch: `_run_forward`'s
+// `NeedCall` handling, via the resident `call_scripts` registry threaded from `_drive_manifest_request`).
 fn _validate_manifest_calls(scripts: &Array<ManifestScript>, registries: &Array<ScriptRegistry>) throws -> Void {
 	var targets: Array<ir.CallTarget> = [];
 	var i = 0;
@@ -1162,15 +1235,9 @@ fn _validate_manifest_calls(scripts: &Array<ManifestScript>, registries: &Array<
 		i = i + 1;
 	}
 	_assert_no_call_cycles(scripts, registries);
-	i = 0;
-	while i < registries.len {
-		val edges = ir.call_edges(&registries[i].revisions[0].graph);
-		if edges.len > 0 {
-			throw RunnerError(message = "script '" + _dup(&scripts[i].name) + "@" + _dup(&scripts[i].version)
-				+ "' calls a child workflow — static validation passed, but runtime dispatch is not implemented until composition slice 1b.1");
-		}
-		i = i + 1;
-	}
+	// Runtime dispatch is implemented (1b.1) — a manifest with reachable call edges, having passed
+	// every check above (type-check against the manifest-wide call-target registry, static
+	// cross-script cycle rejection), is now a legitimately runnable manifest, not a build-time reject.
 }
 
 // Static call-cycle rejection across the WHOLE manifest: nodes are the manifest's own scripts
@@ -1260,7 +1327,7 @@ fn _drive_manifest_request(host: &arc.Arc<mf.MicroflowsHost>, ms: &ManifestSet, 
 		if !has_script { return Outcome::Aborted(reason = "script_required_for_submission", code = 2); }
 		val sidx = _find_script(&ms.scripts, script_name);
 		if sidx < 0 { return Outcome::Aborted(reason = "unknown_script", code = 2); }
-		return _run_core(host, &ms.scripts[sidx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+		return _run_core(host, &ms.scripts[sidx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, &ms.scripts, admission);
 	}
 	// RESUME: pick the script by the DURABLE pin (name, version) — never the active version.
 	val workflow_id = _hex_to_bytes(workflow_hex);
@@ -1280,9 +1347,9 @@ fn _drive_manifest_request(host: &arc.Arc<mf.MicroflowsHost>, ms: &ManifestSet, 
 		// (registry-independent), and a CLAIMABLE workflow gets a DURABLE `revision_unavailable` defer
 		// (lease cleared, admission-aware via _defer_dispatch), exactly as an absent pinned plan does on
 		// the `--config` path. Never substitute.
-		return _run_core(host, &ms.deployment, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+		return _run_core(host, &ms.deployment, workflow_hex, operation_name, input_json, arguments_json, has_arguments, &ms.scripts, admission);
 	}
-	return _run_core(host, &ms.scripts[ridx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+	return _run_core(host, &ms.scripts[ridx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, &ms.scripts, admission);
 }
 
 // Manifest mode (one-shot CLI): validate the whole set, build a host, then drive the one needed script.
@@ -1326,7 +1393,7 @@ fn _run_manifest(manifest_path: &String, workflow_hex: &String, script_name: &St
 // a claimed REVERSING workflow unwinds instead.
 fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
                 workflow_canon_hex: &String, storage_pin: &PinView,
-                is_submission: Bool, args_json: &String, admission: &AdmissionState) -> Outcome {
+                is_submission: Bool, args_json: &String, call_scripts: &Array<ManifestScript>, admission: &AdmissionState) -> Outcome {
 	var pin_name: String = _dup(&storage_pin.name);
 	var pin_version: String = _dup(&storage_pin.version);
 	var pin_hash_hex: String = _dup(&storage_pin.hash_hex);
@@ -1356,7 +1423,11 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		try {
 			_validate_registry(cfg);
 			_validate_plan(cfg);
-			reg = _registry_build(cfg, false);
+			// allow_calls (1b.1): a reachable call is only runnable in manifest mode, where
+			// call_scripts is the resident sibling registry NeedCall resolves against
+			// (call_scripts.len == 0 <=> the legacy --config single-script path, which has no
+			// siblings to call and must keep rejecting a reachable call at build time).
+			reg = _registry_build(cfg, call_scripts.len > 0);
 			cfg_ok = true;
 		} catch RunnerError(e) {
 			// EXPECTED config-validation failure (bad registry/plan/argument_type/semver). An
@@ -1489,7 +1560,8 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		var ok = false;
 		try {
 			_validate_registry(cfg);
-			reg = _registry_build(cfg, false);
+			// allow_calls (1b.1): see the submission branch's identical rationale above.
+			reg = _registry_build(cfg, call_scripts.len > 0);
 			ok = true;
 		} catch RunnerError(e) {
 			// EXPECTED config-validation failure (malformed registry, bad semver, invalid
@@ -1529,7 +1601,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 	}
 	val ch_hex = _bytes_to_hex(&reg.revisions[ridx].content_hash);
-	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].graph, reg.revisions[ridx].plan_length, &ch_hex, &reg.revisions[ridx].return_type, admission);
+	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].graph, reg.revisions[ridx].plan_length, &ch_hex, &reg.revisions[ridx].return_type, call_scripts, admission);
 }
 
 // ===== ScriptRegistry build + lookup (v1: one configured generation per process) =====
@@ -1999,7 +2071,7 @@ fn _lp(s: &String) nothrow -> String {
 // compensated, and with none (e.g. the FIRST operation rejected) it reaches a terminal `failed`
 // (compensated:false) immediately — never `blocked_resolution` for a definite forward rejection.
 fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
-                workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int, content_hash_hex: &String, return_type: &Optional<ir.IrType>, admission: &AdmissionState) -> Outcome {
+                workflow_canon_hex: &String, fencing_token: Int, graph: &ir.IrGraph, plan_length: Int, content_hash_hex: &String, return_type: &Optional<ir.IrType>, call_scripts: &Array<ManifestScript>, admission: &AdmissionState) -> Outcome {
 	val n = plan_length;
 	var final_result: String = "{}";
 	var last_op_id_hex: String = "";
@@ -2253,10 +2325,10 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						}
 					},
 					DispatchResult::PendingObserved => {
-						return _defer_pending(host, workflow_id, fencing_token, admission);
+						return _defer_pending(host, workflow_id, fencing_token, &"", admission);
 					},
 					DispatchResult::PendingUncertain => {
-						return _defer_pending(host, workflow_id, fencing_token, admission);
+						return _defer_pending(host, workflow_id, fencing_token, &"", admission);
 					},
 					DispatchResult::Rejected(reason) => {
 						// A DEFINITE forward rejection ALWAYS begins reversal (the model: every
@@ -2269,6 +2341,197 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 					},
 					DispatchResult::Route404 => {
 						return _reconcile_budget_forward(host, cfg, workflow_id, fencing_token, seq, &operation_id, admission);
+					}
+				}
+			},
+			ir.StepOutcome::NeedCall(node_id, child, plan_version, input) => {
+				// Composition (1b.1): a `call` occupies one forward step, same seq/settle discipline as
+				// NeedOperation. Durable seq = EXECUTION POSITION (settled.len+1).
+				val seq = settled.len + 1;
+				// Already durably settled (resume)? Same top-of-arm pattern as NeedOperation: adopt +
+				// replay, never re-submit/re-inspect an already-terminal call.
+				var prior_done = false;
+				match host.operation_result(workflow_id, seq) {
+					mf.OperationResultOutcome::Succeeded(r) => {
+						match host.operation_request_get(workflow_id, seq) {
+							mf.OperationRequestGetOutcome::Found(rec) => { last_op_id_hex = _bytes_to_hex(&rec.operation_id); },
+							mf.OperationRequestGetOutcome::NotFound => {
+								return _defer_dispatch(host, workflow_id, fencing_token, "settled_call_request_missing", admission);
+							}
+						}
+						settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&r)));
+						final_result = move r;
+						prior_done = true;
+					},
+					mf.OperationResultOutcome::Requested => {},
+					mf.OperationResultOutcome::NotFound => {}
+				}
+				if prior_done { continue; }
+
+				// Resolve the call target against the RESIDENT manifest sibling registry. Build-time
+				// validation (_validate_manifest_calls) already confirmed this binds; a miss here is a
+				// defensive registry-drift guard, not an expected path.
+				val sidx = _find_script_nv(call_scripts, &child, &plan_version);
+				if sidx < 0 {
+					return _defer_dispatch(host, workflow_id, fencing_token, "call_target_unavailable", admission);
+				}
+				val child_script_name = _dup(&call_scripts[sidx].name);
+				val child_plan_version_resolved = _dup(&call_scripts[sidx].version);
+				val child_content_hash_hex = _dup(&call_scripts[sidx].content_hash_hex);
+				var child_content_hash: Array<Byte> = [];
+				match codec.hex_decode(&child_content_hash_hex) {
+					core.Result::Ok(b) => { child_content_hash = move b; },
+					core.Result::Err(_) => {
+						return _defer_dispatch(host, workflow_id, fencing_token, "call_target_hash_invalid", admission);
+					}
+				}
+				val child_plan_length = call_scripts[sidx].plan_length;
+
+				// Child + operation identity: DOMAIN-SEPARATED from _operation_id_node (mf-call; vs
+				// mf-op;), derived ONLY from (parent workflow, parent content_hash, this call node) — a
+				// pure function, so a resumed drive re-derives the IDENTICAL id; never a second child.
+				val child_workflow_id = _child_workflow_id_node(workflow_canon_hex, content_hash_hex, node_id);
+				val operation_id = _copy_bytes(&child_workflow_id);
+				val operation_id_hex = _bytes_to_hex(&operation_id);
+				val parent_node_id = _dup(node_id);
+				val max_call_depth = _max_call_depth(cfg);
+
+				// sp_mf_call_submit is fully idempotent (fresh: Submitted; replay: AlreadySubmitted,
+				// full-agreement checked against the durably-stored identities) — UNLIKE a participant
+				// HTTP dispatch there is no external non-idempotent side effect to guard with
+				// GET-first/PUT-first reconciliation, so this is called UNCONDITIONALLY on every pass,
+				// fresh or resumed. This IS the recovery mechanism: a resumed drive re-enters this exact
+				// arm, `ir.advance` deterministically re-evaluates the SAME `input` (a pure function of
+				// the workflow's durable arguments + settled results), and call_submit reconfirms
+				// agreement — never a differently-recreated identity.
+				val cont_dispatch = "{\"pos\":\"call:" + fmt.format_int(seq) + ":dispatched\",\"operation_seq\":" + fmt.format_int(seq) + "}";
+				val t_submit = _now(host);
+				match host.call_submit(workflow_id, fencing_token, seq, &operation_id, &input,
+				                       &cont_dispatch, &t_submit, &"{}",
+				                       &child_workflow_id, &child_script_name, &child_plan_version_resolved, &child_content_hash,
+				                       child_plan_length, &"{\"pos\":\"start\"}", &t_submit, &"{}",
+				                       &parent_node_id, max_call_depth) {
+					mf.CallSubmitOutcome::Submitted(child_workflow_id) => {},
+					mf.CallSubmitOutcome::AlreadySubmitted(child_workflow_id) => {},
+					mf.CallSubmitOutcome::CallConflict => {
+						return Outcome::Aborted(reason = "call_conflict", code = 3);
+					},
+					mf.CallSubmitOutcome::CallRejected(reason) => {
+						// The recursion guard (call_cycle / max_call_depth_exceeded): a rejected call IS a
+						// rejected forward step, same as a definite participant rejection -> reversal.
+						return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, "call_rejected:" + move reason, admission);
+					},
+					mf.CallSubmitOutcome::PlanViolation(reason, plan_length) => {
+						return Outcome::Aborted(reason = "call_plan_violation:" + move reason, code = 8);
+					},
+					mf.CallSubmitOutcome::EventTimeSkew(defer_until) => {
+						return _defer(host, workflow_id, fencing_token, &defer_until, "call_submit_event_time_skew", admission);
+					},
+					mf.CallSubmitOutcome::FenceLost => {
+						return Outcome::Aborted(reason = "call_submit_fence_lost", code = 3);
+					},
+					mf.CallSubmitOutcome::NotFound => {
+						return Outcome::Aborted(reason = "call_submit_not_found", code = 3);
+					}
+				}
+
+				// AWAIT the child: a pure read, every pass (fresh or resumed) — call_submit above already
+				// made this call's existence durable+idempotent, so no separate dispatch/reconcile step
+				// is needed here.
+				match host.call_inspect(workflow_id, seq) {
+					mf.CallInspectOutcome::Found(child_workflow_id, child_status, state, execution_direction, current_disposition, is_terminal, terminal_reason, workflow_return_json) => {
+						if !is_terminal {
+							// Child still forward/reversing (or blocked_resolution — deliberately NOT
+							// escalated to a parent block: "no block cascade"): defer the PARENT normally,
+							// exactly like an uncertain/pending participant result. The next attempt
+							// re-enters this same arm and polls again via the same idempotent pair.
+							// child_workflow_id (from call_inspect's own return, already fetched above —
+							// no new lookup): carried into the rendered Pending outcome so an operator can
+							// see which child this parent is waiting on.
+							if state == STATE_BLOCKED {
+								// Best-effort sidecar hint refresh (never fenced, never affects THIS
+								// defer): an operator inspecting the parent's call op should see "blocked"
+								// rather than a stale "pending" hint. Failure here changes nothing — the
+								// authoritative state always comes from call_inspect itself, never the hint.
+								match _advisory_now(host) {
+									Optional::Some(t_hint) => {
+										_log_best_effort("call_hint_refresh", &_bytes_to_hex(workflow_id), host.call_hint_refresh_best_effort(workflow_id, seq, CHILD_STATUS_BLOCKED, &t_hint));
+									},
+									Optional::None => {}
+								}
+							}
+							return _defer_pending(host, workflow_id, fencing_token, &child_workflow_id, admission);
+						}
+						if state == STATE_COMPLETED {
+							var child_return: String = "{}";
+							match workflow_return_json {
+								Optional::Some(r) => { child_return = move r; },
+								Optional::None => {
+									return _defer_dispatch(host, workflow_id, fencing_token, "call_child_return_missing", admission);
+								}
+							}
+							// Finality PROBE + settle: IDENTICAL discipline to NeedOperation's Done arm —
+							// replay with the child's return as this call op's result, settle
+							// non-final/final accordingly. Checkpoint payload = the call's own input
+							// (matches the participant-op convention), even though a no-op reversal never
+							// consults it.
+							var probe: Array<ir.OpResult> = [];
+							var pj = 0;
+							while pj < settled.len {
+								probe.push(ir.OpResult(node_id = _dup(&settled[pj].node_id), result_json = _dup(&settled[pj].result_json)));
+								pj = pj + 1;
+							}
+							probe.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&child_return)));
+							var is_final = false;
+							match ir.advance(graph, &args, &probe) {
+								ir.StepOutcome::Completed(result) => {
+									is_final = true;
+									var is_unit = false;
+									match return_type { Optional::None => { is_unit = true; }, Optional::Some(_) => {} }
+									if is_unit or _str_eq(&result, &"null") { workflow_return = "{}"; } else { workflow_return = _dup(&result); }
+								},
+								default => {}
+							}
+							val t_settle = _now(host);
+							var cont_settle = "{\"pos\":\"complete\"}";
+							if !is_final { cont_settle = "{\"pos\":\"call:" + fmt.format_int(seq) + ":settled\",\"next_operation_seq\":" + fmt.format_int(seq + 1) + "}"; }
+							var settle_return: Optional<String> = Optional<String>::None();
+							if is_final { settle_return = Optional<String>::Some(_dup(&workflow_return)); }
+							match host.operation_settle(workflow_id, fencing_token, seq, &operation_id, seq,
+							                            &child_return, &input, &settle_return, &cont_settle, &t_settle, &"{}", is_final) {
+								mf.OperationSettleOutcome::Settled(res) => {
+									last_op_id_hex = _dup(&operation_id_hex);
+									settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+									final_result = move res;
+								},
+								mf.OperationSettleOutcome::AlreadySettled(res) => {
+									last_op_id_hex = _dup(&operation_id_hex);
+									settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+									final_result = move res;
+								},
+								mf.OperationSettleOutcome::FenceLost => {
+									return Outcome::Aborted(reason = "call_settle_fence_lost", code = 3);
+								},
+								mf.OperationSettleOutcome::PlanViolation(reason) => {
+									return Outcome::Aborted(reason = "call_settle_plan_violation:" + move reason, code = 8);
+								},
+								mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
+									return _defer(host, workflow_id, fencing_token, &defer_until, "call_settle_event_time_skew", admission);
+								},
+								default => {
+									throw RunnerError(message = "call operation_settle unexpected outcome");
+								}
+							}
+						} else {
+							// Child terminated WITHOUT completing (reversed / failed / resolved_exception):
+							// a call rejection, same as a definite participant rejection -> reversal.
+							return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, "call_child_failed:" + terminal_reason, admission);
+						}
+					},
+					mf.CallInspectOutcome::NotFound => {
+						// Should not happen right after a successful call_submit — defensive defer, never
+						// synthesize a result.
+						return _defer_dispatch(host, workflow_id, fencing_token, "call_sidecar_missing", admission);
 					}
 				}
 			}
@@ -2618,15 +2881,15 @@ fn _pending_redispatch_or_defer(host: &mf.MicroflowsHost, cfg: &json.JsonNode, w
 	val clock = host.clock_read(PENDING_RETRY_SECONDS);
 	match host.operation_pending_defer(workflow_id, fencing_token, operation_seq, operation_id, &clock.now, &clock.deadline, &clock.now, after_ms) {
 		mf.OperationPendingDeferOutcome::Defer(_) => {
-			return RedispatchStep::Return(Outcome::Pending(reason = "operation_pending", defer_until = _dup(&clock.deadline)));
+			return RedispatchStep::Return(Outcome::Pending(reason = "operation_pending", defer_until = _dup(&clock.deadline), child_workflow_id = ""));
 		},
 		mf.OperationPendingDeferOutcome::Redispatch(_) => {
 			match _classify_dispatch(base, operation_name, operation_id_hex, input_json) {
 				DispatchResult::Done(r) => { return RedispatchStep::Done(move r); },
 				DispatchResult::Rejected(reason) => { return RedispatchStep::Reject(move reason); },
 				DispatchResult::Route404 => { return RedispatchStep::Route404(); },
-				DispatchResult::PendingObserved => { return RedispatchStep::Return(_defer_pending(host, workflow_id, fencing_token, admission)); },
-				DispatchResult::PendingUncertain => { return RedispatchStep::Return(_defer_pending(host, workflow_id, fencing_token, admission)); }
+				DispatchResult::PendingObserved => { return RedispatchStep::Return(_defer_pending(host, workflow_id, fencing_token, &"", admission)); },
+				DispatchResult::PendingUncertain => { return RedispatchStep::Return(_defer_pending(host, workflow_id, fencing_token, &"", admission)); }
 			}
 		},
 		mf.OperationPendingDeferOutcome::FenceLost => { return RedispatchStep::Return(Outcome::Aborted(reason = "pending_fence_lost", code = 3)); },
@@ -2820,7 +3083,11 @@ fn _report_terminal(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>,
 // releasing the lease with a near-term next-attempt, so the workflow becomes
 // due again and re-polls. Reports only on a committed release (else a distinct
 // defer_failed outcome — never claim a transition that did not happen).
-fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, admission: &AdmissionState) -> Outcome {
+// child_workflow_id_hex: "" for every non-call cause (the ordinary participant-pending path); the
+// call's child id (1b.1) when this defer is a NeedCall waiting on a non-terminal child — carried
+// through to the rendered Pending outcome (operator-visible link) WITHOUT changing the release
+// semantics below in any way: same lease-release, same next-attempt scheduling, same admission gate.
+fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, child_workflow_id_hex: &String, admission: &AdmissionState) -> Outcome {
 	// Admission (slice 2): while draining/stopped, do NOT schedule new retry work — release at now
 	// and report pending_restart so the drain converges. Admission is THREADED from the drive
 	// boundary (`_run`), so a library caller passing Draining is honored without any env dependency.
@@ -2830,7 +3097,7 @@ fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 	val clock = host.clock_read(PENDING_RETRY_SECONDS);
 	match host.release(workflow_id, fencing_token, &clock.now, &clock.deadline) {
 		mf.ReleaseOutcome::Released => {
-			return Outcome::Pending(reason = "operation_pending", defer_until = _dup(&clock.deadline));
+			return Outcome::Pending(reason = "operation_pending", defer_until = _dup(&clock.deadline), child_workflow_id = _dup(child_workflow_id_hex));
 		},
 		mf.ReleaseOutcome::FenceLost => {
 			return Outcome::DeferFailed(reason = "release_fence_lost", code = 7);
@@ -3102,14 +3369,36 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				// worker until expiry.
 				return _defer_dispatch(host, workflow_id, fencing_token, "reverse_no_active_checkpoint", admission);
 			},
-			mf.ReverseHeadOutcome::Pending(seq, forward_operation_name, forward_payload, _call_kind) => {
-				// _call_kind (composition, 1b.1): NOT branched on yet — that wiring
-				// (skip _compensation_for + call checkpoint_reverse_noop directly for
-				// call_kind=child_workflow) is explicit runner-runtime work, deferred
-				// to its own pass per work/workflow-composition/PROGRESS.md. This
-				// minimal fix only keeps this match exhaustive against the now-4-field
-				// ReverseHeadOutcome::Pending; behavior here is UNCHANGED (every
-				// checkpoint still goes through the existing participant-only path).
+			mf.ReverseHeadOutcome::Pending(seq, forward_operation_name, forward_payload, call_kind) => {
+				if call_kind == 2 {
+					// child_workflow (1b.1): no compensation was EVER dispatched for a call checkpoint —
+					// skip _compensation_for entirely and reverse it as a no-op directly.
+					val t = _now(host);
+					match host.checkpoint_reverse_noop(workflow_id, fencing_token, seq, &t) {
+						mf.CheckpointReverseNoopOutcome::Reversed(terminal_reason) => {
+							return Outcome::TerminalFailure(reason = move terminal_reason, compensated = true);
+						},
+						mf.CheckpointReverseNoopOutcome::Reversing(next_seq) => {},   // descend -> re-read head
+						mf.CheckpointReverseNoopOutcome::AlreadyReversed => {},       // idempotent replay -> re-read head
+						mf.CheckpointReverseNoopOutcome::OutOfOrder(top_seq) => {
+							return Outcome::ReverseAborted(reason = "checkpoint_reverse_noop_out_of_order", code = 8);
+						},
+						mf.CheckpointReverseNoopOutcome::EventTimeSkew(defer_until) => {
+							return _defer(host, workflow_id, fencing_token, &defer_until, "checkpoint_reverse_noop_skew", admission);
+						},
+						mf.CheckpointReverseNoopOutcome::FenceLost => {
+							return Outcome::ReverseAborted(reason = "checkpoint_reverse_noop_fence_lost", code = 7);
+						},
+						default => {
+							// NotFound / CheckpointNotFound / CheckpointNotSettleable / NotCallCheckpoint: a
+							// durable inconsistency for a checkpoint reverse_head just reported as this
+							// workflow's own active call checkpoint — never silently proceed.
+							return Outcome::ReverseAborted(reason = "checkpoint_reverse_noop_precondition", code = 8);
+						}
+					}
+					continue;
+				}
+				// participant (call_kind == 1): UNCHANGED existing compensation path.
 				val rev_id = _reverse_id(workflow_canon_hex, seq);
 				val rev_id_hex = _bytes_to_hex(&rev_id);
 				var comp_op: String = "";
@@ -3239,6 +3528,19 @@ fn _now(host: &mf.MicroflowsHost) -> String {
 	return host.clock_read(LEASE_SECONDS).now;
 }
 
+// Advisory clock read for a best-effort notify/hint path (1b.1): a clock-read failure here means we
+// EXPLICITLY skip the advisory wake/hint entirely (None), never an inline catch-and-swallow at the
+// call site. No logging on the None path is a deliberate choice, not an oversight — these are
+// latency-only hints (poll/call_inspect is always the correctness floor), and there is no operator
+// action a log line here would prompt.
+fn _advisory_now(host: &mf.MicroflowsHost) nothrow -> Optional<String> {
+	try {
+		return Optional<String>::Some(_now(host));
+	} catch e {
+		return Optional<String>::None();
+	}
+}
+
 // ===== identity / hashing =====
 
 fn _join3(a: &String, b: &String, c: &String) nothrow -> String {
@@ -3272,6 +3574,18 @@ fn _operation_id_node(workflow_hex: &String, content_hash_hex: &String, node_id:
 	return uuid.to_bytes(&u);
 }
 
+// Child-workflow identity for a `call` node (1b.1). Same derivation shape as `_operation_id_node` (parent
+// workflow + parent script content_hash + call node id -> deterministic, resume-stable), but tagged
+// `mf-call;` — a DISJOINT id space from `_operation_id_node`'s `mf-op;` and `_reverse_id`'s `reverse:1`
+// tags, so a call node and an operation node can never collide even at the same node-address shape. This
+// id doubles as BOTH the child's own workflow_id and the parent's operation_id for this call (the SP/schema
+// pass's decision: operation_id = child_workflow_id).
+fn _child_workflow_id_node(workflow_hex: &String, content_hash_hex: &String, node_id: &String) nothrow -> Array<Byte> {
+	val seed = "mf-call;" + _join3(workflow_hex, content_hash_hex, node_id);
+	val u = uuid.v3_from_string(&seed);
+	return uuid.to_bytes(&u);
+}
+
 fn _input_hash(input_json: &String) -> String {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
 	match json.parse_strict(input_json) {
@@ -3300,6 +3614,7 @@ fn _validate_registry(cfg: &json.JsonNode) -> Void {
 	_validate_operations(cfg, &ids);
 	_validate_reconcile_budget(cfg);
 	_validate_pending_redispatch(cfg);
+	_validate_workflow_call(cfg);
 }
 
 // If pending_redispatch_after_ms is present it is validated STRICTLY (fail-fast at registry build), like
@@ -3342,6 +3657,32 @@ fn _validate_reconcile_budget(cfg: &json.JsonNode) -> Void {
 					match n.as_int() {
 						Optional::Some(v) => { if v < 1 { throw RunnerError(message = "reconcile_budget.min_attempts must be an integer >= 1"); } },
 						Optional::None => { throw RunnerError(message = "reconcile_budget.min_attempts must be an integer"); }
+					}
+				},
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
+}
+
+// If workflow_call is present it is validated STRICTLY (fail-fast at registry build), matching
+// reconcile_budget/pending_redispatch_after_ms: max_call_depth is a recursion SAFETY knob — a typo
+// must fail loudly, never silently widen (or narrow) the cap the deployment actually asked for by
+// falling back to _max_call_depth's runtime default. Absent -> DEFAULT_MAX_CALL_DEPTH (read at
+// dispatch time by _max_call_depth). Must be an object; max_call_depth (if present) an integer >= 1.
+fn _validate_workflow_call(cfg: &json.JsonNode) -> Void {
+	match cfg.get(&"workflow_call") {
+		Optional::Some(wc) => {
+			match wc.as_object() {
+				Optional::Some(_) => {},
+				Optional::None => { throw RunnerError(message = "workflow_call must be an object"); }
+			}
+			match wc.get(&"max_call_depth") {
+				Optional::Some(n) => {
+					match n.as_int() {
+						Optional::Some(v) => { if v < 1 { throw RunnerError(message = "workflow_call.max_call_depth must be an integer >= 1"); } },
+						Optional::None => { throw RunnerError(message = "workflow_call.max_call_depth must be an integer"); }
 					}
 				},
 				Optional::None => {}
@@ -3773,6 +4114,25 @@ fn _config_bool(cfg: &json.JsonNode, key: &String, default_val: Bool) nothrow ->
 	return default_val;
 }
 
+// deployment.workflow_call.max_call_depth (1b.1) — how deep a call chain may nest before
+// sp_mf_call_submit's recursion guard rejects it. `cfg` already carries every deployment-level key
+// (ManifestScript.cfg is built by `_deployment_for`, which passes every OTHER key through unchanged), so
+// this reads straight off the SAME `cfg` `_run_forward` already has — no new parameter needed. A missing
+// or malformed value silently defaults (same tolerance as `_config_str`/`_config_bool`) rather than
+// failing a dispatch over an optional tuning knob.
+fn _max_call_depth(cfg: &json.JsonNode) nothrow -> Int {
+	match cfg.get(&"workflow_call") {
+		Optional::Some(wc) => {
+			match wc.get(&"max_call_depth") {
+				Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { if v >= 1 { return v; } }, Optional::None => {} } },
+				Optional::None => {}
+			}
+		},
+		Optional::None => {}
+	}
+	return DEFAULT_MAX_CALL_DEPTH;
+}
+
 // ===== bytes / hex =====
 
 fn _hex_to_bytes(hex: &String) -> Array<Byte> {
@@ -3883,7 +4243,7 @@ fn _outcome_http_status(o: &Outcome) nothrow -> Int {
 		Outcome::TerminalFailure(r, c) => { return 200; },
 		Outcome::ResolvedException() => { return 200; },
 		Outcome::TerminalState(s) => { return 200; },
-		Outcome::Pending(r, d) => { return 202; },
+		Outcome::Pending(reason, defer_until, child_workflow_id) => { return 202; },
 		Outcome::PendingRestart(r) => { return 503; },   // drain back-pressure: same 503 contract as Refused (§13)
 		Outcome::Refused(r) => { return 503; },
 		Outcome::Deferred(r, d, c) => { if _str_eq(r, &"workflow_conflict") { return 409; } return 202; },

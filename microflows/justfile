@@ -262,6 +262,10 @@ _test-sp:
 	[[ -x "$MARIACHI_PY" ]] || { echo "error: mariachi venv python not found at $MARIACHI_PY (set MARIACHI_BIN to the venv's mariachi binary)" >&2; exit 1; }
 	"$MARIACHI_PY" db-tests/sp_operation_test.py
 	"$MARIACHI_PY" db-tests/sp_call_test.py
+	# 1b.1: runner-level integration (actual NeedCall dispatch + call_kind reversal through the built
+	# mfrunner binary, not just the SP layer). Needs the binary the top-level `test` recipe already
+	# built (`cd runner && just test`, which runs before the DB lock is taken).
+	MF_RUNNER_BIN="$(pwd)/runner/build/dist/bin/mfrunner" "$MARIACHI_PY" db-tests/call_integration_test.py
 
 # NOTE: the cross-component coordinator<->Singular E2E moved to the repository
 # level: integration/coordinator-singular/ (run via root `just test-integration`

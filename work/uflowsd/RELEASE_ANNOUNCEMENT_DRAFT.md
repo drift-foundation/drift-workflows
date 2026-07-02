@@ -17,7 +17,7 @@ singular, the microflows component (148-check stored-procedure regression + 20 e
 | `microflows` (package, code + `microflows/db`) | **0.5.0** | ↑ from 0.4.0 |
 | `uflowsd` (app / coordinator daemon) | **0.3.0** | ↑ from 0.2.0 (dep microflows 0.5) |
 
-`microflows-runner` (one-shot CLI) and `microflows-participant-stub` remain component-local dev artifacts
+`mfrunner` (one-shot CLI) and `microflows-participant-stub` remain component-local dev artifacts
 (`0.0.0`) — not Drift release artifacts.
 
 ---

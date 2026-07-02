@@ -1100,6 +1100,7 @@ pub struct OpResult {
 // The outcome of advancing to the next durable boundary.
 pub variant StepOutcome {
 	NeedOperation(node_id: String, operation: String, input_json: String),   // next unsettled remote op
+	NeedCall(node_id: String, child: String, plan_version: String, input_json: String), // next unsettled child-workflow call (1b.1)
 	Completed(result_json: String),                                          // reached NReturn
 	Fail(node_id: String, reason_json: String),                              // reached NFail; reason_json = canonical JSON of the evaluated reason
 	Fault(message: String)                                                   // defensive (validate first)
@@ -1153,10 +1154,17 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 				}
 			},
 			IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => {
-				// Composition slice 1a is FRONTEND ONLY — no runtime. A workflow call's dispatch/await/settle
-				// arrives in slice 1b; reaching it in the interpreter now is a defensive fault (parse-check /
-				// hashing never execute, so this is unreachable in 1a tests).
-				return StepOutcome::Fault(message = "workflow call execution arrives in composition slice 1b: " + _dup(id));
+				// Mirrors NOperation exactly (1b.1): a call occupies one forward step, same
+				// replay/settle discipline as a participant operation.
+				match _find_settled(settled, id) {
+					Optional::Some(_) => { cur = _dup(next); },   // settled: continue past it
+					Optional::None => {
+						match _eval(g, input, &args_node, settled, &local_names, &local_vals) {
+							core.Result::Ok(n) => { return StepOutcome::NeedCall(node_id = _dup(id), child = _dup(child), plan_version = _dup(plan_version), input_json = _canon_node(&n)); },
+							core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
+						}
+					}
+				}
 			},
 			IrNode::NLet(id, name, value, next) => {
 				match _eval(g, value, &args_node, settled, &local_names, &local_vals) {
