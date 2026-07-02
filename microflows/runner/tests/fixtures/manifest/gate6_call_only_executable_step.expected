@@ -1,0 +1,4 @@
+{
+  "returncode": 2,
+  "stderr_contains": "runner: invalid manifest: script 'parent@1.0.0' calls a child workflow — static validation passed, but runtime dispatch is not implemented until composition slice 1b.1"
+}

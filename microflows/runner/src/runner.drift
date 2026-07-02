@@ -408,7 +408,7 @@ fn main(argv: Array<String>) nothrow -> Int {
 fn _emit_content_hash(config_path: &String) throws -> Int {
 	val cfg = _load_config_json(config_path);
 	_validate_registry(&cfg);
-	val reg = _registry_build(&cfg);
+	val reg = _registry_build(&cfg, false);
 	if reg.revisions.len == 0 {
 		console.eprintln("runner: --config has no 'plan' (nothing to hash)");
 		return 2;
@@ -563,7 +563,7 @@ fn _pc_typecheck(pw: &parser.ParsedWorkflow) -> String {
 			// against unit; the manifest/config path (`lower_source`/`--lower-source`) is where a
 			// real declared `returns.type` gets validated — see the `coordinator-singular` "C5l"
 			// integration tests.
-			match ir.type_check_graph(&g, &at, &ocs, &Optional<ir.IrType>::None()) { Optional::Some(_) => { return "reject"; }, Optional::None => { return "ok"; } }
+			match ir.type_check_graph(&g, &at, &ocs, &Optional<ir.IrType>::None(), &Optional<Array<ir.CallTarget>>::None()) { Optional::Some(_) => { return "reject"; }, Optional::None => { return "ok"; } }
 		},
 		core.Result::Err(_) => { return "n/a"; }
 	}
@@ -631,7 +631,7 @@ fn _log_parse_diagnostic(e: &parser.ParseError) nothrow -> Void {
 // on any build-time rejection; returns true when the config builds to exactly one revision.
 fn _validate_lowered(merged: &json.JsonNode) throws -> Bool {
 	_validate_registry(merged);
-	val reg = _registry_build(merged);
+	val reg = _registry_build(merged, false);
 	if reg.revisions.len == 0 { throw RunnerError(message = "lowered config has no 'plan'"); }
 	return true;
 }
@@ -988,7 +988,17 @@ fn _run(config_path: &String, workflow_hex: &String,
 //
 // Manifest shape:
 //   { "deployment": { …db, participants, operations… },
-//     "scripts": [ { "name": "checkout-v1", "version": "1.0.0", "path": "workflows/checkout.mf" }, … ] }
+//     "scripts": [ { "name": "checkout-v1", "version": "1.0.0", "path": "workflows/checkout.mf",
+//                    "returns": { "type": <type> } }, … ] }
+// Each script in a manifest is its own typed function (`name@version : ArgsType -> ResultType`) —
+// `returns` is REQUIRED on EVERY script entry, explicit unit spelled `"returns": {}` (never omitted).
+// There is NO fallback to a shared `deployment.returns` and NO inheritance/default across scripts in
+// manifest mode: a script entry missing its own `returns` key fails manifest loading outright (`.mf`
+// source has no `returns` syntax of its own, so the manifest entry is the ONLY place this contract is
+// declared). `argument_type` remains `.mf`-source-local (each script's own `args { }` block) — that
+// is already per-script and required by the source shape, so it needs no manifest-level counterpart
+// (a future manifest-level ARGUMENT override, if ever added, would likewise have to be per-script,
+// never shared).
 struct ManifestScript {
 	pub name: String,
 	pub version: String,
@@ -1027,14 +1037,19 @@ fn _resolve_script_path(manifest_path: &String, spath: &String) nothrow -> Strin
 
 // `base` with `script_name`/`plan_version` set to the manifest's declared identity, so the lowered
 // config carries it into the revision + the durable pin. (A parsed JsonNode is immutable — rebuild.)
-fn _deployment_for(base: &json.JsonNode, name: &String, version: &String) -> json.JsonNode {
+// `returns_value`: THIS script's own manifest-entry `returns` — ALWAYS given (the caller has already
+// rejected a manifest script missing it), and ALWAYS replaces whatever `base.returns` (the shared
+// deployment's) would otherwise carry through. There is no fallback/inheritance path here at all —
+// `base.returns`, if present, is unconditionally dropped and never consulted.
+fn _deployment_for(base: &json.JsonNode, name: &String, version: &String, returns_value: &json.JsonNode) -> json.JsonNode {
 	var o = json.new_object();
 	var it = base.entries();
 	var done = false;
 	while !done {
 		match it.next() {
 			Optional::Some(entry) => {
-				if !_str_eq(entry.key, &"script_name") and !_str_eq(entry.key, &"plan_version") {
+				val skip = _str_eq(entry.key, &"script_name") or _str_eq(entry.key, &"plan_version") or _str_eq(entry.key, &"returns");
+				if !skip {
 					o.set(_dup(entry.key), entry.value.clone_deep());
 				}
 			},
@@ -1043,6 +1058,7 @@ fn _deployment_for(base: &json.JsonNode, name: &String, version: &String) -> jso
 	}
 	o.set("script_name", json.JsonNode::String(value = _dup(name)));
 	o.set("plan_version", json.JsonNode::String(value = _dup(version)));
+	o.set("returns", returns_value.clone_deep());
 	return o.to_node();
 }
 
@@ -1061,6 +1077,10 @@ fn _load_manifest(manifest_path: &String) throws -> ManifestSet {
 		Optional::None => { throw RunnerError(message = "manifest missing 'deployment'"); }
 	}
 	var scripts: Array<ManifestScript> = [];
+	// 1b.0: kept alongside `scripts` (same index) ONLY for the manifest-wide call-validation pass
+	// below — never persisted on `ManifestScript` itself (that struct's existing shape/callers,
+	// e.g. `_find_script`/`_drive_manifest_request`'s dispatch-selection, are unaffected).
+	var registries: Array<ScriptRegistry> = [];
 	match mjson.get(&"scripts") {
 		Optional::Some(sn) => {
 			match sn.as_array() {
@@ -1076,20 +1096,29 @@ fn _load_manifest(manifest_path: &String) throws -> ManifestSet {
 							if _str_eq(&scripts[d].name, &name) { throw RunnerError(message = "duplicate script name in manifest: " + _dup(&name)); }
 							d = d + 1;
 						}
+						// 1b.0: EVERY manifest script must declare its OWN full workflow contract — no
+						// shared/inherited `returns` across scripts, no fallback to `deployment.returns`.
+						// Explicit unit is `"returns": {}`; the key itself must never be omitted.
+						var returns_value = json.JsonNode::Null();
+						match arr[i].get(&"returns") {
+							Optional::Some(r) => { returns_value = r.clone_deep(); },
+							Optional::None => { throw RunnerError(message = "script '" + _dup(&name) + "' is missing required 'returns' declaration (every manifest script must declare its own return contract; use \"returns\": {} for an explicit unit return)"); }
+						}
 						val rpath = _resolve_script_path(manifest_path, &spath);
 						val source = _read_text(&rpath);
-						val base2 = _deployment_for(&deployment, &name, &version);
+						val base2 = _deployment_for(&deployment, &name, &version, &returns_value);
 						var merged = json.JsonNode::Null();
 						match parser.lower(&source, &base2) {
 							core.Result::Ok(m) => { merged = move m; },
 							core.Result::Err(e) => { throw RunnerError(message = "script '" + _dup(&name) + "' failed to lower: " + _dup(&e.message)); }
 						}
 						_validate_registry(&merged);
-						val reg = _registry_build(&merged);
+						val reg = _registry_build(&merged, true);   // 1b.0: defer call-executability to the manifest-wide pass below
 						if reg.revisions.len == 0 { throw RunnerError(message = "script '" + _dup(&name) + "' produced no revision (empty plan/graph)"); }
 						val chx = _bytes_to_hex(&reg.revisions[0].content_hash);
 						val plen = reg.revisions[0].plan_length;
 						scripts.push(ManifestScript(name = move name, version = move version, cfg = move merged, content_hash_hex = move chx, plan_length = plen));
+						registries.push(move reg);
 						i = i + 1;
 					}
 				},
@@ -1099,7 +1128,112 @@ fn _load_manifest(manifest_path: &String) throws -> ManifestSet {
 		Optional::None => { throw RunnerError(message = "manifest missing 'scripts'"); }
 	}
 	if scripts.len == 0 { throw RunnerError(message = "manifest declares no scripts"); }
+	// 1b.0: NOW that every sibling script's own contract (arg_type/return_type/graph) is known,
+	// resolve + validate every `call` across the whole manifest — see `_validate_manifest_calls`.
+	_validate_manifest_calls(&scripts, &registries);
 	return ManifestSet(deployment = move deployment, scripts = move scripts);
+}
+
+// 1b.0: build-time registry validation gate — resolves `call <child>@<plan_version>` against the
+// manifest's OTHER scripts by EXACT (name, version) match, validates the call's input against the
+// resolved callee's declared arg_type, binds the callee's declared return_type so downstream
+// `result <call_id>.path` type-checks against it (unit -> reject any path access), and rejects a
+// static call cycle across the whole manifest. Throws the PRECISE reason on the FIRST failure
+// found — never falls through to the generic "not runnable" message for a malformed call. ONLY once
+// ALL of that passes does a script with a reachable call get the FINAL, distinct "not implemented
+// until 1b.1" rejection, proving static validation ran and passed rather than being skipped.
+fn _validate_manifest_calls(scripts: &Array<ManifestScript>, registries: &Array<ScriptRegistry>) throws -> Void {
+	var targets: Array<ir.CallTarget> = [];
+	var i = 0;
+	while i < registries.len {
+		val rev = &registries[i].revisions[0];
+		targets.push(ir.make_call_target(_dup(&rev.name), _dup(&rev.version), &rev.arg_type, &rev.return_type));
+		i = i + 1;
+	}
+	val call_targets_opt = Optional<Array<ir.CallTarget>>::Some(move targets);
+	i = 0;
+	while i < registries.len {
+		val rev = &registries[i].revisions[0];
+		val contracts = _op_contracts(&scripts[i].cfg);
+		match ir.type_check_graph(&rev.graph, &rev.arg_type, &contracts, &rev.return_type, &call_targets_opt) {
+			Optional::Some(m) => { throw RunnerError(message = "script '" + _dup(&scripts[i].name) + "@" + _dup(&scripts[i].version) + "': " + move m); },
+			Optional::None => {}
+		}
+		i = i + 1;
+	}
+	_assert_no_call_cycles(scripts, registries);
+	i = 0;
+	while i < registries.len {
+		val edges = ir.call_edges(&registries[i].revisions[0].graph);
+		if edges.len > 0 {
+			throw RunnerError(message = "script '" + _dup(&scripts[i].name) + "@" + _dup(&scripts[i].version)
+				+ "' calls a child workflow — static validation passed, but runtime dispatch is not implemented until composition slice 1b.1");
+		}
+		i = i + 1;
+	}
+}
+
+// Static call-cycle rejection across the WHOLE manifest: nodes are the manifest's own scripts
+// (distinct by name — duplicates already rejected during loading), edges are each script's OWN
+// `call` targets that resolve to another manifest script (an edge to a target OUTSIDE the manifest
+// is a separate "not found" rejection, already thrown by the type-check pass above — not
+// double-counted here). Kahn's algorithm: a script whose in-degree never reaches 0 is part of a
+// cycle — this also catches a direct self-call (a script's own edge back to itself), since a
+// self-loop's in-degree can never be decremented to 0 without the node processing itself first.
+fn _assert_no_call_cycles(scripts: &Array<ManifestScript>, registries: &Array<ScriptRegistry>) throws -> Void {
+	val n = scripts.len;
+	var indeg: Array<Int> = [];
+	// Flat edge list (from_index, to_index) — NOT a nested Array<Array<Int>> adjacency list (this
+	// small manifest-script graph is tiny; an O(n*edges) Kahn's-algorithm scan per node is simplest).
+	var edge_from: Array<Int> = [];
+	var edge_to: Array<Int> = [];
+	var i = 0;
+	while i < n { indeg.push(0); i = i + 1; }
+	i = 0;
+	while i < n {
+		val edges = ir.call_edges(&registries[i].revisions[0].graph);
+		var e = 0;
+		while e < edges.len {
+			var j = -1;
+			var k = 0;
+			while k < n {
+				if _str_eq(&scripts[k].name, &edges[e].child) and _str_eq(&scripts[k].version, &edges[e].plan_version) { j = k; }
+				k = k + 1;
+			}
+			if j >= 0 {
+				edge_from.push(i);
+				edge_to.push(j);
+				indeg[j] = indeg[j] + 1;
+			}
+			e = e + 1;
+		}
+		i = i + 1;
+	}
+	var queue: Array<Int> = [];
+	var qh = 0;
+	var visited = 0;
+	i = 0;
+	while i < n { if indeg[i] == 0 { queue.push(i); } i = i + 1; }
+	while qh < queue.len {
+		val u = queue[qh];
+		qh = qh + 1;
+		visited = visited + 1;
+		var e = 0;
+		while e < edge_from.len {
+			if edge_from[e] == u {
+				val v = edge_to[e];
+				indeg[v] = indeg[v] - 1;
+				if indeg[v] == 0 { queue.push(v); }
+			}
+			e = e + 1;
+		}
+	}
+	if visited < n {
+		var culprit = "";
+		i = 0;
+		while i < n { if indeg[i] > 0 { culprit = _dup(&scripts[i].name) + "@" + _dup(&scripts[i].version); } i = i + 1; }
+		throw RunnerError(message = "static call cycle detected in manifest (involves " + culprit + ")");
+	}
 }
 
 fn _find_script(scripts: &Array<ManifestScript>, name: &String) nothrow -> Int {
@@ -1222,7 +1356,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		try {
 			_validate_registry(cfg);
 			_validate_plan(cfg);
-			reg = _registry_build(cfg);
+			reg = _registry_build(cfg, false);
 			cfg_ok = true;
 		} catch RunnerError(e) {
 			// EXPECTED config-validation failure (bad registry/plan/argument_type/semver). An
@@ -1355,7 +1489,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		var ok = false;
 		try {
 			_validate_registry(cfg);
-			reg = _registry_build(cfg);
+			reg = _registry_build(cfg, false);
 			ok = true;
 		} catch RunnerError(e) {
 			// EXPECTED config-validation failure (malformed registry, bad semver, invalid
@@ -1415,7 +1549,9 @@ fn _is_planned_config(cfg: &json.JsonNode) nothrow -> Bool {
 	return false;
 }
 
-fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
+// `allow_calls`: 1b.0's escape hatch, threaded to `_assert_executable`/`_assert_reversible` — see
+// their doc comments. `false` for every caller except manifest loading's per-script build pass.
+fn _registry_build(cfg: &json.JsonNode, allow_calls: Bool) -> ScriptRegistry {
 	var revs: Array<ScriptRevision> = [];
 	// The revision IR comes from EITHER an explicit manual-IR "graph" config (non-degenerate
 	// shapes) OR the flat "plan" lifted to a degenerate straight-line graph. Neither present ->
@@ -1456,17 +1592,24 @@ fn _registry_build(cfg: &json.JsonNode) -> ScriptRegistry {
 			}
 			// Reject non-executable shapes (loops; op-unbalanced branches) at build, BEFORE any
 			// claim, and derive plan_length = the uniform per-path operation count.
-			val plan_length = _assert_executable(&graph);
+			val plan_length = _assert_executable(&graph, allow_calls);
 			// Reject non-reversible graphs: every non-final operation must be compensable (mirrors
 			// the flat-plan rule, generalized over branches), so reversal can never strand.
-			_assert_reversible(cfg, &graph);
+			_assert_reversible(cfg, &graph, allow_calls);
 			// TYPE-check the graph against the declared argument type + operation contracts +
 			// declared return type (1b.0a: also structurally validates every explicit `return`
 			// value's SHAPE against return_type — not just terminal-reachability, which
 			// validate_return_contract below still separately owns). A type error is a config
 			// error (invalid_config / revision_unavailable), never a dispatch.
 			val contracts = _op_contracts(cfg);
-			match ir.type_check_graph(&graph, &arg_type, &contracts, &return_type) {
+			// `call_targets` is ALWAYS None here (1b.0): `_registry_build` is single-script-scoped
+			// (it runs per-script even inside manifest loading, BEFORE any sibling script's own
+			// contract is known — a chicken-and-egg problem), so a call's input/result-path is
+			// still checked permissively at this point. The manifest-wide pass in `_load_manifest`
+			// re-invokes `ir.type_check_graph` a SECOND time per script, once every sibling's
+			// arg_type/return_type is known, with the REAL call_targets populated — see
+			// `_validate_manifest_calls`.
+			match ir.type_check_graph(&graph, &arg_type, &contracts, &return_type, &Optional<Array<ir.CallTarget>>::None()) {
 				Optional::Some(m) => { throw RunnerError(message = "graph type error: " + move m); },
 				Optional::None => {}
 			}
@@ -1791,8 +1934,12 @@ fn _build_graph(plan: &Array<PlanStep>) -> ir.IrGraph {
 // is checkpointed, not completed). Returns plan_length; throws RunnerError on a return-path imbalance
 // or a zero-op (fail-only/empty) graph. Called at registry build so rejection is
 // BEFORE any claim (invalid_config / revision_unavailable, no lease leak).
-fn _assert_executable(graph: &ir.IrGraph) -> Int {
-	match ir.op_depth(graph) {
+// `allow_calls`: false for every ordinary caller (preserves the existing blanket call-rejection);
+// true ONLY for manifest-mode's per-script build pass (1b.0), which must compute plan_length for a
+// script with a reachable call BEFORE the manifest-wide cross-script validation has run — see
+// `_node_depths`'s comment for the full rationale.
+fn _assert_executable(graph: &ir.IrGraph, allow_calls: Bool) -> Int {
+	match ir.op_depth(graph, allow_calls) {
 		core.Result::Ok(d) => { return d; },
 		core.Result::Err(e) => { throw RunnerError(message = "graph not executable: " + e.message); }
 	}
@@ -1802,8 +1949,8 @@ fn _assert_executable(graph: &ir.IrGraph) -> Int {
 // op can still fail and begin reversal) MUST declare a compensation binding — else a reversal
 // would strand at no_compensation_binding. Mirrors _validate_plan's flat-plan rule, generalized
 // over the graph (covers branches). Throws RunnerError at registry build (before any claim).
-fn _assert_reversible(cfg: &json.JsonNode, graph: &ir.IrGraph) -> Void {
-	match ir.nonfinal_operations(graph) {
+fn _assert_reversible(cfg: &json.JsonNode, graph: &ir.IrGraph, allow_calls: Bool) -> Void {
+	match ir.nonfinal_operations(graph, allow_calls) {
 		core.Result::Ok(ops) => {
 			var i = 0;
 			while i < ops.len {

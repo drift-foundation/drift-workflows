@@ -1,0 +1,5 @@
+args { amount: int }
+op charge { input: { amount: int } }
+steps {
+  charge { amount: arg amount }
+}

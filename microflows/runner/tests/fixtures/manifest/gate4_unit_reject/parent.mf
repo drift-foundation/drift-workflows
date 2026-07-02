@@ -1,0 +1,5 @@
+args { amount: int }
+steps {
+  let x = call child@1.0.0 { amount: arg amount }
+  let y = result x.total
+}

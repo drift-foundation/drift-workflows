@@ -1,0 +1,6 @@
+args { amount: int }
+op charge { input: { amount: int } result: { charge_id: int } }
+steps {
+  let c = charge { amount: arg amount }
+  return { charge_id: result c.charge_id }
+}

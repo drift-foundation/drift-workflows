@@ -1,0 +1,4 @@
+{
+  "returncode": 2,
+  "stderr_contains": "runner: invalid manifest: script 'parent' is missing required 'returns' declaration (every manifest script must declare its own return contract; use \"returns\": {} for an explicit unit return)"
+}

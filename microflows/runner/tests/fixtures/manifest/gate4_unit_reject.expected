@@ -1,0 +1,4 @@
+{
+  "returncode": 2,
+  "stderr_contains": "runner: invalid manifest: script 'parent@1.0.0': EResult(n0): child workflow child@1.0.0 declares a unit return — result access is not allowed"
+}

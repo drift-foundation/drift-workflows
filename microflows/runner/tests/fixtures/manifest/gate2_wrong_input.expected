@@ -1,0 +1,4 @@
+{
+  "returncode": 2,
+  "stderr_contains": "runner: invalid manifest: script 'parent@1.0.0': call 'n0' (child@1.0.0) input: type mismatch (expected O{6:amount;i;}, got O{11:wrong_field;i;})"
+}

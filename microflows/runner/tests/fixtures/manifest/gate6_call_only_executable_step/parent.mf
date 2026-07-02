@@ -1,0 +1,4 @@
+args { }
+steps {
+  call child@1.0.0 { }
+}

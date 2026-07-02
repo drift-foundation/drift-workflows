@@ -39,7 +39,11 @@ export {
 	StepOutcome,
 	advance,
 	OpContract,
-	type_check_graph
+	type_check_graph,
+	CallTarget,
+	make_call_target,
+	CallEdge,
+	call_edges
 };
 
 // ===== V1 closed value-type model (manual-IR frontend, Step 1b: argument types) =====
@@ -2062,6 +2066,66 @@ pub struct OpContract {
 	pub result_type: Optional<IrType>
 }
 
+// 1b.0: a resolved call target — the (name, version)-pinned callee's declared arg/return contract,
+// as known ONLY from a manifest (a set of sibling scripts). Built by the caller (runner.drift, which
+// has manifest visibility ir.drift does not) via `make_call_target`, one per script in the manifest.
+pub struct CallTarget {
+	pub name: String,
+	pub version: String,
+	pub arg_type: IrType,
+	pub return_type: Optional<IrType>
+}
+
+// Deep-clones `arg_type`/`return_type` so the caller's own copies (e.g. a `ScriptRevision`) are
+// untouched — `IrType`/`Optional<IrType>` are not trivially copyable (recursive object fields).
+pub fn make_call_target(name: String, version: String, arg_type: &IrType, return_type: &Optional<IrType>) nothrow -> CallTarget {
+	var rt: Optional<IrType> = Optional<IrType>::None();
+	match return_type { Optional::Some(t) => { rt = Optional<IrType>::Some(_clone_type(t)); }, Optional::None => {} }
+	return CallTarget(name = move name, version = move version, arg_type = _clone_type(arg_type), return_type = move rt);
+}
+
+fn _resolve_call_target(call_targets: &Optional<Array<CallTarget>>, name: &String, version: &String) nothrow -> Optional<&CallTarget> {
+	match call_targets {
+		Optional::Some(targets) => {
+			var i = 0;
+			while i < targets.len {
+				if _str_eq(&targets[i].name, name) and _str_eq(&targets[i].version, version) {
+					return Optional<&CallTarget>::Some(&targets[i]);
+				}
+				i = i + 1;
+			}
+			return Optional<&CallTarget>::None();
+		},
+		Optional::None => { return Optional<&CallTarget>::None(); }
+	}
+}
+
+// A `call <child>@<plan_version>` edge from this graph, keyed by the call node's id — the raw
+// declaration, NOT yet resolved against any registry (1b.0's manifest-wide pass does that). Used for
+// static cross-script cycle detection (runner.drift) and for the manifest-wide call-target-binding
+// re-check of `type_check_graph` once every sibling script's contract is known.
+pub struct CallEdge {
+	pub node_id: String,
+	pub child: String,
+	pub plan_version: String
+}
+
+pub fn call_edges(g: &IrGraph) nothrow -> Array<CallEdge> {
+	val order = _node_order_by_id(&g.nodes);
+	var out: Array<CallEdge> = [];
+	var k = 0;
+	while k < order.len {
+		match &g.nodes[order[k]] {
+			IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => {
+				out.push(CallEdge(node_id = _dup(id), child = _dup(child), plan_version = _dup(plan_version)));
+			},
+			default => {}
+		}
+		k = k + 1;
+	}
+	return move out;
+}
+
 // The outcome of inferring an expression's type. The THREE-WAY distinction is essential at a typed
 // boundary: a `Known` type is checked by assignability; `Unknown` (from an UNTYPED op result/binder)
 // is the permissive backward-compat escape hatch; `Imprecise` (a const LITERAL whose precise type is
@@ -2091,7 +2155,7 @@ fn _clone_infer(i: &InferType) nothrow -> InferType {
 // reached through a `let`) is checked by VALUE (`validate`), so an imprecise literal (e.g. an empty
 // array field) is still rejected against a declared type, not waved through. Call AFTER
 // `validate_graph` (assumes acyclic, refs resolve).
-pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpContract>, return_type: &Optional<IrType>) nothrow -> Optional<String> {
+pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpContract>, return_type: &Optional<IrType>, call_targets: &Optional<Array<CallTarget>>) nothrow -> Optional<String> {
 	var order: Array<Int> = [];
 	match _topo_order(g) {
 		core.Result::Ok(o) => { order = move o; },
@@ -2108,7 +2172,7 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 			IrNode::NOperation(id, operation, input, next) => {
 				match _op_input_type(contracts, operation) {
 					Optional::Some(it) => {
-						match _check_value_is(g, input, it, arg_type, contracts, &lt_names, &lt_types) {
+						match _check_value_is(g, input, it, arg_type, contracts, &lt_names, &lt_types, call_targets) {
 							Optional::Some(m) => { return Optional<String>::Some("operation '" + _dup(operation) + "' input: " + move m); },
 							Optional::None => {}
 						}
@@ -2117,18 +2181,40 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 				}
 			},
 			IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => {
-				// Composition slice 1a has no child-workflow registry here, so the input is NOT matched
-				// against the child arg-type (that lands with manifest-backed validation in 1a). Still infer
-				// the input expr to catch a structurally-bad projection (like NReturn). The call's result
-				// type is unknown (no contract) -> `_op_result_type` returns None -> downstream `result`
-				// uses stay permissive.
-				match _infer_expr_type(g, input, arg_type, contracts, &lt_names, &lt_types) {
-					core.Result::Ok(_) => {},
-					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
+				// 1b.0: `call_targets` is `Some(...)` ONLY from the manifest-wide re-check
+				// (runner.drift, once every sibling script's contract is known) — `None` everywhere
+				// else (single-script contexts: `--parse-check`, `ir_exec_test.drift`,
+				// `graph_cfg`-based tests, and even manifest mode's OWN per-script build pass, which
+				// runs BEFORE any sibling's contract exists yet). `None` stays fully permissive
+				// (still infers the input expr structurally, to catch a bad projection like NReturn),
+				// matching the exact pre-1b.0 behavior. `Some(targets)`: resolve `child@plan_version`
+				// by EXACT match; unresolved -> invalid_config; resolved -> the input must match the
+				// callee's declared arg_type (same machinery an operation's input is checked with).
+				match call_targets {
+					Optional::Some(_) => {
+						match _resolve_call_target(call_targets, child, plan_version) {
+							Optional::Some(target) => {
+								val cat = _clone_type(&target.arg_type);
+								match _check_value_is(g, input, &cat, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+									Optional::Some(m) => { return Optional<String>::Some("call '" + _dup(id) + "' (" + _dup(child) + "@" + _dup(plan_version) + ") input: " + m); },
+									Optional::None => {}
+								}
+							},
+							Optional::None => {
+								return Optional<String>::Some("call '" + _dup(id) + "' target not found in manifest: " + _dup(child) + "@" + _dup(plan_version));
+							}
+						}
+					},
+					Optional::None => {
+						match _infer_expr_type(g, input, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+							core.Result::Ok(_) => {},
+							core.Result::Err(e) => { return Optional<String>::Some(e.message); }
+						}
+					}
 				}
 			},
 			IrNode::NIf(id, cond, then_node, else_node) => {
-				match _infer_expr_type(g, cond, arg_type, contracts, &lt_names, &lt_types) {
+				match _infer_expr_type(g, cond, arg_type, contracts, &lt_names, &lt_types, call_targets) {
 					core.Result::Ok(it) => {
 						match &it {
 							InferType::Known(t) => { if !_str_eq(&canonical(t), &"b") { return Optional<String>::Some("NIf condition must be Bool (got " + canonical(t) + "): " + _dup(id)); } },
@@ -2140,7 +2226,7 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 				}
 			},
 			IrNode::NFail(id, reason) => {
-				match _infer_expr_type(g, reason, arg_type, contracts, &lt_names, &lt_types) {
+				match _infer_expr_type(g, reason, arg_type, contracts, &lt_names, &lt_types, call_targets) {
 					core.Result::Ok(it) => {
 						match &it {
 							InferType::Known(t) => { if !_str_eq(&canonical(t), &"s") { return Optional<String>::Some("fail reason must be String (got " + canonical(t) + "): " + _dup(id)); } },
@@ -2152,7 +2238,7 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 				}
 			},
 			IrNode::NCase(id, scrutinee, arms, default_node) => {
-				match _infer_expr_type(g, scrutinee, arg_type, contracts, &lt_names, &lt_types) {
+				match _infer_expr_type(g, scrutinee, arg_type, contracts, &lt_names, &lt_types, call_targets) {
 					core.Result::Ok(it) => {
 						match &it {
 							InferType::Known(st) => {
@@ -2177,19 +2263,19 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 				}
 			},
 			IrNode::NLet(id, name, value, next) => {
-				match _infer_expr_type(g, value, arg_type, contracts, &lt_names, &lt_types) {
+				match _infer_expr_type(g, value, arg_type, contracts, &lt_names, &lt_types, call_targets) {
 					core.Result::Ok(opt) => { lt_names.push(_dup(name)); lt_types.push(move opt); },
 					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
 				}
 			},
 			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
-				match _tc_loop(g, id, kind, source, elem, acc, init, body, arg_type, contracts, &lt_names, &lt_types) {
+				match _tc_loop(g, id, kind, source, elem, acc, init, body, arg_type, contracts, &lt_names, &lt_types, call_targets) {
 					core.Result::Ok(rt) => { lt_names.push(_dup(acc)); lt_types.push(move rt); },
 					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
 				}
 			},
 			IrNode::NMerge(id, name, sources, next) => {
-				match _tc_merge(g, id, sources, arg_type, contracts, &lt_names, &lt_types) {
+				match _tc_merge(g, id, sources, arg_type, contracts, &lt_names, &lt_types, call_targets) {
 					core.Result::Ok(mt) => { lt_names.push(_dup(name)); lt_types.push(move mt); },
 					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
 				}
@@ -2197,7 +2283,7 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 			IrNode::NReturn(id, value) => {
 				// Always infer, even with no declared return type, to catch a structurally-bad
 				// projection.
-				match _infer_expr_type(g, value, arg_type, contracts, &lt_names, &lt_types) {
+				match _infer_expr_type(g, value, arg_type, contracts, &lt_names, &lt_types, call_targets) {
 					core.Result::Ok(_) => {},
 					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
 				}
@@ -2230,7 +2316,7 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 						// scalar or a wrong-shaped object is rejected here, not silently persisted as
 						// `workflow_return_json` and only discovered later at the host/SP boundary.
 						Optional::Some(rt) => {
-							match _check_value_is(g, value, rt, arg_type, contracts, &lt_names, &lt_types) {
+							match _check_value_is(g, value, rt, arg_type, contracts, &lt_names, &lt_types, call_targets) {
 								Optional::Some(m) => { return Optional<String>::Some("return value does not match the declared return type (" + m + "): " + _dup(id)); },
 								Optional::None => {}
 							}
@@ -2252,12 +2338,12 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 // `Optional<T>`). A bare `unknown` inferred type (untyped op result / binder source) stays
 // permissive — that is the backward-compatible escape hatch, NOT a literal whose precision failed.
 fn _check_value_is(g: &IrGraph, e: &IrExpr, expected: &IrType, arg_type: &IrType, contracts: &Array<OpContract>,
-                   lt_names: &Array<String>, lt_types: &Array<InferType>) nothrow -> Optional<String> {
+                   lt_names: &Array<String>, lt_types: &Array<InferType>, call_targets: &Optional<Array<CallTarget>>) nothrow -> Optional<String> {
 	match _const_value_of(g, e) {
 		Optional::Some(v) => { return validate(&v, expected); },
 		Optional::None => {}
 	}
-	match _infer_expr_type(g, e, arg_type, contracts, lt_names, lt_types) {
+	match _infer_expr_type(g, e, arg_type, contracts, lt_names, lt_types, call_targets) {
 		core.Result::Ok(it) => {
 			match &it {
 				InferType::Known(t) => {
@@ -2366,12 +2452,12 @@ fn _type_assignable(actual: &IrType, expected: &IrType) nothrow -> Bool {
 // Type-check an NLoop body and return the loop result's inferred type (the binding for `acc`).
 fn _tc_loop(g: &IrGraph, id: &String, kind: &LoopKind, source: &IrExpr, elem: &String, acc: &String, init: &IrExpr,
             body: &IrExpr, arg_type: &IrType, contracts: &Array<OpContract>,
-            lt_names: &Array<String>, lt_types: &Array<InferType>) nothrow -> core.Result<InferType, IrError> {
+            lt_names: &Array<String>, lt_types: &Array<InferType>, call_targets: &Optional<Array<CallTarget>>) nothrow -> core.Result<InferType, IrError> {
 	// source: must be an array. Known(Array<e>) -> elem Known(e); imprecise/unknown array source ->
 	// elem Unknown (undetermined element, permissive body).
 	var elem_it: InferType = InferType::Unknown();
 	var src_it: InferType = InferType::Unknown();
-	match _infer_expr_type(g, source, arg_type, contracts, lt_names, lt_types) {
+	match _infer_expr_type(g, source, arg_type, contracts, lt_names, lt_types, call_targets) {
 		core.Result::Ok(it) => {
 			match &it {
 				InferType::Known(st) => {
@@ -2401,7 +2487,7 @@ fn _tc_loop(g: &IrGraph, id: &String, kind: &LoopKind, source: &IrExpr, elem: &S
 	val is_fold = _is_fold(kind);
 	var acc_it: InferType = InferType::Unknown();
 	if is_fold {
-		match _infer_expr_type(g, init, arg_type, contracts, lt_names, lt_types) {
+		match _infer_expr_type(g, init, arg_type, contracts, lt_names, lt_types, call_targets) {
 			core.Result::Ok(it) => { acc_it = move it; },
 			core.Result::Err(e) => { return core.Result<InferType, IrError>::Err(e); }
 		}
@@ -2414,7 +2500,7 @@ fn _tc_loop(g: &IrGraph, id: &String, kind: &LoopKind, source: &IrExpr, elem: &S
 	bn.push(_dup(elem)); bt.push(_clone_infer(&elem_it));
 	if is_fold { bn.push(_dup(acc)); bt.push(_clone_infer(&acc_it)); }
 	var body_it: InferType = InferType::Unknown();
-	match _infer_expr_type(g, body, arg_type, contracts, &bn, &bt) {
+	match _infer_expr_type(g, body, arg_type, contracts, &bn, &bt, call_targets) {
 		core.Result::Ok(it) => { body_it = move it; },
 		core.Result::Err(e) => { return core.Result<InferType, IrError>::Err(e); }
 	}
@@ -2456,14 +2542,14 @@ fn _tc_loop(g: &IrGraph, id: &String, kind: &LoopKind, source: &IrExpr, elem: &S
 // Type-check an NMerge: all KNOWN sources must agree (canonical); any IMPRECISE source makes the
 // merge imprecise (its value can be any source's, so the consumer must reject conservatively).
 fn _tc_merge(g: &IrGraph, id: &String, sources: &Array<MergeArm>, arg_type: &IrType, contracts: &Array<OpContract>,
-             lt_names: &Array<String>, lt_types: &Array<InferType>) nothrow -> core.Result<InferType, IrError> {
+             lt_names: &Array<String>, lt_types: &Array<InferType>, call_targets: &Optional<Array<CallTarget>>) nothrow -> core.Result<InferType, IrError> {
 	var any_imprecise = false;
 	var have_known = false;
 	var first_canon: String = "";
 	var merged_known: Optional<IrType> = Optional<IrType>::None();
 	var s = 0;
 	while s < sources.len {
-		match _infer_expr_type(g, &sources[s].value, arg_type, contracts, lt_names, lt_types) {
+		match _infer_expr_type(g, &sources[s].value, arg_type, contracts, lt_names, lt_types, call_targets) {
 			core.Result::Ok(it) => {
 				match &it {
 					InferType::Known(t) => {
@@ -2493,7 +2579,7 @@ fn _tc_merge(g: &IrGraph, id: &String, sources: &Array<MergeArm>, arg_type: &IrT
 // Infer an expression's type (three-way: Known / Unknown / Imprecise). Err on a structural type
 // error (projecting a key into a non-object, or an absent field).
 fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Array<OpContract>,
-                    lt_names: &Array<String>, lt_types: &Array<InferType>) nothrow -> core.Result<InferType, IrError> {
+                    lt_names: &Array<String>, lt_types: &Array<InferType>, call_targets: &Optional<Array<CallTarget>>) nothrow -> core.Result<InferType, IrError> {
 	match e {
 		IrExpr::EConst(canonical_json) => {
 			match json.parse_strict(canonical_json) {
@@ -2508,6 +2594,46 @@ fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Arra
 			}
 		},
 		IrExpr::EResult(node, path) => {
+			// 1b.0: a `result <call>.path` reference is handled SEPARATELY from an operation's
+			// result — a call's contract comes from a resolved manifest CallTarget, not from
+			// `contracts` (OpContract), and "no declared type" means something DIFFERENT for each:
+			// an untyped OPERATION result is permissive (Unknown); a UNIT-returning call's result is
+			// a HARD REJECT for every path (there is nothing to project — DESIGN.md: "unit -> all
+			// result <call_id>.* paths rejected"), never silently permissive. `call_targets = None`
+			// (no manifest context — single-script/`--parse-check`/pre-1b.0 tests) stays exactly as
+			// permissive as before resolution existed at all.
+			val t = _find_node(g, node);
+			var is_call_node = false;
+			if t >= 0 { match &g.nodes[t] { IrNode::NCallWorkflow(cid, child, plan_version, cinput, cnext, ccomp) => { is_call_node = true; }, default => {} } }
+			if is_call_node {
+				match call_targets {
+					Optional::None => { return core.Result<InferType, IrError>::Ok(InferType::Unknown()); },
+					Optional::Some(_) => {
+						var child_name: String = "";
+						var child_ver: String = "";
+						match &g.nodes[t] { IrNode::NCallWorkflow(cid, child, plan_version, cinput, cnext, ccomp) => { child_name = _dup(child); child_ver = _dup(plan_version); }, default => {} }
+						match _resolve_call_target(call_targets, &child_name, &child_ver) {
+							Optional::Some(target) => {
+								match &target.return_type {
+									Optional::Some(rt) => {
+										match _project_type(rt, path, 0) {
+											core.Result::Ok(ty) => { return core.Result<InferType, IrError>::Ok(InferType::Known(ty = move ty)); },
+											core.Result::Err(m) => { return core.Result<InferType, IrError>::Err(IrError(message = "EResult(" + _dup(node) + "): " + m.message)); }
+										}
+									},
+									Optional::None => {
+										return core.Result<InferType, IrError>::Err(IrError(message = "EResult(" + _dup(node) + "): child workflow " + _dup(&child_name) + "@" + _dup(&child_ver) + " declares a unit return — result access is not allowed"));
+									}
+								}
+							},
+							// Unreachable in a well-formed graph: the call node's OWN arm in
+							// type_check_graph already rejects an unresolved target before any
+							// dominated EResult reference could be reached. Kept as a safety net.
+							Optional::None => { return core.Result<InferType, IrError>::Err(IrError(message = "EResult(" + _dup(node) + "): call target not found")); }
+						}
+					}
+				}
+			}
 			match _op_result_type(g, contracts, node) {
 				Optional::Some(rt) => {
 					match _project_type(rt, path, 0) {
@@ -2545,7 +2671,7 @@ fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Arra
 			var ftypes: Array<IrField> = [];
 			var i = 0;
 			while i < fields.len {
-				match _infer_expr_type(g, &fields[i].value, arg_type, contracts, lt_names, lt_types) {
+				match _infer_expr_type(g, &fields[i].value, arg_type, contracts, lt_names, lt_types, call_targets) {
 					core.Result::Ok(it) => {
 						match it {
 							InferType::Known(t) => { ftypes.push(IrField(name = _dup(&fields[i].key), ty = move t)); },
@@ -2573,7 +2699,7 @@ fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Arra
 			var elem_known: Optional<IrType> = Optional<IrType>::None();
 			var i = 0;
 			while i < elems.len {
-				match _infer_expr_type(g, &elems[i], arg_type, contracts, lt_names, lt_types) {
+				match _infer_expr_type(g, &elems[i], arg_type, contracts, lt_names, lt_types, call_targets) {
 					core.Result::Ok(it) => {
 						match &it {
 							InferType::Known(t) => {
@@ -2829,7 +2955,7 @@ fn _contains_str(xs: &Array<String>, x: &String) nothrow -> Bool {
 // Per-node op-depth (number of NOperations strictly before each node), in topological order from
 // `entry` (Kahn). Unreachable nodes keep depth -1. Err on an op-unbalanced branch (a node reached
 // via paths with differing operation counts). The shared core of op_depth / nonfinal_operations.
-fn _node_depths(g: &IrGraph) nothrow -> core.Result<Array<Int>, IrError> {
+fn _node_depths(g: &IrGraph, allow_calls: Bool) nothrow -> core.Result<Array<Int>, IrError> {
 	val nn = g.nodes.len;
 	var depth: Array<Int> = [];
 	var indeg: Array<Int> = [];
@@ -2859,16 +2985,31 @@ fn _node_depths(g: &IrGraph) nothrow -> core.Result<Array<Int>, IrError> {
 	while qh < queue.len {
 		val u = queue[qh];
 		qh = qh + 1;
-		// Composition slice 1a is FRONTEND-ONLY: a workflow `call` has no runtime (dispatch/await/settle land
-		// in 1b). op-depth is the BUILD gate (plan_length / nonfinal_operations / registry pin) and is NOT on
-		// the `--parse-check` path, so reject a reachable call HERE — a graph mixing `call` with a participant
-		// op would otherwise build (plan_length from the op) and reach the defensive runtime fault. Fail at
-		// build, not at runtime.
-		if _is_call(&g.nodes[u]) {
+		// A workflow `call` has no runtime yet (dispatch/await/settle land in 1b.1) — op-depth is the
+		// BUILD gate (plan_length / nonfinal_operations / registry pin) and is NOT on the
+		// `--parse-check` path, so reject a reachable call HERE by default — a graph mixing `call`
+		// with a participant op would otherwise build (plan_length from the op) and reach the
+		// defensive runtime fault. Fail at build, not at runtime. `allow_calls` is the 1b.0
+		// escape hatch: manifest-mode's PER-SCRIPT build pass (runner.drift's `_load_manifest`, via
+		// `_registry_build`) must be able to compute plan_length/arg_type/return_type for a script
+		// with a reachable call BEFORE the manifest-wide cross-script validation pass has run (a
+		// chicken-and-egg problem — that pass needs every sibling script's contract, which requires
+		// every sibling to have already built). Every OTHER caller (single-script CLI/service
+		// dispatch, `ir_exec_test.drift`, `--parse-check`) passes `false`, preserving this exact
+		// rejection unchanged — the manifest-wide pass makes the FINAL "not implemented until 1b.1"
+		// call once precise validation has run (see `_validate_manifest_calls`).
+		if !allow_calls and _is_call(&g.nodes[u]) {
 			return core.Result<Array<Int>, IrError>::Err(IrError(message = "workflow call is not runnable until composition slice 1b (frontend-only in slice 1a)"));
 		}
+		// A call counts as an executable step ONLY once `allow_calls` has let it through — DESIGN.md's
+		// own terminology ("a workflow call is a pending CALL OPERATION") treats it as occupying
+		// exactly one forward step, same as a participant operation, once it's a real candidate for
+		// execution (1b.0's manifest-wide pass, eventually 1b.1's runtime). Under `allow_calls=false`
+		// this is unreachable (the graph was already rejected above), so it never changes behavior
+		// for any pre-existing single-script caller.
 		var inc = 0;
 		if _is_operation(&g.nodes[u]) { inc = 1; }
+		else if allow_calls and _is_call(&g.nodes[u]) { inc = 1; }
 		val ud = depth[u] + inc;
 		var succs: Array<String> = [];
 		_succs(&g.nodes[u], &mut succs);
@@ -2888,9 +3029,9 @@ fn _node_depths(g: &IrGraph) nothrow -> core.Result<Array<Int>, IrError> {
 }
 
 // plan_length: the uniform NReturn op-depth (all reachable terminals agree), or Err.
-pub fn op_depth(g: &IrGraph) nothrow -> core.Result<Int, IrError> {
+pub fn op_depth(g: &IrGraph, allow_calls: Bool) nothrow -> core.Result<Int, IrError> {
 	var depth: Array<Int> = [];
-	match _node_depths(g) {
+	match _node_depths(g, allow_calls) {
 		core.Result::Ok(d) => { depth = move d; },
 		core.Result::Err(e) => { return core.Result<Int, IrError>::Err(IrError(message = e.message)); }
 	}
@@ -2910,9 +3051,9 @@ pub fn op_depth(g: &IrGraph) nothrow -> core.Result<Int, IrError> {
 // before the final one (seq < plan_length) on their (uniform-length) path, so a later operation
 // can still fail and trigger reversal. Such operations MUST be compensable; the caller checks each
 // against the registry. Err if op-unbalanced (same shape op_depth rejects).
-pub fn nonfinal_operations(g: &IrGraph) nothrow -> core.Result<Array<String>, IrError> {
+pub fn nonfinal_operations(g: &IrGraph, allow_calls: Bool) nothrow -> core.Result<Array<String>, IrError> {
 	var depth: Array<Int> = [];
-	match _node_depths(g) {
+	match _node_depths(g, allow_calls) {
 		core.Result::Ok(d) => { depth = move d; },
 		core.Result::Err(e) => { return core.Result<Array<String>, IrError>::Err(IrError(message = e.message)); }
 	}

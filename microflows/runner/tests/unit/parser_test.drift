@@ -433,7 +433,7 @@ fn scenario() -> Int {
 	match ir.parse_graph(&tmm_body) {
 		core.Result::Ok(g) => {
 			match ir.validate_graph(&g) { Optional::Some(_) => { return 104; }, Optional::None => {} }   // structurally valid
-			match ir.type_check_graph(&g, &tat, &tmc, &Optional<ir.IrType>::None()) { Optional::Some(_) => {}, Optional::None => { return 105; } }   // type-rejected
+			match ir.type_check_graph(&g, &tat, &tmc, &Optional<ir.IrType>::None(), &Optional<Array<ir.CallTarget>>::None()) { Optional::Some(_) => {}, Optional::None => { return 105; } }   // type-rejected
 		},
 		core.Result::Err(_) => { return 106; }
 	}

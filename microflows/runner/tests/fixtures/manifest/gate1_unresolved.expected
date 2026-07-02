@@ -1,0 +1,4 @@
+{
+  "returncode": 2,
+  "stderr_contains": "runner: invalid manifest: script 'parent@1.0.0': call 'n0' target not found in manifest: nonexistent@9.9.9"
+}

@@ -1,0 +1,46 @@
+{
+  "deployment": {
+    "worker_id": "w",
+    "db": {
+      "host": "127.0.0.1",
+      "port": 34214,
+      "user": "root",
+      "password": "",
+      "database": "microflows"
+    },
+    "participants": [
+      {
+        "id": "ref",
+        "transport": {
+          "kind": "http",
+          "endpoints": [
+            "http://ref.invalid:8443"
+          ],
+          "selection": "ordered_failover"
+        },
+        "auth_profile": null
+      }
+    ],
+    "operations": [
+      {
+        "name": "ping",
+        "participant": "ref",
+        "schema_version": 1
+      }
+    ]
+  },
+  "scripts": [
+    {
+      "name": "child",
+      "version": "1.0.0",
+      "path": "child.mf",
+      "returns": {}
+    },
+    {
+      "name": "parent",
+      "version": "1.0.0",
+      "path": "parent.mf",
+      "returns": {}
+    }
+  ]
+}

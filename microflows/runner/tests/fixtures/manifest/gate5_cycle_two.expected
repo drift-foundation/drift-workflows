@@ -1,0 +1,4 @@
+{
+  "returncode": 2,
+  "stderr_contains": "runner: invalid manifest: static call cycle detected in manifest (involves b@1.0.0)"
+}

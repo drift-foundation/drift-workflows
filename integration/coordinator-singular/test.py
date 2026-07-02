@@ -130,11 +130,13 @@ def run_manifest(manifest_path, wf_hex, script=None, arguments=None):
 
 def write_manifest(deployment, scripts):
     # scripts: list of (name, version, mf_source). Writes each .mf to a temp file and a manifest JSON
-    # referencing them; returns the manifest path.
+    # referencing them; returns the manifest path. 1b.0: every manifest script must declare its OWN
+    # "returns" (no fallback/inheritance) — every `mf_source` used by callers of this helper is
+    # unit-returning, so `{}` (explicit unit) is correct for all of them.
     decl = []
     for name, version, src in scripts:
         mf = tempfile.NamedTemporaryFile("w", suffix=".mf", delete=False); mf.write(src); mf.close()
-        decl.append({"name": name, "version": version, "path": mf.name})
+        decl.append({"name": name, "version": version, "path": mf.name, "returns": {}})
     mpath = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
     json.dump({"deployment": deployment, "scripts": decl}, mpath); mpath.close()
     return mpath.name
@@ -142,10 +144,11 @@ def write_manifest(deployment, scripts):
 
 def write_manifest_at(path, deployment, scripts):
     # Like write_manifest but to a SPECIFIC path (so a SIGUSR1 reload can overwrite the same file).
+    # 1b.0: same explicit-unit "returns" as write_manifest above.
     decl = []
     for name, version, src in scripts:
         mf = tempfile.NamedTemporaryFile("w", suffix=".mf", delete=False); mf.write(src); mf.close()
-        decl.append({"name": name, "version": version, "path": mf.name})
+        decl.append({"name": name, "version": version, "path": mf.name, "returns": {}})
     with open(path, "w") as f:
         json.dump({"deployment": deployment, "scripts": decl}, f)
     return path
@@ -2998,7 +3001,7 @@ def main():
             f.write(mf_src)
         relman = os.path.join(reldir, "manifest.json")
         with open(relman, "w") as f:
-            json.dump({"deployment": runner_cfg, "scripts": [{"name": "rel-v1", "version": "1.0.0", "path": "wf.mf"}]}, f)
+            json.dump({"deployment": runner_cfg, "scripts": [{"name": "rel-v1", "version": "1.0.0", "path": "wf.mf", "returns": {}}]}, f)
         rel_wf = _wf_id()
         relc, relb = run_manifest(relman, rel_wf, script="rel-v1", arguments=json.dumps({"code": "rl1"}))
         check("manifest_relative_path_resolved",
@@ -3154,7 +3157,9 @@ def main():
             ],
             "operations": ex_ops,
         }
-        ex_scripts = [{"name": n, "version": "1.0.0", "path": str(EXW / f"{n}.mf")} for n in (
+        # 1b.0: every manifest script must declare its OWN "returns" — all 5 example workflows are
+        # unit-returning (no explicit `return` statement in their .mf source), so `{}` is correct.
+        ex_scripts = [{"name": n, "version": "1.0.0", "path": str(EXW / f"{n}.mf"), "returns": {}} for n in (
             "payment_authorize_capture", "payment_refund", "inventory_reserve_release",
             "account_adjustment_with_rollback", "checkout_branch_merge")]
         ex_manifest = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False).name

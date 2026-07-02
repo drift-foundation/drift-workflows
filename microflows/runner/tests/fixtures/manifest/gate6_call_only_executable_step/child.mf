@@ -1,0 +1,5 @@
+args { }
+op ping { input: {} }
+steps {
+  ping {}
+}

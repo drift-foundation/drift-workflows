@@ -1,0 +1,4 @@
+args { wrong_field: int }
+steps {
+  call child@1.0.0 { wrong_field: arg wrong_field }
+}

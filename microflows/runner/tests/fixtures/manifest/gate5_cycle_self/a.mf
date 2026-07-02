@@ -1,0 +1,4 @@
+args { amount: int }
+steps {
+  call a@1.0.0 { amount: arg amount }
+}

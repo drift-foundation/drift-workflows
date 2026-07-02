@@ -1,0 +1,5 @@
+args { amount: int }
+steps {
+  let x = call child@1.0.0 { amount: arg amount }
+  return { receipt_id: result x.charge_id }
+}

@@ -57,6 +57,10 @@ test:
 	just build
 	python3 tests/run_parser_fixtures.py --bin "{{BIN_DIR}}/microflows-runner"
 	echo "[runner] parser fixtures ok"
+	# 1b.0: build-time registry validation gate for workflow calls — multi-script manifest fixtures,
+	# entirely DB-free (a rejection at any gate happens before _load_manifest ever tries to connect).
+	python3 tests/run_manifest_fixtures.py --bin "{{BIN_DIR}}/microflows-runner"
+	echo "[runner] manifest fixtures ok"
 
 # Compiler-regression canary — NOT on the daily/cert gate (`just test` data-drives the same coverage).
 # Compiles the legacy all-in-one parser_test.drift (a ~520-line scenario() with ~60 inlined .mf

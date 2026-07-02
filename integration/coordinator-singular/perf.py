@@ -97,7 +97,7 @@ def main():
         }
         manifest = Path(mfdir) / "manifest.json"
         manifest.write_text(json.dumps({"deployment": deployment,
-                                        "scripts": [{"name": "reserve", "version": "1.0.0", "path": "reserve.mf"}]}))
+                                        "scripts": [{"name": "reserve", "version": "1.0.0", "path": "reserve.mf", "returns": {}}]}))
         vport = _free_port()
         svc = subprocess.Popen([SERVICE_BIN, "--manifest", str(manifest), "--port", str(vport)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

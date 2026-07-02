@@ -100,7 +100,7 @@ fn _tc_rt(text: &String, rt: &Optional<ir.IrType>) -> Optional<String> {
 	match json.parse_strict(text) {
 		core.Result::Ok(n) => {
 			match ir.parse_graph(&n) {
-				core.Result::Ok(g) => { return ir.type_check_graph(&g, &at, &no_contracts, rt); },
+				core.Result::Ok(g) => { return ir.type_check_graph(&g, &at, &no_contracts, rt, &Optional<Array<ir.CallTarget>>::None()); },
 				core.Result::Err(e) => { return Optional<String>::Some("parse-failed"); }
 			}
 		},
@@ -122,7 +122,7 @@ fn _pt(text: &String) -> ir.IrType {
 	}
 }
 fn _tc_ok(g: &ir.IrGraph, at: &ir.IrType, cs: &Array<ir.OpContract>) nothrow -> Bool {
-	match ir.type_check_graph(g, at, cs, &Optional<ir.IrType>::None()) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
+	match ir.type_check_graph(g, at, cs, &Optional<ir.IrType>::None(), &Optional<Array<ir.CallTarget>>::None()) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
 }
 
 fn _seq(a: &String, b: &String) nothrow -> Bool {
@@ -371,7 +371,7 @@ fn scenario() -> Int {
 
 	// ===== op_depth: uniform per-path operation count (durable seq model) =====
 	// straight-line 2-op graph -> depth 2.
-	match ir.op_depth(&gd) {
+	match ir.op_depth(&gd, false) {
 		core.Result::Ok(d) => { if d != 2 { return 70; } },
 		core.Result::Err(e) => { return 71; }
 	}
@@ -383,7 +383,7 @@ fn scenario() -> Int {
 	bnodes.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val bal = ir.IrGraph(nodes = move bnodes, entry = "n0");
 	if !_ok_validate(&bal) { return 72; }
-	match ir.op_depth(&bal) {
+	match ir.op_depth(&bal, false) {
 		core.Result::Ok(d) => { if d != 1 { return 73; } },
 		core.Result::Err(e) => { return 74; }
 	}
@@ -396,14 +396,14 @@ fn scenario() -> Int {
 	unodes.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val unbal = ir.IrGraph(nodes = move unodes, entry = "n0");
 	if !_ok_validate(&unbal) { return 75; }
-	match ir.op_depth(&unbal) {
+	match ir.op_depth(&unbal, false) {
 		core.Result::Err(e) => {},
 		core.Result::Ok(d) => { return 76; }
 	}
 
 	// ===== nonfinal_operations: NOperations before the final execution position (must be compensable) =====
 	// straight-line [alpha, beta]: alpha is non-final (seq1 < plan_length 2), beta is final.
-	match ir.nonfinal_operations(&gd) {
+	match ir.nonfinal_operations(&gd, false) {
 		core.Result::Ok(nf) => {
 			if nf.len != 1 { return 77; }
 			if !_seq(&nf[0], &"alpha") { return 78; }
@@ -411,7 +411,7 @@ fn scenario() -> Int {
 		core.Result::Err(e) => { return 79; }
 	}
 	// balanced if (1 op per branch, plan_length 1): both branch ops are FINAL -> none non-final.
-	match ir.nonfinal_operations(&bal) {
+	match ir.nonfinal_operations(&bal, false) {
 		core.Result::Ok(nf) => { if nf.len != 0 { return 80; } },
 		core.Result::Err(e) => { return 81; }
 	}

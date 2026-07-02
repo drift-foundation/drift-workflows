@@ -1,5 +1,5 @@
 {
-  "_comment": "Microflows service manifest (roadmap item 4 starter kit). `uflowsd --manifest manifest.json` loads + validates EVERY script below at startup, over the shared `deployment` routing registry. This is a TEMPLATE: replace db.* and each participant endpoint with your environment. Script `path`s are resolved relative to THIS file's directory. SECURITY: auth_profile is null everywhere and the service is internal-only \u2014 see RUN_LOCAL.md 'Security boundary'.",
+  "_comment": "Microflows service manifest (roadmap item 4 starter kit). `uflowsd --manifest manifest.json` loads + validates EVERY script below at startup, over the shared `deployment` routing registry. This is a TEMPLATE: replace db.* and each participant endpoint with your environment. Script `path`s are resolved relative to THIS file's directory. Each script MUST declare its own `returns` (explicit unit as `{}`, or `{\"type\": <type>}` for a typed return) \u2014 there is no shared/inherited default across scripts. SECURITY: auth_profile is null everywhere and the service is internal-only \u2014 see RUN_LOCAL.md 'Security boundary'.",
   "deployment": {
     "worker_id": "uflowsd-1",
     "db": {
@@ -138,32 +138,38 @@
     {
       "name": "payment_authorize_capture",
       "version": "1.0.0",
-      "path": "workflows/payment_authorize_capture.mf"
+      "path": "workflows/payment_authorize_capture.mf",
+      "returns": {}
     },
     {
       "name": "payment_refund",
       "version": "1.0.0",
-      "path": "workflows/payment_refund.mf"
+      "path": "workflows/payment_refund.mf",
+      "returns": {}
     },
     {
       "name": "inventory_reserve_release",
       "version": "1.0.0",
-      "path": "workflows/inventory_reserve_release.mf"
+      "path": "workflows/inventory_reserve_release.mf",
+      "returns": {}
     },
     {
       "name": "account_adjustment_with_rollback",
       "version": "1.0.0",
-      "path": "workflows/account_adjustment_with_rollback.mf"
+      "path": "workflows/account_adjustment_with_rollback.mf",
+      "returns": {}
     },
     {
       "name": "checkout_branch_merge",
       "version": "1.0.0",
-      "path": "workflows/checkout_branch_merge.mf"
+      "path": "workflows/checkout_branch_merge.mf",
+      "returns": {}
     },
     {
       "name": "payment_decline_guard",
       "version": "1.0.0",
-      "path": "workflows/payment_decline_guard.mf"
+      "path": "workflows/payment_decline_guard.mf",
+      "returns": {}
     }
   ]
 }

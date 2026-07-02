@@ -1,0 +1,4 @@
+args { amount: int }
+steps {
+  call nonexistent@9.9.9 { amount: arg amount }
+}

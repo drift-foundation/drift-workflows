@@ -810,7 +810,7 @@ declared arg/input contract; bind the child `return` type so `result <call_id>.p
 (unit ⇒ every path rejected); reject static call cycles at build. See the design section below (pending
 review) before implementation starts.
 
-## 1b.0 — build-time registry validation gate (DESIGN, pending review)
+## 1b.0 — build-time registry validation gate (DONE)
 
 **Scope, confirmed with the user before implementation.** Two rounds of clarification landed on:
 1. Layered build validation for a `call <child>@<plan_version>` node, in order: (a) resolve `child@plan_version`;
@@ -882,15 +882,181 @@ The existing slice-1a parser fixtures (`call_single.mf` etc.) are similarly unaf
 `_pc_validate`/`_pc_typecheck` call `ir.validate_graph`/`ir.type_check_graph` directly and never invoke
 `_assert_executable` at all, so they don't exercise this gate either way.
 
-**Testing shape**: multi-script MANIFEST fixtures (a new manifest-mode test surface, or extending whatever
-harness already drives `_load_manifest` — needs a quick look at how manifest-mode is currently tested, if at
-all, before implementation) proving, per the user's explicit ask: (1) each of the 4 validation failure modes
-fails for its OWN precise reason (unresolved target, bad input shape, bad result-path projection including the
-unit-reject-all-paths case, a 2-script and a self-loop cycle); (2) a fully well-formed multi-script call graph
-still fails, but with the distinct "1b.1 pending" message — proving validation ran and passed first.
+### Implementation summary
 
-**Open items to confirm before coding** (smaller than the two already-resolved forks, flagging for
-completeness): the exact new-function names/signatures (`_registry_build_for_manifest` vs a boolean parameter
-on the existing `_registry_build`; a new `CallTarget`/cross-script-check struct name); whether `fan`/`on
-failed` need any NEW rejection tests here or are fully covered already by existing slice-1a fixtures (research
-should confirm before assuming no work is needed there).
+Implemented in the 6 gates given, verified after each: (1) resolve `call child@plan_version` against the
+manifest registry; (2) validate call input against the child's declared arg type; (3) bind the child's
+declared return type so `result <call_id>.path` type-checks downstream; (4) reject result access on a
+unit-returning child; (5) static cycle detection across pinned call edges; (6) keep a reachable
+`NCallWorkflow` non-runnable until 1b.1, replacing the blanket message with precise validation first, then a
+distinct final gate.
+
+**ir.drift** — new exported `pub struct CallTarget { name, version, arg_type, return_type }` (the resolved
+callee's contract, built by `make_call_target(name, version, &arg_type, &return_type)` — deep-clones via the
+existing private `_clone_type`, since a struct built in runner.drift needs its own owned copy) and `pub struct
+CallEdge { node_id, child, plan_version }` + `pub fn call_edges(g) -> Array<CallEdge>` (the raw, unresolved
+declarations — used for cross-script cycle detection and by the manifest-wide re-check).
+
+`type_check_graph` gained a 5th parameter, `call_targets: &Optional<Array<CallTarget>>` — `None` (every
+existing caller: `_pc_typecheck`, `ir_exec_test.drift`/`parser_test.drift` helpers, and even
+`_registry_build`'s own per-script pass, see below) means exactly today's permissive behavior, unchanged
+byte-for-byte; `Some(targets)` (ONLY the new manifest-wide re-check) makes `NCallWorkflow`'s input get
+resolved + validated (same `_check_value_is` machinery an operation's input uses) and makes `EResult`
+referencing a call resolve through `targets` instead of the operation-only `_op_result_type` — unit ⇒ a HARD
+reject for any path (not `_op_result_type`'s "permissive Unknown" convention, which is reserved for an
+UNTYPED operation and means something different), typed ⇒ project via the same `_project_type` an operation's
+typed result already uses. Threading `call_targets` required updating `_check_value_is`/`_tc_loop`/`_tc_merge`
+and every recursive `_infer_expr_type` call site (any expression position — object/array fields, loop/merge
+bodies — could nest an `EResult` referencing a call), all mechanical.
+
+`op_depth`/`nonfinal_operations`/their shared `_node_depths` core gained an `allow_calls: Bool` parameter —
+`false` everywhere existing (preserves the blanket "workflow call is not runnable" rejection exactly);
+`true` ONLY for manifest-mode's PER-SCRIPT build pass (`_registry_build`, called from `_load_manifest`'s
+existing per-script loop) — that pass must compute `plan_length`/`arg_type`/`return_type` for a script with a
+reachable call BEFORE the manifest-wide pass has run (a chicken-and-egg problem: cross-script validation
+needs every sibling's contract, which requires every sibling to have already built). `_assert_executable`/
+`_assert_reversible`/`_registry_build` all thread this through; every one of their other call sites (single
+CLI/service dispatch, `--emit-content-hash`, `--lower-source`) passes `false`, unaffected.
+
+**runner.drift** — `_load_manifest`'s per-script loop now ALSO collects `registries: Array<ScriptRegistry>`
+(parallel to `scripts`, index-matched — kept local, never bolted onto `ManifestScript`'s public shape, so
+`_find_script`/`_drive_manifest_request`'s dispatch-selection callers are untouched). After the loop, a NEW
+`_validate_manifest_calls(&scripts, &registries)` runs: builds `call_targets` from every script's resolved
+contract, RE-INVOKES `ir.type_check_graph` per script with the real targets (accepted as simpler and safer
+than inventing a parallel surgical re-check — graphs are small, re-running the full pass costs nothing and
+can't silently diverge from the real one), runs `_assert_no_call_cycles` (a flat `(from_index, to_index)`
+edge-list Kahn's algorithm — NOT a nested `Array<Array<Int>>` adjacency list, which driftc rejected with
+"cannot copy value of type 'Array'"; a script whose in-degree never reaches 0 is part of a cycle, which also
+correctly catches a direct self-call), and ONLY THEN, for any script with `ir.call_edges(&graph).len > 0`,
+throws the final distinct "static validation passed, but runtime dispatch is not implemented until
+composition slice 1b.1" — never the old blanket message, and never reached at all for a script that failed
+gates 1-5 first.
+
+**Manifest test surface (new)** — `--manifest` mode's `_load_manifest` runs entirely DB-free (confirmed:
+`_require_db` is only reached AFTER `_load_manifest` returns successfully), so EVERY 1b.0 rejection (today,
+every manifest with a reachable call rejects — either for a precise gates-1-5 reason, or the final gate-6
+"1b.1 pending" message) is testable with zero DB/stub setup. New `tests/fixtures/manifest/<name>/` (manifest
++ `.mf` scripts + a `run.json` naming the submitted script/arguments) + `tests/run_manifest_fixtures.py`
+(mirrors `run_parser_fixtures.py`'s golden-diff pattern exactly: `{returncode, stderr_contains}` goldens),
+wired into `justfile`'s `test` target. 6 fixtures, one per gate: `gates1_4_ok` (resolves, input validates,
+result type-checks through a real projection — final message is the "1b.1 pending" gate, proving 1-4 AND 6
+together); `gate1_unresolved`; `gate2_wrong_input`; `gate4_unit_reject`; `gate5_cycle_two`; `gate5_cycle_self`.
+
+**Regression note (caught by manual testing before committing fixtures)**: a bare `call` with no other
+operation gives `plan_length = 0`, tripping the PRE-EXISTING "a workflow must execute at least one operation"
+rule — unrelated to 1b.0, but every hand-written test script needed a real op alongside its `call` to avoid
+this red herring. Also: a parent script whose OWN explicit `return` is non-null under an undeclared
+`returns.type` trips step 6's `validate_source_unit_return` BEFORE gate 4 is ever reached (since pass 1 runs
+before the manifest-wide pass) — the `gate4_unit_reject` fixture isolates gate 4 by routing the call's result
+through a `let` binding instead of the parent's own `return`, since `type_check_graph`'s `NLet` arm always
+type-checks its bound value regardless of whether the binding is later used.
+
+**Verification**: full `just test` (runner) green — `ir_graph_test`/`ir_exec_test` base+asan, 100/100 parser
+fixtures, 6/6 manifest fixtures (new), full binary build (both `::main` and `::service_main` entry points).
+No changes needed to `coordinator-singular` — 1b.0 introduces no new single-script-visible behavior (every
+existing test there passes `call_targets = None`/`allow_calls = false` implicitly, unchanged).
+
+### Post-implementation review round — two real gaps found and fixed
+
+A follow-up review caught two issues in the first 1b.0 landing, both confirmed and fixed before this
+was considered done:
+
+**1. (High) A call did not count as an executable step even under `allow_calls=true`.** `_node_depths`'s
+`inc` computation only checked `_is_operation`, never `_is_call` — so a workflow whose ONLY step is a `call`
+got `plan_length = 0`, tripping the PRE-EXISTING (unrelated) "a workflow must execute at least one operation"
+rule BEFORE 1b.0's real validation/gate-6 path was ever reached. The `gates1_4_ok` fixture had (unknowingly)
+masked this by prefixing every call-containing script with a dummy `ping {}` op. Fixed: `inc = 1` for a call
+too, but ONLY when `allow_calls` is true (DESIGN.md's own terminology — "a workflow call is a pending CALL
+OPERATION" — treats it as occupying one forward step, matching the eventual 1b.1 runtime); `allow_calls=false`
+makes this branch unreachable (the graph is already rejected earlier), so no existing single-script caller is
+affected. Fixing this correctly REQUIRED removing the dummy `ping {}` from every fixture — with the call now
+correctly contributing to depth, a `ping` BEFORE the call is genuinely non-final and needs a compensation
+binding it doesn't have (a second, correct rejection this fix surfaced, not a regression) — every fixture's
+parent script is now the call by itself (or the call followed by nothing), which is both simpler and the
+actually-intended shape. Added a dedicated, minimal fixture, `gate6_call_only_executable_step`, whose parent
+is a single bare `call` with no other operation at all, reaching the "1b.1 pending" message directly — proving
+this fix, isolated from every other gate.
+
+**2. (High/Medium) The "child returns a different type than the parent" case was never actually proven.**
+`_deployment_for` copied ONE shared `deployment` object for every script, overriding only `script_name`/
+`plan_version` — so `gates1_4_ok`'s single deployment-level `returns.type` applied IDENTICALLY to both child
+and parent. If gate 3/4's binding had a bug that used the caller's OWN return_type instead of resolving the
+callee's, this fixture could not have caught it (both types were the same value). The user separately
+generalized this finding into a broader requirement: a manifest holds multiple typed-function workflows
+(`name@version : ArgsType -> ResultType`), and BOTH sides of that signature must be per-workflow, not just
+`returns.type` — a deployment-level value may exist as a fallback default, never as the only source.
+
+Fixed for **returns**: each `scripts[]` manifest entry may now declare its own `"returns"` key, which
+OVERRIDES the shared `deployment.returns` for that script only (`_deployment_for` gained a
+`returns_override: &Optional<json.JsonNode>` parameter — skips copying `base.returns` when an override is
+given, then sets the override instead; `None` behaves exactly as before). `gates1_4_ok` was rewritten with
+GENUINELY different types: child declares `returns.type = {charge_id: int}`, parent declares
+`returns.type = {receipt_id: int}` (deliberately different FIELD NAMES so a wrong-type bug is structurally
+unable to pass) — parent's `return { receipt_id: result x.charge_id }` can only build if `result x.charge_id`
+resolves against the CHILD's own type (parent's type has no `charge_id` field) AND the parent's own return
+value is checked against the PARENT's own type — a sound cross-check by construction, no separate negative
+fixture needed.
+
+**Arguments were investigated and found to need NO code change** — per-workflow argument typing is ALREADY
+structurally guaranteed, for a different reason than returns: `.mf` SOURCE (not config) declares
+`argument_type` via its own `args { }` block, and `parser.lower`'s `_merge` UNCONDITIONALLY derives
+`argument_type` from the source, discarding whatever the wrapping config/deployment/manifest-entry would
+otherwise carry — this is why `returns.type` (which has no `.mf` syntax and stays config-sourced) needed a
+new manifest-schema field while `argument_type` did not: a manifest-level "arguments" override would be
+INERT for every real manifest script (100% `.mf`-sourced today) since `_merge` always overwrites it from the
+source regardless. `gate2_wrong_input`'s child/parent already declare genuinely different `args {}` shapes
+and already prove the call-input check resolves against the CALLEE's own declared type, not the caller's —
+this was true before this review round too, just not framed as the proof it already was.
+
+**Verification**: manifest fixtures re-verified 7/7 (all messages precise — no accidental fallback errors);
+full `just test` (runner) and `coordinator-singular` integration re-run clean after these fixes.
+
+### Post-implementation review round 2 — remove shared/inherited manifest signatures entirely
+
+The user tightened the model further: a manifest holds multiple typed-function workflows, and each one's
+`returns` contract must be declared EXPLICITLY on its OWN `scripts[]` entry — no optional fallback to
+`deployment.returns` at all (the previous round made per-script `returns` possible; this round makes it
+MANDATORY and removes the fallback path entirely). Rules: `scripts[].returns` required on every entry;
+no inheritance/default across scripts; explicit unit spelled `"returns": {}`, never omitted.
+
+**`_deployment_for` simplified**: its `returns_override` parameter (previously `&Optional<json.JsonNode>`,
+falling back to `base.returns` when absent) is now `returns_value: &json.JsonNode` — always given, no
+fallback branch left in the function at all. `base.returns` (the shared deployment's, if present) is now
+UNCONDITIONALLY stripped and never consulted, matching "no fallback" literally.
+
+**`_load_manifest`'s per-script loop** now REQUIRES the `returns` key on every `scripts[]` entry — its
+absence throws `RunnerError` immediately ("script 'X' is missing required 'returns' declaration... use
+\"returns\": {} for an explicit unit return"), before the script is even lowered. This is a hard manifest
+LOADING failure, not a downstream type-check rejection — a manifest missing this on any one script never
+gets past parsing that entry.
+
+**Manifest schema doc comment** rewritten to state the requirement directly, and to note that
+`argument_type` needs no analogous manifest-level field: `.mf` source's own `args { }` block already makes
+it per-script and mandatory-by-source-shape (unaffected by this round — see the prior round's finding that a
+manifest-level "arguments" override would be structurally inert, since `parser.lower`'s `_merge`
+unconditionally derives `argument_type` from the source regardless of what a wrapping config carries).
+
+**Fixtures**: every existing manifest fixture updated to declare `"returns": {}` (or a real type, for
+`gates1_4_ok`) on EVERY script entry — none rely on omission or a deployment-level default anymore. Added a
+NEW dedicated fixture, `gate_missing_returns_rejected` (a script entry that omits `returns` entirely),
+proving the new mandatory-declaration rule is enforced with the precise message. 8 fixtures total.
+
+**Verification**: manifest fixtures 8/8; full `just test` (runner) clean.
+
+**Regression found and fixed by the FIRST `coordinator-singular` integration run after this change**: 6
+PRE-EXISTING manifest-mode tests there (`manifest_submit_pins_and_runs`, `manifest_unknown_script_rejected`,
+`manifest_resume_by_pin`, `manifest_relative_path_resolved`,
+`manifest_resume_missing_revision_claimable_defers`, `manifest_resume_missing_revision_terminal_replays`)
+construct their own manifest JSON inline via two shared helpers (`write_manifest`/`write_manifest_at`) plus
+one hand-rolled site (`manifest_relative_path_resolved`) — none of their script entries declared `returns`,
+since that requirement didn't exist when they were written. All 6 immediately failed with `invalid_manifest`
+once `returns` became mandatory. Fixed by adding `"returns": {}` (unit — confirmed none of these tests' `.mf`
+sources use an explicit `return`) directly inside the two helpers and the one inline site. The same sweep
+also found and fixed two MORE pre-existing sites with the identical gap outside `coordinator-singular`:
+`integration/coordinator-singular/perf.py`'s inline manifest (a "reserve" perf-test script) and the
+committed example template `microflows/examples/manifest.json` (6 example workflows) — both confirmed unit
+(no explicit `return` in any referenced `.mf`), both fixed the same way, and the template's own `_comment`
+field updated to state the new per-script `returns` requirement for real users following it.
+
+**Verification (re-run after the regression fix)**: `coordinator-singular` integration green, **225/225**,
+0 FAILs — including all 6 previously-failing `manifest_*` checks now passing.
