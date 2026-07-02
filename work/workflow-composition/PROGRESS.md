@@ -89,7 +89,10 @@ verification pass; no separate acceptance step was needed.
 **`mfinspect` first slice is LANDED** (tooling/debugging aid, not a composition slice — packaged as a
 mariachi-style zipapp at `microflows/tools/mfinspect/`) — see "`mfinspect` first, then 1c compensation" at
 the bottom of this file for scope, status, and the carried-forward 1c observability/correlation requirement.
-**Active next step: slice 1c — compensation.**
+**Active next step: slice 1c — compensation. Design-to-implementation pass DRAFTED** (durable transition
+spec for reverse-child/T1 at `work/workflow-composition/1c-design.md`, 5 open questions flagged) — **review
+checkpoint, no implementation code written yet.** See "1c compensation — design-to-implementation pass
+started" at the bottom of this file.
 
 ### 1b.0a — DONE — **workflows are typed functions** (decided)
 - **`return <expr>` statement added to the parser and UN-GATED (step 6, DONE)** — see "Step 6 — DONE" below.
@@ -1931,3 +1934,67 @@ Minimum fields to carry/emit wherever applicable, so this join is always possibl
 identity). This is a requirement to design 1c's logging/event shape around, not a mandate to build log
 ingestion now — `mfinspect`'s first slice deliberately does not ingest logs (DB-only), but its JSON output
 preserves every one of these fields so a later log-correlation pass has something to join against.
+
+## 1c compensation — design-to-implementation pass started (DRAFT v2, review checkpoint)
+
+Started the design-to-implementation pass for the single MVP mechanism already decided (reverse-child/T1,
+DESIGN.md §5): full durable transition spec drafted at `work/workflow-composition/1c-design.md`, covering the
+`completed(4)->reversing(2)` reopen (fenced/idempotent, keyed on child state) and the two new SPs —
+`sp_mf_checkpoint_reverse_child_reopen` ("T1", an explicit parent+child transaction with dual event-time-skew
+checks and a matching event appended on both sides) and `sp_mf_checkpoint_reverse_child_settle` (genuinely new
+verification logic: it independently locks and confirms the child has actually reached
+`reversed(5)`/`resolved_exception(6)` before flipping the parent's checkpoint — it is not a reuse of
+`sp_mf_checkpoint_reverse_noop`, which is retired outright). Also covers how the parent's `_run_reversal`
+invokes this pair from a call checkpoint (submit-then-await, mirroring `NeedCall`'s existing forward pattern
+and reusing `sp_mf_call_inspect` UNCHANGED for the reverse-side await — no new inspect SP needed), terminal/
+blocked child outcomes during compensation (confirmed symmetric with the forward side's no-cascade rule;
+`failed(7)` is treated as diagnostic corruption evidence, never a soft success), replay behavior (T1 called
+unconditionally every pass, same idempotent-every-pass philosophy as `call_submit`; the child's own recovery
+is completely unchanged once reopened — the main simplifying property of this mechanism), and the required
+test list (nested A→B→C compensation with call-kind vs. participant-checkpoint cases kept distinct,
+no-parent-enumeration assertion, exactly-once reopen, a dedicated settle-refuses-non-terminal-child
+regression, a dedicated `failed(7)`-is-diagnosed regression, blocked-child-no-cascade, in-flight-crash
+recovery, fence-before-mutation ordering, dual event-time-skew). Also carries forward the 1c observability/
+correlation requirement concretely: new event kinds on both sides of T1 carry `parent_workflow_id`/
+`operation_seq`/`child_workflow_id` so `mfinspect` needs zero code changes for 1c, provided the new SPs follow
+the existing field-naming conventions (an acceptance criterion on the new SPs, not separate follow-up work).
+
+**No open questions remain. No implementation code has been written.** This remains a review checkpoint.
+
+### Review round: 2 High + 2 Medium findings, spec revised to v2
+
+1. **[High] The settle SP could not safely be "reverse_noop verbatim."** v1 proposed reusing
+   `sp_mf_checkpoint_reverse_noop`'s body unchanged for the post-compensation settle step — but that
+   body never inspected the child's state at all, so a runner bug (e.g. calling settle right after
+   reopen, before ever polling) could flip the parent's checkpoint to reversed while the child was
+   still `reversing(2)` or stuck `blocked_resolution(3)`. Fixed: `sp_mf_checkpoint_reverse_child_settle`
+   now independently locks and verifies the child's state is `reversed(5)`/`resolved_exception(6)`
+   inside its own transaction — new `child_not_terminal` (defer, not an error) / `child_not_compensated`
+   (diagnostic, carries the child's actual state) outcomes.
+2. **[High] T1 self-contradicted on whether it writes the parent row.** v1 claimed "the parent's row
+   is never written by this SP" while separately requiring a parent-side audit event at T1-reopen
+   time — appending an event inherently advances `current_event_seq`/`current_event_ts`, which is a
+   write. Resolved by keeping the parent event (parity with the participant path's own
+   `compensation_requested`, per review's recommendation) and making T1 an explicit two-row
+   (parent+child) transaction — precedented by `sp_mf_call_submit`, which already writes parent+child
+   in one transaction. Added dual event-time-skew checking (against both timelines, deferring past
+   whichever is later) since two event streams now advance in the same commit.
+3. **[Medium] `failed(7)` is now treated as corruption evidence, not a benign skip.** A failed child
+   should never have become a parent checkpoint at all (DESIGN.md §4), so v1's
+   "already-terminal-no-comp" framing for a checkpoint whose child is `failed(7)` would have silently
+   hidden that inconsistency. Both T1 and settle now return a distinct diagnostic outcome
+   (`child_state_inconsistent`/`child_not_compensated`) and perform no write; the runner aborts rather
+   than proceeding as if compensated.
+4. **[Medium] Tightened "no-op if nothing to undo" wording.** That phrasing (echoing DESIGN.md §5)
+   describes call-kind checkpoints only — a participant checkpoint with no declared compensation
+   binding still defers forever on the existing (unchanged, pre-1c) `no_compensation_binding` path; it
+   never silently no-ops. Added an explicit statement to this effect plus a nested test that covers
+   both the pure-call-kind-chain case and the participant-checkpoint-strands case separately, so they
+   can't be conflated.
+
+Open questions from the first round were resolved on review, not left open: `current_disposition=
+failed(2)` reuse confirmed OK (no new disposition code for MVP), `terminal_reason='parent_compensation'`
+confirmed OK, SP names confirmed (`sp_mf_checkpoint_reverse_child_reopen`/`_child_settle`) — and given
+finding #1, `sp_mf_checkpoint_reverse_noop` is now retired outright (removed, not kept as an unreachable
+alias) rather than renamed-with-identical-body as v1 proposed. **No open questions remain from this
+round; no implementation code has been written.** Still a review checkpoint pending acceptance of v2.
