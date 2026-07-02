@@ -18,6 +18,11 @@
 -- operation_id is the stable, caller(Microflows)-derived participant key,
 -- unique within a workflow run. Time discipline (§24.4): explicit timestamps,
 -- no NOW(); event ordering is event_seq.
+--
+-- call_kind codes (composition, 1b.1): 1 = participant (default), 2 = child_workflow. A
+-- child_workflow row reuses this table only for its idempotency spine (operation_id =
+-- child_workflow_id); all call-specific state lives in the sidecar tb_mf_call
+-- (work/workflow-composition/DESIGN.md §Durable state).
 CREATE TABLE IF NOT EXISTS `tb_mf_operation` (
 	`workflow_id` varbinary(16) NOT NULL,
 	-- Static call-site position of this operation within the workflow.
@@ -33,6 +38,13 @@ CREATE TABLE IF NOT EXISTS `tb_mf_operation` (
 	-- The typed input document (JSON OBJECT) and its canonical hash.
 	`input_json` mediumtext NOT NULL CHECK (json_valid(`input_json`) AND json_type(`input_json`) = 'OBJECT'),
 	`input_hash` varchar(64) NOT NULL,
+	-- Composition (1b.1): the ONLY column this table gains for workflow-to-workflow calls — kept
+	-- narrow deliberately (all call-specific state lives in the sidecar tb_mf_call). For
+	-- call_kind=2: operation_id = child_workflow_id, operation_name = child_script_name,
+	-- schema_version = CALL_OPERATION_SCHEMA_VERSION (a fixed constant, NOT the child plan
+	-- revision); status/result_json keep their EXACT existing meaning + ck_mf_operation_status_result
+	-- invariant (result_json becomes the child's workflow_return_json once settled) — none overloaded.
+	`call_kind` tinyint NOT NULL DEFAULT 1,
 	`status` tinyint NOT NULL,
 	-- The durable success result (JSON OBJECT), set on settle; NULL while requested.
 	`result_json` mediumtext NULL,
@@ -55,6 +67,8 @@ CREATE TABLE IF NOT EXISTS `tb_mf_operation` (
 	`redispatch_count` int NOT NULL DEFAULT 0,
 	PRIMARY KEY (`workflow_id`,`operation_seq`),
 	UNIQUE KEY `uq_mf_operation_opid` (`operation_id`),
+	-- 1 = participant (the default; every pre-1b.1 row), 2 = child_workflow.
+	CONSTRAINT `ck_mf_operation_call_kind` CHECK (`call_kind` IN (1,2)),
 	CONSTRAINT `ck_mf_operation_status` CHECK (`status` IN (1,2)),
 	-- status/result invariant: requested has no result; succeeded has a valid
 	-- JSON-object result. (requested + result, or succeeded + NULL, are

@@ -1424,6 +1424,18 @@ transaction primitive needed):
   and the child's timestamps in this one command — mirrors `sp_mf_workflow_create_planned`'s own single
   `arg_event_ts` covering workflow/plan/args `created_at` AND the created event's `event_ts` together; no
   separate `child_event_ts` is needed.
+  **Implementation note (entry validation):** "same shape as `create_planned`" implies, but should say
+  explicitly so it isn't missed in code/tests, that `sp_mf_call_submit` must validate these new child
+  inputs with the SAME arg-shape `SIGNAL`s `sp_mf_workflow_create_planned` already uses for the identical
+  fields, before anything else runs: `arg_child_plan_length IS NULL OR < 1` → `SIGNAL`; `arg_child_continuation`
+  not a valid JSON OBJECT → `SIGNAL`; `arg_child_event_payload` not a valid JSON OBJECT → `SIGNAL`;
+  `arg_child_next_attempt_at IS NULL` → `SIGNAL`; `arg_input_json` (the child's future `args_canonical`) not
+  a valid JSON OBJECT → `SIGNAL` — the exact same entry-check tier `sp_mf_workflow_create_planned` runs for
+  `arg_plan_length`/`arg_continuation`/`arg_event_payload`/`arg_next_attempt_at`/`arg_args` today (all
+  `SIGNAL`s, all before the fence/idempotent/recursion-guard phase in step 1-3 above, matching how every
+  other SP in this codebase puts arg-shape SIGNALs first, structured outcomes second). Carry this into the
+  SP regression test list too (round-3/round-4 already added submit-idempotency + zero-partial-rows-on-
+  rejection tests — add one more: each new child-input SIGNAL fires on its corresponding malformed input).
   `input_json` is DOUBLE-duty (round-2 finding #1): it is both the call operation's `input_json` AND, in the
   SAME call, canonicalized into the child's `tb_mf_workflow_args.args_canonical` — one caller-supplied value,
   two rows, one transaction; `CallConflict` now also covers an args-byte mismatch on replay.
@@ -1446,3 +1458,86 @@ The exact `NeedCall`/`advance()` IR-side wiring (DESIGN.md already specifies `St
 `_run_reversal` branch consuming the new `call_kind` field (sketched above but not yet code), and the exact
 runner call site that triggers `child_terminal_notify` post-commit are deferred to the runner-runtime design
 pass once this SP/schema plan is signed off.
+
+## 1b.1 — schema/SP implementation (LANDED, green)
+
+The SP/schema plan above (round 5, fully reviewed) is now implemented and passing. Scope matches
+exactly what was green-lit: (1) durable schema, (2) the 5 new SPs + 1 extended SP. Runner/host
+wiring (item 3) is explicitly NOT part of this pass — deferred to its own design/implementation
+round, as scoped from the start.
+
+**Schema**: `microflows/db/schema/tb_mf_workflow_operation.sql` (+`call_kind` TINYINT +
+`ck_mf_operation_call_kind`), `microflows/db/schema/tb_mf_workflow.sql` (+4 ancestry columns +
+`ck_mf_workflow_ancestry`), new `microflows/db/schema/tb_mf_workflow_operation_call.sql` (the
+`tb_mf_call` sidecar — named with the `tb_mf_workflow_operation_` prefix purely so Mariachi applies
+it after both FK parents, same trick `tb_mf_workflow_operation.sql` itself already uses). Migration
+`microflows/db/migrations/0005_workflow_call.sql` mirrors the schema files for an already-deployed
+install — no backfill needed anywhere (every pre-existing row is, by construction, a top-level
+workflow / a participant operation, satisfying both new CHECK constraints with zero data changes).
+
+**SPs**: `sp_mf_call_submit`, `sp_mf_call_inspect`, `sp_mf_call_hint_refresh`,
+`sp_mf_child_terminal_notify`, `sp_mf_checkpoint_reverse_noop` (all new), plus
+`sp_mf_checkpoint_reverse_head` extended (`Pending` outcome gains `call_kind`, defaulting to 1 if
+the operation row is somehow absent — defensive, never blocks existing behavior).
+
+**Two implementation-time refinements beyond the reviewed plan, both additive/consistency fixes,
+neither a design change:**
+1. **Plan-order conformance added to `sp_mf_call_submit`.** The reviewed plan didn't explicitly
+   call this out, but since a call op occupies a call-site position within the PARENT's own plan
+   exactly like a participant op, the SAME durable ordering rules `sp_mf_operation_request` already
+   enforces (`operation_seq` in `[1, plan_length]`, predecessor settled) apply here too — added,
+   mirroring that SP's exact logic and ordering (checked before the existing-row/idempotency check,
+   same as `operation_request`).
+2. **`operation_id`/`child_workflow_id` equality is an ENFORCED SIGNAL (`MfOperationIdChildMismatch`),
+   not a silent derivation.** The reviewed host signature listed both as separate parameters (mirroring
+   `operation_id` always being caller-supplied, never derived, throughout this codebase); the SP
+   entry-validates that they agree rather than silently trusting or overwriting one from the other.
+
+**Recursion guard**: implemented via a `WITH RECURSIVE` CTE (confirmed safe — the repo's pinned dev/test
+MariaDB fixture is 11.4, well past the 10.2 minimum for recursive CTEs). Walks `parent_workflow_id`
+links from the immediate parent upward (hops bounded by `max_call_depth`), joining
+`tb_mf_workflow_plan` at each ancestor, comparing against the child's own `(script_name, plan_version,
+content_hash)` — the base case (hops=0) is the parent itself, so a direct self-cycle (A calls A) is
+caught by the same query, no special-casing needed.
+
+**Tests**: new `microflows/db-tests/sp_call_test.py` (77 checks, mirrors `sp_operation_test.py`'s
+`check()`/`call()`/`EXPECTED_CHECKS`-completeness-guard pattern exactly), wired into
+`microflows/justfile`'s `_test-sp` alongside the existing file. Covers every minimum pin requested:
+fresh submit's full atomic bundle (op row, child workflow/plan/args/created-event, sidecar, parent
+continuation/event — verified column-by-column via direct `SELECT`s, not just the SP's own JSON
+outcome), every new child-input SIGNAL firing with zero rows left behind, both recursion-guard
+rejection paths (`call_cycle` via a manufactured self-cycle, `max_call_depth_exceeded` via a genuine
+2-hop nested call) each leaving zero partial rows, idempotent replay vs `call_conflict` on each
+individual immutable field, `call_inspect`'s pure-read property (snapshotted before/after, byte-
+identical), `call_hint_refresh`'s monotonic-by-time no-clobber behavior, `child_terminal_notify`'s
+strict scope (hint + wake only — parent state/event-count/op-row snapshotted before/after, confirmed
+unchanged), `reverse_head` surfacing `call_kind` for both a call and a participant checkpoint, and
+`checkpoint_reverse_noop`'s full state machine (reverses a call checkpoint, idempotent replay,
+rejects a participant checkpoint outright, out-of-order rejection, descend-to-next-checkpoint).
+
+**Verification**: `microflows`'s full `just test` green — `sp_operation regression: 156/156` (no
+regressions from the schema changes), `sp_call regression: 77/77` (new), parser fixtures 100/100,
+manifest fixtures 8/8, all unit tests, `JUST_EXIT=0`.
+
+**Next**: host wrappers (`call_submit`/`call_inspect`/`call_hint_refresh`/`child_terminal_notify`/
+`checkpoint_reverse_noop` on `MicroflowsHost`) + the runner-runtime pass (item 3: `NCallWorkflow`
+dispatch, `StepOutcome::NeedCall`, `_run_reversal`'s `call_kind` branch, the post-commit
+`child_terminal_notify` call site) — per the user's own sequencing, review of this landed schema/SP
+pass comes first.
+
+**Post-landing review found 3 more gaps, all fixed, `sp_call_test.py` now 79/79**: (1) MEDIUM —
+`sp_mf_call_submit`'s idempotent-replay check compared the sidecar's plan-identity triple
+(`script_name`/`plan_version`/`content_hash`) but never the child's `plan_length`, even though the
+durable plan pin is all four fields together and the fresh-submit write phase DOES write
+`plan_length` from `arg_child_plan_length`. Fixed: reads `tb_mf_workflow_plan` for the child on
+replay, includes `plan_length` in the agreement check, treats a missing plan row as `call_conflict`
+(same as a missing sidecar/args row) — pinned by `submit_conflict_plan_length`. (2) MEDIUM —
+canonicalization of the child's args was undocumented at this layer (the SP stores `arg_input_json`
+verbatim into `args_canonical`, with no host wrapper written yet to canonicalize it first). Fixed:
+the SP's header + parameter comment now explicitly states the same division of responsibility
+`sp_mf_workflow_create_planned` already documents for its own `arg_args` — canonicalization is the
+CALLER's job, never this SP's — and a new regression test (`submit_noncanonical_json_not_idempotent`)
+pins this by proving a byte-different-but-semantically-equal JSON document is rejected as
+`call_conflict`, not silently treated as `already_submitted`. (3) LOW — a stale comment in
+`sp_mf_child_terminal_notify` said "blocked (1, non-terminal)"; `child_status` code 1 is `pending`,
+`blocked` is 4 — comment corrected.

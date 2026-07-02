@@ -502,7 +502,13 @@ SP/schema plan in `PROGRESS.md` — see that file for the full transaction-bound
         top-level), all-or-none via a CHECK constraint. (Recursion key reads `script_name` here +
         `plan_version` / `content_hash` from `tb_mf_workflow_plan` — no new workflow column.)
 - [ ] `sp_mf_call_submit` — sibling of `sp_mf_operation_request`. **Strict validate-then-mutate phasing**
-      (no exceptions): (1) fence check; (2) existing-row check — a prior op row means this is a replay,
+      (no exceptions): (0) **arg-shape `SIGNAL`s for the new child inputs — implementation note, easy to
+      miss since it's implied by "same shape" rather than stated:** `sp_mf_call_submit` must validate
+      `arg_child_plan_length`/`arg_child_continuation`/`arg_child_next_attempt_at`/`arg_child_event_payload`/
+      `arg_input_json` with the SAME entry-check tier `sp_mf_workflow_create_planned` already runs for the
+      identical fields (`plan_length >= 1`, `continuation`/`event_payload` valid JSON OBJECTs, `next_attempt_at`
+      non-NULL, `args` a valid JSON OBJECT) — all `SIGNAL`s, all before step (1); (1) fence check; (2)
+      existing-row check — a prior op row means this is a replay,
       compare ALL immutable fields (`operation_id`, child plan identity, `input_hash`, `call_kind`, AND the
       child's `tb_mf_workflow_args.args_canonical` byte-for-byte) → `already_submitted` on full agreement,
       `call_conflict` on any mismatch (mirrors `operation_conflict`); (3) recursion guard — ONLY reached on a
@@ -558,7 +564,9 @@ SP/schema plan in `PROGRESS.md` — see that file for the full transaction-bound
       `child_terminal_notify` / `checkpoint_reverse_noop` + decoded outcome variants; extend
       `ReverseHeadOutcome::Pending` with `call_kind`.
 - [ ] Tests: SP regression — submit idempotency (incl. args-row agreement), submit rejection leaves zero
-      partial rows (recursion/depth), inspect (authoritative read, pure), hint-refresh (best-effort),
+      partial rows (recursion/depth), submit's new child-input arg-shape SIGNALs each fire on their
+      corresponding malformed input (`plan_length < 1`, non-object `continuation`/`event_payload`, NULL
+      `next_attempt_at`, non-object `args`), inspect (authoritative read, pure), hint-refresh (best-effort),
       terminal-notify (hint only, no settle), checkpoint-reverse-noop (call-checkpoint no-op reversal,
       defensive `not_call_checkpoint` guard on a participant checkpoint).
 

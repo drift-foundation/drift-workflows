@@ -91,6 +91,15 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow` (
 	-- literal `{}`; NULL on every non-completed state (see ck_mf_workflow_state_return).
 	-- Terminal replay reads this column directly — never re-derives from the graph.
 	`workflow_return_json` mediumtext NULL,
+	-- Composition (1b.1) ancestry — NULL for a top-level workflow, all four set together for a
+	-- child (see ck_mf_workflow_ancestry). The recursion-guard ancestor key is reconstructed by
+	-- walking parent_workflow_id links + joining tb_mf_workflow_plan for each ancestor's
+	-- (script_name, plan_version, content_hash) — script_name lives on THIS table, so no
+	-- additional identity column is needed here beyond these four.
+	`parent_workflow_id` varbinary(16) NULL,
+	`parent_node_id` varchar(64) NULL,
+	`root_workflow_id` varbinary(16) NULL,
+	`call_depth` int NULL,
 	`created_at` datetime(6) NOT NULL,
 	`updated_at` datetime(6) NOT NULL,
 	PRIMARY KEY (`workflow_id`),
@@ -125,5 +134,14 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow` (
 		(`state` = 4 AND `workflow_return_json` IS NOT NULL
 			AND json_valid(`workflow_return_json`) AND json_type(`workflow_return_json`) = 'OBJECT')
 		OR (`state` <> 4 AND `workflow_return_json` IS NULL)
+	),
+	-- Ancestry is all-or-none: a top-level workflow has none of the four; a child (created by
+	-- sp_mf_call_submit) has all four set together. call_depth >= 1 for a child (1 = direct
+	-- child of a top-level parent).
+	CONSTRAINT `ck_mf_workflow_ancestry` CHECK (
+		(`parent_workflow_id` IS NULL AND `parent_node_id` IS NULL
+			AND `root_workflow_id` IS NULL AND `call_depth` IS NULL)
+		OR (`parent_workflow_id` IS NOT NULL AND `parent_node_id` IS NOT NULL
+			AND `root_workflow_id` IS NOT NULL AND `call_depth` IS NOT NULL AND `call_depth` >= 1)
 	)
 ) ENGINE=InnoDB;

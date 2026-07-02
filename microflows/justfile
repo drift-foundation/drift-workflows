@@ -239,7 +239,8 @@ db-sql SQL:
 	mariadb -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"${MDB_ROOT_PWD}" {{DB_SCHEMA}} -e "{{SQL}}"
 
 # Focused SQL regression for the operation lifecycle stored procedures
-# (NULL fencing, command-identity conflict, idempotent settle, invariants).
+# (NULL fencing, command-identity conflict, idempotent settle, invariants) PLUS the
+# composition (1b.1) workflow-call stored procedures (sp_call_test.py).
 # Requires the schema loaded (just db-load-schema) + MDB_ROOT_PWD.
 # PUBLIC entry: acquire the shared DB lock, then run the private regression.
 test-sp:
@@ -260,6 +261,7 @@ _test-sp:
 	MARIACHI_PY="$(dirname "$MARIACHI_BIN")/python"
 	[[ -x "$MARIACHI_PY" ]] || { echo "error: mariachi venv python not found at $MARIACHI_PY (set MARIACHI_BIN to the venv's mariachi binary)" >&2; exit 1; }
 	"$MARIACHI_PY" db-tests/sp_operation_test.py
+	"$MARIACHI_PY" db-tests/sp_call_test.py
 
 # NOTE: the cross-component coordinator<->Singular E2E moved to the repository
 # level: integration/coordinator-singular/ (run via root `just test-integration`
