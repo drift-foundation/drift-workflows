@@ -112,7 +112,14 @@ fn _seed_reversing(wf: &Array<Byte>, cp_op: &Array<Byte>, trig: &Array<Byte>,
 	args.push(rpc.arg_string(_dup_str(ts)));
 	var stmt = conn.call(&"sp_mf_test_seed_reversing", &args).or_throw();
 	rpc.skip_remaining(&mut stmt).or_throw();
-	rpc.commit(&mut conn).or_throw();
+	// RpcCommitError is a plain struct, not a `pub error` (or_throw() requires
+	// `pub error`), so its Err arm is handled explicitly here -- re-thrown as
+	// RpcError (already `pub error`, already used via or_throw() above) so
+	// main()'s `catch unexpected` still reports it the same way.
+	match rpc.commit(&mut conn) {
+		core.Result::Err(e) => { throw rpc.RpcError(tag = e.cause_tag, message = "commit failed"); },
+		core.Result::Ok(_) => {}
+	}
 	val _ = conn.close();
 }
 

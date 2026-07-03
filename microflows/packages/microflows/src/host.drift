@@ -2626,9 +2626,23 @@ fn _finish_stmt_and_commit(stmt: &mut rpc.RpcStatement, conn: &mut rpc.RpcConnec
 		core.Result::Ok(_) => {}
 	}
 	match rpc.commit(conn) {
+		// RpcCommitError is a plain struct (kind: RpcCommitErrorKind, cause_tag:
+		// String), not the tag/message shape every other RPC error here uses.
+		// `kind` is NOT cosmetic: AmbiguousWrite (full COMMIT sent, no clean ACK
+		// read — may or may not be durable) and NotSent (never fully written —
+		// definitely not committed) are both retriable/reconcile-safe, distinct
+		// from ServerRejected (server is alive and definitively did NOT commit —
+		// non-retriable). Mapping all three to BackendRejected would turn a lost
+		// commit ACK into a hard rejection instead of a retriable path; only
+		// ServerRejected earns that.
 		core.Result::Err(e) => {
-			val tag_owned: String = e.tag;
-			throw HostException(kind = HostErrorKind::BackendRejected(detail = move tag_owned));
+			val tag_owned: String = e.cause_tag;
+			val kind = match e.kind {
+				rpc.RpcCommitErrorKind::ServerRejected => { HostErrorKind::BackendRejected(detail = move tag_owned) },
+				rpc.RpcCommitErrorKind::AmbiguousWrite => { HostErrorKind::BackendUnavailable(detail = move tag_owned) },
+				rpc.RpcCommitErrorKind::NotSent => { HostErrorKind::BackendUnavailable(detail = move tag_owned) }
+			};
+			throw HostException(kind = move kind);
 		},
 		core.Result::Ok(_) => {}
 	}
