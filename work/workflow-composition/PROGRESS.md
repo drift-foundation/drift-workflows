@@ -2076,3 +2076,73 @@ integration tests.
    correlation-field assertions rather than adding new ones, since the scenarios already existed.
 
 `sp_call_test.py`: **131/131** (was 125). `sp_operation_test.py` re-confirmed unaffected: 156/156.
+
+## 1c implementation, gated increment 2: host wrappers — LANDED, green
+
+Second gated increment: host bindings only, no runner behavior wiring (per explicit direction).
+
+- **`host.drift`**: added `checkpoint_reverse_child_reopen`/`checkpoint_reverse_child_settle`
+  methods + `CheckpointReverseChildReopenOutcome`/`CheckpointReverseChildSettleOutcome` variants
+  (exhaustive over every outcome string both SPs can return), replacing
+  `checkpoint_reverse_noop`/`CheckpointReverseNoopOutcome` entirely (removed, not aliased). Fixed
+  the stale `ReverseHeadOutcome::Pending` comment that still named the retired SP. Export list
+  updated.
+- **`packages/microflows/tests/e2e/live_call_test.drift`**: rewritten to drive the child through a
+  REAL forward completion (claim + operation_request + final operation_settle) before exercising
+  the new methods, so `checkpoint_reverse_child_reopen`'s happy path (`Reopened`) is genuinely
+  proven, not faked via the old test's manually-supplied settle result (which never touched the
+  child's own row at all). Also proves `AlreadyReopened` (idempotent replay), both `NotFound`
+  branches, and `checkpoint_reverse_child_settle`'s `ChildNotTerminal` outcome (called immediately
+  after reopen, while the child is genuinely still `reversing(2)`) — this last one is a real,
+  meaningful proof that the settle SP's own independent verification (finding #1 from the SP-layer
+  review) works through actual host wiring, not just the SP-layer regression. Deliberately did NOT
+  drive the child all the way to `reversed(5)` here (would need a full participant-checkpoint
+  reversal cycle on the child's own op) — that happy path is left to the nested A→B→C runner
+  integration test, matching this file's own stated scope ("reversal state machines... move to the
+  runner integration step").
+- **`runner.drift`**: minimal compile fix only, exactly as scoped. `_run_reversal`'s
+  `call_kind == 2` branch no longer calls the retired SP; it now returns
+  `Outcome::ReverseAborted(reason = "checkpoint_reverse_child_not_yet_wired", code = 8)`
+  unconditionally, without calling either new host method. Deliberately does NOT call reopen and
+  then discard the result — that would leave a real child durably reopened with no path to finish
+  compensating, which is worse than not touching it. This whole branch is replaced (not extended)
+  by the next phase.
+
+**Verification — mixed gate, exactly as expected:**
+- Required green (this phase's actual gate): `parser-fixtures` 100/100, `manifest-fixtures` 11/11,
+  `drift-test-run` 25 ok/0 failed (including `live_call_test` across base/asan/memcheck/run-*
+  variants), `sp_operation` 156/156, `sp_call` 131/131 — **all confirmed green.**
+- Expected red, not a regression: `call_integration_test.py`'s `checkpoint_noop` scenario now fails
+  2 of its 20 assertions (`call_integration regression: 18/20`) — `resume parent -> failed
+  (reversal complete)` gets `reverse_aborted`/`checkpoint_reverse_child_not_yet_wired` instead of
+  the old `reversed`/`compensated=true`, and the parent workflow correctly stays state=2 (reversing)
+  rather than reaching 5 (reversed). This is the exact, sole, already-documented gap — nothing else
+  in that suite regressed. `just test`'s overall exit code is 1 because of this one known scenario;
+  the phase's own gate (unit/e2e + SP regressions) is fully green.
+
+Next: full runner wiring (`_run_reversal`'s real submit-then-await-then-settle loop per
+`1c-design.md` §3), which will make `call_integration_test.py`'s `checkpoint_noop` scenario green
+again (likely renamed, since it's no longer testing a no-op) and unlock the nested A→B→C
+integration tests.
+
+### Post-increment-2 review: 2 Medium + 1 Low, all fixed
+
+1. **[Medium] `child_terminal_notify` was exercised while the child was still `forward(1)`.** The
+   test called it right after `call_hint_refresh`, before the child had actually reached a terminal
+   state — since notify is only ever valid after a genuine terminal transition, this normalized a
+   semantically invalid call even though the host wiring itself decoded correctly. Fixed by moving
+   the notify assertion to fire AFTER the child's real final `operation_settle` (which the previous
+   review round already added to the test); the pre-terminal sidecar-hint exercise stays under
+   `call_hint_refresh` only, which explicitly covers the non-terminal case by design.
+2. **[Medium/Low] The parent's call-op settle used a value that didn't match the child's actual
+   workflow return.** The child's final settle stored `workflow_return_json = {}` while the
+   parent's call-op settle used `{"receipt_id": 7}` — two different values, even though the
+   comment claimed the parent settle used "the child's authoritative completed return." Fixed by
+   making the child's own `workflow_return_json` also `{"receipt_id": 7}` (matching its own op's
+   result — a natural single-op-workflow shape), so the parent's settle now genuinely uses the same
+   value the comment always claimed.
+3. **[Low] Stale file header.** Updated from "composition (1b.1)" / "79 passing checks" to
+   "composition (1b.1/1c)" / "131/131", matching the file's actual current scope.
+
+Rebuilt and re-ran the full suite; `live_call_test` (base/asan/memcheck/run-*) and every other
+required-green item confirmed unaffected by these comment/ordering/value fixes.

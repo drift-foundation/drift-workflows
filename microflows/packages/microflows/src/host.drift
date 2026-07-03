@@ -76,7 +76,8 @@ export {
 	CallHintRefreshOutcome,
 	ChildTerminalNotifyOutcome,
 	BestEffort,
-	CheckpointReverseNoopOutcome
+	CheckpointReverseChildReopenOutcome,
+	CheckpointReverseChildSettleOutcome
 };
 
 // ===== Identity =====
@@ -301,10 +302,11 @@ pub variant CheckpointPendingDeferOutcome {
 // pinned reverse binding to reconcile/redispatch against.
 pub variant ReverseHeadOutcome {
 	NoneActive,
-	// call_kind (composition, 1b.1): 1=participant, 2=child_workflow — lets the runner branch to
-	// checkpoint_reverse_noop for a call checkpoint BEFORE ever looking up a compensation binding
-	// (a call checkpoint never has one). Only carried here (Pending) — a call checkpoint can never
-	// reach Dispatched, since nothing is ever dispatched for one.
+	// call_kind (composition, 1b.1/1c): 1=participant, 2=child_workflow — lets the runner branch to
+	// checkpoint_reverse_child_reopen ("T1") + checkpoint_reverse_child_settle for a call checkpoint
+	// BEFORE ever looking up a compensation binding (a call checkpoint never has one). Only carried
+	// here (Pending) — a call checkpoint can never reach Dispatched, since nothing is ever
+	// dispatched for one.
 	Pending(seq: Int, forward_operation_name: String, forward_payload: String, call_kind: Int),
 	Dispatched(seq: Int, forward_operation_name: String, reverse_invocation_id: String,
 	           reverse_operation_name: String, reverse_schema_version: Int,
@@ -441,22 +443,58 @@ fn _kind_to_best_effort(kind: HostErrorKind) nothrow -> BestEffort {
 	};
 }
 
-// checkpoint_reverse_noop: the no-comp reversal mechanism a call checkpoint actually needs — the
-// SAME reversal_state 1->2 transition + descend-or-terminal logic as reverse_settle, but WITHOUT
-// ever requiring/touching a reverse_invocation_id (nothing is ever dispatched for a call
-// checkpoint). NotCallCheckpoint is a defensive guard: this outcome must never be reachable for a
-// participant checkpoint (that must go through reverse_request/dispatch/reverse_settle instead).
-pub variant CheckpointReverseNoopOutcome {
+// checkpoint_reverse_child_reopen ("T1", composition 1c, work/workflow-composition/1c-design.md
+// §1-2): reopen a workflow-call checkpoint's COMPLETED child into reversal
+// (completed(4)->reversing(2)), fenced on the PARENT (the child has no lease of its own to fence —
+// a completed(4) row is always unclaimed). An explicit two-row (parent+child) transaction: the
+// parent gets a `compensation_requested` audit event in the SAME commit as the child's reopen.
+// Idempotent, keyed on the CHILD's current state: AlreadyReopened covers a prior reopen (child
+// state 2/3/5/6); ChildStateInconsistent is corruption evidence (a failed/otherwise-invalid child
+// state for a call checkpoint that should always have been completed(4)) — never a benign skip.
+pub variant CheckpointReverseChildReopenOutcome {
+	Reopened(child_workflow_id: String),
+	AlreadyReopened(child_state: Int),
+	ChildStateInconsistent(child_state: Int),
+	// Durable inconsistency: every completed(4) child settled >= 1 operation and therefore has
+	// >= 1 active checkpoint by construction; NULL here means that invariant broke.
+	ChildNoActiveCheckpoint,
+	OutOfOrder(top_seq: Int),
+	EventTimeSkew(defer_until: String),
+	FenceLost,
+	NotFound,
+	CheckpointNotFound,
+	NotCallCheckpoint,
+	CallSidecarNotFound,
+	ChildNotFound
+}
+
+// checkpoint_reverse_child_settle (composition 1c, 1c-design.md §2): settle a workflow-call
+// checkpoint once its child's OWN compensation has actually reached a terminal compensated state —
+// this SP independently re-locks and re-reads the child's CURRENT state inside its own transaction
+// and REQUIRES reversed(5)/resolved_exception(6) before flipping the parent's checkpoint; it never
+// trusts a separate, earlier call_inspect read as proof the child is done. ChildNotTerminal (child
+// still reversing/blocked_resolution) is the expected "not yet" shape, not an error — the caller
+// should defer and re-poll. ChildNotCompensated (child forward/completed/failed) is diagnostic,
+// never settled as if compensated. Same reversal_state 1->2 + descend-or-terminal mechanics as the
+// retired sp_mf_checkpoint_reverse_noop (that part was never wrong, only its name and the missing
+// child-state check were). NotCallCheckpoint is a defensive guard: this outcome must never be
+// reachable for a participant checkpoint (that must go through reverse_request/dispatch/
+// reverse_settle instead).
+pub variant CheckpointReverseChildSettleOutcome {
 	Reversed(terminal_reason: String),
 	Reversing(next_seq: Int),
 	AlreadyReversed,
+	ChildNotTerminal(child_state: Int),
+	ChildNotCompensated(child_state: Int),
 	OutOfOrder(top_seq: Int),
 	EventTimeSkew(defer_until: String),
 	FenceLost,
 	NotFound,
 	CheckpointNotFound,
 	CheckpointNotSettleable(reversal_state: Int),
-	NotCallCheckpoint
+	NotCallCheckpoint,
+	CallSidecarNotFound,
+	ChildNotFound
 }
 
 // The durable operation request — authoritative for recovery (a resuming worker
@@ -768,9 +806,13 @@ pub interface MicroflowsHost {
 	// child_terminal_notify_best_effort above.
 	fn call_hint_refresh_best_effort(self: &Self, workflow_id: &Array<Byte>, operation_seq: Int,
 	                                 child_status: Int, event_ts: &String) nothrow -> BestEffort;
-	// Reverse a call checkpoint as a no-op (no compensation was ever dispatched for it).
-	fn checkpoint_reverse_noop(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
-	                          seq: Int, event_ts: &String) -> CheckpointReverseNoopOutcome
+	// Reopen a workflow-call checkpoint's completed child into reversal ("T1", composition 1c).
+	fn checkpoint_reverse_child_reopen(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                                   seq: Int, event_ts: &String) -> CheckpointReverseChildReopenOutcome;
+	// Settle a workflow-call checkpoint once its child's own compensation reached a terminal
+	// compensated state (composition 1c).
+	fn checkpoint_reverse_child_settle(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
+	                                   seq: Int, event_ts: &String) -> CheckpointReverseChildSettleOutcome
 }
 
 // ===== Builder =====
@@ -2239,8 +2281,8 @@ implement MicroflowsHost for HostImpl {
 		}
 	}
 
-	pub fn checkpoint_reverse_noop(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
-	                               seq: Int, event_ts: &String) -> CheckpointReverseNoopOutcome {
+	pub fn checkpoint_reverse_child_reopen(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                                       seq: Int, event_ts: &String) -> CheckpointReverseChildReopenOutcome {
 		_validate_id16("workflow_id", workflow_id);
 		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
 		if seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "seq")); }
@@ -2254,20 +2296,61 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_int(seq));
 			args.push(rpc.arg_string(_dup(event_ts)));
-			val sp: String = "sp_mf_checkpoint_reverse_noop";
+			val sp: String = "sp_mf_checkpoint_reverse_child_reopen";
 			val doc = _call_sp_doc(conn, &sp, move args);
 			val outcome = _doc_outcome(&doc);
-			if outcome == "reversed" { return CheckpointReverseNoopOutcome::Reversed(_doc_str_opt(&doc, &"terminal_reason")); }
-			if outcome == "reversing" { return CheckpointReverseNoopOutcome::Reversing(_doc_int_req(&doc, &"next_seq", "revnoop-no-next-seq")); }
-			if outcome == "already_reversed" { return CheckpointReverseNoopOutcome::AlreadyReversed(); }
-			if outcome == "out_of_order" { return CheckpointReverseNoopOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "revnoop-no-top")); }
-			if outcome == "event_time_skew" { return CheckpointReverseNoopOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "revnoop-no-defer-until")); }
-			if outcome == "fence_lost" { return CheckpointReverseNoopOutcome::FenceLost(); }
-			if outcome == "not_found" { return CheckpointReverseNoopOutcome::NotFound(); }
-			if outcome == "checkpoint_not_found" { return CheckpointReverseNoopOutcome::CheckpointNotFound(); }
-			if outcome == "checkpoint_not_settleable" { return CheckpointReverseNoopOutcome::CheckpointNotSettleable(_doc_int_req(&doc, &"reversal_state", "revnoop-no-cpstate")); }
-			if outcome == "not_call_checkpoint" { return CheckpointReverseNoopOutcome::NotCallCheckpoint(); }
-			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:checkpoint_reverse_noop"));
+			if outcome == "reopened" { return CheckpointReverseChildReopenOutcome::Reopened(_doc_str_req(&doc, &"child_workflow_id", "reopen-no-child-id")); }
+			if outcome == "already_reopened" { return CheckpointReverseChildReopenOutcome::AlreadyReopened(_doc_int_req(&doc, &"child_state", "reopen-no-child-state")); }
+			if outcome == "child_state_inconsistent" { return CheckpointReverseChildReopenOutcome::ChildStateInconsistent(_doc_int_req(&doc, &"child_state", "reopen-no-child-state")); }
+			if outcome == "child_no_active_checkpoint" { return CheckpointReverseChildReopenOutcome::ChildNoActiveCheckpoint(); }
+			if outcome == "out_of_order" { return CheckpointReverseChildReopenOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "reopen-no-top")); }
+			if outcome == "event_time_skew" { return CheckpointReverseChildReopenOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "reopen-no-defer-until")); }
+			if outcome == "fence_lost" { return CheckpointReverseChildReopenOutcome::FenceLost(); }
+			if outcome == "not_found" { return CheckpointReverseChildReopenOutcome::NotFound(); }
+			if outcome == "checkpoint_not_found" { return CheckpointReverseChildReopenOutcome::CheckpointNotFound(); }
+			if outcome == "not_call_checkpoint" { return CheckpointReverseChildReopenOutcome::NotCallCheckpoint(); }
+			if outcome == "call_sidecar_not_found" { return CheckpointReverseChildReopenOutcome::CallSidecarNotFound(); }
+			if outcome == "child_not_found" { return CheckpointReverseChildReopenOutcome::ChildNotFound(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:checkpoint_reverse_child_reopen"));
+		} catch managed:ManagedError(e) {
+			val tag_owned: String = e.tag;
+			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
+		}
+	}
+
+	pub fn checkpoint_reverse_child_settle(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
+	                                       seq: Int, event_ts: &String) -> CheckpointReverseChildSettleOutcome {
+		_validate_id16("workflow_id", workflow_id);
+		if fencing_token < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "fencing_token")); }
+		if seq < 1 { throw HostException(kind = HostErrorKind::InvalidArg(field = "seq")); }
+		_validate_nonempty("event_ts", event_ts);
+		try {
+			var lease = _acquire_conn(self);
+			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
+			var args = rpc.new_args();
+			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_int(fencing_token));
+			args.push(rpc.arg_int(seq));
+			args.push(rpc.arg_string(_dup(event_ts)));
+			val sp: String = "sp_mf_checkpoint_reverse_child_settle";
+			val doc = _call_sp_doc(conn, &sp, move args);
+			val outcome = _doc_outcome(&doc);
+			if outcome == "reversed" { return CheckpointReverseChildSettleOutcome::Reversed(_doc_str_opt(&doc, &"terminal_reason")); }
+			if outcome == "reversing" { return CheckpointReverseChildSettleOutcome::Reversing(_doc_int_req(&doc, &"next_seq", "settle-no-next-seq")); }
+			if outcome == "already_reversed" { return CheckpointReverseChildSettleOutcome::AlreadyReversed(); }
+			if outcome == "child_not_terminal" { return CheckpointReverseChildSettleOutcome::ChildNotTerminal(_doc_int_req(&doc, &"child_state", "settle-no-child-state")); }
+			if outcome == "child_not_compensated" { return CheckpointReverseChildSettleOutcome::ChildNotCompensated(_doc_int_req(&doc, &"child_state", "settle-no-child-state")); }
+			if outcome == "out_of_order" { return CheckpointReverseChildSettleOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "settle-no-top")); }
+			if outcome == "event_time_skew" { return CheckpointReverseChildSettleOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "settle-no-defer-until")); }
+			if outcome == "fence_lost" { return CheckpointReverseChildSettleOutcome::FenceLost(); }
+			if outcome == "not_found" { return CheckpointReverseChildSettleOutcome::NotFound(); }
+			if outcome == "checkpoint_not_found" { return CheckpointReverseChildSettleOutcome::CheckpointNotFound(); }
+			if outcome == "checkpoint_not_settleable" { return CheckpointReverseChildSettleOutcome::CheckpointNotSettleable(_doc_int_req(&doc, &"reversal_state", "settle-no-cpstate")); }
+			if outcome == "not_call_checkpoint" { return CheckpointReverseChildSettleOutcome::NotCallCheckpoint(); }
+			if outcome == "call_sidecar_not_found" { return CheckpointReverseChildSettleOutcome::CallSidecarNotFound(); }
+			if outcome == "child_not_found" { return CheckpointReverseChildSettleOutcome::ChildNotFound(); }
+			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:checkpoint_reverse_child_settle"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
 			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));

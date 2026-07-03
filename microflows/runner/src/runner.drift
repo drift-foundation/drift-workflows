@@ -3371,32 +3371,17 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 			},
 			mf.ReverseHeadOutcome::Pending(seq, forward_operation_name, forward_payload, call_kind) => {
 				if call_kind == 2 {
-					// child_workflow (1b.1): no compensation was EVER dispatched for a call checkpoint —
-					// skip _compensation_for entirely and reverse it as a no-op directly.
-					val t = _now(host);
-					match host.checkpoint_reverse_noop(workflow_id, fencing_token, seq, &t) {
-						mf.CheckpointReverseNoopOutcome::Reversed(terminal_reason) => {
-							return Outcome::TerminalFailure(reason = move terminal_reason, compensated = true);
-						},
-						mf.CheckpointReverseNoopOutcome::Reversing(next_seq) => {},   // descend -> re-read head
-						mf.CheckpointReverseNoopOutcome::AlreadyReversed => {},       // idempotent replay -> re-read head
-						mf.CheckpointReverseNoopOutcome::OutOfOrder(top_seq) => {
-							return Outcome::ReverseAborted(reason = "checkpoint_reverse_noop_out_of_order", code = 8);
-						},
-						mf.CheckpointReverseNoopOutcome::EventTimeSkew(defer_until) => {
-							return _defer(host, workflow_id, fencing_token, &defer_until, "checkpoint_reverse_noop_skew", admission);
-						},
-						mf.CheckpointReverseNoopOutcome::FenceLost => {
-							return Outcome::ReverseAborted(reason = "checkpoint_reverse_noop_fence_lost", code = 7);
-						},
-						default => {
-							// NotFound / CheckpointNotFound / CheckpointNotSettleable / NotCallCheckpoint: a
-							// durable inconsistency for a checkpoint reverse_head just reported as this
-							// workflow's own active call checkpoint — never silently proceed.
-							return Outcome::ReverseAborted(reason = "checkpoint_reverse_noop_precondition", code = 8);
-						}
-					}
-					continue;
+					// child_workflow (composition 1c): the host bindings for
+					// checkpoint_reverse_child_reopen ("T1") / checkpoint_reverse_child_settle now exist
+					// and are proven directly at packages/microflows/tests/e2e/live_call_test.drift, but
+					// this runner-side submit-then-await-then-settle wiring
+					// (work/workflow-composition/1c-design.md §3) is NOT YET landed — that is the next
+					// phase, deliberately kept separate from this host-wrapper phase. Aborting outright
+					// here (never calling either new host method from this branch) is intentional: calling
+					// reopen without also implementing the await/settle loop would leave a real child
+					// durably reopened with no path to ever finish compensating — worse than not touching
+					// it at all. This whole branch is replaced, not extended, by the next phase.
+					return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_not_yet_wired", code = 8);
 				}
 				// participant (call_kind == 1): UNCHANGED existing compensation path.
 				val rev_id = _reverse_id(workflow_canon_hex, seq);
