@@ -1,10 +1,12 @@
-# Release draft — workflow composition MVP (microflows 0.6.0 · uflowsd 0.4.0 proposed)
+# Release draft — workflow composition MVP (microflows 0.6.0 · uflowsd 0.4.0)
 
-> **Status: DRAFT — NOT CERTIFIED.** This is a release-note *proposal* for hand-off to the cert
-> team, not a certified/sealed release. It has **not** gone through the cert/seal process and
-> `drift/manifest.json` (the sole version authority) has **not** been changed. Do not treat this
-> file, or any version numbers in it, as final until the cert team runs their own process and the
-> manifest is actually bumped.
+> **Status: DRAFT — NOT CERTIFIED.** This is a release-note proposal for hand-off to the cert team
+> (`../build-orchestrator`), not a certified/sealed release — certifying a release for distribution
+> is exclusively the cert team's role, never self-asserted from this repo. `drift/manifest.json`
+> (the sole version authority) **has** been bumped to the versions below (at explicit user
+> direction), but **author-claim has not been re-minted** (`just author-claim`/`just reseal`) and
+> **no distribution-certification step has been run**. Do not treat this file as final until the
+> cert team runs their own process.
 >
 > **This is a separate, later body of work from the already-certified
 > `work/uflowsd/RELEASE_ANNOUNCEMENT_DRAFT.md` (microflows 0.5.0 · uflowsd 0.3.0, Status:
@@ -14,13 +16,13 @@
 > landed in later commits and is not part of that cert. See "Version audit" below for how the two
 > relate.
 
-## Version audit (current state, as found — nothing in this section has been changed)
+## Version audit
 
-| Artifact | Current (`drift/manifest.json`) | Status | Proposed next |
+| Artifact | Was (last certified) | Now (`drift/manifest.json`) | Status |
 |---|---|---|---|
-| `singular` (package) | 0.7.0 | unchanged by composition (no `singular` code touched) | **0.7.0** (no bump needed) |
-| `microflows` (package) | 0.5.0 | **already certified/sealed** at this version (see below) for a *different* feature set | **0.6.0** (proposed) |
-| `uflowsd` (app) | 0.3.0 | **already certified/sealed** at this version for a *different* feature set | **0.4.0** (proposed, dep `microflows 0.6`) |
+| `singular` (package) | 0.7.0 | 0.7.0 (unchanged) | unchanged by composition (no `singular` code touched) |
+| `microflows` (package) | 0.5.0 | **0.6.0** (bumped) | `drift/manifest.json` updated; author-claim/reseal **not yet re-run** |
+| `uflowsd` (app) | 0.3.0 | **0.4.0** (bumped, dep `microflows 0.6`) | `drift/manifest.json` updated; author-claim/reseal **not yet re-run** |
 
 `mfrunner` (one-shot CLI) and `microflows-participant-stub` remain component-local dev artifacts
 (`0.0.0`) — unchanged convention, not Drift release artifacts. `mfinspect` (new, this body of work)

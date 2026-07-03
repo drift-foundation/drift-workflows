@@ -2489,3 +2489,21 @@ the user) to apply.
 **Verification:** repo-wide grep swept for every one of the five bug patterns after fixing to confirm
 no other occurrence was missed (none found); rebuilt `mfrunner` to confirm the doc-only changes
 didn't break anything (they don't touch code, expected to build clean — confirmed).
+
+### `drift/manifest.json` version bump applied (at explicit user direction)
+
+Clarified with the user: "self-certify"/`CERTIFIED` status is exclusively `../build-orchestrator`'s
+(the cert team's) role, never asserted from this repo — but `just author-claim` (an Ed25519
+signature over the *source* an artifact definition names, proving authorship/provenance) is a
+separate, repo-local mechanical step, not a certification claim. Per explicit "yes do 1" direction,
+bumped `drift/manifest.json` (the sole version authority) to the proposed next versions: `microflows`
+0.5.0→**0.6.0**, `uflowsd` 0.3.0→**0.4.0** (and `uflowsd`'s own `microflows` package_dep pin,
+0.5→0.6, kept in lockstep). `singular` untouched (no `singular` code touched by composition).
+Confirmed valid JSON and a clean 3-line diff (only the intended fields changed) before and after.
+
+**Not yet done, deliberately, pending further direction:** `just author-claim`/`just reseal` (signing
+the new manifest state) has **not** been run — the "do 1" instruction was read narrowly as "bump the
+manifest" only, distinct from "also re-sign it," given the two were offered as separate numbered
+steps. Updated `RELEASE_ANNOUNCEMENT_DRAFT.md`'s own version-audit table to reflect the bump
+(`Now (drift/manifest.json)` column) while still flagging that author-claim/reseal and distribution
+certification are both outstanding.
