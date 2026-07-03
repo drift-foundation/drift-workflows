@@ -16,14 +16,26 @@
 # EXPLICIT no-op recipe (see integration/coordinator-singular/justfile) — the
 # root never silently skips a missing gate.
 
+HEARTBEAT_SECS := "30"
+FLOCKER := env("DRIFT_TOOLCHAIN_ROOT", env("HOME") + "/opt/drift/certified/current/toolchain") + "/bin/flocker"
+
 # --- Aggregate gates (repository-wide readiness) ---
 
-# All gates: component unit + stored-procedure + component E2E, then every
-# cross-component integration suite. Ordered, fail-fast (set -e).
+# All gates in ONE combined plan (tools/emit_test_plan.py imports and merges
+# singular's + microflows's + microflows/runner's + every integration suite's
+# own build/run-unit/run-live jobs), handed to ONE drift_test_run.py
+# invocation: every DB-free compile across all four sources overlaps under
+# the shared flocker pool (previously three fully sequential `just test-*`
+# calls, each with its own separate compile phase), and the runner binary
+# (mfrunner/microflows-runner — identical sources/entry/trust-store) is built
+# exactly once via the executor's `out`-dedup instead of twice.
+# `test-singular`/`test-microflows`/`test-integration` below remain fully
+# independent, unchanged standalone recipes for anyone testing one component.
 test:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source tools/cert-env.sh
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
 	# Gate RESTORES ENTRY STATE exactly: bring up our private DB, then on exit (success OR failure) put it
 	# back as found — created->removed, was-stopped->stopped, was-running->left. Sub-gates see it RUNNING.
 	_dbstate="$("$DB_INSTANCE_SH" up)"
@@ -31,9 +43,24 @@ test:
 	  CREATED) trap '"$DB_INSTANCE_SH" down >/dev/null 2>&1 || true' EXIT ;;
 	  STARTED) trap '"$DB_INSTANCE_SH" stop >/dev/null 2>&1 || true' EXIT ;;
 	esac
-	just test-singular
-	just test-microflows
-	just test-integration
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	exec "{{FLOCKER}}" --key "$DB_LOCK" -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _test-combined
+
+# PRIVATE: emit + run the one combined plan. Runs ONLY under the shared lock
+# held by `test` (flocker is not re-entrant — the plan's own run-live jobs use
+# $DB_HELD_GROUP, a distinct key, for their internal serial chain).
+_test-combined:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	source tools/cert-env.sh
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
+	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
+	WORK="$(mktemp -d -t root-combined-test-XXXXXX)"
+	trap 'rm -rf "$WORK"' EXIT
+	python3 tools/emit_test_plan.py test --out "$WORK/plan.json"
+	python3 "$RUNNER" --plan "$WORK/plan.json" --work-dir "$WORK" --heartbeat {{HEARTBEAT_SECS}}
 
 # All performance suites, in the same order.
 perf:

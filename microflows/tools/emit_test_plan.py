@@ -79,7 +79,10 @@ def resolved_dep_flags():
 
 
 def src_files():
-    """Every .drift under microflows's manifest src dirs."""
+    """Every .drift under microflows's manifest src dirs. ABSOLUTE paths: a
+    job's `cmd` must resolve regardless of the invoking process's cwd (a
+    combined root-level plan runs from one cwd across several components'
+    sources), matching integration/coordinator-singular's emitter."""
     m = json.loads(MANIFEST.read_text())
     art = next((a for a in m.get("artifacts", []) if a["name"] == ARTIFACT), None)
     if not art:
@@ -90,7 +93,7 @@ def src_files():
         p = ROOT / d
         if p.is_dir():
             for f in p.rglob("*.drift"):
-                seen.add(str(f.relative_to(ROOT)))
+                seen.add(str(f))
     return sorted(seen)
 
 
@@ -119,9 +122,12 @@ def src_build(out_name, srcs, dep_flags, entry, test_rel, sanitize=False):
 
 
 def _entries(root):
+    # ABSOLUTE (see src_files() above) — is_test_entry/module_of still work: an
+    # absolute `rel` makes `ROOT / rel` return `rel` unchanged (pathlib: an
+    # absolute right operand replaces the whole path).
     p = ROOT / root
-    return [str(f.relative_to(ROOT)) for f in sorted(p.glob("*.drift"))
-            if p.is_dir() and is_test_entry(str(f.relative_to(ROOT)))]
+    return [str(f) for f in sorted(p.glob("*.drift"))
+            if p.is_dir() and is_test_entry(str(f))]
 
 
 # ------------------------------------------------------------------ gate: test
@@ -147,8 +153,9 @@ def emit_test():
             sys.exit(f"error: {rel} is not an executable test entry (module + fn main)")
         qual = f"{ARTIFACT}-e2e-{Path(rel).stem}"
         entry = f"{module_of(rel)}::main"
-        build.append(src_build(f"{qual}#base", srcs, dep_flags, entry, rel))
-        build.append(src_build(f"{qual}#asan", srcs, dep_flags, entry, rel, sanitize=True))
+        abs_rel = str(ROOT / rel)   # LIVE_TESTS entries are component-relative; job cmd needs absolute
+        build.append(src_build(f"{qual}#base", srcs, dep_flags, entry, abs_rel))
+        build.append(src_build(f"{qual}#asan", srcs, dep_flags, entry, abs_rel, sanitize=True))
         live_quals.append(qual)
 
     order = 0
@@ -180,7 +187,7 @@ def emit_one(rel):
         sys.exit(f"error: {rel} is not an executable test entry (module + fn main)")
     srcs, dep_flags = src_files(), resolved_dep_flags()
     name = Path(rel).stem
-    build = [src_build(name, srcs, dep_flags, f"{module_of(rel)}::main", rel)]
+    build = [src_build(name, srcs, dep_flags, f"{module_of(rel)}::main", str(ROOT / rel))]
     run_job = {"id": f"{name}#run", "cmd": [f"{{work}}/{name}"], "needs": [name]}
     if "/tests/e2e/" in rel:
         run_job["env"] = {"MICROFLOWS_E2E_NS": f"drift-test-{NONCE}-one"}
@@ -192,7 +199,8 @@ def emit_one(rel):
 
 def emit_compile(rel):
     srcs, dep_flags = src_files(), resolved_dep_flags()
-    extra = [] if rel in srcs else [rel]  # don't pass a src file twice
+    abs_rel = str(ROOT / rel)
+    extra = [] if abs_rel in srcs else [abs_rel]  # don't pass a src file twice (srcs are absolute)
     cmd = (["{driftc}", "--target-word-bits", TWB, "--package-root", PKG_ROOT]
            + dep_flags + _sanitize(False) + srcs + extra)
     return {"name": "compile", "phases": [{"name": "compile", "jobs": [{"id": "compile-check", "cmd": cmd}]}]}
