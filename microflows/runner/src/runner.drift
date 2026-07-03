@@ -325,7 +325,7 @@ variant CompStep {
 	Terminal(exit_code: Outcome)
 }
 
-fn main(argv: Array<String>) nothrow -> Int {
+pub fn main(argv: Array<String>) nothrow -> Int {
 	var p = cli.parser("mfrunner", "0.1.0", "Microflows coordinator runner (first slice)");
 	val _ = p.option_string("config", "c", "FILE", "JSON config: db + participants + operations registries (or use --manifest)", false);
 	val _ = p.option_string("workflow-id", "w", "HEX", "32-hex-char workflow id", false);
@@ -4424,7 +4424,7 @@ implement ServiceApp {
 }
 
 // The long-running service: `--manifest FILE` [`--port N`]. A second artifact (uflowsd).
-fn service_main(argv: Array<String>) nothrow -> Int {
+pub fn service_main(argv: Array<String>) nothrow -> Int {
 	var p = cli.parser("uflowsd", "0.1.0", "Microflows coordinator service (manifest-driven, long-running)");
 	val _ = p.option_string("manifest", "m", "FILE", "deployment manifest (named scripts + shared deployment routing)", true);
 	val _ = p.option_int("port", "p", "PORT", "listening port (default 8088)", false);

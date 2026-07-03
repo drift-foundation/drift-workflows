@@ -1,3 +1,24 @@
+## 2026-07-03 – 0.8.0: RpcCommitError compatibility (mariadb-rpc kind/cause_tag redesign)
+
+Bumped from 0.7.0 (source changed; 0.7.0 predates this work and was already an existing version, so
+reusing it would have meant re-signing an already-sealed number for new content).
+
+Upstream `drift-mariadb-client` redesigned `RpcCommitError` from a `tag`/`message` `pub error` into a
+plain struct — `kind: RpcCommitErrorKind` (`AmbiguousWrite` / `NotSent` / `ServerRejected`) plus
+`cause_tag: String` for diagnostics only, documented as "consumers branch on `kind`". `gateway.drift`'s
+`_finish_stmt_and_commit` hadn't caught up:
+
+- First pass (compat-only) read `e.tag`, which no longer exists — replaced with `e.cause_tag`, but still
+  collapsed every commit failure into `BackendRejected`.
+- Follow-up (review finding, high severity): that collapse was semantically wrong.
+  `AmbiguousWrite`/`NotSent` are retriable/reconcile-safe (the write may not have applied, or definitely
+  didn't); only `ServerRejected` (server alive, definitively did not commit) is a hard rejection. Now
+  matches on `e.kind`: `ServerRejected` → `BackendRejected`, `AmbiguousWrite`/`NotSent` →
+  `BackendUnavailable`.
+
+Verified: full root `just test` green (61/61) against a refreshed `mariadb-rpc` package pool (the locally
+cached one predated the upstream redesign and couldn't validate the fix on its own).
+
 ## 2026-06-06 – PR1: Singular/Microflows protocol hardening (minimal safe protocol)
 
 PR1 establishes the minimal safe Singular/Microflows task protocol — "at-least-once

@@ -54,7 +54,7 @@
       "kind": "app",
       "name": "uflowsd",
       "module_namespace": "microflows.runner",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "description": "Microflows coordinator daemon — manifest-driven HTTP front-door driving .mf plans + dispatching operations over MariaDB",
       "entry_module": "microflows/runner/src/runner.drift",
       "entry_point": "microflows.runner::service_main",
