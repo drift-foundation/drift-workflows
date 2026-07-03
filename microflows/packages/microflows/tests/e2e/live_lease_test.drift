@@ -233,7 +233,7 @@ fn scenario_lease_timeline() -> Int {
 	return 0;
 }
 
-fn main() nothrow -> Int {
+pub fn main() nothrow -> Int {
 	try {
 		var r = scenario_clock_read();
 		if r != 0 { return r; }

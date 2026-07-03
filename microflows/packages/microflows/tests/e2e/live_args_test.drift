@@ -147,7 +147,7 @@ fn scenario_args() -> Int {
 	return 0;
 }
 
-fn main() nothrow -> Int {
+pub fn main() nothrow -> Int {
 	try {
 		val r = scenario_args();
 		if r != 0 { return r; }

@@ -327,7 +327,7 @@ fn scenario_dispositions() nothrow -> Int {
 	return 0;
 }
 
-fn main() nothrow -> Int {
+pub fn main() nothrow -> Int {
 	var r = scenario_state_codes_names();
 	if r != 0 { return r; }
 	r = scenario_claimable_terminal();

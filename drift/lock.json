@@ -68,34 +68,34 @@
           "dep_type": "co-artifact"
         },
         "net-tls": {
-          "version": "0.6.0",
-          "sha256": "5ca2b0d22e52ac4699b70a4b1fbc53c935e617c5f9c6bad8d9c7b2f19d936171",
+          "version": "0.6.1",
+          "sha256": "120e7b4a38a33114cc79d3deed3fd4821547476cfc8c76e36b3cde247081c79e",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:16bce96817c6e5e1ea302929e951b9b67947090c018bcc7ff5838a0e0eac0cc3",
+          "source_content_id": "sha256:f8dba0837d102b1c61ccb9ce201feb03d36bfb56a7e4f3cdc86ca3052dcd7420",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         },
         "web-client": {
-          "version": "0.5.0",
-          "sha256": "30f2d7aabcd2160294c7c24d54a9e5935bf656fdfd37e8c24d3c5ec69d60d5d5",
+          "version": "0.5.1",
+          "sha256": "9bbbaaf06c0cca9224b05a426c23722ab84e50e45fb15763712dfa3323b5d13f",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:2d7ba2bb89810eca01e1e89695c198d5fecddaad326ebe55e8c604eeb9edb05f",
+          "source_content_id": "sha256:9ed5715bff7eaf0faf16f8d5a09d75eb189cda6b40ea95679ed95c3ece9383d8",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         },
         "web-jwt": {
-          "version": "0.5.0",
-          "sha256": "614824f17574d934d212cb5da69af9230f5ed314ca3be1ef077b1a91c277bab3",
+          "version": "0.5.1",
+          "sha256": "1b63b7a5ba7af96990ce22dc638b8b0845667553b9b421280334732c873bb7ee",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:3b423060246a8856ba9b7e4cb3312e3b53bab3dab1d593bd64c97e5665840afe",
+          "source_content_id": "sha256:df16d406a2a36046e1fcf20e06b0894b80f0531ab49f2b7467b87f79546951b2",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         },
         "web-rest": {
-          "version": "0.6.0",
-          "sha256": "f505a57949762d6d1db79679f6a3842864d81a56313939f968beec3d978b6ba5",
+          "version": "0.6.1",
+          "sha256": "5fd80debc2919f423d02c393ec3141731b27a3bfef3f17c8af2eab529ea7fc32",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:e01cf823eb956bf47a25b13b1c8e3811ce06954be2f20769382be4983b1eeb8e",
+          "source_content_id": "sha256:0fab012d7e3e3f51fa5a55ba693255c8a5ad18246f3c8e605b426d6146e8a466",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         }

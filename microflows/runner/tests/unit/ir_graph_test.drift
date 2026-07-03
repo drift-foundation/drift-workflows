@@ -215,7 +215,7 @@ fn scenario() nothrow -> Int {
 	return 0;
 }
 
-fn main() nothrow -> Int {
+pub fn main() nothrow -> Int {
 	val r = scenario();
 	if r != 0 { return r; }
 	return 0;

@@ -102,7 +102,7 @@ fn _cycle(g: arc.Arc<gw.SingularGateway>, seed: Int) nothrow -> Bool {
 	return ok;
 }
 
-fn main(argv: Array<String>) nothrow -> Int {
+pub fn main(argv: Array<String>) nothrow -> Int {
 	var gopt: Optional<arc.Arc<gw.SingularGateway>> = Optional<arc.Arc<gw.SingularGateway>>::None();
 	try { gopt = Optional<arc.Arc<gw.SingularGateway>>::Some(_build_gw()); }
 	catch unexpected { con.eprintln("singular-perf: gateway build failed"); return 2; }

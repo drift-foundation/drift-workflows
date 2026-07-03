@@ -697,7 +697,7 @@ fn _pj(text: &String) -> json.JsonNode {
 	}
 }
 
-fn main() nothrow -> Int {
+pub fn main() nothrow -> Int {
 	var r = 0;
 	try { r = scenario(); } catch unexpected { return 91; }
 	return r;

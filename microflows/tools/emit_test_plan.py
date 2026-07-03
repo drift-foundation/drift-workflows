@@ -98,8 +98,10 @@ def src_files():
 
 
 def is_test_entry(rel):
+    # drift >= 0.33.67 requires the --entry target to be `pub`, so `main` may be
+    # declared `pub fn main` (older tests still use bare `fn main`).
     txt = (ROOT / rel).read_text(errors="ignore")
-    return bool(re.search(r"^module\s+", txt, re.M)) and bool(re.search(r"^fn\s+main\(", txt, re.M))
+    return bool(re.search(r"^module\s+", txt, re.M)) and bool(re.search(r"^(?:pub\s+)?fn\s+main\(", txt, re.M))
 
 
 def module_of(rel):

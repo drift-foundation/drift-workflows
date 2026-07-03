@@ -936,7 +936,7 @@ fn scenario_reclaim_expired() -> Int {
     return 0;
 }
 
-fn main() nothrow -> Int {
+pub fn main() nothrow -> Int {
     con.println("01 start_complete_resume");
     val r01 = try scenario_start_complete_resume() catch { 199 };
     if r01 != 0 { return r01; }

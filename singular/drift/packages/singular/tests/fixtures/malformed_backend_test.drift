@@ -121,7 +121,7 @@ fn scenario_history_event_status() -> Int {
     return 0;
 }
 
-fn main() nothrow -> Int {
+pub fn main() nothrow -> Int {
     con.println("malformed object-contract (envelope + payload + owner/checkpoint; accept + reject)");
     val r1 = try scenario_object_contract() catch { 91 };
     if r1 != 0 { return r1; }

@@ -950,7 +950,7 @@ fn scenario() -> Int {
 	return 0;
 }
 
-fn main() nothrow -> Int {
+pub fn main() nothrow -> Int {
 	var r = 0;
 	try { r = scenario(); } catch unexpected { return 91; }
 	if r != 0 { return r; }

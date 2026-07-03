@@ -124,7 +124,7 @@ const OP_UNDO_DECIDE: String = "undo-decide";   // no-op compensation for `decid
 
 // ===== Entry point =====
 
-fn main(argv: Array<String>) nothrow -> Int {
+pub fn main(argv: Array<String>) nothrow -> Int {
 	var p = cli.parser("participant-stub", "0.1.0", "Microflows reference participant (Singular-backed)");
 	val _ = p.option_string("config", "c", "FILE", "path to JSON config (singular subtree, port, service-group, worker-id)", true);
 	val _ = p.option_int("port", "p", "PORT", "listening port (default: 8080)", false);
