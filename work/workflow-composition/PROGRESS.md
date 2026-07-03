@@ -2146,3 +2146,147 @@ integration tests.
 
 Rebuilt and re-ran the full suite; `live_call_test` (base/asan/memcheck/run-*) and every other
 required-green item confirmed unaffected by these comment/ordering/value fixes.
+
+## 1c implementation, gated increment 3: runner wiring — LANDED, green
+
+Third and final gated increment: the actual `_run_reversal` behavior, replacing the placeholder
+abort from increment 2 with the real design (`1c-design.md` §3).
+
+- **`runner.drift`**: `_run_reversal`'s `call_kind == 2` branch now implements the full
+  reopen-then-await-then-settle loop: calls `checkpoint_reverse_child_reopen` unconditionally on
+  every pass (idempotent, same philosophy as `call_submit`); on success, reads the child's current
+  state via the SAME `call_inspect` the forward side's `NeedCall` already uses; if the child is
+  non-terminal (`reversing`/`blocked_resolution`), defers the parent via the new
+  `_defer_reverse_pending` helper (a small reverse-side sibling of `_defer_pending`, reporting
+  `"compensation_pending"` instead of the forward-flavored `"operation_pending"` — matching the
+  reason-string convention already used elsewhere in this file for reverse-side waits) — NO CASCADE:
+  the parent stays `reversing(2)`, never `blocked_resolution(3)`; if the child is terminal, calls
+  `checkpoint_reverse_child_settle` and handles `Reversed` (parent's own terminal, `compensated=true`),
+  `Reversing`/`AlreadyReversed` (descend, re-read `reverse_head` — restored the participant path's own
+  established `continue;` idiom here, since the branch's own outcome doesn't return in those two
+  cases and would otherwise fall through into the unrelated participant code below), `ChildNotTerminal`
+  (a stale-read race, defer and re-poll, not an error), and every other outcome as a diagnostic abort.
+  Participant checkpoint reversal (`call_kind == 1`) is completely untouched.
+- **`call_integration_test.py`**: renamed `scenario_call_checkpoint_noop_reversal` to
+  `scenario_reverse_child_compensation` and rewrote it end to end — the manifest now gives the
+  child's `noop` op a real compensation binding (`noop_undo`, via the stub), so the scenario proves
+  the actual reopen→await→settle cycle: parent submits, child completes, parent's resume reopens the
+  child and defers (no cascade, asserted both via the rendered `"pending"` outcome and a direct
+  `tb_mf_workflow.state == 2` read), a separate drive of the child runs its own participant
+  compensation to `reversed(5)`, and the parent's next resume observes that and settles to its own
+  terminal (`compensated=true`, internal state `5`). Added a new
+  `scenario_nested_abc_compensation` — the acceptance test `DESIGN.md` calls out: A calls B calls C,
+  A's reversal reopens B, B's *own* reverse loop (the same generic machinery, recursively) reopens C,
+  C's participant checkpoint compensates, and the settle cascades back up through B to A — asserting
+  every level's own terminal state plus a DB-level structural check that A's own
+  `compensation_requested` event references only B's `child_workflow_id`, never C's (no parent
+  enumeration of child internals). Module docstring updated from "1b.1" to "1b.1/1c".
+- Also fixed while investigating: this file's module docstring stale "1b.1"-only framing (matches
+  the same nit class caught in `live_call_test.drift`'s prior review round).
+
+**Verification — fast iteration first, then full gate:**
+- Ran `call_integration_test.py` standalone (under `flocker`, against the live DB) before the full
+  suite to iterate quickly: **43/43 passed on the first attempt** — the design's timing/sequencing
+  reasoning (no cascade, idempotent re-reopen, descend-vs-terminal settle) held up exactly as
+  specified, no bugs found in this increment.
+- Then ran the full `just test` gate: **parser-fixtures 100/100, manifest-fixtures 11/11,
+  drift-test-run 25 ok/0 failed (including `live_call_test` across every variant),
+  sp_operation 156/156, sp_call 131/131, call_integration 43/43 (up from the prior phase's
+  documented 18/20 mixed-red gap) — `JUST_EXIT=0`.** This is the first phase in the 1c sequence
+  where the full suite is genuinely all-green, not a mixed gate with a deliberately-deferred red
+  item — matching the gate target ("full `just test` green, not mixed red") exactly.
+
+1c compensation (reverse-child/T1) is now fully landed end to end: SP layer, host wrappers, and
+runner wiring all green, with nested cascading compensation pinned by an integration test. Per the
+"Post-1c MVP release path" section immediately below, the next step is MVP stabilization and
+release — not a new feature slice.
+
+### Post-increment-3 review: 2 Medium findings, both fixed
+
+1. **[Medium] Impossible reverse-side `call_inspect` `NotFound` was treated as a retryable defer.**
+   `runner.drift`'s `call_kind == 2` branch handled `CallInspectOutcome::NotFound` (right after a
+   successful `checkpoint_reverse_child_reopen`) via `_defer_dispatch("call_sidecar_missing")` — the
+   same reason used on the FORWARD side right after `call_submit`'s own first write. But on the
+   REVERSE side, the reopen SP just above already proved both the call sidecar and the child row
+   exist in durable state (it resolves `child_workflow_id` via that same sidecar and locks the child
+   row) — a `NotFound` here is a durable inconsistency, not a repairable one, and deferring would
+   retry forever (reopen re-succeeds idempotently as `AlreadyReopened`, `call_inspect` fails again,
+   with no self-healing action a retry could take). Fixed by making this a diagnostic
+   `Outcome::ReverseAborted(reason = "checkpoint_reverse_child_call_inspect_missing", code = 8)`,
+   matching every other durable-inconsistency outcome already in this branch.
+2. **[Medium] Reverse-side blocked-child no-cascade wasn't pinned at runner-integration level.**
+   `sp_call_test.py` already covers `settle_refuses_blocked` at the SP layer, but nothing exercised
+   the actual runner branch (`_run_reversal`'s `call_kind == 2`, `state == STATE_BLOCKED` path) end
+   to end through the compiled binary — the exact gap `1c-design.md` §6 calls out. Fixed by adding
+   `scenario_reverse_child_blocked_no_cascade` to `call_integration_test.py`: the child's own
+   compensation dispatch (`noop_undo`) is forced to a non-retryable HTTP 400 rejection via a new
+   `_REJECT_OPS` set the in-process stub checks per-operation-name (parsed from the PUT URL path,
+   matching `runner.drift`'s own `_op_url` shape) — driving the child into `blocked_resolution(3)`
+   — then confirms the parent's resume observes `is_terminal=0`/`state=STATE_BLOCKED`, defers
+   (rendered `"pending"`), and stays `reversing(2)` durably, never cascading to `blocked_resolution`
+   itself.
+
+**Verification:** ran `call_integration_test.py` standalone first (fast iteration) — **50/50 passed
+on the first attempt** (43 prior + 7 new blocked-no-cascade checks). Then re-ran the full `just test`
+gate: still fully green across every category (`parser-fixtures` 100/100, `manifest-fixtures` 11/11,
+`drift-test-run` 25/25, `sp_operation` 156/156, `sp_call` 131/131, `call_integration` 50/50),
+`JUST_EXIT=0` — no mixed-red, same as the prior increment-3 landing.
+
+## Post-1c MVP release path
+
+**What's next after 1c lands is MVP stabilization and certification/release — not Slice 2, not
+Slice 3, not another feature slice.** This is a deliberate decision, recorded here so it isn't
+accidentally relitigated or drifted past: once 1c runner wiring is green, the literal answer to
+"what's next?" is "stabilize and ship the MVP," full stop.
+
+### MVP scope (what ships)
+
+- Single async workflow call (composition 1b.1/1c) — one parent calling one child, awaited via
+  `call_inspect`, no fan-out.
+- Typed args/returns across the call boundary.
+- No blocked-cascade — a child stuck in `blocked_resolution(3)` (forward OR reverse) never
+  escalates the parent into a blocked state; the parent defers/polls instead (§0/§3/§4 of
+  `1c-design.md`).
+- Reverse-child compensation (1c) — `checkpoint_reverse_child_reopen`/`_settle`, cascading through
+  arbitrarily nested call chains via the same generic reversal machinery recursively.
+- `mfinspect` basic inspection support — `inspect <workflow_id>` / `list --script ...` read-only
+  dumps, sufficient for debugging a call/compensation tree.
+
+### Explicitly out of MVP (deferred, not forgotten — see backlog below)
+
+- Fan-out (parallel/multiple concurrent calls from one parent).
+- `on failed` / failure-as-data (a call's rejection surfaced to the parent as a value the parent's
+  own script can branch on, rather than always driving reversal).
+- Stuck-child liveness budget (an upper bound on how long a parent will poll a non-terminal child
+  before treating the wait itself as an error condition).
+- A separate compensating-workflow mode (a script explicitly authored to run only during
+  reversal, distinct from the forward script) — `compensation <wf>@<version>` stays build-rejected,
+  unchanged from 1a.
+
+### Post-1c release checklist
+
+- [ ] No expected-red tests anywhere in the suite — the `call_integration_test.py` `checkpoint_noop`
+      gap closes as part of 1c runner wiring; confirm no other scenario is carrying a similar
+      "known, deliberate" red checkbox before calling this done.
+- [ ] Full root gate green (`just test` at the repo root, not just `microflows/just test`).
+- [ ] Stale `checkpoint_noop` / "1b.1"-only wording swept across the codebase (SQL comments, Drift
+      doc comments, test docstrings, `work/` docs) — grep for `checkpoint_noop` and bare `1b.1`
+      mentions that should now say `1b.1/1c` or just `1c`.
+- [ ] Nested A→B→C call + compensation case verified end to end (both the fully-unwinding
+      call-kind-only chain AND, if in scope, the "participant checkpoint present, correctly
+      strands" variant from `1c-design.md` §6 — confirm which of these landed and note any gap).
+- [ ] `mfinspect` smoke-tested by hand against that same nested A→B→C tree (not just unit-tested in
+      isolation) — confirm the call/compensation correlation fields actually read sensibly for a
+      human debugging a real cascade.
+- [ ] Docs / user-facing examples updated to reflect the MVP surface (single call, typed
+      args/returns, compensation) — no lingering "coming soon" language for shipped behavior.
+- [ ] Version bump, manifest updates, release notes, and cert handoff prepared.
+
+### Backlog after MVP release (in no particular priority order yet)
+
+- Fan-out (parallel calls).
+- Failure-as-data (`on failed` / non-reversal-driven rejection handling).
+- Stuck-child liveness budget.
+- Richer inspect/log aggregation (log-correlation tooling beyond `mfinspect`'s current DB-only
+  dump, cross-referencing service logs by the correlation fields 1c's observability pass already
+  established).

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Runner-level integration test for composition (1b.1): actual runtime dispatch of
-workflow-to-workflow calls, driven through the built `mfrunner` CLI binary against a live DB.
+"""Runner-level integration test for composition (1b.1/1c): actual runtime dispatch of
+workflow-to-workflow calls, including reverse-child compensation, driven through the built
+`mfrunner` CLI binary against a live DB.
 
 Unlike run_manifest_fixtures.py (build-time-only, DB-connection-free) and sp_call_test.py (SP-layer
 only, never touches the runner), this exercises the ACTUAL `_run_forward`/`NeedCall` dispatch and
@@ -68,9 +69,16 @@ def new_wf_id():
 
 
 # ===================================================================
-# Stub participant: always succeeds with an empty result, per uflowsd_participant_contract.md §4.1
-# (PUT 200 -> {"result": {...}}, result mandatory and an object).
+# Stub participant: succeeds with an empty result, per uflowsd_participant_contract.md §4.1
+# (PUT 200 -> {"result": {...}}, result mandatory and an object) -- EXCEPT for an operation name
+# named in _REJECT_OPS, which gets a 400 instead (classified by the runner as a definite,
+# non-retryable rejection -- DispatchResult::Rejected -- used to force a participant compensation
+# into blocked_resolution(3) for the reverse-side no-cascade test). Scenarios add/discard entries
+# around their own drive calls; tests run sequentially so this shared, mutable set is safe.
 # ===================================================================
+_REJECT_OPS = set()
+
+
 class _StubHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -83,10 +91,28 @@ class _StubHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _respond_rejected(self):
+        body = b'{"error":"rejected"}'
+        self.send_response(400)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _op_name_from_path(self):
+        # PUT URL shape (runner.drift's own _op_url): /microflows/v1/operations/<name>/<id_hex>.
+        parts = self.path.strip("/").split("/")
+        if len(parts) >= 4 and parts[0] == "microflows" and parts[2] == "operations":
+            return parts[3]
+        return None
+
     def do_PUT(self):
         n = int(self.headers.get("Content-Length", 0))
         if n:
             self.rfile.read(n)
+        if self._op_name_from_path() in _REJECT_OPS:
+            self._respond_rejected()
+            return
         self._respond_ok()
 
     def do_GET(self):
@@ -169,6 +195,13 @@ CHILD_FAIL_SRC = "args { }\nop noop { input: {} }\nsteps {\n  noop {}\n  fail \"
 PARENT_CALL_ONLY_SRC = "args { }\nsteps {\n  call child@1.0.0 { }\n}\n"
 PARENT_CALL_THEN_FAIL_SRC = "args { }\nsteps {\n  call child@1.0.0 { }\n  fail \"boom\"\n}\n"
 PARENT_VALUE_SRC = "args { x: int }\nsteps {\n  let r = call child@1.0.0 { x: arg x }\n  return { y: result r.y }\n}\n"
+
+# Nested A -> B -> C (composition 1c): B's own graph is a single call to C (same shape as
+# PARENT_CALL_ONLY_SRC, but calling "c"); A's own graph calls B then authors a fail (same shape as
+# PARENT_CALL_THEN_FAIL_SRC, but calling "b") -- distinct source strings are needed since the call
+# target name is baked into the .mf source text, unlike CHILD_OK_SRC/PARENT_*_SRC's own "child" name.
+B_CALLS_C_SRC = "args { }\nsteps {\n  call c@1.0.0 { }\n}\n"
+A_CALLS_B_THEN_FAIL_SRC = "args { }\nsteps {\n  call b@1.0.0 { }\n  fail \"boom\"\n}\n"
 
 
 def child_row_count(conn, parent_hex, seq=1):
@@ -311,43 +344,252 @@ def scenario_replay_no_second_child(stub_url):
 
 
 # ===================================================================
-# Scenario 5: call checkpoint reverses as a no-op.
+# Scenario 5: call checkpoint reverses via reverse-child compensation (composition 1c) -- T1
+# reopens the completed child, the child runs its OWN participant compensation (noop/noop_undo) to
+# its own internal reversed(5), then the parent's checkpoint settles once it observes that.
 # ===================================================================
-def scenario_call_checkpoint_noop_reversal(stub_url):
+def scenario_reverse_child_compensation(stub_url):
     with tempfile.TemporaryDirectory() as d:
         mpath = write_manifest(d, [
             ("child", "1.0.0", CHILD_OK_SRC, UNIT_RETURNS),
             ("parent", "1.0.0", PARENT_CALL_THEN_FAIL_SRC, UNIT_RETURNS),
-        ], stub_url, [NOOP_OP])
+        ], stub_url, [NOOP_WITH_COMP_OP, NOOP_UNDO_OP])
         parent_id = new_wf_id()
         r1 = run_cli(mpath, parent_id, script="parent", arguments={})
         pending = r1["json"] is not None and r1["json"].get("workflow") == "pending"
-        check("checkpoint_noop: submit parent -> pending", pending, r1)
+        check("reverse_child: submit parent -> pending", pending, r1)
         if not pending:
             return
         child_id = r1["json"].get("child_workflow_id", "")
-        check("checkpoint_noop: pending carries child_workflow_id", bool(child_id), r1["json"])
+        check("reverse_child: pending carries child_workflow_id", bool(child_id), r1["json"])
         if not child_id:
             return
 
         r2 = run_cli(mpath, child_id)
-        check("checkpoint_noop: drive child -> completed", r2["json"] is not None and r2["json"].get("workflow") == "completed", r2)
+        check("reverse_child: drive child -> completed", r2["json"] is not None and r2["json"].get("workflow") == "completed", r2)
 
         # The call (seq=1) settles as a non-final checkpoint, then seq=2's authored `fail "boom"`
-        # begins reversal; reverse_head's FIRST checkpoint IS the call -> checkpoint_reverse_noop ->
-        # terminal, all within this single resume.
+        # begins reversal; reverse_head's sole checkpoint IS the call -> T1 reopens the (completed)
+        # child within this single resume. The child's OWN reverse loop hasn't run yet, so the
+        # parent observes it non-terminal and defers -- NO CASCADE (1c-design.md §3/§4): the parent
+        # stays reversing(2), rendered "pending", never "failed" or "blocked".
         wait_for_due()
         r3 = run_cli(mpath, parent_id)
-        ok3 = r3["json"] is not None and r3["json"].get("workflow") == "failed"
-        check("checkpoint_noop: resume parent -> failed (reversal complete)", ok3, r3)
-        if ok3:
-            check("checkpoint_noop: compensated=true (the no-op reversal ran)",
-                  r3["json"].get("compensated") is True, r3["json"])
+        check("reverse_child: parent defers waiting on child compensation (no cascade)",
+              r3["json"] is not None and r3["json"].get("workflow") == "pending", r3)
+
+        conn_mid = db()
+        try:
+            check("reverse_child: parent stays reversing(2) durably (never blocked_resolution)",
+                  workflow_state(conn_mid, parent_id) == 2, workflow_state(conn_mid, parent_id))
+        finally:
+            conn_mid.close()
+
+        # Drive the child's OWN reverse loop: its single noop/noop_undo checkpoint compensates via
+        # the stub, reaching the child's own internal reversed(5) terminal.
+        r4 = run_cli(mpath, child_id)
+        ok4 = r4["json"] is not None and r4["json"].get("workflow") == "failed"
+        check("reverse_child: drive child's own compensation -> reversed", ok4, r4)
+        if ok4:
+            check("reverse_child: child's own compensated=true (noop_undo ran)",
+                  r4["json"].get("compensated") is True, r4["json"])
+
+        # Resume parent again: T1 re-reopens (idempotent AlreadyReopened), observes the child now
+        # terminal+compensated, settles the parent's (sole) checkpoint -> parent's own terminal.
+        wait_for_due()
+        r5 = run_cli(mpath, parent_id)
+        ok5 = r5["json"] is not None and r5["json"].get("workflow") == "failed"
+        check("reverse_child: resume parent -> failed (reversal complete)", ok5, r5)
+        if ok5:
+            check("reverse_child: compensated=true (child compensation settled)",
+                  r5["json"].get("compensated") is True, r5["json"])
 
         conn = db()
         try:
-            check("checkpoint_noop: parent workflow reaches REVERSED state (5)",
+            check("reverse_child: parent workflow reaches REVERSED state (5)",
                   workflow_state(conn, parent_id) == 5, workflow_state(conn, parent_id))
+        finally:
+            conn.close()
+
+
+# ===================================================================
+# Scenario 6: nested A -> B -> C compensation (the acceptance test DESIGN.md calls out),
+# fully-unwinding case. A's reversal reaches its call-to-B checkpoint -> T1 reopens B; B's OWN
+# reverse loop (the SAME generic machinery, recursively -- B is now an ordinary reversing
+# workflow) reaches its call-to-C checkpoint -> T1 reopens C; C's single participant checkpoint
+# (noop/noop_undo) compensates -> C reaches reversed(5) -> B's checkpoint settles -> B reaches
+# reversed(5) -> A's checkpoint settles -> A reaches reversed(5).
+# ===================================================================
+def scenario_nested_abc_compensation(stub_url):
+    with tempfile.TemporaryDirectory() as d:
+        mpath = write_manifest(d, [
+            ("c", "1.0.0", CHILD_OK_SRC, UNIT_RETURNS),
+            ("b", "1.0.0", B_CALLS_C_SRC, UNIT_RETURNS),
+            ("a", "1.0.0", A_CALLS_B_THEN_FAIL_SRC, UNIT_RETURNS),
+        ], stub_url, [NOOP_WITH_COMP_OP, NOOP_UNDO_OP])
+
+        a_id = new_wf_id()
+        r1 = run_cli(mpath, a_id, script="a", arguments={})
+        pending1 = r1["json"] is not None and r1["json"].get("workflow") == "pending"
+        check("nested_abc: submit a -> pending", pending1, r1)
+        if not pending1:
+            return
+        b_id = r1["json"].get("child_workflow_id", "")
+        check("nested_abc: a's pending carries b's child_workflow_id", bool(b_id), r1["json"])
+        if not b_id:
+            return
+
+        # Drive b forward: b's own single step is a call to c -> b's first response is ALSO
+        # pending, carrying c's id (b hasn't driven c yet).
+        r2 = run_cli(mpath, b_id)
+        pending2 = r2["json"] is not None and r2["json"].get("workflow") == "pending"
+        check("nested_abc: drive b -> pending (waiting on c)", pending2, r2)
+        if not pending2:
+            return
+        c_id = r2["json"].get("child_workflow_id", "")
+        check("nested_abc: b's pending carries c's child_workflow_id", bool(c_id), r2["json"])
+        if not c_id:
+            return
+
+        # Drive c forward: c's single noop op settles -> c completes.
+        r3 = run_cli(mpath, c_id)
+        check("nested_abc: drive c -> completed", r3["json"] is not None and r3["json"].get("workflow") == "completed", r3)
+
+        # Resume b: b's call-to-c settles (final, b's only step) -> b completes.
+        wait_for_due()
+        r4 = run_cli(mpath, b_id)
+        check("nested_abc: resume b -> completed", r4["json"] is not None and r4["json"].get("workflow") == "completed", r4)
+
+        # Resume a: op1 (call to b) settles intermediate, op2 (authored fail) rejects ->
+        # begin_reversal -> reverse_head's sole checkpoint is the call-to-b -> T1 reopens b
+        # (completed -> reversing) within this single resume. b's own reverse loop hasn't run yet,
+        # so a observes b non-terminal and defers -- no cascade.
+        wait_for_due()
+        r5 = run_cli(mpath, a_id)
+        check("nested_abc: resume a -> pending (waiting on b's compensation)",
+              r5["json"] is not None and r5["json"].get("workflow") == "pending", r5)
+
+        # Drive b's OWN reverse loop: b re-enters its own reversal, T1 reopens c (completed ->
+        # reversing) within this single resume -- the SAME mechanism, recursively. c's own reverse
+        # loop hasn't run yet, so b observes c non-terminal and defers -- no cascade.
+        r6 = run_cli(mpath, b_id)
+        check("nested_abc: drive b's reverse -> pending (waiting on c's compensation)",
+              r6["json"] is not None and r6["json"].get("workflow") == "pending", r6)
+
+        # Drive c's OWN reverse loop: c's single participant checkpoint (noop/noop_undo)
+        # compensates via the stub -> c reaches its own internal reversed(5).
+        r7 = run_cli(mpath, c_id)
+        ok7 = r7["json"] is not None and r7["json"].get("workflow") == "failed"
+        check("nested_abc: drive c's own compensation -> reversed", ok7, r7)
+        if ok7:
+            check("nested_abc: c's own compensated=true (noop_undo ran)", r7["json"].get("compensated") is True, r7["json"])
+
+        # Resume b: T1 re-reopens c (idempotent AlreadyReopened), observes c now
+        # terminal+compensated, settles b's (sole) checkpoint -> b reaches reversed(5).
+        wait_for_due()
+        r8 = run_cli(mpath, b_id)
+        ok8 = r8["json"] is not None and r8["json"].get("workflow") == "failed"
+        check("nested_abc: resume b -> reversed (b's compensation settled)", ok8, r8)
+        if ok8:
+            check("nested_abc: b's compensated=true", r8["json"].get("compensated") is True, r8["json"])
+
+        # Resume a: T1 re-reopens b (idempotent AlreadyReopened), observes b now
+        # terminal+compensated, settles a's (sole) checkpoint -> a reaches reversed(5).
+        wait_for_due()
+        r9 = run_cli(mpath, a_id)
+        ok9 = r9["json"] is not None and r9["json"].get("workflow") == "failed"
+        check("nested_abc: resume a -> reversed (full chain unwound)", ok9, r9)
+        if ok9:
+            check("nested_abc: a's compensated=true", r9["json"].get("compensated") is True, r9["json"])
+
+        conn = db()
+        try:
+            check("nested_abc: a reaches internal REVERSED state (5)", workflow_state(conn, a_id) == 5, workflow_state(conn, a_id))
+            check("nested_abc: b reaches internal REVERSED state (5)", workflow_state(conn, b_id) == 5, workflow_state(conn, b_id))
+            check("nested_abc: c reaches internal REVERSED state (5)", workflow_state(conn, c_id) == 5, workflow_state(conn, c_id))
+
+            # No parent enumeration of child internals (1c-design.md §6): a's own
+            # compensation_requested event references only b, never c's identifiers.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT payload FROM tb_mf_workflow_event WHERE workflow_id = UNHEX(%s) AND kind = 'compensation_requested'",
+                    (a_id,),
+                )
+                row = cur.fetchone()
+                a_event_ok = False
+                if row is not None:
+                    payload = json.loads(row[0])
+                    a_event_ok = payload.get("child_workflow_id") == b_id and c_id not in json.dumps(payload)
+                check("nested_abc: a's compensation_requested event references only b, never c",
+                      a_event_ok, row)
+        finally:
+            conn.close()
+
+
+# ===================================================================
+# Scenario 7: child's OWN compensation gets blocked (a non-retryable participant rejection)
+# during reverse -- the parent stays PENDING/reversing(2), never cascades to blocked itself
+# (1c-design.md §4/§6's explicit "blocked child compensation -> parent stays pending, not
+# blocked" callout; direct reverse-side mirror of the forward-side "blocked child does NOT
+# block the parent" behavior already pinned by scenario_child_non_terminal).
+# ===================================================================
+def scenario_reverse_child_blocked_no_cascade(stub_url):
+    with tempfile.TemporaryDirectory() as d:
+        mpath = write_manifest(d, [
+            ("child", "1.0.0", CHILD_OK_SRC, UNIT_RETURNS),
+            ("parent", "1.0.0", PARENT_CALL_THEN_FAIL_SRC, UNIT_RETURNS),
+        ], stub_url, [NOOP_WITH_COMP_OP, NOOP_UNDO_OP])
+        parent_id = new_wf_id()
+        r1 = run_cli(mpath, parent_id, script="parent", arguments={})
+        pending = r1["json"] is not None and r1["json"].get("workflow") == "pending"
+        check("reverse_blocked: submit parent -> pending", pending, r1)
+        if not pending:
+            return
+        child_id = r1["json"].get("child_workflow_id", "")
+        if not child_id:
+            check("reverse_blocked: pending carries child_workflow_id", False, r1["json"])
+            return
+
+        r2 = run_cli(mpath, child_id)
+        check("reverse_blocked: drive child -> completed", r2["json"] is not None and r2["json"].get("workflow") == "completed", r2)
+
+        # Parent's resume reopens the (completed) child within this single resume, then observes
+        # it non-terminal (reversing) and defers -- same shape as scenario_reverse_child_compensation.
+        wait_for_due()
+        r3 = run_cli(mpath, parent_id)
+        check("reverse_blocked: parent defers waiting on child compensation",
+              r3["json"] is not None and r3["json"].get("workflow") == "pending", r3)
+
+        # Force the child's OWN compensation dispatch (noop_undo) to be REJECTED (HTTP 400 ->
+        # participant_invalid_request) -- drives the child's own reverse loop into
+        # blocked_resolution(3), never reaching a terminal reversed(5).
+        _REJECT_OPS.add("noop_undo")
+        try:
+            r4 = run_cli(mpath, child_id)
+            check("reverse_blocked: child's own compensation blocked (non-retryable rejection)",
+                  r4["json"] is not None and r4["json"].get("workflow") == "blocked", r4)
+        finally:
+            _REJECT_OPS.discard("noop_undo")
+
+        conn_mid = db()
+        try:
+            check("reverse_blocked: child reaches internal BLOCKED_RESOLUTION state (3)",
+                  workflow_state(conn_mid, child_id) == 3, workflow_state(conn_mid, child_id))
+        finally:
+            conn_mid.close()
+
+        # Resume parent again: T1 re-reopens (idempotent AlreadyReopened -- the child is well
+        # past completed(4)), call_inspect observes the child non-terminal/BLOCKED -- NO CASCADE:
+        # the parent defers (rendered "pending"), never durably blocked itself.
+        wait_for_due()
+        r5 = run_cli(mpath, parent_id)
+        check("reverse_blocked: parent stays pending, never cascades to blocked",
+              r5["json"] is not None and r5["json"].get("workflow") == "pending", r5)
+
+        conn = db()
+        try:
+            check("reverse_blocked: parent workflow stays REVERSING (2), never blocked_resolution",
+                  workflow_state(conn, parent_id) == 2, workflow_state(conn, parent_id))
         finally:
             conn.close()
 
@@ -362,7 +604,9 @@ def main():
         scenario_child_fails(stub_url)
         scenario_child_non_terminal(stub_url)
         scenario_replay_no_second_child(stub_url)
-        scenario_call_checkpoint_noop_reversal(stub_url)
+        scenario_reverse_child_compensation(stub_url)
+        scenario_nested_abc_compensation(stub_url)
+        scenario_reverse_child_blocked_no_cascade(stub_url)
     finally:
         server.shutdown()
     print(f"call_integration regression: {passed}/{passed + len(failures)} passed (expected {passed + len(failures)})")

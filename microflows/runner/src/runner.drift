@@ -3108,6 +3108,30 @@ fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 	}
 }
 
+// Reverse-side sibling of _defer_pending (composition 1c): identical shape (clears the lease,
+// schedules the next attempt PENDING_RETRY_SECONDS out, carries child_workflow_id into the
+// rendered Pending outcome) -- host.release is state-agnostic, so the workflow's own reversing(2)
+// state is untouched either way. The only difference is the reported reason: "compensation_pending"
+// matches the convention already used elsewhere in this file for reverse-side waits
+// (_checkpoint_pending_redispatch_or_defer, _compensate's PendingObserved/PendingUncertain arms),
+// rather than the forward-flavored "operation_pending", so a log reader / mfinspect correlation can
+// tell which direction the wait is in.
+fn _defer_reverse_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, child_workflow_id_hex: &String, admission: &AdmissionState) -> Outcome {
+	if !_admission_accepting(admission) { return _drain_release(host, workflow_id, fencing_token, admission); }
+	val clock = host.clock_read(PENDING_RETRY_SECONDS);
+	match host.release(workflow_id, fencing_token, &clock.now, &clock.deadline) {
+		mf.ReleaseOutcome::Released => {
+			return Outcome::Pending(reason = "compensation_pending", defer_until = _dup(&clock.deadline), child_workflow_id = _dup(child_workflow_id_hex));
+		},
+		mf.ReleaseOutcome::FenceLost => {
+			return Outcome::DeferFailed(reason = "release_fence_lost", code = 7);
+		},
+		mf.ReleaseOutcome::NotFound => {
+			return Outcome::DeferFailed(reason = "release_not_found", code = 8);
+		}
+	}
+}
+
 // Clock skew (non-increasing event_ts): release/defer the workflow until the
 // LAST ACCEPTED event time + margin (defer_until), rather than adjusting the
 // timestamp or retrying immediately. The deferral is only reported once the
@@ -3371,17 +3395,111 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 			},
 			mf.ReverseHeadOutcome::Pending(seq, forward_operation_name, forward_payload, call_kind) => {
 				if call_kind == 2 {
-					// child_workflow (composition 1c): the host bindings for
-					// checkpoint_reverse_child_reopen ("T1") / checkpoint_reverse_child_settle now exist
-					// and are proven directly at packages/microflows/tests/e2e/live_call_test.drift, but
-					// this runner-side submit-then-await-then-settle wiring
-					// (work/workflow-composition/1c-design.md §3) is NOT YET landed — that is the next
-					// phase, deliberately kept separate from this host-wrapper phase. Aborting outright
-					// here (never calling either new host method from this branch) is intentional: calling
-					// reopen without also implementing the await/settle loop would leave a real child
-					// durably reopened with no path to ever finish compensating — worse than not touching
-					// it at all. This whole branch is replaced, not extended, by the next phase.
-					return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_not_yet_wired", code = 8);
+					// child_workflow (composition 1c): "T1" — idempotent "ask the child to
+					// compensate," safe on every pass, fresh or resumed, exactly like call_submit is
+					// called unconditionally on every NeedCall pass (1c-design.md §5). T1's own
+					// idempotency is keyed on the child's CURRENT state, not a persisted "was this
+					// dispatched" flag, so re-calling it every pass is correct and cheap — a true
+					// replay writes nothing at all, on either the parent's or the child's event stream.
+					val t_reopen = _now(host);
+					match host.checkpoint_reverse_child_reopen(workflow_id, fencing_token, seq, &t_reopen) {
+						mf.CheckpointReverseChildReopenOutcome::Reopened(_) => {},
+						mf.CheckpointReverseChildReopenOutcome::AlreadyReopened(_) => {},
+						mf.CheckpointReverseChildReopenOutcome::ChildStateInconsistent(_) => {
+							return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_state_inconsistent", code = 8);
+						},
+						mf.CheckpointReverseChildReopenOutcome::ChildNoActiveCheckpoint => {
+							return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_no_active_checkpoint", code = 8);
+						},
+						mf.CheckpointReverseChildReopenOutcome::OutOfOrder(_) => {
+							return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_reopen_out_of_order", code = 8);
+						},
+						mf.CheckpointReverseChildReopenOutcome::EventTimeSkew(defer_until) => {
+							return _defer(host, workflow_id, fencing_token, &defer_until, "checkpoint_reverse_child_reopen_skew", admission);
+						},
+						mf.CheckpointReverseChildReopenOutcome::FenceLost => {
+							return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_reopen_fence_lost", code = 7);
+						},
+						default => {
+							// NotFound / CheckpointNotFound / NotCallCheckpoint / CallSidecarNotFound /
+							// ChildNotFound: a durable inconsistency for a checkpoint reverse_head just
+							// reported as this workflow's own active call checkpoint — never silently proceed.
+							return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_reopen_precondition", code = 8);
+						}
+					}
+
+					// AWAIT the child: a pure read, every pass — the SAME call_inspect used by NeedCall's
+					// forward await (1b.1). Used here only to decide WHETHER it's worth attempting
+					// settle; the settle SP's own independent child-state check (1c-design.md §2) is the
+					// single source of truth for whether a settle actually succeeds, never bypassed here.
+					match host.call_inspect(workflow_id, seq) {
+						mf.CallInspectOutcome::Found(child_workflow_id, child_status, state, execution_direction, current_disposition, is_terminal, terminal_reason, workflow_return_json) => {
+							if !is_terminal {
+								// reversing(2) or blocked_resolution(3): child compensation in flight or
+								// stuck. NO CASCADE (1c-design.md §3/§4): the parent's own state stays
+								// reversing(2), never blocked_resolution — an operator resolves the CHILD
+								// directly; the parent's next poll then observes the child terminal.
+								if state == STATE_BLOCKED {
+									// Best-effort sidecar hint refresh, same pattern as the forward side's
+									// NeedCall await — never fenced, never affects this defer.
+									match _advisory_now(host) {
+										Optional::Some(t_hint) => {
+											_log_best_effort("call_hint_refresh", &_bytes_to_hex(workflow_id), host.call_hint_refresh_best_effort(workflow_id, seq, CHILD_STATUS_BLOCKED, &t_hint));
+										},
+										Optional::None => {}
+									}
+								}
+								return _defer_reverse_pending(host, workflow_id, fencing_token, &child_workflow_id, admission);
+							}
+							// is_terminal: attempt settle regardless of WHICH terminal state — the settle
+							// SP's own child-state check (1c-design.md §2) is the single source of truth
+							// for whether this is a valid settle, never enumerated by this runner branch
+							// (the parent must never branch on the child's internal terminal disposition).
+							val t_settle = _now(host);
+							match host.checkpoint_reverse_child_settle(workflow_id, fencing_token, seq, &t_settle) {
+								mf.CheckpointReverseChildSettleOutcome::Reversed(reason) => {
+									return Outcome::TerminalFailure(reason = move reason, compensated = true);
+								},
+								mf.CheckpointReverseChildSettleOutcome::Reversing(_) => {},   // descend -> re-read head
+								mf.CheckpointReverseChildSettleOutcome::AlreadyReversed => {},
+								mf.CheckpointReverseChildSettleOutcome::ChildNotTerminal(_) => {
+									// Race: our own call_inspect read (above) is stale relative to the
+									// settle SP's own (later, authoritative) read, or the child regressed.
+									// Defer and re-poll — not an error.
+									return _defer_reverse_pending(host, workflow_id, fencing_token, &child_workflow_id, admission);
+								},
+								mf.CheckpointReverseChildSettleOutcome::ChildNotCompensated(_) => {
+									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_not_compensated", code = 8);
+								},
+								mf.CheckpointReverseChildSettleOutcome::OutOfOrder(_) => {
+									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_settle_out_of_order", code = 8);
+								},
+								mf.CheckpointReverseChildSettleOutcome::EventTimeSkew(defer_until) => {
+									return _defer(host, workflow_id, fencing_token, &defer_until, "checkpoint_reverse_child_settle_skew", admission);
+								},
+								mf.CheckpointReverseChildSettleOutcome::FenceLost => {
+									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_settle_fence_lost", code = 7);
+								},
+								default => {
+									// NotFound / CheckpointNotFound / CheckpointNotSettleable / NotCallCheckpoint /
+									// CallSidecarNotFound / ChildNotFound: durable inconsistency, never silently retry.
+									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_settle_precondition", code = 8);
+								}
+							}
+						},
+						mf.CallInspectOutcome::NotFound => {
+							// UNLIKE the forward side's call_sidecar_missing (which defers a genuinely
+							// repairable "not visible yet" race right after call_submit's own first
+							// write), checkpoint_reverse_child_reopen just above ALREADY proved both the
+							// call sidecar and the child row exist in durable state (it resolves
+							// child_workflow_id via the same sidecar and locks the child row) -- a
+							// NotFound here is a durable inconsistency, not a repairable one. Deferring
+							// would retry forever: reopen re-succeeds idempotently (AlreadyReopened),
+							// call_inspect fails again, with no self-healing action a retry could take.
+							return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_call_inspect_missing", code = 8);
+						}
+					}
+					continue;
 				}
 				// participant (call_kind == 1): UNCHANGED existing compensation path.
 				val rev_id = _reverse_id(workflow_canon_hex, seq);
