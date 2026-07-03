@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""mfinspect — read-only workflow/call-tree state dump for Microflows composition (1b.1).
+"""mfinspect — read-only workflow/call-tree state dump for Microflows composition (1b.1/1c).
 
 Composition (1b.1) lets a parent sit `pending` on a child, and a blocked descendant deliberately
-does not cascade up the call tree (work/workflow-composition/DESIGN.md). That is the right
-forward-execution model, but it means "what is this workflow actually waiting on?" cannot be
+does not cascade up the call tree (work/workflow-composition/DESIGN.md) -- 1c extends this with
+reverse-child compensation, where a parent's reversal can leave it `pending` on a child's own
+in-flight compensation instead. Either way, "what is this workflow actually waiting on?" cannot be
 answered by looking at one row -- it requires walking `tb_mf_call.child_workflow_id` down the tree.
 This tool answers that question directly from the coordinator DB, without hand SQL.
 
@@ -333,7 +334,7 @@ def list_workflows(conn, args: argparse.Namespace):
 
 def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(
-		description="Read-only inspector for Microflows composition (1b.1) workflow state. "
+		description="Read-only inspector for Microflows composition (1b.1/1c) workflow state. "
 		            "Never claims, resumes, notifies, unblocks, or mutates anything.")
 	parser.add_argument(
 		"--version", "-v", action="version", version=f"mfinspect {__version__}",

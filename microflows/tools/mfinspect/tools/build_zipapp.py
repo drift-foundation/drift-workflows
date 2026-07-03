@@ -152,7 +152,7 @@ def stage(staging: Path, version: str, pymysql_dir: Path, pymysql_dist_info: Pat
 		"Metadata-Version: 2.1\n"
 		"Name: mfinspect\n"
 		f"Version: {version}\n"
-		"Summary: Read-only workflow/call-tree state dump for Microflows composition (1b.1).\n"
+		"Summary: Read-only workflow/call-tree state dump for Microflows composition (1b.1/1c).\n"
 		"Requires-Python: >=3.10\n",
 		encoding="utf-8",
 	)

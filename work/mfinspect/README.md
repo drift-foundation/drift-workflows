@@ -1,17 +1,18 @@
 # mfinspect
 
-A read-only debugging/inspection tool for Microflows composition (1b.1) workflow state.
+A read-only debugging/inspection tool for Microflows composition (1b.1/1c) workflow state.
 
 ## Why
 
 1b.1 lets a parent workflow sit `pending` on a child call, and a blocked descendant deliberately
-does not cascade up the call tree (see `work/workflow-composition/DESIGN.md`). That is the right
-forward-execution model — but it means "what is this workflow actually waiting on?" cannot be
-answered from a single row; it requires walking `tb_mf_call.child_workflow_id` down the tree by
-hand. `mfinspect` answers that question directly from the coordinator DB.
+does not cascade up the call tree (see `work/workflow-composition/DESIGN.md`); 1c extends this with
+reverse-child compensation, where a parent's own reversal can likewise sit `pending` on a child's
+in-flight compensation. Either way, "what is this workflow actually waiting on?" cannot be answered
+from a single row; it requires walking `tb_mf_call.child_workflow_id` down the tree by hand.
+`mfinspect` answers that question directly from the coordinator DB.
 
 Decided to build this before 1c compensation (see `work/workflow-composition/PROGRESS.md` §"mfinspect
-first, then 1c compensation"), since 1c's own reversal-across-a-tree integration work will need it
+first, then 1c compensation"), since 1c's own reversal-across-a-tree integration work needed it
 immediately.
 
 ## What it is

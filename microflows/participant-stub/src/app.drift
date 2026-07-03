@@ -712,6 +712,10 @@ fn _biz_spec(op: &String) nothrow -> Optional<BizOp> {
 	if op == "adjust_balance"     { return Optional<BizOp>::Some(BizOp(src = "account_id", id_field = "adjustment_id",          prefix = "adj")); }
 	if op == "reverse_adjustment" { return Optional<BizOp>::Some(BizOp(src = "account_id", id_field = "rollback_id",            prefix = "rbk")); }  // <- adjust_balance input
 	if op == "post_journal"       { return Optional<BizOp>::Some(BizOp(src = "adjustment_id", id_field = "journal_id",         prefix = "jnl")); }
+	// order_fulfillment / shipment_booking (workflow composition example, roadmap item 4.5):
+	if op == "book_shipment"      { return Optional<BizOp>::Some(BizOp(src = "order_id",     id_field = "shipment_id",         prefix = "bkg")); }
+	if op == "cancel_shipment"    { return Optional<BizOp>::Some(BizOp(src = "order_id",     id_field = "cancellation_id",     prefix = "cxl")); }  // <- book_shipment input
+	if op == "charge_payment"     { return Optional<BizOp>::Some(BizOp(src = "order_id",     id_field = "payment_id",          prefix = "pay")); }
 	return Optional<BizOp>::None();
 }
 

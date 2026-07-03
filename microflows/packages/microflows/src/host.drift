@@ -358,7 +358,7 @@ pub variant ReverseBlockOutcome {
 	EventTimeSkew(defer_until: String)
 }
 
-// --- Composition (1b.1): workflow-to-workflow calls ---
+// --- Composition (1b.1/1c): workflow-to-workflow calls ---
 
 // call_submit: sibling of operation_request — persists the parent's call-op row AND, in the
 // SAME transaction, creates the full planned-workflow bundle for the child (workflow + plan +
@@ -766,7 +766,7 @@ pub interface MicroflowsHost {
 	fn reverse_block(self: &Self, workflow_id: &Array<Byte>, fencing_token: Int,
 	                 seq: Int, reverse_id: &Array<Byte>, disposition: Int, reason: &String,
 	                 event_ts: &String) -> ReverseBlockOutcome;
-	// --- Composition (1b.1): workflow-to-workflow calls ---
+	// --- Composition (1b.1/1c): workflow-to-workflow calls ---
 	// Submit a workflow call: persist the parent's call op + create the full planned child
 	// bundle, atomically. input_json is the call's input, canonicalized here exactly as
 	// create_planned canonicalizes instance args (it becomes the child's own args).
@@ -2109,7 +2109,7 @@ implement MicroflowsHost for HostImpl {
 		}
 	}
 
-	// --- Composition (1b.1): workflow-to-workflow calls ---
+	// --- Composition (1b.1/1c): workflow-to-workflow calls ---
 
 	pub fn call_submit(self: &HostImpl, workflow_id: &Array<Byte>, fencing_token: Int,
 	                   operation_seq: Int, operation_id: &Array<Byte>,

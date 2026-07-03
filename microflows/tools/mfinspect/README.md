@@ -1,6 +1,6 @@
 # mfinspect
 
-A read-only inspector for Microflows composition (1b.1) workflow state: `inspect` dumps one known
+A read-only inspector for Microflows composition (1b.1/1c) workflow state: `inspect` dumps one known
 `workflow_id`'s full durable state and call tree; `list` searches for candidate workflow instances
 by script name, time range, plan version, and state. See `work/mfinspect/README.md` at the repo
 root for the "why" and design notes.

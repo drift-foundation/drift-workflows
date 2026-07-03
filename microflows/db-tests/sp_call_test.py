@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused SQL regression for the composition (1b.1) workflow-call stored procedures.
+"""Focused SQL regression for the composition (1b.1/1c) workflow-call stored procedures.
 
 Covers the hardening invariants:
   - sp_mf_call_submit creates the full atomic bundle (parent op, child workflow/plan/args/created

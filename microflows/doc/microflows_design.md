@@ -1164,6 +1164,10 @@ data flow: pass values between steps via arg / result / local, with path project
 named results + cross-branch merge (NMerge phi) feeding shared downstream work
 finite PURE collection transforms: map / filter / fold (projection/selection)
 typed contracts: optional per-operation input/result types, checked before dispatch
+workflow composition: a single async `call child@<version> {…}` per step, typed
+  args in / return out, awaited like any other durable step; a completed
+  child's own checkpoint reverses via reverse-child compensation if the parent
+  later unwinds — no fan-out, see §16
 ```
 
 **NOT in V1 (deliberate — design accordingly):**
@@ -1174,6 +1178,12 @@ in-workflow COMPUTATION — IrExpr is const/arg/result/local projections ONLY.
   => every COMPUTED value must be produced by a participant.
 remote ops INSIDE a loop — loop bodies are pure; no dynamic fan-out
   ("charge each of N items"). Model a batch as one participant op, or unroll.
+workflow call FAN-OUT — `call` is one child per step; no "call N children and
+  gather" (deferred, see §16). `on failed` / failure-as-data for a call is also
+  deferred — a child that terminates without completing (rejected, reversed,
+  or failed) always drives the parent's own reversal, never a value the
+  parent's script can branch on. (A non-terminal/blocked child does not drive
+  reversal; it keeps the parent pending — see §16.2.)
 `while` / unbounded loops — loops are finite array transforms only.
 AUTHENTICATION — participant `auth_profile` must be null/absent (any value is
   rejected at build). Fine for trusted-network participants; a production
@@ -1486,3 +1496,102 @@ runnable (was `400`, becomes `200` after the swap); and a service booted **drain
 submissions with **`503`** *and* converges an existing pending workflow resumed under drain as
 **`pending_restart` → `503`** (the §13 back-pressure contract), reporting `/readyz` not-ready. Full gate
 green — integration **165/165**.
+
+---
+
+## 16. Workflow composition — LANDED
+
+A workflow step can call **another workflow** and await its terminal outcome, as an ordinary durable
+step. Full design/history: `work/workflow-composition/DESIGN.md` (the original charter + slice plan)
+and `work/workflow-composition/1c-design.md` (the compensation transition spec); current status is
+tracked in `work/workflow-composition/PROGRESS.md`. This section summarizes the as-built shape.
+
+### 16.1 Syntax, identity, and data flow
+
+`let r = call child@1.0.0 { field: arg x }` (or as a bare statement, discarding the result) occupies
+one forward step, exactly like a participant operation — same seq/settle discipline, same durable
+checkpoint. `@1.0.0` is a semantic-version token resolved against the manifest's script registry at
+build time (exact match → the child's pinned `content_hash`); a `call` to an unresolvable
+name/version, or one that would create a call cycle or exceed `max_call_depth`
+(`deployment.workflow_call.max_call_depth`, default in `runner.drift`), is rejected at build/dispatch
+time — never silently accepted. The child's own workflow id is derived deterministically from
+`(parent workflow_id, parent content_hash, call node id)` — domain-separated from a participant
+operation id — so a resumed drive re-derives the identical child id and never creates a second one,
+and two different parent *instances* of the same script (same `content_hash`, different
+`workflow_id`) never collide on the same call node. The child's `return`
+type is bound to the call's result binder; `result r.path` downstream reads it exactly like a
+participant result.
+
+### 16.2 Control flow — no block cascade
+
+A child that is still forward/reversing/`blocked_resolution` is simply **non-terminal**: the parent
+defers and stays `pending` (rendered `Outcome::Pending`, carrying the child's id so an operator can
+see what it's waiting on) — it never adopts the child's `blocked_resolution` state itself. This holds
+on both the forward side (`_run_forward`'s `NeedCall` await) and the reverse side (§16.4) — a stuck
+descendant anywhere in the tree never blocks an ancestor; an operator resolves the *actual* stuck
+workflow directly, and the next poll up the chain observes it terminal and proceeds. A child that
+completes advances the parent with its typed return; a child that terminates *without* completing
+(reversed / failed / resolved_exception) is a call rejection — the same as a definite participant
+rejection — and begins the *parent's own* reversal.
+
+### 16.3 Recovery — idempotent by construction
+
+`call_submit` is called unconditionally on every pass, fresh or resumed (like `call_submit`'s
+participant-op sibling `operation_request`) — a resumed drive re-enters the same step, `ir.advance`
+deterministically re-evaluates the same input (a pure function of durable arguments/prior results),
+and `call_submit` reconfirms agreement against the durably-stored identity rather than re-creating
+anything. A crash between the child's completion and the parent's own settle simply resumes the same
+await/settle sequence on the next drive. No new recovery machinery was needed for composition — it
+reuses the same claim/lease/fencing/idempotent-replay discipline every workflow already has.
+
+### 16.4 Compensation — reverse-child ("T1")
+
+If the parent itself reverses, a call checkpoint compensates by asking the (already-completed) child
+to compensate **itself**, recursively — the parent never enumerates or reaches into a child's own
+checkpoints:
+
+1. `checkpoint_reverse_child_reopen` ("T1") is called unconditionally on every reverse pass of that
+   checkpoint (same idempotent-every-pass philosophy as `call_submit`). Fresh: reopens the child
+   `completed(4) → reversing(2)` in one fenced parent+child transaction (dual event-time-skew check
+   against both timelines), appending a `compensation_requested` event on the parent and a
+   `compensation_requested_by_parent` event on the child. Replay: idempotent (`AlreadyReopened`),
+   keyed on the child's *current* state, not a persisted dispatch flag — a true replay writes nothing.
+2. The parent reads the child's current state via the SAME `call_inspect` the forward await already
+   uses. Non-terminal → defer, no cascade (§16.2). Terminal → attempt settle.
+3. `checkpoint_reverse_child_settle` independently re-verifies the child reached a genuinely
+   compensated terminal (`reversed(5)` or `resolved_exception(6)` — settled identically, since the
+   parent's control flow must never branch on which; the audit event records which as a passive
+   correlation field only) before flipping the parent's own checkpoint. Any other state (still
+   forward/reversing/blocked, or `failed`) is refused with a diagnostic outcome and no write — a
+   settle can never be tricked into treating an uncompensated or corrupted child as done.
+4. Once the child is settled, the parent's reversal continues exactly as a participant checkpoint
+   does: descend to the next checkpoint, or reach the parent's own terminal `reversed(5)`.
+
+Because a reversing child is just an ordinary reversing workflow, this is the **same mechanism,
+applied recursively** through arbitrarily nested call chains — a chain A→B→C compensates as A reopens
+B, B's own reverse loop reopens C, C compensates (its own participant checkpoint, if any, unwinds via
+the unchanged pre-composition compensation path), and the settles cascade back up B→A. No
+per-nesting-depth special case exists anywhere in this path.
+
+### 16.5 Observability
+
+`mfinspect` (`microflows/tools/mfinspect/`, packaged as a self-contained zipapp like `mariachi`) gives
+read-only recursive JSON dumps of a workflow's full call/event/checkpoint tree — `inspect
+<workflow_id>` for one known instance, `list --script NAME --since TS --until TS` to find candidates
+first. Every T1/settle event carries `child_workflow_id` (and, on the child's own reopen event,
+`parent_workflow_id` + the triggering `operation_seq`), so a durable event, a service log line, and an
+`mfinspect` dump can all be joined by the same identifiers.
+
+### 16.6 Tests, MVP scope, and explicit exclusions
+
+Full gate green — `microflows`'s unit/e2e suite (including host-wiring proofs in
+`live_call_test.drift`), the SP-layer regression (`sp_call_test.py`, **131/131**), and the
+runner-level integration suite (`call_integration_test.py`, **50/50** — including a nested A→B→C
+acceptance case asserting the full chain's final states *and* that no level's audit trail references
+a grandchild's identifiers). **MVP scope**: a single async workflow call, typed args/return, no block
+cascade, reverse-child compensation, and `mfinspect` inspection. **Explicitly deferred** (not
+forgotten — tracked in `work/workflow-composition/PROGRESS.md`'s backlog): fan-out (parallel/multiple
+concurrent calls from one parent), `on failed`/failure-as-data (surfacing a child's rejection as a
+branchable value instead of always driving reversal), a stuck-child liveness budget, and a separate
+compensating-workflow mode (`compensation <wf>@<version>` stays build-rejected, unchanged from the
+original 1a slice).

@@ -1,4 +1,4 @@
-# mfinspect — read-only workflow/call-tree state dump for Microflows composition (1b.1).
+# mfinspect — read-only workflow/call-tree state dump for Microflows composition (1b.1/1c).
 #
 # Local venv layout (created by `just setup`):
 #   .venv/                      — Python virtual environment (gitignored)

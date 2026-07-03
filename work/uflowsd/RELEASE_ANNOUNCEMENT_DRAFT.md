@@ -1,5 +1,10 @@
 # Release — microflows 0.5.0 · uflowsd 0.3.0 (singular 0.7.0)
 
+> **This certified content is historical and unchanged below.** Workflow composition (typed calls,
+> reverse-child compensation, `mfinspect`) landed in later work and is **not** part of this cut — see
+> `work/workflow-composition/RELEASE_ANNOUNCEMENT_DRAFT.md` for that separate, not-yet-certified
+> release draft.
+
 **Status: CERTIFIED.** Certified driftc 0.33.64 / ABI 18. Root `just test` green end-to-end:
 singular, the microflows component (148-check stored-procedure regression + 20 e2e base/asan/memcheck +
 99 parser fixtures), and the coordinator↔singular integration suite — **208 checks**.

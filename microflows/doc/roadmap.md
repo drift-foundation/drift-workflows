@@ -93,6 +93,25 @@ As-built: `microflows/examples/README.md` + `RUN_LOCAL.md`.
 > degraded). Reported to the web team with a minimal DB-free repro; fixed in **web-rest 0.5.6 /
 > driftc 0.33.53**. No Microflows change was needed — re-validating on the new toolchain unblocked it.
 
+### 4.5. Workflow composition — ✅ LANDED (2026-07-02)
+A parent workflow step can `call child@<plan_version> { … }` and await the child's terminal outcome
+as an ordinary durable step (typed args in, typed return out) — a **single async workflow call**,
+not fan-out. A blocked/non-terminal child never cascades a block up the call tree; the parent simply
+stays `pending` on it (§0/§4 of `work/workflow-composition/DESIGN.md`). If the parent itself later
+reverses, its call checkpoint drives **reverse-child compensation**: the (already-completed) child is
+durably reopened into its own reversal and asked to compensate itself — recursively, through
+arbitrarily nested call chains, via the same generic reversal machinery every level already has, with
+no parent enumeration of a child's internal checkpoints (`work/workflow-composition/1c-design.md`).
+`mfinspect` (`microflows/tools/mfinspect/`), a read-only DB inspector for a workflow's full call/event
+tree, was pulled forward ahead of this work since the reversal-across-a-tree integration debugging
+needed it immediately. Full gate green — `microflows` unit/e2e/SP/integration suites (SP regression
+131/131, runner-level `call_integration_test.py` 50/50, including a nested A→B→C acceptance case with
+a DB-level assertion that no level's audit trail references a grandchild's identifiers). Explicitly
+**out of MVP scope** (deferred, not forgotten): fan-out, `on failed`/failure-as-data, a stuck-child
+liveness budget, and a separate compensating-workflow mode. As-built:
+`work/workflow-composition/DESIGN.md`, `work/workflow-composition/1c-design.md`, and
+`work/workflow-composition/PROGRESS.md` (the authoritative, current status).
+
 ### 5. Participant auth / security context reference
 Important for prod, but **defer the design until the app team gives us real requirements** — we should
 not guess the security model now. (Today `auth_profile` must be null/absent; see `security_model.md`

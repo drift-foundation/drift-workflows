@@ -1,0 +1,23 @@
+// shipment_booking — a small, standalone workflow a parent can call and await.
+//
+// Business intent: book a shipment for one order. This workflow owns exactly one compensable step;
+// it does not know or care who calls it. If a caller's own reversal later asks this workflow to
+// compensate itself (composition's reverse-child mechanism — see order_fulfillment.mf's own header
+// comment), it unwinds `book_shipment` via `cancel_shipment` like any ordinary reversal — no special
+// "I was called by a parent" logic exists anywhere in this file.
+//
+// Operation contracts:
+//   book_shipment  inventory  {order_id,sku,quantity} -> {shipment_id}   compensation: cancel_shipment
+
+args {
+  order_id: string
+  sku:      string
+  quantity: int
+}
+
+op book_shipment { input: { order_id: string, sku: string, quantity: int } result: { shipment_id: string } }
+
+steps {
+  let booking = book_shipment { order_id: arg order_id, sku: arg sku, quantity: arg quantity }
+  return { shipment_id: result booking.shipment_id }
+}

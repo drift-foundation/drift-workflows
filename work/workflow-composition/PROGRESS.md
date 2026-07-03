@@ -89,10 +89,17 @@ verification pass; no separate acceptance step was needed.
 **`mfinspect` first slice is LANDED** (tooling/debugging aid, not a composition slice — packaged as a
 mariachi-style zipapp at `microflows/tools/mfinspect/`) — see "`mfinspect` first, then 1c compensation" at
 the bottom of this file for scope, status, and the carried-forward 1c observability/correlation requirement.
-**Active next step: slice 1c — compensation. Design-to-implementation pass DRAFTED** (durable transition
-spec for reverse-child/T1 at `work/workflow-composition/1c-design.md`, 5 open questions flagged) — **review
-checkpoint, no implementation code written yet.** See "1c compensation — design-to-implementation pass
-started" at the bottom of this file.
+
+**Slice 1c — compensation (reverse-child/T1) is LANDED, all three gated increments green: DB/SP layer
+(`sp_call_test.py` 131/131), host wrappers (`host.drift` — `checkpoint_reverse_child_reopen`/
+`checkpoint_reverse_child_settle`), and runner wiring (`_run_reversal`'s real reopen→await→settle loop,
+cascading correctly through arbitrarily nested call chains — pinned by a nested A→B→C integration test).**
+The MVP release-readiness sweep (root `just test` green end to end, stale-wording sweep, an `mfinspect`
+smoke test against a real nested compensation tree, a minimal composition example added to the starter
+kit, and a DRAFT — not certified — release note proposing the next version bump) is also done. **The
+literal next action is MVP stabilization/cert handoff, not a new feature slice** — see "Post-1c MVP
+release path" and "Release-readiness sweep" below, and
+`work/workflow-composition/RELEASE_ANNOUNCEMENT_DRAFT.md` for the handoff draft itself.
 
 ### 1b.0a — DONE — **workflows are typed functions** (decided)
 - **`return <expr>` statement added to the parser and UN-GATED (step 6, DONE)** — see "Step 6 — DONE" below.
@@ -2290,3 +2297,195 @@ accidentally relitigated or drifted past: once 1c runner wiring is green, the li
 - Richer inspect/log aggregation (log-correlation tooling beyond `mfinspect`'s current DB-only
   dump, cross-referencing service logs by the correlation fields 1c's observability pass already
   established).
+
+## Release-readiness sweep (MVP stabilization/cert prep)
+
+### Root `just test` — found + fixed a real, pre-existing fixture bug
+
+Running the ROOT-level `just test` (singular → microflows → every `integration/<suite>`) — not just
+`microflows/just test`, which had been the gate run throughout 1c — surfaced a genuine, pre-existing
+defect unrelated to 1c: `integration/coordinator-singular/`'s DB-seed fixtures
+(`microflows/db-tests/coordinator/scenarios/coordinator-fixtures/`) predated composition and were
+never updated when `call_kind` (`tb_mf_workflow_operation`, 1b.1) and the four ancestry columns
+(`parent_workflow_id`/`parent_node_id`/`root_workflow_id`/`call_depth`, `tb_mf_workflow`, 1b.1) were
+added to the schema. Mariachi's fixture loader hard-fails on a column mismatch rather than silently
+defaulting: `Constant file '...tb_mf_operation.data.csv' does not match table 'tb_mf_operation':
+missing columns: call_kind`. This had been latent since 1b.1 — the root-level gate (the only one that
+seeds these specific fixtures) apparently hadn't been run end-to-end since, since `microflows/just
+test` alone never touches this suite.
+
+Fixed by inserting the missing columns (with values matching every existing row's actual shape: all
+pre-composition top-level participant-only workflows) into both affected CSVs, preserving comment
+lines and correctly round-tripping quoted JSON fields (via Python's `csv` module, not naive
+`split(",")`) — `call_kind=1` (participant, the schema's own default) into
+`tb_mf_operation.data.csv` between `input_hash`/`status`; `\N,\N,\N,\N` (top-level, no parent) into
+`tb_mf_workflow.data.csv` between `workflow_return_json`/`created_at`. Row counts and every other
+column's values confirmed unchanged by diff before re-running.
+
+**Verification:** full root `just test` — singular (16/16), microflows (drift-test-run 25/25,
+sp_operation 156/156, sp_call 131/131, call_integration 50/50), and
+`integration/coordinator-singular/` (225/225, including the C22 business-example suite) — all green,
+`JUST_EXIT=0`.
+
+### Stale-wording sweep
+
+Grepped for `checkpoint_noop`, `checkpoint_reverse_child_not_yet_wired`, and mixed-gate/expected-red
+language across the repo: all surviving hits are in `PROGRESS.md`'s own past-tense narrative
+(describing what a retired mechanism *was* or what a *since-fixed* gap *used to be*) — correctly
+historical, not live claims, left as-is. Bare "1b.1"-only mentions were mostly accurate
+when-introduced annotations (e.g. schema/SP header comments for mechanisms 1c left genuinely
+unchanged) and left alone; fixed the ones describing a file/tool's *current* overall scope where 1c
+now also applies: `mfinspect`'s own module docstring + CLI description + `README.md` (both
+`work/mfinspect/README.md` and `microflows/tools/mfinspect/README.md`) + its zipapp dist-info
+Summary string, `sp_call_test.py`'s module docstring, and `host.drift`'s three
+`--- Composition (1b.1): workflow-to-workflow calls ---` section headers (now `1b.1/1c`, since all
+three sections contain the 1c methods too). Also added a "Landed" pointer + fixed a stale placeholder
+SP name (`sp_mf_T1` → the shipped `sp_mf_checkpoint_reverse_child_reopen`) in `DESIGN.md`'s Slice 1c
+checklist (left the checkboxes themselves unchecked, matching the file's own established convention
+of being a static original plan, not a live tracker — Slices 1a/1b are equally unchecked despite
+being long shipped; `PROGRESS.md` is the authoritative status doc) and updated its `mfinspect`
+section from "(queued separately)" to "(landed)". Confirmed via grep: `microflows_design.md` (the
+main as-built doc) and the repo/microflows-level READMEs had **zero** mention of workflow composition
+at all — not stale wording, a genuine documentation gap, addressed below and in the next section.
+
+Closed the main-doc gap: added `microflows_design.md` §16 "Workflow composition — LANDED" (syntax/
+identity/data-flow, no-block-cascade control flow, idempotent recovery, reverse-child compensation
+mechanics, observability, tests/MVP-scope/exclusions — summarizing this whole `work/
+workflow-composition/` effort for a reader who only has the main as-built doc), updated §12.7's
+capability envelope (supported: workflow composition; NOT in V1: call fan-out / `on failed`), and
+added `doc/roadmap.md` item "4.5. Workflow composition — ✅ LANDED" (this repo's roadmap had never
+listed composition at all, since it was tracked as a separate parallel initiative).
+
+### `mfinspect` smoke test against a real nested A→B→C compensation tree
+
+Drove a REAL nested A→B→C compensation through `mfrunner` (same shape as
+`call_integration_test.py`'s `scenario_nested_abc_compensation`, standalone script, not a committed
+test) and ran the built `mfinspect` zipapp's `inspect`/`list` against the resulting live DB state —
+smoke-testing by hand rather than only unit-testing in isolation, per the release checklist.
+
+**Result: fully legible and complete.** `inspect <a_id>` recursively dumps the whole tree — A's own
+`workflow` (state=5/reversed, `terminal_reason:"boom"`) and `events` (the full causal chain:
+`created` → `call_submitted` → `operation_settled` → `reversal_begun` → `compensation_requested` →
+`compensation_settled`, the last two carrying `child_workflow_id`/`child_state` exactly as 1c's
+observability design intended) plus a `children` array recursing correctly into B then C, each with
+its own complete `workflow`/`checkpoints`/`events`/`calls`, terminating cleanly at C (`children: []`,
+no infinite/incorrect recursion, `terminal_reason:"parent_compensation"` matching T1's own
+design). `list --script a --since ... --until ...` correctly summarizes the same workflow with a
+human-readable `state_name:"reversed"`.
+
+**One minor, pre-existing (not-1c-introduced) observability gap found, not fixed (backlog item, not
+a stabilization blocker):** the `tb_mf_call` sidecar's display-only `child_status` hint showed `3`
+("failed") for child B, even though B was successfully *compensated* (`reversed(5)`, not a genuine
+uncompensated failure) — because the CHILD_STATUS_* enum (1b.1-era, `runner.drift`) only has
+`COMPLETED`/`FAILED`/`BLOCKED` codes; `_oc_render`'s `Outcome::TerminalFailure` classifies to
+`CHILD_STATUS_FAILED` regardless of `compensated` true/false, so the hint can't distinguish "genuinely
+failed" from "successfully reversed." This is a coarse, best-effort DISPLAY hint only — the
+AUTHORITATIVE state (`workflow.state=5`, `terminal_reason`) is correct and visible in the same
+`mfinspect` dump right next to it, so this doesn't mislead a reader who checks both fields, but it is
+a real gap for someone reading the hint alone. Not fixing now (extending the enum touches SP/host/
+runner classification code — real feature-adjacent work, not stabilization) — folded into the
+existing "richer inspect/log aggregation" backlog item above.
+
+### Composition starter-kit example — LANDED
+
+Per explicit user scope (one minimal, runnable MVP example, not a broad sample suite — no fan-out, no
+nested A→B→C, no failure-as-data, no multiple compensation styles in the starter kit): added
+`microflows/examples/workflows/shipment_booking.mf` (a small standalone child — one op
+`book_shipment`, compensation `cancel_shipment`, typed `{shipment_id: string}` return) and
+`order_fulfillment.mf` (the parent — `call shipment_booking@1.0.0 {...}`, awaits the typed return,
+then a later `charge_payment` step; if that fails, the parent's reversal reopens the completed child
+and asks it to compensate itself). Wired into `microflows/examples/manifest.json` (3 new operations,
+2 new scripts with explicit typed `returns`), `participant-stub`'s generic `_biz_spec` table (3 new
+entries — no other stub code needed, confirming the table-driven design scales to a new business
+op with zero additional plumbing), and 6 new `integration/coordinator-singular/test.py` checks
+(`ex_composition_*`) proving the full submit→child-completes→reject→no-cascade-defer→
+child-compensates→parent-compensates cycle through the real `uflowsd` service. Added the matching
+"Workflow composition" item (6) to `microflows/examples/README.md`'s numbered list, covering exactly
+the five points requested: call is async/awaited; the parent compensates the call as one checkpoint;
+the child owns its own internal compensation; a blocked child never cascades; and the MVP exclusions
+(no fan-out, no `on failed`, no separate compensating-workflow mode).
+
+**Verification:** manually drove both the happy path and the compensation path via raw `mfrunner`
+CLI calls (against a throwaway local stub) before writing the committed test, confirming the .mf
+files and manifest wiring were correct in isolation. Then ran the full
+`integration/coordinator-singular` suite twice — first attempt correctly found and required fixing
+a stale `EXPECTED_CHECKS` completeness-guard constant (225 → 231, since 6 checks were added); final
+re-run: **231/231 passed, `JUST_EXIT=0`.**
+
+**Process note (own mistake, caught and fixed):** the first attempt to run this suite wrapped `just
+test` in an extra outer `flocker --key "$DB_LOCK"` call — but that recipe already acquires the same
+lock internally for its DB-reset phase, and flocker is not re-entrant, so the outer wrap deadlocked
+the run (it sat silently with no progress). Diagnosed by checking `ps` for the expected build
+processes and finding none, then re-reading the recipe's own internal locking. Fixed by dropping the
+redundant outer wrap — this suite's own `just test`/`just perf`/`just stress` recipes all handle their
+own DB serialization and should be invoked directly, unlike raw `mfrunner`/script invocations against
+the shared DB (e.g. the mfinspect smoke-test driver above), which do need an explicit `flocker` wrap
+since they have no locking of their own.
+
+### Version/manifest/release-notes/cert handoff — DRAFT prepared, nothing sealed
+
+Audited current version state before touching anything: `drift/manifest.json` (the sole version
+authority) has `singular` 0.7.0, `microflows` 0.5.0, `uflowsd` 0.3.0 — unchanged. Confirmed
+`work/uflowsd/RELEASE_ANNOUNCEMENT_DRAFT.md` is genuinely **already sealed/certified history**
+(explicit `Status: CERTIFIED`, verification counts and feature list matching
+`microflows/CHANGELOG.md`'s current top entry) for a *different*, pre-composition feature set
+(case-[12] pending-redispatch, etc.) — git history confirms its only edit since that content was
+written is an unrelated one-line naming fix, not a composition update. Migrations `0004`
+(workflow_return) and `0005`(workflow_call) both postdate that cert and aren't mentioned in it.
+
+Per explicit correction from an earlier attempt (do not edit an already-certified announcement as if
+composition were part of it; treat it as historical; prepare a handoff, not a self-cert): added a new
+`work/workflow-composition/RELEASE_ANNOUNCEMENT_DRAFT.md`, clearly marked "DRAFT — NOT CERTIFIED"
+throughout, proposing `microflows` 0.6.0 / `uflowsd` 0.4.0 (not reusing the sealed 0.5.0/0.3.0
+numbers) and covering: the composition MVP feature list (typed args/returns, `call`, async-awaited
+child, no-cascade, reverse-child compensation, `mfinspect`), the explicit MVP exclusions (fan-out,
+`on failed`/failure-as-data, stuck-child budget, separate compensating-workflow mode), the `0004`/
+`0005` migration path, no breaking changes to the participant HTTP contract, and full verification
+counts. Added a short, non-invasive pointer at the top of the *old* certified announcement noting
+composition is a separate, later, not-yet-certified draft — its own certified content is otherwise
+untouched. `drift/manifest.json` was **not** edited; no `CERTIFIED` status was set anywhere; no
+cert/seal steps were run. The version bump is a proposal in the new draft, left for the cert team (or
+the user) to apply.
+
+### Post-sweep review: 3 Medium + 2 Low findings, all fixed
+
+1. **[Medium] Public docs misstated child workflow identity.** `microflows_design.md` §16.1 and
+   `RELEASE_ANNOUNCEMENT_DRAFT.md` said the child id derives from `H(parent content_hash, call node
+   id)` — but the actual implementation (`runner.drift`'s `_child_workflow_id_node`) also mixes in
+   the **parent's own `workflow_id`**. As written, the docs implied two different instances of the
+   same parent script (same `content_hash`, different `workflow_id`) could collide on the same call
+   node — they can't. Fixed both to say `H(parent workflow_id, parent content_hash, call node id)`,
+   with a sentence spelling out the non-collision property explicitly.
+2. **[Medium] Non-terminal child behavior described incorrectly.** `examples/README.md`'s
+   "Workflow composition" item, `microflows_design.md` §12.7, and `RELEASE_ANNOUNCEMENT_DRAFT.md`
+   all said "a rejected **or non-terminal** child always drives the parent's own reversal" — directly
+   contradicting the immediately-preceding "blocked/non-terminal child never blocks the parent"
+   point in the same documents. A non-terminal/blocked child does not drive reversal; it keeps the
+   parent `pending`. Reworded all three to: a child that terminates *without completing* (rejected/
+   reversed/failed) drives reversal; non-terminal/blocked does not, and keeps the parent pending —
+   with an explicit cross-reference back to the no-cascade point so the two can't drift apart again.
+3. **[Medium] `PROGRESS.md`'s own "Current Scope" section was badly stale.** It still said "Active
+   next step: slice 1c — compensation... review checkpoint, no implementation code written yet" —
+   describing the state from *before* any of the DB/SP, host-wrapper, or runner-wiring increments,
+   let alone the MVP stabilization sweep. Rewrote it to state plainly that 1c (all three increments)
+   is landed and the literal next action is MVP stabilization/cert handoff, cross-referencing the
+   sections below where that detail actually lives — closing the exact gap the reviewer named ("will
+   mislead the next resume").
+4. **[Low/Medium] `DESIGN.md` still carried the rejected v1 failed-child semantics** at both its
+   "New durable transitions" (T1) description and the Slice 1c build checklist — both said
+   `failed` → "already-terminal-no-comp," which the 1c design-review round (finding #3, folded into
+   `1c-design.md` v2) explicitly overturned: `failed` is corruption evidence, diagnosed as
+   `child_state_inconsistent`/`child_not_compensated`, never a benign no-op settle. Annotated both
+   spots in place with strikethrough + a **SUPERSEDED** note pointing at `1c-design.md` §4, rather
+   than silently rewriting a document that's otherwise an intentionally-static historical plan.
+5. **[Low] `mfinspect` package metadata still said "(1b.1)" only** in `pyproject.toml`'s
+   `description` and the `justfile`'s header comment, inconsistent with the runtime/docstring/README
+   fixes from the earlier stale-wording sweep. Fixed both, then **rebuilt the committed zipapp
+   artifact** (`just setup && just build`) since the OLD string was still baked into its dist-info
+   `METADATA` from before that earlier sweep — confirmed via the packaging test suite,
+   **14/14 passing**, including `test_committed_artifact_matches_fresh_build`, and by reading the
+   rebuilt zipapp's own embedded METADATA directly.
+
+**Verification:** repo-wide grep swept for every one of the five bug patterns after fixing to confirm
+no other occurrence was missed (none found); rebuilt `mfrunner` to confirm the doc-only changes
+didn't break anything (they don't touch code, expected to build clean — confirmed).

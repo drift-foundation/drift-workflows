@@ -1,0 +1,34 @@
+// order_fulfillment — the minimal end-to-end shape for workflow composition + reverse-child
+// compensation (see the "Workflow composition" item in examples/README.md for the full explanation).
+//
+// Business intent: book a shipment (a CALL to a separate child workflow), then charge the customer.
+// `call shipment_booking@1.0.0 {...}` is async but AWAITED like any other step — typed args in
+// (order_id/sku/quantity), typed return out (`result shipment.shipment_id`). This parent's own call
+// checkpoint compensates as ONE unit if this workflow later reverses: it never reaches into the
+// child's own checkpoint directly, it only asks the child to undo itself.
+//
+// Compensation behavior: if the LATER `charge_payment` step fails, this workflow's reversal reaches
+// its call checkpoint and reopens the (already-completed) `shipment_booking` child into ITS OWN
+// reversal, asking it to compensate itself (`cancel_shipment`, declared on shipment_booking's own
+// `book_shipment` operation). This workflow settles once the child reports back compensated — it
+// never enumerates or inspects the child's own internal steps to do so.
+//
+// Operation contracts:
+//   charge_payment  payments  {order_id,customer_id} -> {payment_id}   (terminal)
+//
+// (shipment_booking@1.0.0's own contract is documented in shipment_booking.mf.)
+
+args {
+  order_id:    string
+  customer_id: string
+  sku:         string
+  quantity:    int
+}
+
+op charge_payment { input: { order_id: string, customer_id: string } result: { payment_id: string } }
+
+steps {
+  let shipment = call shipment_booking@1.0.0 { order_id: arg order_id, sku: arg sku, quantity: arg quantity }
+  charge_payment { order_id: arg order_id, customer_id: arg customer_id }
+  return { shipment_id: result shipment.shipment_id }
+}

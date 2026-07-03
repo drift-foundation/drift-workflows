@@ -3147,6 +3147,9 @@ def main():
             {"name": "adjust_balance", "participant": "accounts", "schema_version": 1, "compensation": {"operation": "reverse_adjustment", "schema_version": 1}},
             {"name": "reverse_adjustment", "participant": "accounts", "schema_version": 1},
             {"name": "post_journal", "participant": "accounts", "schema_version": 1},
+            {"name": "book_shipment", "participant": "inventory", "schema_version": 1, "compensation": {"operation": "cancel_shipment", "schema_version": 1}},
+            {"name": "cancel_shipment", "participant": "inventory", "schema_version": 1},
+            {"name": "charge_payment", "participant": "payments", "schema_version": 1},
         ]
         ex_dep = {
             "worker_id": "examples-runner",
@@ -3157,11 +3160,19 @@ def main():
             ],
             "operations": ex_ops,
         }
-        # 1b.0: every manifest script must declare its OWN "returns" — all 5 example workflows are
-        # unit-returning (no explicit `return` statement in their .mf source), so `{}` is correct.
+        # 1b.0: every manifest script must declare its OWN "returns" — all 5 (pre-composition) example
+        # workflows are unit-returning (no explicit `return` statement in their .mf source), so `{}` is
+        # correct.
         ex_scripts = [{"name": n, "version": "1.0.0", "path": str(EXW / f"{n}.mf"), "returns": {}} for n in (
             "payment_authorize_capture", "payment_refund", "inventory_reserve_release",
             "account_adjustment_with_rollback", "checkout_branch_merge")]
+        # order_fulfillment / shipment_booking (workflow composition example, roadmap item 4.5): both
+        # RETURN a typed {shipment_id: string} object (`return { shipment_id: ... }` in their own .mf).
+        SHIPMENT_ID_RETURNS = {"type": {"type": "object", "fields": [{"name": "shipment_id", "type": {"type": "string"}}]}}
+        ex_scripts += [
+            {"name": n, "version": "1.0.0", "path": str(EXW / f"{n}.mf"), "returns": SHIPMENT_ID_RETURNS}
+            for n in ("shipment_booking", "order_fulfillment")
+        ]
         ex_manifest = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False).name
         with open(ex_manifest, "w") as f:
             json.dump({"deployment": ex_dep, "scripts": ex_scripts}, f)
@@ -3239,6 +3250,52 @@ def main():
             check("ex_terminal_replay_no_participant_call",
                   tc == 200 and tb.get("workflow") == "already_terminal" and _request_count(base) == preq,
                   (tc, tb, preq, _request_count(base)))
+
+            # (h) workflow composition (roadmap item 4.5): order_fulfillment CALLS shipment_booking as
+            # a child workflow, awaits its typed {shipment_id} return, then charges payment. If
+            # charge_payment fails, the parent's reversal reopens the (already-completed) child and
+            # asks IT to compensate itself (cancel_shipment) -- reverse-child compensation, end to end,
+            # through the real service.
+            exwf_h = _wf_id()
+            hc, hb = _svc_post(exbase, f"/v1/workflows/{exwf_h}/submit?script=order_fulfillment",
+                               {"order_id": "ord-H1", "customer_id": "cust-11", "sku": "SKU-9", "quantity": 2})
+            check("ex_composition_submit_pending", hc == 202 and hb.get("workflow") == "pending", (hc, hb))
+            h_child = hb.get("child_workflow_id", "")
+            check("ex_composition_pending_carries_child_workflow_id", bool(h_child), hb)
+
+            # Drive the child to completion (books the shipment; deterministic id from the stub).
+            hcc, hcb = _svc_post(exbase, f"/v1/workflows/{h_child}/resume")
+            check("ex_composition_child_completes",
+                  hcc == 200 and hcb.get("workflow") == "completed"
+                  and hcb.get("result", {}).get("shipment_id") == "bkg-ord-H1",
+                  (hcc, hcb))
+
+            # charge_payment REJECTS -> parent begins reversal -> reaches its call checkpoint -> T1
+            # reopens the (completed) shipment_booking child within this single resume. The child's
+            # own reverse loop hasn't run yet, so the parent observes it non-terminal and defers --
+            # NO CASCADE: rendered "pending" (202), never "failed"/"blocked".
+            _arm_fault(base, "charge_payment", "reject")
+            _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{exwf_h}')")
+            hpc, hpb = _svc_post(exbase, f"/v1/workflows/{exwf_h}/resume")
+            _arm_fault(base, "charge_payment", "")  # disarm
+            check("ex_composition_parent_defers_no_cascade",
+                  hpc == 202 and hpb.get("workflow") == "pending", (hpc, hpb))
+
+            # Drive the child's OWN reverse loop: its book_shipment/cancel_shipment checkpoint
+            # compensates via the stub -> the child reaches its own internal reversed(5).
+            hrc, hrb = _svc_post(exbase, f"/v1/workflows/{h_child}/resume")
+            check("ex_composition_child_compensates",
+                  hrc == 200 and hrb.get("workflow") == "failed" and hrb.get("compensated") == True,
+                  (hrc, hrb))
+
+            # Resume the parent again: T1 re-reopens (idempotent), observes the child now
+            # terminal+compensated, settles the parent's checkpoint -> the parent reaches its own
+            # terminal, compensated.
+            _mdb(f"UPDATE tb_mf_workflow SET next_attempt_at = '2000-01-01 00:00:00.000000' WHERE workflow_id = UNHEX('{exwf_h}')")
+            hfc, hfb = _svc_post(exbase, f"/v1/workflows/{exwf_h}/resume")
+            check("ex_composition_parent_compensates",
+                  hfc == 200 and hfb.get("workflow") == "failed" and hfb.get("compensated") == True,
+                  (hfc, hfb))
         finally:
             stop_service(exproc)
 
@@ -3657,7 +3714,7 @@ def main():
     # Display counts are DERIVED (always honest). EXPECTED_CHECKS is a completeness guard,
     # NOT the display denominator: a deleted/bypassed check drifts the ran-count from this
     # manifest and FAILS the run (so N/N can't hide a gap).
-    EXPECTED_CHECKS = 225
+    EXPECTED_CHECKS = 231
     total = passed + len(failures)
     if total != EXPECTED_CHECKS:
         failures.append(f"completeness_guard: ran {total} checks, expected {EXPECTED_CHECKS}")

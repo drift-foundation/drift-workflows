@@ -25,11 +25,15 @@ or mechanic into app surface is a defect.
 - **callback workflow** — **avoid** (implies event-handler / out-of-band notification semantics). A workflow
   call is **async but awaited**, not a callback.
 
-## Operational tooling — `mfinspect` (queued separately)
+## Operational tooling — `mfinspect` (landed — `microflows/tools/mfinspect/`)
 
 Composition makes the durable tree inspectable, but nested calls still need an operator-facing dump tool.
-Queue a separate **read-only** Python tool named `mfinspect` after the core composition slices unless K needs
-it sooner for 1b/1c integration debugging.
+Built as a separate **read-only** Python tool named `mfinspect` (packaged as a self-contained zipapp, see
+`work/mfinspect/README.md`), pulled forward ahead of 1c per `work/workflow-composition/PROGRESS.md`'s
+"mfinspect first, then 1c compensation" decision, since 1c's own reversal-across-a-tree integration
+debugging needed it immediately. The surface below is the original target; see the tool's own `--help`
+and README for the actual shipped CLI (`inspect <workflow_id>` / `list --script ... --since ... --until
+...`), which converged slightly differently through review.
 
 Minimum target surface:
 - `mfinspect --workflow-id <hex>`
@@ -271,7 +275,10 @@ The internal path replaces #2's route-404 budget with an explicit, **async** liv
 ## New durable transitions (the core of the first slices)
 
 - **T1 — reverse-child reopen** [K1]: child `completed(4) → reversing(2)`, fenced; no-op if already
-  reversing/reversed; **already-terminal-no-comp if failed** (round-2 #3). Only for the reverse-child default.
+  reversing/reversed; ~~already-terminal-no-comp if failed~~ (round-2 #3) **— SUPERSEDED: the shipped
+  `1c-design.md` review found `failed` here is corruption evidence (a `failed` child should never have
+  been a parent's completed-call checkpoint at all), so T1 diagnoses it as `child_state_inconsistent`
+  and never settles as if compensated — see `1c-design.md` §4.** Only for the reverse-child default.
 - *(Round-1 "T2 parent-unblock" is removed — blocked does not cascade, so there is no parent block to undo.)*
 - **Notification SP** — **wake + status-hint ONLY**: child-terminal → pull the parent call operation due
   (`next_attempt = now`, **monotonic — only earlier**) + write the `child_status` **hint** in `tb_mf_call`. It
@@ -619,10 +626,17 @@ SP/schema plan in `PROGRESS.md` — see that file for the full transaction-bound
 
 ### Slice 1c — child-owned compensation path
 
+**Landed** — see `work/workflow-composition/PROGRESS.md` for the authoritative, current status (this
+checklist is the original static plan and is not kept in sync box-by-box; it was superseded by the
+design-to-implementation pass at `1c-design.md`, which is where `sp_mf_T1` below was renamed to the
+shipped `sp_mf_checkpoint_reverse_child_reopen` / `sp_mf_checkpoint_reverse_child_settle` pair).
+
 - [ ] Keep the 1a build-rejection of `compensation <wf>@<plan_version>` for MVP; no compensation mode selector
       or compensating-workflow runtime is exposed.
-- [ ] Implement `sp_mf_T1` child-compensation reopen (`completed(4)→reversing(2)`, fenced; `failed` →
-      already-terminal-no-comp) plus the child-compensation **await + settle + recovery** path.
+- [ ] Implement `sp_mf_T1` (shipped as `sp_mf_checkpoint_reverse_child_reopen`) child-compensation reopen
+      (`completed(4)→reversing(2)`, fenced; ~~`failed` → already-terminal-no-comp~~ **SUPERSEDED —
+      shipped behavior diagnoses `failed` as `child_state_inconsistent`, never a benign no-op; see
+      `1c-design.md` §4**) plus the child-compensation **await + settle + recovery** path.
 - [ ] Preserve the recursive compensation invariant: the parent compensates one call checkpoint by asking the
       child to compensate itself; the parent never reaches into child checkpoints directly.
 - [ ] Acceptance: parent reversal sends one compensation request to a completed child exactly once; the child

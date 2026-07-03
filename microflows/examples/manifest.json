@@ -114,6 +114,25 @@
         "schema_version": 1
       },
       {
+        "name": "book_shipment",
+        "participant": "inventory",
+        "schema_version": 1,
+        "compensation": {
+          "operation": "cancel_shipment",
+          "schema_version": 1
+        }
+      },
+      {
+        "name": "cancel_shipment",
+        "participant": "inventory",
+        "schema_version": 1
+      },
+      {
+        "name": "charge_payment",
+        "participant": "payments",
+        "schema_version": 1
+      },
+      {
         "name": "adjust_balance",
         "participant": "accounts",
         "schema_version": 1,
@@ -170,6 +189,18 @@
       "version": "1.0.0",
       "path": "workflows/payment_decline_guard.mf",
       "returns": {}
+    },
+    {
+      "name": "shipment_booking",
+      "version": "1.0.0",
+      "path": "workflows/shipment_booking.mf",
+      "returns": {"type": {"type": "object", "fields": [{"name": "shipment_id", "type": {"type": "string"}}]}}
+    },
+    {
+      "name": "order_fulfillment",
+      "version": "1.0.0",
+      "path": "workflows/order_fulfillment.mf",
+      "returns": {"type": {"type": "object", "fields": [{"name": "shipment_id", "type": {"type": "string"}}]}}
     }
   ]
 }

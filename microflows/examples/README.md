@@ -14,7 +14,7 @@ checks `ex_*`), not pseudo-code.
 
 ```
 examples/
-  manifest.json     # the service manifest: 5 named scripts + ONE shared deployment/routing registry
+  manifest.json     # the service manifest: 7 named scripts + ONE shared deployment/routing registry
   deployment notes  # the `deployment` block inside manifest.json is the shared routing registry:
                     #   participants (payments / inventory / accounts), operation contracts, and
                     #   compensation bindings. (db + endpoints are placeholders to fill in.)
@@ -25,6 +25,9 @@ examples/
     account_adjustment_with_rollback.mf# adjust_balance → post_journal        (auto-rollback)
     payment_decline_guard.mf           # authorize → case result status → fail (result-branch + authored fail)
     checkout_branch_merge.mf           # BRANCH + MERGE + COMPENSATION in one flow
+    shipment_booking.mf                # a small child workflow: one op (book_shipment) + compensation
+    order_fulfillment.mf               # PARENT: calls shipment_booking, then charge_payment
+                                        #   (workflow composition + reverse-child compensation)
   RUN_LOCAL.md                         # start the service, submit/resume/reload over HTTP
 ```
 
@@ -55,6 +58,30 @@ examples/
    from a **durable argument** and joins the arms into one binding the tail reads — see
    `checkout_branch_merge.mf`.
 
+6. **Workflow composition** (`order_fulfillment.mf` calling `shipment_booking.mf`) — a step can
+   `call` another workflow and await its result, exactly like a participant operation:
+   - **`call` is async but *awaited*** — `let shipment = call shipment_booking@1.0.0 { order_id: arg
+     order_id, sku: arg sku, quantity: arg quantity }` occupies one durable step and only advances
+     once the child reaches a terminal state; `result shipment.shipment_id` reads its typed return
+     downstream, same as a participant result.
+   - **The parent compensates the call as ONE checkpoint.** If a later step (here, `charge_payment`)
+     fails, the parent's reversal reaches the call checkpoint and treats "undo this child" as a
+     single unit — it never reaches into the child's own steps.
+   - **The child owns its own internal compensation.** The parent just asks the (already-completed)
+     child to reverse itself; `shipment_booking.mf` unwinds its *own* `book_shipment` step via
+     `cancel_shipment` exactly like any other reversal, with no awareness that a parent asked it to.
+   - **A blocked/non-terminal child never blocks the parent.** Whether waiting on a child that hasn't
+     finished yet (forward) or one that hasn't finished compensating yet (reverse), the parent simply
+     stays `pending` — it never adopts the child's own stuck state.
+   - **Not in this MVP** (see `microflows_design.md` §16 for the full design/status): **fan-out** (one
+     `call` is one child, no "call N children and gather"), **`on failed`/failure-as-data** (a child
+     that terminates *without completing* — rejected, reversed, or failed — always drives the
+     parent's *own* reversal; a non-terminal/blocked child never does, it just keeps the parent
+     `pending` per the point above — there is no way for the parent's script to branch on either
+     outcome as a value), and **a separate compensating-workflow mode** (`compensation
+     <wf>@<version>` stays build-rejected; a child
+     compensates via its own ordinary reversal, not a distinct authored "compensation script").
+
 ## Adapting these to your services
 
 - Replace the operation **names**, **payloads**, and **result fields** with your participants' real
@@ -74,7 +101,8 @@ examples/
 | payment_refund | idempotent single-op corrective flow |
 | inventory_reserve_release | participant **pending → resume** completes |
 | checkout_branch_merge | branch + merge + compensation runs end to end |
+| order_fulfillment (calls shipment_booking) | typed call + return completes; later-step failure → **reverse-child compensation** (parent `pending` on the child, no cascade; child compensates itself; parent ends `failed`, `compensated:true`) |
 | (any) | manifest **reload** doesn't break a pinned older workflow; **terminal replay** with the participant down |
 
-Toolchain: driftc 0.33.53 / abi 18. As-built design: `microflows/doc/microflows_design.md` §15 (service)
-and §12 (the language/IR).
+Toolchain: driftc 0.33.53 / abi 18. As-built design: `microflows/doc/microflows_design.md` §15 (service),
+§12 (the language/IR), and §16 (workflow composition).
