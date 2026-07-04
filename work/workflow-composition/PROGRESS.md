@@ -96,9 +96,15 @@ the bottom of this file for scope, status, and the carried-forward 1c observabil
 cascading correctly through arbitrarily nested call chains — pinned by a nested A→B→C integration test).**
 The MVP release-readiness sweep (root `just test` green end to end, stale-wording sweep, an `mfinspect`
 smoke test against a real nested compensation tree, a minimal composition example added to the starter
-kit, and a DRAFT — not certified — release note proposing the next version bump) is also done. **The
-literal next action is MVP stabilization/cert handoff, not a new feature slice** — see "Post-1c MVP
-release path" and "Release-readiness sweep" below, and
+kit, and a release note) is also done. **CERTIFIED** by `build-orchestrator` run
+`20260703-174026-drift-lang-5c6e03f` (`drift-workflows @ 7fb7f98`, both `normal`/`debug` lanes PASS) —
+`singular` 0.8.0, `microflows` 0.6.0, `uflowsd` 0.5.0 (the last two bumps past this run's own original
+proposal came from two real compatibility fixes found via actual cert-run rejections: `RpcCommitError`'s
+`kind`/`cause_tag` redesign, and driftc >= 0.33.67's `pub`-entry-point requirement — see
+`work/workflow-composition/RELEASE_ANNOUNCEMENT_DRAFT.md`'s "Post-draft fixes" section for the full
+detail). **The literal next action is whatever comes after this MVP — Slice 2 (stuck-child liveness
+budget) or Slice 3 (fan-out + `on failed`-as-data), per user direction — not more stabilization work.**
+See "Post-1c MVP release path" and "Release-readiness sweep" below, and
 `work/workflow-composition/RELEASE_ANNOUNCEMENT_DRAFT.md` for the handoff draft itself.
 
 ### 1b.0a — DONE — **workflows are typed functions** (decided)

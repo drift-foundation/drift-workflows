@@ -1,12 +1,10 @@
-# Release draft — workflow composition MVP (microflows 0.6.0 · uflowsd 0.4.0)
+# Release — workflow composition MVP (singular 0.8.0 · microflows 0.6.0 · uflowsd 0.5.0)
 
-> **Status: DRAFT — NOT CERTIFIED.** This is a release-note proposal for hand-off to the cert team
-> (`../build-orchestrator`), not a certified/sealed release — certifying a release for distribution
-> is exclusively the cert team's role, never self-asserted from this repo. `drift/manifest.json`
-> (the sole version authority) **has** been bumped to the versions below (at explicit user
-> direction), but **author-claim has not been re-minted** (`just author-claim`/`just reseal`) and
-> **no distribution-certification step has been run**. Do not treat this file as final until the
-> cert team runs their own process.
+> **Status: CERTIFIED.** Certified by `build-orchestrator` run
+> `20260703-174026-drift-lang-5c6e03f` — `drift-workflows @ 7fb7f98`, both `normal` and `debug` lanes
+> PASS, submitted alongside `drift-lang@5c6e03f`, `drift-mariadb-client@92fcc3e`,
+> `drift-net-tls@b9550de`, `drift-web@a152b48`. `drift/manifest.json`, `drift/lock.json`, and
+> `drift/*.author-claim` all reflect this certified state.
 >
 > **This is a separate, later body of work from the already-certified
 > `work/uflowsd/RELEASE_ANNOUNCEMENT_DRAFT.md` (microflows 0.5.0 · uflowsd 0.3.0, Status:
@@ -20,9 +18,9 @@
 
 | Artifact | Was (last certified) | Now (`drift/manifest.json`) | Status |
 |---|---|---|---|
-| `singular` (package) | 0.7.0 | 0.7.0 (unchanged) | unchanged by composition (no `singular` code touched) |
-| `microflows` (package) | 0.5.0 | **0.6.0** (bumped) | `drift/manifest.json` updated; author-claim/reseal **not yet re-run** |
-| `uflowsd` (app) | 0.3.0 | **0.4.0** (bumped, dep `microflows 0.6`) | `drift/manifest.json` updated; author-claim/reseal **not yet re-run** |
+| `singular` (package) | 0.7.0 | **0.8.0** | bumped after this draft — a real source fix (`RpcCommitError` compatibility, see "Post-draft fixes") |
+| `microflows` (package) | 0.5.0 | **0.6.0** | as proposed in this draft |
+| `uflowsd` (app) | 0.3.0 | **0.5.0** | bumped once more past this draft's proposed 0.4.0 — a second real source fix (`pub` entry points, see "Post-draft fixes") |
 
 `mfrunner` (one-shot CLI) and `microflows-participant-stub` remain component-local dev artifacts
 (`0.0.0`) — unchanged convention, not Drift release artifacts. `mfinspect` (new, this body of work)
@@ -43,12 +41,41 @@ document. **Note for the cert team:** `microflows/CHANGELOG.md`'s top entry is s
 inconsistency is unrelated to composition and is flagged here for the cert team's own judgment, not
 silently resolved by this pass.
 
-**Why 0.6.0/0.4.0, not reusing 0.5.0/0.3.0:** the 0.5.0/0.3.0 numbers are already sealed against a
-specific, different, already-verified feature set and verification count. Composition adds a real
-new package surface (`host.drift`: `checkpoint_reverse_child_reopen`/`checkpoint_reverse_child_settle`
-methods + outcome types) and a real new schema/runtime footprint (below) on top of that sealed
-content — per this repo's own pre-1.0 convention (`CHANGELOG.md`'s header note: "breaking changes are
-expected and arrive in minor bumps"), that is a new minor bump, not a re-use of an already-sealed one.
+**Why 0.6.0/0.4.0 (this draft's original proposal), not reusing 0.5.0/0.3.0:** the 0.5.0/0.3.0 numbers
+are already sealed against a specific, different, already-verified feature set and verification count.
+Composition adds a real new package surface (`host.drift`:
+`checkpoint_reverse_child_reopen`/`checkpoint_reverse_child_settle` methods + outcome types) and a real
+new schema/runtime footprint (below) on top of that sealed content — per this repo's own pre-1.0
+convention (`CHANGELOG.md`'s header note: "breaking changes are expected and arrive in minor bumps"),
+that is a new minor bump, not a re-use of an already-sealed one.
+
+## Post-draft fixes (why the final versions moved past this draft's original proposal)
+
+Two real, unrelated compatibility breaks surfaced during cert submission after this draft was first
+written, each requiring its own version bump:
+
+- **`RpcCommitError` compatibility (`singular` 0.7.0 → 0.8.0).** Upstream `drift-mariadb-client`
+  redesigned `RpcCommitError` from a `tag`/`message` `pub error` into a plain struct — `kind`
+  (`AmbiguousWrite`/`NotSent`/`ServerRejected`) plus `cause_tag` for diagnostics only, documented as
+  "consumers branch on `kind`". Both `microflows/.../host.drift` and `singular/.../gateway.drift` still
+  read the old `.tag` field. Fixed in both: `ServerRejected` → `BackendRejected` (non-retriable,
+  unchanged), `AmbiguousWrite`/`NotSent` → `BackendUnavailable` (retriable — collapsing all three into
+  a hard rejection, as an interim compat-only pass first did, was flagged in review as semantically
+  wrong and corrected). A related break in `live_reversal_test.drift`'s fixture-seeding helper
+  (`RpcCommitError` no longer being a `pub error` broke `.or_throw()`) was fixed with an explicit
+  `match` + rethrow as `rpc.RpcError`.
+- **`pub` entry points required (`uflowsd` 0.4.0 → 0.5.0).** driftc >= 0.33.67 rejects any `--entry`
+  target not declared `pub`. `microflows.runner::main`/`::service_main` needed `pub fn`, and so did
+  every unit/e2e/stress/perf test's `fn main` across both `singular` and `microflows` (14 files) — the
+  emitters' own `is_test_entry()` check was updated to recognize an optional `pub` prefix, matching
+  `drift-mariadb-client`'s own already-updated pattern. Also required refreshing three stale dependency
+  locks (`drift/lock.json` and the `microflows/runner`/`microflows/participant-stub` component-local
+  ones) pinned to `net-tls`/`web-client`/`web-jwt`/`web-rest` versions no longer present in the current
+  package pool.
+
+Both were caught and fixed via direct iteration against the cert pipeline's own toolchain and package
+pool (not a locally-cached one) after real cert-run rejections — see the two `build-orchestrator` run
+logs referenced in "Certification" below for the full before/after.
 
 ## What's in this draft
 
@@ -151,12 +178,23 @@ Full per-change detail: `work/workflow-composition/PROGRESS.md` (day-to-day stat
 `work/workflow-composition/1c-design.md` (the compensation transition spec), and
 `microflows/doc/microflows_design.md` §16 (as-built summary).
 
-## Handoff note for the cert team
+## Certification
 
-This draft is prepared for cert review, not self-certified:
+**CERTIFIED** by `build-orchestrator` run `20260703-174026-drift-lang-5c6e03f`:
 
-- No `CERTIFIED` status has been set anywhere in this file or elsewhere for this body of work.
-- `drift/manifest.json` has **not** been edited — the version bump proposed above
-  (`microflows` 0.5.0→0.6.0, `uflowsd` 0.3.0→0.4.0, `uflowsd`'s `microflows` dep 0.5→0.6) is a
-  proposal for the cert team to apply once they're satisfied, not a fait accompli.
-- No cert/seal steps have been run as part of this pass.
+```
+Certification Result: CERTIFIED
+Submitted commits:
+  - drift-lang @ 5c6e03f
+  - drift-mariadb-client @ 92fcc3e
+  - drift-net-tls @ b9550de
+  - drift-web @ a152b48
+  - drift-workflows @ 7fb7f98
+Result by repo:
+  - drift-workflows (normal): PASS
+  - drift-workflows (debug): PASS
+```
+
+`drift/manifest.json` (`singular` 0.8.0, `microflows` 0.6.0, `uflowsd` 0.5.0), `drift/lock.json`, and
+`drift/*.author-claim` all reflect this certified commit. This status was set by `build-orchestrator`'s
+own process, not asserted from this repo.
