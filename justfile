@@ -90,6 +90,77 @@ stress:
 	echo "=== [root] stress: microflows ===" ; ( cd microflows && just stress )
 	just _integration-gate stress
 
+# AmbiguousWrite resilience gate (see work/workflows-failpoint-resilience/): injects a lost COMMIT
+# ack via drift-mariadb-client's mariadb-failpoint-proxy against real Microflows/Singular schemas and
+# verifies the coordinator/participant recover safely (retriable outcome, no crash, no duplicate
+# mutation, RpcCommitError.kind respected). Deliberately NOT part of `test`/`_test-combined`: the
+# proxy binary comes from a sibling repo that is not a declared cert capability
+# (requires:["tool:mariachi","tool:docker"] only), and this gate is materially slower than the
+# cert-critical path. Runnable in any environment with a `drift-mariadb-client` checkout built
+# alongside this one (or MARIADB_FAILPOINT_PROXY_BIN pointing at a pre-built binary) — not yet wired
+# into build-orchestrator's own capability set.
+test-resilience:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	source tools/cert-env.sh
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	PROXY_BIN="${MARIADB_FAILPOINT_PROXY_BIN:-../drift-mariadb-client/build/local-app/mariadb-failpoint-proxy}"
+	[[ -x "$PROXY_BIN" ]] || { echo "error: mariadb-failpoint-proxy not found at $PROXY_BIN (set MARIADB_FAILPOINT_PROXY_BIN, or build it: cd ../drift-mariadb-client && just build-app mariadb-failpoint-proxy)" >&2; exit 1; }
+	MARIACHI_PY="$(dirname "$MARIACHI_BIN")/python"
+	[[ -x "$MARIACHI_PY" ]] || { echo "error: mariachi venv python (with pymysql) not found at $MARIACHI_PY -- required for the failpoint tests' own DB assertions (set MARIACHI_BIN to the venv's mariachi binary)" >&2; exit 1; }
+	_dbstate="$("$DB_INSTANCE_SH" up)"   # restore entry state (see `test`): tear down on exit iff we started it
+	case "$_dbstate" in
+	  CREATED) trap '"$DB_INSTANCE_SH" down >/dev/null 2>&1 || true' EXIT ;;
+	  STARTED) trap '"$DB_INSTANCE_SH" stop >/dev/null 2>&1 || true' EXIT ;;
+	esac
+	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
+	# NOT `exec` here (unlike `test`'s own _test-combined call) -- exec REPLACES this shell's process
+	# image, so the EXIT trap registered above (restoring DB entry state) would never fire if this
+	# recipe is the one that created/started the DB. Running flocker as a normal foreground command
+	# keeps this shell alive to run its own trap on exit; `set -e` already propagates flocker's exit
+	# code identically (a nonzero exit here ends the script with that same code, after the trap runs).
+	"{{FLOCKER}}" --key "$DB_LOCK" -j 1 -- just _test-resilience-locked "$PROXY_BIN" "$MARIACHI_PY"
+
+# PRIVATE: runs ONLY under the shared lock held by `test-resilience` (flocker is not re-entrant, so
+# every schema reset below calls the component's PRIVATE `_db-load-schema`/etc recipe directly,
+# bypassing that component's own lock-acquiring public wrapper).
+_test-resilience-locked PROXY_BIN MARIACHI_PY:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	source tools/cert-env.sh
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+
+	echo "=== [resilience] reset schemas ==="
+	( cd singular && just _db-load-schema )
+	( cd microflows && just _db-load-schema && just _db-load-test-fixtures )
+
+	echo "=== [resilience] build binaries ==="
+	( cd microflows/runner && just prepare && just build )
+	( cd microflows/participant-stub && just prepare && just build )
+
+	echo "=== [resilience] start mariadb-failpoint-proxy ==="
+	PROXY_DATA_PORT=43306
+	PROXY_CONTROL_PORT=43307
+	"{{PROXY_BIN}}" --data-host 127.0.0.1 --data-port "$PROXY_DATA_PORT" \
+	                --backend-host "$DB_HOST" --backend-port "$DB_PORT" \
+	                --control-host 127.0.0.1 --control-port "$PROXY_CONTROL_PORT" &
+	PROXY_PID=$!
+	trap 'kill "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true' EXIT
+	_ready=0
+	for _ in $(seq 1 50); do
+	  if (exec 3<>"/dev/tcp/127.0.0.1/$PROXY_CONTROL_PORT") 2>/dev/null; then exec 3<&- 3>&-; _ready=1; break; fi
+	  sleep 0.2
+	done
+	[[ "$_ready" == 1 ]] || { echo "error: mariadb-failpoint-proxy did not become ready on control port $PROXY_CONTROL_PORT" >&2; exit 1; }
+
+	echo "=== [resilience] microflows failpoint tests (call_submit / operation_request / operation_settle / checkpoint_reverse_child_reopen / checkpoint_reverse_child_settle) ==="
+	MF_RUNNER_BIN="$(pwd)/microflows/runner/build/dist/bin/mfrunner" \
+	  "{{MARIACHI_PY}}" microflows/db-tests/failpoint_resilience_test.py
+
+	echo "=== [resilience] singular failpoint tests, via participant-stub (start / complete / resume) ==="
+	"{{MARIACHI_PY}}" microflows/participant-stub/tests/http/failpoint_resilience_test.py
+
 # --- Repo-private MariaDB fixture (Docker) ---
 # drift-workflows owns its DB: a private mariadb:11.4 container (tools/db_instance.sh) on port 34214 —
 # NOT a platform `service:mariadb`, NOT shared with any other repo. The gates AUTO-PROVISION + tear it

@@ -324,76 +324,96 @@ implement StubApp {
 		// start round-trip) is strictly later, satisfying Singular's monotonicity.
 		val claim_time = time.now_utc();
 		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(&claim_time) + _lease_ttl_seconds() * 1000000);
-		match self.gateway.get().start(&key, &item_meta, &"{}", &claim_time, &lease_expires, &token) {
-			singular.StartOutcome::Granted(lease) => {
-				// Fault injection: RESPOND-PENDING. 202 BEFORE the body -> nothing committed, op left Working
-				// (no reclaim path exercised). exec_count unchanged.
-				if _fault_respond_pending(&eff) {
-					return _json(202, _envelope_pending());
-				}
-				// Run the body IDEMPOTENTLY keyed by operation_id (APPLIED: exec_count++ + result stored;
-				// a later rerun for the same id is REPLAYED with no re-execution). Handles the omit_result /
-				// invalid_result protocol-violation faults internally (stored so a replay reproduces them).
-				val result_json = self.run_idempotent(op_id, op, &eff);
-				// Fault injection: CRASH-AFTER-COMMIT. The side effect is committed (applied + lease Working),
-				// but we "crash" before complete -> return 202 WITHOUT completing. The lease expires and a
-				// later byte-identical PUT reclaims it (Exists branch). Models case [12].
-				if _fault_crash_after_commit(&eff) {
-					return _json(202, _envelope_pending());
-				}
-				val settle_time = time.now_utc();
-				match self.gateway.get().complete(&lease, &settle_time, &result_json) {
-					singular.SettleOutcome::Settled(tr) => {
-						// Fault injection: DROP-AFTER-COMMIT (lost ack). The result is already durably
-						// committed; sleeping past the client's PUT timeout yields a genuine uncertain
-						// outcome. Still executed exactly once.
-						val delay_ms = _fault_delay_after_commit_ms(&eff);
-						if delay_ms > 0 {
-							val _ = conc.sleep(conc.Duration(millis = delay_ms));
+		match self.gateway.get().start_checked(&key, &item_meta, &"{}", &claim_time, &lease_expires, &token) {
+			core.Result::Err(kind) => { return _retriable_response_or_rejected(kind); },
+			core.Result::Ok(start_outcome) => {
+				match start_outcome {
+					singular.StartOutcome::Granted(lease) => {
+						// Fault injection: RESPOND-PENDING. 202 BEFORE the body -> nothing committed, op left Working
+						// (no reclaim path exercised). exec_count unchanged.
+						if _fault_respond_pending(&eff) {
+							return _json(202, _envelope_pending());
 						}
-						return _json(200, _envelope_terminal(&tr));
+						// Run the body IDEMPOTENTLY keyed by operation_id (APPLIED: exec_count++ + result stored;
+						// a later rerun for the same id is REPLAYED with no re-execution). Handles the omit_result /
+						// invalid_result protocol-violation faults internally (stored so a replay reproduces them).
+						val result_json = self.run_idempotent(op_id, op, &eff);
+						// Fault injection: CRASH-AFTER-COMMIT. The side effect is committed (applied + lease Working),
+						// but we "crash" before complete -> return 202 WITHOUT completing. The lease expires and a
+						// later byte-identical PUT reclaims it (Exists branch). Models case [12].
+						if _fault_crash_after_commit(&eff) {
+							return _json(202, _envelope_pending());
+						}
+						val settle_time = time.now_utc();
+						match self.gateway.get().complete_checked(&lease, &settle_time, &result_json) {
+							core.Result::Err(kind) => { return _retriable_response_or_rejected(kind); },
+							core.Result::Ok(settle_outcome) => {
+								match settle_outcome {
+									singular.SettleOutcome::Settled(tr) => {
+										// Fault injection: DROP-AFTER-COMMIT (lost ack). The result is already durably
+										// committed; sleeping past the client's PUT timeout yields a genuine uncertain
+										// outcome. Still executed exactly once.
+										val delay_ms = _fault_delay_after_commit_ms(&eff);
+										if delay_ms > 0 {
+											val _ = conc.sleep(conc.Duration(millis = delay_ms));
+										}
+										return _json(200, _envelope_terminal(&tr));
+									},
+									default => {
+										return _json(500, _envelope_error("complete-unexpected"));
+									}
+								}
+							}
+						}
 					},
-					default => {
-						return _json(500, _envelope_error("complete-unexpected"));
-					}
-				}
-			},
-			singular.StartOutcome::Exists => {
-				// Already exists: same id + different input -> 409. The bound input hash lives in Singular's
-				// item_meta (single authority), read back via history. A missing/corrupt record -> 500.
-				match self.read_original_hash(&key) {
-					Optional::Some(original_hash) => {
-						if original_hash != input_hash {
-							return _json(409, _envelope_error("input-conflict"));
-						}
-						// Same input: RECLAIM-or-replay via Singular resume with a FRESH recovery lease
-						// (PR2). The byte-identical PUT is the recovery driver (GET stays read-only):
-						//   Terminal  -> replay the recorded result (200);
-						//   Active    -> the lease is still LIVE; never steal it -> 202 pending;
-						//   Granted   -> the lease EXPIRED; we reclaimed a fresh attempt (rotated token) ->
-						//                rerun idempotently (REPLAYED, no exec_count++) + complete under the
-						//                new lease -> 200. This is the crash-after-commit recovery.
-						val r_token = singular.new_lease_token();
-						val r_claim = time.now_utc();
-						val r_expires = time.utc_from_unix_micros(time.utc_unix_micros(&r_claim) + _lease_ttl_seconds() * 1000000);
-						val recovery = Optional<singular.RecoveryLease>::Some(singular.RecoveryLease(
-							lease_meta_json = "{}", event_time = r_claim, lease_expires_at = r_expires, lease_token = r_token));
-						match self.gateway.get().resume(&key, &recovery) {
-							singular.ResumeOutcome::Terminal(tr) => { return _json(200, _envelope_terminal(&tr)); },
-							singular.ResumeOutcome::Active(_) => { return _json(202, _envelope_pending()); },
-							singular.ResumeOutcome::Granted(rlease, _attempt, _ckpt) => {
-								val result_json = self.run_idempotent(op_id, op, &eff);
-								val settle_time = time.now_utc();
-								match self.gateway.get().complete(&rlease, &settle_time, &result_json) {
-									singular.SettleOutcome::Settled(tr) => { return _json(200, _envelope_terminal(&tr)); },
-									default => { return _json(500, _envelope_error("reclaim-complete-unexpected")); }
+					singular.StartOutcome::Exists => {
+						// Already exists: same id + different input -> 409. The bound input hash lives in Singular's
+						// item_meta (single authority), read back via history. A missing/corrupt record -> 500.
+						match self.read_original_hash(&key) {
+							Optional::Some(original_hash) => {
+								if original_hash != input_hash {
+									return _json(409, _envelope_error("input-conflict"));
+								}
+								// Same input: RECLAIM-or-replay via Singular resume with a FRESH recovery lease
+								// (PR2). The byte-identical PUT is the recovery driver (GET stays read-only):
+								//   Terminal  -> replay the recorded result (200);
+								//   Active    -> the lease is still LIVE; never steal it -> 202 pending;
+								//   Granted   -> the lease EXPIRED; we reclaimed a fresh attempt (rotated token) ->
+								//                rerun idempotently (REPLAYED, no exec_count++) + complete under the
+								//                new lease -> 200. This is the crash-after-commit recovery.
+								val r_token = singular.new_lease_token();
+								val r_claim = time.now_utc();
+								val r_expires = time.utc_from_unix_micros(time.utc_unix_micros(&r_claim) + _lease_ttl_seconds() * 1000000);
+								val recovery = Optional<singular.RecoveryLease>::Some(singular.RecoveryLease(
+									lease_meta_json = "{}", event_time = r_claim, lease_expires_at = r_expires, lease_token = r_token));
+								match self.gateway.get().resume_checked(&key, &recovery) {
+									core.Result::Err(kind) => { return _retriable_response_or_rejected(kind); },
+									core.Result::Ok(resume_outcome) => {
+										match resume_outcome {
+											singular.ResumeOutcome::Terminal(tr) => { return _json(200, _envelope_terminal(&tr)); },
+											singular.ResumeOutcome::Active(_) => { return _json(202, _envelope_pending()); },
+											singular.ResumeOutcome::Granted(rlease, _attempt, _ckpt) => {
+												val result_json = self.run_idempotent(op_id, op, &eff);
+												val settle_time = time.now_utc();
+												match self.gateway.get().complete_checked(&rlease, &settle_time, &result_json) {
+													core.Result::Err(kind) => { return _retriable_response_or_rejected(kind); },
+													core.Result::Ok(settle_outcome) => {
+														match settle_outcome {
+															singular.SettleOutcome::Settled(tr) => { return _json(200, _envelope_terminal(&tr)); },
+															default => { return _json(500, _envelope_error("reclaim-complete-unexpected")); }
+														}
+													}
+												}
+											},
+											singular.ResumeOutcome::NotFound => { return _json(500, _envelope_error("exists-but-not-found")); }
+										}
+									}
 								}
 							},
-							singular.ResumeOutcome::NotFound => { return _json(500, _envelope_error("exists-but-not-found")); }
+							Optional::None => {
+								return _json(500, _envelope_error("item-meta-unreadable"));
+							}
 						}
-					},
-					Optional::None => {
-						return _json(500, _envelope_error("item-meta-unreadable"));
 					}
 				}
 			}
@@ -1068,6 +1088,28 @@ fn _envelope_terminal(tr: &singular.TerminalResult) -> String {
 
 fn _envelope_pending() nothrow -> String { return "{\"state\":\"pending\"}"; }
 fn _envelope_unknown() nothrow -> String { return "{\"state\":\"unknown\"}"; }
+
+// workflows-failpoint-resilience: a RuntimeErrorKind recovered from one of Singular's "_checked"
+// gateway entry points (start_checked/resume_checked/complete_checked). BackendUnavailable/
+// BackendTimeout (AmbiguousWrite/NotSent commit ambiguity, connection loss, a stalled deadline) is
+// retriable -- respond 202 pending, the SAME response this file already uses for every other "try
+// again" condition (armed-fault pending, a live lease never stolen on reclaim), so the coordinator's
+// own dispatch retry naturally re-drives the byte-identical PUT. Everything else (BackendRejected --
+// the store definitively said no; InvalidKey/InvalidLeaseToken/etc -- a caller bug; BackendResponseInvalid
+// -- a malformed doc, a real defect) is NOT retriable and responds a plain 500 "rejected", matching
+// this file's own established _envelope_error(reason) convention used everywhere else in handle_put
+// (rather than reconstructing/re-throwing the original SingularException, a cross-module exception
+// construction driftc's checker doesn't resolve from this file -- E-AUTO-f8fcbb32 "unknown exception
+// event"; returning the response directly sidesteps that and needs no throws annotation). This must
+// stay a narrow match, not a catch-all, or a genuine non-retriable failure would look identical to a
+// transient one to the calling coordinator.
+fn _retriable_response_or_rejected(kind: singular.RuntimeErrorKind) nothrow -> rest.Response {
+	match kind {
+		singular.RuntimeErrorKind::BackendUnavailable(_) => { return _json(202, _envelope_pending()); },
+		singular.RuntimeErrorKind::BackendTimeout(_) => { return _json(202, _envelope_pending()); },
+		default => { return _json(500, _envelope_error("rejected")); }
+	}
+}
 
 fn _envelope_error(reason: String) nothrow -> String {
 	var o = json.new_object();

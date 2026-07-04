@@ -2212,27 +2212,34 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// Exists) + the suspended continuation BEFORE dispatch.
 				val cont_dispatch = "{\"pos\":\"op:" + fmt.format_int(seq) + ":dispatched\",\"operation_seq\":" + fmt.format_int(seq) + "}";
 				val t_req = _now(host);
-				match host.operation_request(workflow_id, fencing_token, seq, &operation_id,
-				                             &op_name, schema_version, &input_json, &input_hash,
-				                             &cont_dispatch, &t_req, &"{}") {
-					mf.OperationRequestOutcome::Requested(_) => {},
-					mf.OperationRequestOutcome::Exists(_) => {},
-					mf.OperationRequestOutcome::FenceLost => {
-						return Outcome::Aborted(reason = "request_fence_lost", code = 3);
+				match host.operation_request_checked(workflow_id, fencing_token, seq, &operation_id,
+				                                     &op_name, schema_version, &input_json, &input_hash,
+				                                     &cont_dispatch, &t_req, &"{}") {
+					core.Result::Err(kind) => {
+						return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "operation_request", admission);
 					},
-					mf.OperationRequestOutcome::OperationConflict => {
-						return Outcome::Aborted(reason = "operation_conflict", code = 3);
-					},
-					mf.OperationRequestOutcome::PlanViolation(reason) => {
-						// The request is out of the pinned plan (seq range / predecessor not
-						// settled). Stop BEFORE dispatch — never a remote side effect out of order.
-						return Outcome::Aborted(reason = "request_plan_violation:" + move reason, code = 8);
-					},
-					mf.OperationRequestOutcome::EventTimeSkew(defer_until) => {
-						return _defer(host, workflow_id, fencing_token, &defer_until, "request_event_time_skew", admission);
-					},
-					default => {
-						throw RunnerError(message = "operation_request unexpected outcome");
+					core.Result::Ok(outcome) => {
+						match outcome {
+							mf.OperationRequestOutcome::Requested(_) => {},
+							mf.OperationRequestOutcome::Exists(_) => {},
+							mf.OperationRequestOutcome::FenceLost => {
+								return Outcome::Aborted(reason = "request_fence_lost", code = 3);
+							},
+							mf.OperationRequestOutcome::OperationConflict => {
+								return Outcome::Aborted(reason = "operation_conflict", code = 3);
+							},
+							mf.OperationRequestOutcome::PlanViolation(reason) => {
+								// The request is out of the pinned plan (seq range / predecessor not
+								// settled). Stop BEFORE dispatch — never a remote side effect out of order.
+								return Outcome::Aborted(reason = "request_plan_violation:" + move reason, code = 8);
+							},
+							mf.OperationRequestOutcome::EventTimeSkew(defer_until) => {
+								return _defer(host, workflow_id, fencing_token, &defer_until, "request_event_time_skew", admission);
+							},
+							default => {
+								throw RunnerError(message = "operation_request unexpected outcome");
+							}
+						}
 					}
 				}
 
@@ -2296,31 +2303,38 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						// object exactly when arg_is_final=1), None otherwise (SP requires SQL NULL).
 						var settle_return: Optional<String> = Optional<String>::None();
 						if is_final { settle_return = Optional<String>::Some(_dup(&workflow_return)); }
-						match host.operation_settle(workflow_id, fencing_token, seq, &operation_id, seq,
-						                            &r, &input_json, &settle_return, &cont_settle, &t_settle, &"{}", is_final) {
-							mf.OperationSettleOutcome::Settled(res) => {
-								last_op_id_hex = _dup(&operation_id_hex);
-								settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
-								final_result = move res;
+						match host.operation_settle_checked(workflow_id, fencing_token, seq, &operation_id, seq,
+						                                    &r, &input_json, &settle_return, &cont_settle, &t_settle, &"{}", is_final) {
+							core.Result::Err(kind) => {
+								return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "operation_settle", admission);
 							},
-							mf.OperationSettleOutcome::AlreadySettled(res) => {
-								last_op_id_hex = _dup(&operation_id_hex);
-								settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
-								final_result = move res;
-							},
-							mf.OperationSettleOutcome::FenceLost => {
-								return Outcome::Aborted(reason = "settle_fence_lost", code = 3);
-							},
-							mf.OperationSettleOutcome::PlanViolation(reason) => {
-								// The settle is outside the pinned plan (seq/checkpoint/finality): a
-								// runner/plan inconsistency, never silently settle. Stop and report.
-								return Outcome::Aborted(reason = "settle_plan_violation:" + move reason, code = 8);
-							},
-							mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
-								return _defer(host, workflow_id, fencing_token, &defer_until, "settle_event_time_skew", admission);
-							},
-							default => {
-								throw RunnerError(message = "operation_settle unexpected outcome");
+							core.Result::Ok(outcome) => {
+								match outcome {
+									mf.OperationSettleOutcome::Settled(res) => {
+										last_op_id_hex = _dup(&operation_id_hex);
+										settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+										final_result = move res;
+									},
+									mf.OperationSettleOutcome::AlreadySettled(res) => {
+										last_op_id_hex = _dup(&operation_id_hex);
+										settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+										final_result = move res;
+									},
+									mf.OperationSettleOutcome::FenceLost => {
+										return Outcome::Aborted(reason = "settle_fence_lost", code = 3);
+									},
+									mf.OperationSettleOutcome::PlanViolation(reason) => {
+										// The settle is outside the pinned plan (seq/checkpoint/finality): a
+										// runner/plan inconsistency, never silently settle. Stop and report.
+										return Outcome::Aborted(reason = "settle_plan_violation:" + move reason, code = 8);
+									},
+									mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
+										return _defer(host, workflow_id, fencing_token, &defer_until, "settle_event_time_skew", admission);
+									},
+									default => {
+										throw RunnerError(message = "operation_settle unexpected outcome");
+									}
+								}
 							}
 						}
 					},
@@ -2406,32 +2420,39 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// agreement — never a differently-recreated identity.
 				val cont_dispatch = "{\"pos\":\"call:" + fmt.format_int(seq) + ":dispatched\",\"operation_seq\":" + fmt.format_int(seq) + "}";
 				val t_submit = _now(host);
-				match host.call_submit(workflow_id, fencing_token, seq, &operation_id, &input,
-				                       &cont_dispatch, &t_submit, &"{}",
-				                       &child_workflow_id, &child_script_name, &child_plan_version_resolved, &child_content_hash,
-				                       child_plan_length, &"{\"pos\":\"start\"}", &t_submit, &"{}",
-				                       &parent_node_id, max_call_depth) {
-					mf.CallSubmitOutcome::Submitted(child_workflow_id) => {},
-					mf.CallSubmitOutcome::AlreadySubmitted(child_workflow_id) => {},
-					mf.CallSubmitOutcome::CallConflict => {
-						return Outcome::Aborted(reason = "call_conflict", code = 3);
+				match host.call_submit_checked(workflow_id, fencing_token, seq, &operation_id, &input,
+				                               &cont_dispatch, &t_submit, &"{}",
+				                               &child_workflow_id, &child_script_name, &child_plan_version_resolved, &child_content_hash,
+				                               child_plan_length, &"{\"pos\":\"start\"}", &t_submit, &"{}",
+				                               &parent_node_id, max_call_depth) {
+					core.Result::Err(kind) => {
+						return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "call_submit", admission);
 					},
-					mf.CallSubmitOutcome::CallRejected(reason) => {
-						// The recursion guard (call_cycle / max_call_depth_exceeded): a rejected call IS a
-						// rejected forward step, same as a definite participant rejection -> reversal.
-						return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, "call_rejected:" + move reason, admission);
-					},
-					mf.CallSubmitOutcome::PlanViolation(reason, plan_length) => {
-						return Outcome::Aborted(reason = "call_plan_violation:" + move reason, code = 8);
-					},
-					mf.CallSubmitOutcome::EventTimeSkew(defer_until) => {
-						return _defer(host, workflow_id, fencing_token, &defer_until, "call_submit_event_time_skew", admission);
-					},
-					mf.CallSubmitOutcome::FenceLost => {
-						return Outcome::Aborted(reason = "call_submit_fence_lost", code = 3);
-					},
-					mf.CallSubmitOutcome::NotFound => {
-						return Outcome::Aborted(reason = "call_submit_not_found", code = 3);
+					core.Result::Ok(outcome) => {
+						match outcome {
+							mf.CallSubmitOutcome::Submitted(child_workflow_id) => {},
+							mf.CallSubmitOutcome::AlreadySubmitted(child_workflow_id) => {},
+							mf.CallSubmitOutcome::CallConflict => {
+								return Outcome::Aborted(reason = "call_conflict", code = 3);
+							},
+							mf.CallSubmitOutcome::CallRejected(reason) => {
+								// The recursion guard (call_cycle / max_call_depth_exceeded): a rejected call IS a
+								// rejected forward step, same as a definite participant rejection -> reversal.
+								return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, "call_rejected:" + move reason, admission);
+							},
+							mf.CallSubmitOutcome::PlanViolation(reason, plan_length) => {
+								return Outcome::Aborted(reason = "call_plan_violation:" + move reason, code = 8);
+							},
+							mf.CallSubmitOutcome::EventTimeSkew(defer_until) => {
+								return _defer(host, workflow_id, fencing_token, &defer_until, "call_submit_event_time_skew", admission);
+							},
+							mf.CallSubmitOutcome::FenceLost => {
+								return Outcome::Aborted(reason = "call_submit_fence_lost", code = 3);
+							},
+							mf.CallSubmitOutcome::NotFound => {
+								return Outcome::Aborted(reason = "call_submit_not_found", code = 3);
+							}
+						}
 					}
 				}
 
@@ -2497,29 +2518,36 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 							if !is_final { cont_settle = "{\"pos\":\"call:" + fmt.format_int(seq) + ":settled\",\"next_operation_seq\":" + fmt.format_int(seq + 1) + "}"; }
 							var settle_return: Optional<String> = Optional<String>::None();
 							if is_final { settle_return = Optional<String>::Some(_dup(&workflow_return)); }
-							match host.operation_settle(workflow_id, fencing_token, seq, &operation_id, seq,
-							                            &child_return, &input, &settle_return, &cont_settle, &t_settle, &"{}", is_final) {
-								mf.OperationSettleOutcome::Settled(res) => {
-									last_op_id_hex = _dup(&operation_id_hex);
-									settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
-									final_result = move res;
+							match host.operation_settle_checked(workflow_id, fencing_token, seq, &operation_id, seq,
+							                                    &child_return, &input, &settle_return, &cont_settle, &t_settle, &"{}", is_final) {
+								core.Result::Err(kind) => {
+									return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "call_settle", admission);
 								},
-								mf.OperationSettleOutcome::AlreadySettled(res) => {
-									last_op_id_hex = _dup(&operation_id_hex);
-									settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
-									final_result = move res;
-								},
-								mf.OperationSettleOutcome::FenceLost => {
-									return Outcome::Aborted(reason = "call_settle_fence_lost", code = 3);
-								},
-								mf.OperationSettleOutcome::PlanViolation(reason) => {
-									return Outcome::Aborted(reason = "call_settle_plan_violation:" + move reason, code = 8);
-								},
-								mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
-									return _defer(host, workflow_id, fencing_token, &defer_until, "call_settle_event_time_skew", admission);
-								},
-								default => {
-									throw RunnerError(message = "call operation_settle unexpected outcome");
+								core.Result::Ok(outcome) => {
+									match outcome {
+										mf.OperationSettleOutcome::Settled(res) => {
+											last_op_id_hex = _dup(&operation_id_hex);
+											settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+											final_result = move res;
+										},
+										mf.OperationSettleOutcome::AlreadySettled(res) => {
+											last_op_id_hex = _dup(&operation_id_hex);
+											settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+											final_result = move res;
+										},
+										mf.OperationSettleOutcome::FenceLost => {
+											return Outcome::Aborted(reason = "call_settle_fence_lost", code = 3);
+										},
+										mf.OperationSettleOutcome::PlanViolation(reason) => {
+											return Outcome::Aborted(reason = "call_settle_plan_violation:" + move reason, code = 8);
+										},
+										mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
+											return _defer(host, workflow_id, fencing_token, &defer_until, "call_settle_event_time_skew", admission);
+										},
+										default => {
+											throw RunnerError(message = "call operation_settle unexpected outcome");
+										}
+									}
 								}
 							}
 						} else {
@@ -3161,6 +3189,46 @@ fn _defer(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: In
 // absolute future next_attempt, and appends an 'operation_dispatch_deferred'
 // audit event with the reason on ENTRY into the wait condition (deduped on
 // retry), so restoring config auto-recovers it — NOT a failure, NOT blocked.
+// Shared handler for a HostErrorKind recovered from one of the "_checked" host entry points
+// (call_submit_checked / operation_request_checked / operation_settle_checked /
+// checkpoint_reverse_child_reopen_checked / checkpoint_reverse_child_settle_checked): a transient
+// backend condition (AmbiguousWrite/NotSent commit ambiguity, connection loss, a stalled deadline)
+// routes through the SAME short-defer-and-release-lease path other repairable dispatch conditions
+// already use (see EventTimeSkew's _defer(...) call, call_target_unavailable's _defer_dispatch(...)
+// call) instead of crashing to main()'s top-level catch. Anything else (InvalidArg/InvalidId/
+// InvalidJson — a caller bug; BackendRejected — the store definitively said no; BackendResponseInvalid
+// — a malformed doc, a real defect) is NOT retriable here and re-throws unchanged, exactly the
+// HostException the throwing sibling method would have raised — this must stay a narrow match, not a
+// catch-all, or a genuine non-retriable failure would silently loop as a defer forever.
+fn _defer_on_backend_unavailable(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
+                                 kind: mf.HostErrorKind, reason_prefix: String, admission: &AdmissionState) -> Outcome {
+	// Uses _defer (host.release), NOT _defer_dispatch (host.defer_dispatch /
+	// sp_mf_operation_dispatch_defer). Root-caused (not a direction issue -- _defer_dispatch is used
+	// successfully for other reversal-direction conditions elsewhere in this file too): the concrete
+	// crash was `sp_mf_operation_dispatch_defer`'s own `arg_reason varchar(64)` column rejecting our
+	// constructed reason string ("Data too long for column 'arg_reason'") for a longer site name --
+	// e.g. "checkpoint_reverse_child_reopen:backend_unavailable:wire-read-eof" is 66 chars, over the
+	// limit -- and that SQL rejection (a genuine ServerErr/BackendRejected) was uncaught inside
+	// _defer_dispatch, same class of gap as the original finding. _defer's underlying host.release
+	// doesn't take a reason column at all (the reason is purely a client-side Outcome field, never
+	// persisted) -- it has no such length constraint by construction, which is why it's the right
+	// choice for a shared helper whose reason strings are built by concatenating a site name a caller
+	// doesn't control the length of. This is also the generic-across-both-directions mechanism
+	// EventTimeSkew's handler already uses; re-verified clean across repeated pinned-test runs.
+	val clock = host.clock_read(DISPATCH_DEFER_SECONDS);
+	match kind {
+		mf.HostErrorKind::BackendUnavailable(detail) => {
+			return _defer(host, workflow_id, fencing_token, &clock.deadline, reason_prefix + ":backend_unavailable:" + detail, admission);
+		},
+		mf.HostErrorKind::BackendTimeout(detail) => {
+			return _defer(host, workflow_id, fencing_token, &clock.deadline, reason_prefix + ":backend_timeout:" + detail, admission);
+		},
+		default => {
+			throw mf.HostException(kind = move kind);
+		}
+	}
+}
+
 fn _defer_dispatch(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, reason: String, admission: &AdmissionState) -> Outcome {
 	// Admission (slice 2): suppress new dispatch defers while draining/stopped (see _defer_pending).
 	if !_admission_accepting(admission) { return _drain_release(host, workflow_id, fencing_token, admission); }
@@ -3402,29 +3470,36 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 					// dispatched" flag, so re-calling it every pass is correct and cheap — a true
 					// replay writes nothing at all, on either the parent's or the child's event stream.
 					val t_reopen = _now(host);
-					match host.checkpoint_reverse_child_reopen(workflow_id, fencing_token, seq, &t_reopen) {
-						mf.CheckpointReverseChildReopenOutcome::Reopened(_) => {},
-						mf.CheckpointReverseChildReopenOutcome::AlreadyReopened(_) => {},
-						mf.CheckpointReverseChildReopenOutcome::ChildStateInconsistent(_) => {
-							return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_state_inconsistent", code = 8);
+					match host.checkpoint_reverse_child_reopen_checked(workflow_id, fencing_token, seq, &t_reopen) {
+						core.Result::Err(kind) => {
+							return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "checkpoint_reverse_child_reopen", admission);
 						},
-						mf.CheckpointReverseChildReopenOutcome::ChildNoActiveCheckpoint => {
-							return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_no_active_checkpoint", code = 8);
-						},
-						mf.CheckpointReverseChildReopenOutcome::OutOfOrder(_) => {
-							return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_reopen_out_of_order", code = 8);
-						},
-						mf.CheckpointReverseChildReopenOutcome::EventTimeSkew(defer_until) => {
-							return _defer(host, workflow_id, fencing_token, &defer_until, "checkpoint_reverse_child_reopen_skew", admission);
-						},
-						mf.CheckpointReverseChildReopenOutcome::FenceLost => {
-							return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_reopen_fence_lost", code = 7);
-						},
-						default => {
-							// NotFound / CheckpointNotFound / NotCallCheckpoint / CallSidecarNotFound /
-							// ChildNotFound: a durable inconsistency for a checkpoint reverse_head just
-							// reported as this workflow's own active call checkpoint — never silently proceed.
-							return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_reopen_precondition", code = 8);
+						core.Result::Ok(outcome) => {
+							match outcome {
+								mf.CheckpointReverseChildReopenOutcome::Reopened(_) => {},
+								mf.CheckpointReverseChildReopenOutcome::AlreadyReopened(_) => {},
+								mf.CheckpointReverseChildReopenOutcome::ChildStateInconsistent(_) => {
+									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_state_inconsistent", code = 8);
+								},
+								mf.CheckpointReverseChildReopenOutcome::ChildNoActiveCheckpoint => {
+									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_no_active_checkpoint", code = 8);
+								},
+								mf.CheckpointReverseChildReopenOutcome::OutOfOrder(_) => {
+									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_reopen_out_of_order", code = 8);
+								},
+								mf.CheckpointReverseChildReopenOutcome::EventTimeSkew(defer_until) => {
+									return _defer(host, workflow_id, fencing_token, &defer_until, "checkpoint_reverse_child_reopen_skew", admission);
+								},
+								mf.CheckpointReverseChildReopenOutcome::FenceLost => {
+									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_reopen_fence_lost", code = 7);
+								},
+								default => {
+									// NotFound / CheckpointNotFound / NotCallCheckpoint / CallSidecarNotFound /
+									// ChildNotFound: a durable inconsistency for a checkpoint reverse_head just
+									// reported as this workflow's own active call checkpoint — never silently proceed.
+									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_reopen_precondition", code = 8);
+								}
+							}
 						}
 					}
 
@@ -3456,34 +3531,41 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 							// for whether this is a valid settle, never enumerated by this runner branch
 							// (the parent must never branch on the child's internal terminal disposition).
 							val t_settle = _now(host);
-							match host.checkpoint_reverse_child_settle(workflow_id, fencing_token, seq, &t_settle) {
-								mf.CheckpointReverseChildSettleOutcome::Reversed(reason) => {
-									return Outcome::TerminalFailure(reason = move reason, compensated = true);
+							match host.checkpoint_reverse_child_settle_checked(workflow_id, fencing_token, seq, &t_settle) {
+								core.Result::Err(kind) => {
+									return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "checkpoint_reverse_child_settle", admission);
 								},
-								mf.CheckpointReverseChildSettleOutcome::Reversing(_) => {},   // descend -> re-read head
-								mf.CheckpointReverseChildSettleOutcome::AlreadyReversed => {},
-								mf.CheckpointReverseChildSettleOutcome::ChildNotTerminal(_) => {
-									// Race: our own call_inspect read (above) is stale relative to the
-									// settle SP's own (later, authoritative) read, or the child regressed.
-									// Defer and re-poll — not an error.
-									return _defer_reverse_pending(host, workflow_id, fencing_token, &child_workflow_id, admission);
-								},
-								mf.CheckpointReverseChildSettleOutcome::ChildNotCompensated(_) => {
-									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_not_compensated", code = 8);
-								},
-								mf.CheckpointReverseChildSettleOutcome::OutOfOrder(_) => {
-									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_settle_out_of_order", code = 8);
-								},
-								mf.CheckpointReverseChildSettleOutcome::EventTimeSkew(defer_until) => {
-									return _defer(host, workflow_id, fencing_token, &defer_until, "checkpoint_reverse_child_settle_skew", admission);
-								},
-								mf.CheckpointReverseChildSettleOutcome::FenceLost => {
-									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_settle_fence_lost", code = 7);
-								},
-								default => {
-									// NotFound / CheckpointNotFound / CheckpointNotSettleable / NotCallCheckpoint /
-									// CallSidecarNotFound / ChildNotFound: durable inconsistency, never silently retry.
-									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_settle_precondition", code = 8);
+								core.Result::Ok(outcome) => {
+									match outcome {
+										mf.CheckpointReverseChildSettleOutcome::Reversed(reason) => {
+											return Outcome::TerminalFailure(reason = move reason, compensated = true);
+										},
+										mf.CheckpointReverseChildSettleOutcome::Reversing(_) => {},   // descend -> re-read head
+										mf.CheckpointReverseChildSettleOutcome::AlreadyReversed => {},
+										mf.CheckpointReverseChildSettleOutcome::ChildNotTerminal(_) => {
+											// Race: our own call_inspect read (above) is stale relative to the
+											// settle SP's own (later, authoritative) read, or the child regressed.
+											// Defer and re-poll — not an error.
+											return _defer_reverse_pending(host, workflow_id, fencing_token, &child_workflow_id, admission);
+										},
+										mf.CheckpointReverseChildSettleOutcome::ChildNotCompensated(_) => {
+											return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_not_compensated", code = 8);
+										},
+										mf.CheckpointReverseChildSettleOutcome::OutOfOrder(_) => {
+											return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_settle_out_of_order", code = 8);
+										},
+										mf.CheckpointReverseChildSettleOutcome::EventTimeSkew(defer_until) => {
+											return _defer(host, workflow_id, fencing_token, &defer_until, "checkpoint_reverse_child_settle_skew", admission);
+										},
+										mf.CheckpointReverseChildSettleOutcome::FenceLost => {
+											return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_settle_fence_lost", code = 7);
+										},
+										default => {
+											// NotFound / CheckpointNotFound / CheckpointNotSettleable / NotCallCheckpoint /
+											// CallSidecarNotFound / ChildNotFound: durable inconsistency, never silently retry.
+											return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_settle_precondition", code = 8);
+										}
+									}
 								}
 							}
 						},
