@@ -67,6 +67,37 @@ To refresh or add one: edit/add a `plans/*.mf`, run `--emit-graph`, and paste th
 map in `index.html` (the highlight steps reference the `n`-ids). The flag works on any real workflow too,
 e.g. `--emit-graph ../microflows/examples/workflows/checkout_branch_merge.mf` (branch + merge).
 
+## Run the live backend (`microflows-viz serve`)
+
+The committed `./microflows-viz` executable (Python 3.10+, no venv — a mariachi-style zipapp) serves
+the static UI **plus a read-only JSON `/api/...`** over the coordinator MariaDB. The backend owns all
+DB access; the browser only ever talks to `/api` on this origin and never sees a DB host or credential.
+
+```bash
+# read-only production posture: the SELECT-only viz_ro user (microflows/db/grants/viz_ro.sql)
+VIZ_RO_PWD=... ./microflows-viz serve --db-user viz_ro --db-password-env VIZ_RO_PWD
+# local dev against the fixture DB (defaults: $DB_HOST/$DB_PORT/$DB_NAME or 127.0.0.1:34214/microflows)
+MDB_ROOT_PWD=rootpw ./microflows-viz serve            # → http://127.0.0.1:8377
+```
+
+- **HTTP bind** is `--listen HOST:PORT` (default `127.0.0.1:8377`); a non-loopback host additionally
+  requires `--allow-remote` — the API exposes full workflow state (args, payloads, events) to whoever
+  can reach the port.
+- **DB connection** is the `--db-*` family, deliberately prefixed so it can never be confused with the
+  HTTP bind: `--db-host` / `--db-port` / `--db-user` / `--db-password` / `--db-password-env`
+  (preferred; default `MDB_ROOT_PWD`) / `--db-name`.
+- **API (so far):** `GET /api/health`, and `GET /api/workflow/<32-hex>?max_depth=N` — the full
+  recursive workflow-tree dump (workflow, plan + args, operations, calls, checkpoints, full event
+  history, children), same JSON as `mfinspect inspect`. Search/list, call-tree/timeline, and
+  stuck-reason endpoints are next (see `work/viz-consolidation/README.md`).
+- **Read-only by permission:** every query is a SELECT, and running as `viz_ro` makes MariaDB itself
+  reject anything else. `microflows-viz` is absorbing `microflows/tools/mfinspect`, which goes away
+  once parity is reached.
+
+Develop with `just setup` / `just build` / `just test` (the test suite covers packaging, the viz_ro
+grant, and the HTTP surface; DB-backed tests use the standing dev fixture) — `just run serve ...`
+passes through to the venv console script.
+
 ## Alternative views (optional, hosted)
 
 The `microflows.machine.js` XState model powers two hosted views if you want auto-layout / interactivity:
@@ -111,7 +142,10 @@ machine event). Drop that in `scenarios.js` and Play.
 | `index.html` | The player (UI title **μFlows-viz**) — **self-contained**: 3 synced views (Sequence / IR graph / State machine), live highlight, replayable, no network. |
 | `vendor/mermaid.min.js` | Embedded Mermaid 11.16.0 (~3.5 MB) — renders the IR-graph flowchart in-page; no outside calls. |
 | `plans/*.mf` | The `.mf` sources whose `--emit-graph` output is embedded as the IR graphs. |
-| `export_events.py` | Replay a real `tb_mf_workflow_event` log as a tape. |
+| `export_events.py` | Replay a real `tb_mf_workflow_event` log as a tape. *Direct-DB; slated for replacement by the backend's timeline endpoint (work/viz-consolidation).* |
+| `microflows-viz` | The committed backend zipapp — `serve` = static UI + read-only `/api` (see "Run the live backend"). |
+| `src/mfviz/`, `tools/`, `tests/`, `justfile`, `pyproject.toml` | Backend package source, zipapp builder, test suite (packaging + viz_ro grant + HTTP surface). |
 
-*Faithful to certified driftc 0.33.63 / ABI 18; the lifecycle + event kinds match the root-gate-green
-coordinator (`microflows` SP regression 127/127, coordinator↔singular 195/195).*
+*The lifecycle and event kinds are faithful to the certified coordinator's durable contract — the
+seven `state.drift` workflow states and the real `tb_mf_workflow_event` audit kinds — as exercised by
+the root-gate SP regression and coordinator↔singular integration suites on every certified release.*

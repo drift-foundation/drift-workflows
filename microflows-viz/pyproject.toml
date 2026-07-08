@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microflows-viz"
+version = "0.1.0"
+description = "Operator-facing viewer for Microflows workflow state: `serve` backend (read-only MariaDB) + browser UI."
+authors = [
+	{ name = "PushCoin" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+	"PyMySQL>=1.1.0,<2.0"
+]
+
+[project.scripts]
+microflows-viz = "mfviz.cli:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]

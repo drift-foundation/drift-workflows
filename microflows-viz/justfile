@@ -1,0 +1,71 @@
+# microflows-viz — operator-facing viewer for Microflows workflow state.
+#
+# Local venv layout (created by `just setup`):
+#   .venv/                      — Python virtual environment (gitignored)
+#   .venv/bin/microflows-viz    — console script entry point
+#   src/mfviz/                  — package source (editable install)
+#   ./microflows-viz            — standalone zipapp executable (`just build`, committed)
+#
+# Modeled on ../microflows/tools/mfinspect/justfile (itself on ../mariachi/justfile).
+# All commands resolve Python from the venv; no system-python or ambient PYTHONPATH is read.
+#
+# positional-arguments is required for `run`'s *ARGS to forward correctly: plain {{ARGS}}
+# interpolation joins variadic args into one space-separated TEXT string that the recipe's own
+# shell then re-splits on whitespace, silently breaking any arg containing a space. With this
+# set, `run` uses "$@", which `just` populates as real, boundary-preserving positional shell
+# parameters.
+set positional-arguments := true
+
+VENV := ".venv"
+PY := VENV + "/bin/python"
+MFVIZ := VENV + "/bin/microflows-viz"
+
+# Create the venv and install the editable package + deps.
+# Idempotent: re-runs reinstall the editable wheel.
+setup:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	if [[ ! -d "{{VENV}}" ]]; then
+		python3 -m venv "{{VENV}}"
+	fi
+	"{{PY}}" -m pip install --upgrade pip
+	"{{PY}}" -m pip install -e .
+
+# Build the self-contained ./microflows-viz zipapp executable (runs on Python 3.10+
+# alone — no venv, no pip install on the target machine).
+# Regenerate any time with: just setup && just build
+build:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	[[ -x "{{PY}}" ]] || { echo "error: venv missing — run 'just setup' first" >&2; exit 1; }
+	"{{PY}}" tools/build_zipapp.py
+
+# Run the full test suite: packaging (tests/test_zipapp.py) + the DB-backed serve/API/grant
+# tests (tests/test_serve.py — these SKIP cleanly when the dev fixture DB is unreachable).
+# Gate wiring MUST export MFVIZ_REQUIRE_DB=1 so DB absence is a hard failure, never a skip
+# (the read-only viz_ro grant proof is the point of the suite).
+test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	[[ -x "{{PY}}" ]] || { echo "error: venv missing — run 'just setup' first" >&2; exit 1; }
+	PYTHONPATH=src "{{PY}}" -m unittest discover -s tests -v
+
+# Pass through to the built console script verbatim, e.g.:
+#   just run serve --db-password-env MDB_ROOT_PWD
+#   just run serve --listen 127.0.0.1:9000 --db-user viz_ro --db-password-env VIZ_RO_PWD
+run *ARGS:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	[[ -x "{{MFVIZ}}" ]] || { echo "error: venv missing — run 'just setup' first" >&2; exit 1; }
+	"{{MFVIZ}}" "$@"
+
+# Show the CLI help.
+help:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	[[ -x "{{MFVIZ}}" ]] || { echo "error: venv missing — run 'just setup' first" >&2; exit 1; }
+	"{{MFVIZ}}" --help
+
+# Remove the venv (forces a clean re-bootstrap on next `just setup`).
+clean:
+	rm -rf "{{VENV}}"
