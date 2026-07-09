@@ -1,5 +1,5 @@
 # Microflows coordinator runner — first dispatch slice (manual IR).
-_pkg-root := env("DRIFT_PKG_ROOT", env("HOME") + "/opt/drift/certified/current/libs")
+_pkg-root := env("DRIFT_PKG_ROOT", env("HOME") + "/opt/drift/certified/current/pkgs")
 _pkg-local := "../build/dist/lib"
 BIN_DIR := "build/dist/bin"
 

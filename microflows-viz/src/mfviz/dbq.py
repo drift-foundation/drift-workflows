@@ -60,6 +60,23 @@ class MfvizError(Exception):
 	"""Base exception for user-facing errors."""
 
 
+def resolve_state(value: str | None) -> int | None:
+	"""A state filter, by numeric code or name; None passes through (no filter)."""
+	if value is None:
+		return None
+	if value.isdigit():
+		code = int(value)
+		if code not in STATE_NAMES:
+			raise MfvizError(f"unknown state code {value!r}; valid codes: "
+			                  f"{sorted(STATE_NAMES)}")
+		return code
+	name = value.lower()
+	if name not in STATE_CODES:
+		raise MfvizError(f"unknown state name {value!r}; valid names: "
+		                  f"{sorted(STATE_CODES)}")
+	return STATE_CODES[name]
+
+
 @dataclass(frozen=True)
 class DbConfig:
 	host: str
@@ -232,3 +249,47 @@ def inspect_workflow(conn, workflow_id_hex: str, max_depth: int, depth: int = 0,
 		children.append(inspect_workflow(conn, child_hex, max_depth, depth=depth + 1, seen=seen))
 	node["children"] = children
 	return node
+
+
+# ===== bounded search/list (mfinspect `list` parity) =====
+
+def list_workflows(conn, script: str, since: str, until: str,
+                   plan_version: str | None = None, state: str | None = None):
+	"""Search tb_mf_workflow (+ tb_mf_workflow_plan for plan_version) by script + a bounded
+	created_at range (all three required by the caller, to rule out an accidental full-table
+	scan) plus optional plan_version/state. Returns a summary dict per matching row -- never a
+	tree (use inspect_workflow for that).
+
+	Parity note: the field set is mfinspect `list`'s summary (workflow_id, script_name,
+	plan_version, state/state_name/execution_direction/current_disposition, parent/root ids,
+	created_at, current_event_ts, terminal_reason) plus one documented additive field,
+	`updated_at` (the row's last-write timestamp; mfinspect never exposed it)."""
+	where = ["w.script_name = %s", "w.created_at >= %s", "w.created_at <= %s"]
+	params: list = [script, since, until]
+
+	if plan_version is not None:
+		where.append("p.plan_version = %s")
+		params.append(plan_version)
+	state_code = resolve_state(state)
+	if state_code is not None:
+		where.append("w.state = %s")
+		params.append(state_code)
+
+	sql = (
+		"SELECT w.workflow_id, w.script_name, p.plan_version, w.state, w.execution_direction, "
+		"w.current_disposition, w.created_at, w.updated_at, w.current_event_ts, "
+		"w.parent_workflow_id, w.root_workflow_id, w.terminal_reason "
+		"FROM tb_mf_workflow w LEFT JOIN tb_mf_workflow_plan p ON p.workflow_id = w.workflow_id "
+		"WHERE " + " AND ".join(where) + " ORDER BY w.created_at DESC"
+	)
+
+	with conn.cursor() as c:
+		c.execute(sql, params)
+		rows = c.fetchall()
+
+	results = []
+	for row in rows:
+		d = _decode_row(row)
+		d["state_name"] = STATE_NAMES.get(row["state"])
+		results.append(d)
+	return results

@@ -2,20 +2,18 @@
 
 ## Status
 
-**Slice 1 in progress — scaffold + `serve` + first endpoint + grant LANDED (2026-07-07),
-verified end-to-end.** Remaining in slice 1: `GET /api/workflows` (list parity) and the formal
-parity harness wired into a gate.
+**Slice 1 COMPLETE (2026-07-08), review-verified.** `microflows-viz serve` covers mfinspect
+inspect/list parity (`/api/workflow/<id>`, `/api/workflows`), runs read-only as viz_ro, and the
+full suite (35/35, incl. the mfinspect parity harness) is wired into the root `test` gate with
+`MFVIZ_REQUIRE_DB=1`. Next up: slice 2 (tree / timeline / stuck endpoints).
 
 ## Slice tracker
 
-- [~] Slice 1 — `microflows-viz serve`: backend package + `/api/workflow/<id>` +
-      `/api/workflows` at mfinspect inspect/list parity, static UI serving, SELECT-only DB
-      grant in `microflows/db/grants/` (tests run against it), parity harness wired into a
-      gate (temporary — replaced by fixture-owned golden tests before slice 4).
-      **Done:** package scaffold, `serve`, `/api/health`, `/api/workflow/<id>?max_depth=N`,
-      viz_ro grant + grant-enforcement tests, 29/29 tests green.
-      **Remaining:** `/api/workflows` (bounded list, 400 without script/since/until), formal
-      parity harness, wiring `just test` into a repo gate.
+- [x] Slice 1 — COMPLETE (2026-07-08). `microflows-viz serve`: backend package,
+      `/api/workflow/<id>` + `/api/workflows` at mfinspect inspect/list parity, static UI
+      serving, SELECT-only viz_ro grant (tests run against it), formal parity harness, and the
+      suite wired into the root `test` gate with `MFVIZ_REQUIRE_DB=1` (parity harness is
+      temporary — replaced by fixture-owned golden tests before slice 4).
 - [ ] Slice 2 — `/api/workflow/<id>/tree`, `/timeline`, `/stuck` (derived stuck/waiting verdict
       incl. lease, next_attempt_at, reconcile + redispatch timestamps, resolution_required).
 - [ ] Slice 3 — live mode in the browser UI on top of `/api` (demo player stays).
@@ -84,11 +82,40 @@ parity harness wired into a gate.
   (faithful to the coordinator's durable contract as exercised by the root-gate suites) so the
   operator-facing README can't rot against release announcements.
 
+- 2026-07-08 (slice 1 completed):
+  - `GET /api/workflows` at mfinspect `list` parity: `script`+`since`+`until` required
+    (structural 400 naming the missing params), optional `plan_version`/`state` (code or
+    name), summaries ordered created_at DESC with `state_name`. Two documented additive
+    fields beyond mfinspect's summary: `href` (`/api/workflow/<id>` — natural link to the
+    exact-instance inspection) and `updated_at`.
+  - Formal parity harness (`tests/test_parity.py`): seeds a deterministic parent→child tree
+    (plan/args/operation/call/checkpoint/events, reserved script name `mfviz-parity`,
+    fixed ids/timestamps, FK-safe self-cleanup) as root, serves as viz_ro, and asserts API
+    == committed mfinspect zipapp for inspect (full + truncated depth) and list (unfiltered
+    + state + plan_version), modulo exactly the two documented additive fields. Plus
+    bounded-scan 400s and unknown-state 400. TEMPORARY by charter — to be replaced by
+    fixture-owned golden tests before slice 4 removes mfinspect.
+  - Root-gate wiring: root `test` now execs `_test-locked` = `_test-combined` (unchanged
+    combined drift plan) + `_test-viz`, all under the same DB lock. `_test-viz` resets the
+    microflows schema via the component's private `_db-load-schema` (which also applies the
+    viz_ro grant, since grants/ is part of the mariachi template) and runs the suite with
+    the mariachi venv's python (pymysql; same precedent as `_test-resilience-locked`) with
+    **`MFVIZ_REQUIRE_DB=1` exported** — DB absence is a hard failure in the gate. Packaging
+    tests skip without a local `.venv` by design (dev-time contract, covered by
+    `microflows-viz/just test`).
+  - Removed test_serve's opportunistic "inspect whatever row exists" check — it skipped on
+    a freshly reset (empty) schema, i.e. a silent data-dependent skip inside the gate; the
+    parity harness now owns that assertion deterministically.
+  - Verified: `microflows-viz/just test` 35/35 OK; root `just _test-viz` (the exact gate
+    path: schema reset + mariachi python + MFVIZ_REQUIRE_DB=1) 35/35 OK, zero skips;
+    root justfile parses and `just -n _test-locked` shows the intended chain.
+  - README updated: `/api/workflows` documented in the backend section.
+
 ## Next literal action
 
-Implement `GET /api/workflows` (mfinspect `list` parity: `script`+`since`+`until` required →
-400 otherwise; optional `plan_version`/`state`; summary array with `state_name`) by porting
-`list_workflows` into `mfviz/dbq.py`, then write the formal parity harness (seed a fixture
-tree, compare mfinspect vs API for both endpoints) and wire `microflows-viz/just test` into a
-repo-level gate **with `MFVIZ_REQUIRE_DB=1` exported**, so the suite actually runs and the
-grant proof cannot silently skip (pinned means gated).
+Slice 2: implement `GET /api/workflow/<id>/tree` (skeletal call tree: ids/states/depths
+only), `GET /api/workflow/<id>/timeline` (merged event timeline), and
+`GET /api/workflow/<id>/stuck` (derived waiting/stuck verdict from lease, next_attempt_at,
+reconcile_*/redispatch_* columns, checkpoint resolution_required, and deepest non-terminal
+descendant), with fixture-backed tests for each stuck shape per the charter's verification
+criteria.

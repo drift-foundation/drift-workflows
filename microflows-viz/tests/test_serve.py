@@ -277,34 +277,11 @@ class ServeTests(unittest.TestCase):
 		finally:
 			conn.close()
 
-	def test_workflow_inspect_matches_query_layer(self) -> None:
-		"""For a real workflow (when the fixture DB has one), the API response is
-		exactly the query layer's tree — the HTTP layer adds nothing and drops
-		nothing. Full mfinspect-parity harness lands with /api/workflows."""
-		conn = _root_connect(database=DB_NAME)
-		try:
-			with conn.cursor() as c:
-				c.execute("SELECT workflow_id FROM tb_mf_workflow ORDER BY created_at LIMIT 1")
-				row = c.fetchone()
-		finally:
-			conn.close()
-		if row is None:
-			self.skipTest("fixture DB has no workflow rows to inspect")
-		wf_hex = bytes(row[0]).hex()
-
-		status, payload = self._get_json(f"/api/workflow/{wf_hex}?max_depth=3")
-		self.assertEqual(status, 200, payload)
-
-		ro_conn = dbq.connect(self.db_cfg)
-		try:
-			expected = dbq.inspect_workflow(ro_conn, wf_hex, 3)
-		finally:
-			ro_conn.close()
-		self.assertEqual(payload, json.loads(json.dumps(expected, sort_keys=True)))
-		self.assertEqual(payload["workflow_id"], wf_hex)
-		for key in ("workflow", "plan", "args", "operations", "calls",
-		            "checkpoints", "events", "children"):
-			self.assertIn(key, payload)
+	# NOTE: real-data inspection correctness lives in tests/test_parity.py, which
+	# seeds its own deterministic fixture tree and compares the API against both
+	# the query layer and the committed mfinspect zipapp — no data-dependent
+	# skip in the gate. (An earlier opportunistic "inspect whatever row exists"
+	# test here skipped on a freshly reset schema and was removed for that.)
 
 
 if __name__ == "__main__":  # pragma: no cover

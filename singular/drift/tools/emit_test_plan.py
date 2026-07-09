@@ -51,7 +51,7 @@ ARTIFACT = "singular"
 # Foundation-libs root for the external mariadb deps. driftc needs an absolute
 # --package-root; the recipe exports DRIFT_PKG_ROOT (cert env sets it too).
 PKG_ROOT = os.path.abspath(os.environ.get(
-    "DRIFT_PKG_ROOT", os.path.expanduser("~/opt/drift/certified/current/libs")))
+    "DRIFT_PKG_ROOT", os.path.expanduser("~/opt/drift/certified/current/pkgs")))
 
 # Host-global mutex key naming the shared MariaDB *instance* (mdb114-a @ :34214).
 # Must match other consumers' string (mariadb-client) to serialize across suites

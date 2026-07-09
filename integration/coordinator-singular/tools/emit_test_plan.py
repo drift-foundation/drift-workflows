@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[3]   # drift-workflows/ (tools/ -> suite
 TWB = "64"
 PKG_ROOT = os.environ.get("DRIFT_PKG_ROOT",
                           os.environ.get("DRIFT_PACKAGE_ROOT",
-                                         str(Path.home() / "opt/drift/certified/current/libs")))
+                                         str(Path.home() / "opt/drift/certified/current/pkgs")))
 
 # Each app is compiled from its OWN source + a local LIBRARY's source; every
 # other resolved dependency is an external package from DRIFT_PKG_ROOT. Both the

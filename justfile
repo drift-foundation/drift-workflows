@@ -44,7 +44,34 @@ test:
 	  STARTED) trap '"$DB_INSTANCE_SH" stop >/dev/null 2>&1 || true' EXIT ;;
 	esac
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
-	exec "{{FLOCKER}}" --key "$DB_LOCK" -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _test-combined
+	exec "{{FLOCKER}}" --key "$DB_LOCK" -j 1 --heartbeat {{HEARTBEAT_SECS}} -- just _test-locked
+
+# PRIVATE: everything that runs under the one shared DB lock held by `test`:
+# the combined drift plan, then the microflows-viz backend suite (Python; needs
+# the microflows schema loaded and the DB definitely present, hence in-lock).
+_test-locked:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	just _test-combined
+	just _test-viz
+
+# PRIVATE: microflows-viz backend gate (work/viz-consolidation slice 1) — the
+# viz_ro read-only-grant proof, serve/API tests, and the mfinspect parity
+# harness. Runs ONLY under the shared lock (it resets the microflows schema via
+# the component's PRIVATE _db-load-schema, bypassing its lock-acquiring public
+# wrapper). MFVIZ_REQUIRE_DB=1 turns DB absence into a hard failure — this
+# suite must never silently skip in a gate. Interpreter: the mariachi venv's
+# python (has pymysql), same precedent as `_test-resilience-locked`; the
+# packaging tests inside the suite skip without a local .venv, by design.
+_test-viz:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	source tools/cert-env.sh
+	echo "=== [root] test: microflows-viz backend (viz_ro grant + serve/API + mfinspect parity) ==="
+	MARIACHI_PY="$(dirname "$MARIACHI_BIN")/python"
+	[[ -x "$MARIACHI_PY" ]] || { echo "error: mariachi venv python (with pymysql) not found at $MARIACHI_PY -- required for microflows-viz's DB-backed tests (set MARIACHI_BIN to the venv's mariachi binary)" >&2; exit 1; }
+	( cd microflows && just _db-load-schema )
+	( cd microflows-viz && MFVIZ_REQUIRE_DB=1 PYTHONPATH=src "$MARIACHI_PY" -m unittest discover -s tests -v )
 
 # PRIVATE: emit + run the one combined plan. Runs ONLY under the shared lock
 # held by `test` (flocker is not re-entrant — the plan's own run-live jobs use
@@ -54,7 +81,7 @@ _test-combined:
 	set -euo pipefail
 	source tools/cert-env.sh
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
-	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
 	WORK="$(mktemp -d -t root-combined-test-XXXXXX)"
@@ -104,7 +131,7 @@ test-resilience:
 	set -euo pipefail
 	source tools/cert-env.sh
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
-	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 	PROXY_BIN="${MARIADB_FAILPOINT_PROXY_BIN:-../drift-mariadb-client/build/local-app/mariadb-failpoint-proxy}"
 	[[ -x "$PROXY_BIN" ]] || { echo "error: mariadb-failpoint-proxy not found at $PROXY_BIN (set MARIADB_FAILPOINT_PROXY_BIN, or build it: cd ../drift-mariadb-client && just build-app mariadb-failpoint-proxy)" >&2; exit 1; }
 	MARIACHI_PY="$(dirname "$MARIACHI_BIN")/python"
@@ -129,7 +156,7 @@ _test-resilience-locked PROXY_BIN MARIACHI_PY:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source tools/cert-env.sh
-	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 
 	echo "=== [resilience] reset schemas ==="
 	( cd singular && just _db-load-schema )
@@ -250,7 +277,7 @@ prepare:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
-	"$DRIFT" prepare --package-root "${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	"$DRIFT" prepare --package-root "${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 
 # Read-only trust preflight (author-claims, SCI equality, trust grants).
 trust-check:
@@ -273,7 +300,7 @@ deploy *ARGS:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	DRIFT="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/drift"
-	LIBS="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	LIBS="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 	DEST="${DRIFT_DEPLOY_DEST:-build/deploy}"
 	APP_DEST="${DRIFT_APP_DEST:-build/deploy-app}"   # uflowsd is kind:app -> drift deploy requires --app-dest
 	KEY_FILE="${DRIFT_SIGN_KEY_FILE:-$HOME/.config/drift/keys/default.seed}"

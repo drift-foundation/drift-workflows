@@ -31,7 +31,7 @@ test:
 	source "../../tools/cert-env.sh"
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
 	[[ -x "$MARIACHI_BIN" ]] || { echo "error: mariachi not found at '$MARIACHI_BIN' (set MARIACHI_BIN or DRIFT_CERT_CAPABILITIES.tool:mariachi)" >&2; exit 1; }
-	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
 	WORK="$(mktemp -d -t coord-singular-XXXXXX)"
@@ -86,7 +86,7 @@ perf *ARGS:
 	source "../../tools/cert-env.sh"
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
 	[[ -x "$MARIACHI_BIN" ]] || { echo "error: mariachi not found at '$MARIACHI_BIN' (set MARIACHI_BIN or DRIFT_CERT_CAPABILITIES.tool:mariachi)" >&2; exit 1; }
-	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
 	WORK="$(mktemp -d -t coord-singular-perf-XXXXXX)"
@@ -126,7 +126,7 @@ stress:
 	source "../../tools/cert-env.sh"
 	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
 	[[ -x "$MARIACHI_BIN" ]] || { echo "error: mariachi not found at '$MARIACHI_BIN' (set MARIACHI_BIN or DRIFT_CERT_CAPABILITIES.tool:mariachi)" >&2; exit 1; }
-	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/libs}"
+	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
 	WORK="$(mktemp -d -t coord-singular-stress-XXXXXX)"

@@ -16,6 +16,11 @@ prefix-checked against the static root as a second, independent guard.
 API (slice 1):
   GET /api/health                          -> {"ok": true, "database": ...}
   GET /api/workflow/<32-hex>?max_depth=N   -> mfinspect-`inspect`-parity JSON tree
+  GET /api/workflows?script=&since=&until= -> mfinspect-`list`-parity summary array
+      [&plan_version=][&state=]               (script+since+until REQUIRED -> 400,
+                                                the bounded-scan rule; each entry
+                                                carries an `href` to its
+                                                /api/workflow/<id> inspection)
 """
 from __future__ import annotations
 
@@ -122,6 +127,9 @@ class VizRequestHandler(BaseHTTPRequestHandler):
 		if parsed.path == "/api/health":
 			self._api_health()
 			return
+		if parsed.path == "/api/workflows":
+			self._api_workflows(parsed.query)
+			return
 		match = _WORKFLOW_ROUTE.fullmatch(parsed.path)
 		if match:
 			self._api_workflow(match.group(1), parsed.query)
@@ -172,6 +180,45 @@ class VizRequestHandler(BaseHTTPRequestHandler):
 			self._send_json(HTTPStatus.NOT_FOUND, node)
 			return
 		self._send_json(HTTPStatus.OK, node)
+
+	def _api_workflows(self, query: str) -> None:
+		params = urllib.parse.parse_qs(query)
+
+		def one(name: str) -> str | None:
+			values = params.get(name)
+			if not values or not values[-1]:
+				return None
+			return values[-1]
+
+		script, since, until = one("script"), one("since"), one("until")
+		missing = [name for name, value in
+		           (("script", script), ("since", since), ("until", until)) if value is None]
+		if missing:
+			# The bounded-scan rule, enforced structurally (mfinspect `list` parity):
+			# an unbounded search of tb_mf_workflow is never one typo away.
+			self._send_json(HTTPStatus.BAD_REQUEST, {
+				"error": "bad_request",
+				"detail": "missing required query parameter(s): " + ", ".join(missing)
+				          + " (script + a bounded since/until created_at range are required)",
+			})
+			return
+		try:
+			conn = dbq.connect(self.server.db_cfg)
+			try:
+				summaries = dbq.list_workflows(
+					conn, script, since, until,
+					plan_version=one("plan_version"), state=one("state"))
+			finally:
+				conn.close()
+		except dbq.MfvizError as exc:
+			self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad_request", "detail": str(exc)})
+			return
+		except Exception as exc:
+			self._send_json(HTTPStatus.BAD_GATEWAY, {"error": "db_error", "detail": str(exc)})
+			return
+		for entry in summaries:
+			entry["href"] = f"/api/workflow/{entry['workflow_id']}"
+		self._send_json(HTTPStatus.OK, summaries)
 
 	# ===== static UI =====
 

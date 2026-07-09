@@ -40,7 +40,7 @@ ARTIFACT = "microflows"
 
 # Foundation-libs root for the external mariadb deps.
 PKG_ROOT = os.path.abspath(os.environ.get(
-    "DRIFT_PKG_ROOT", os.path.expanduser("~/opt/drift/certified/current/libs")))
+    "DRIFT_PKG_ROOT", os.path.expanduser("~/opt/drift/certified/current/pkgs")))
 
 # Host-global mutex key naming the shared MariaDB *instance* (mdb114-a @ :34214).
 # Must match other consumers' string (singular, mariadb-client) to serialize

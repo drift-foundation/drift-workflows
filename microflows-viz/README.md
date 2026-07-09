@@ -86,10 +86,15 @@ MDB_ROOT_PWD=rootpw ./microflows-viz serve            # → http://127.0.0.1:837
 - **DB connection** is the `--db-*` family, deliberately prefixed so it can never be confused with the
   HTTP bind: `--db-host` / `--db-port` / `--db-user` / `--db-password` / `--db-password-env`
   (preferred; default `MDB_ROOT_PWD`) / `--db-name`.
-- **API (so far):** `GET /api/health`, and `GET /api/workflow/<32-hex>?max_depth=N` — the full
+- **API (so far):** `GET /api/health`; `GET /api/workflow/<32-hex>?max_depth=N` — the full
   recursive workflow-tree dump (workflow, plan + args, operations, calls, checkpoints, full event
-  history, children), same JSON as `mfinspect inspect`. Search/list, call-tree/timeline, and
-  stuck-reason endpoints are next (see `work/viz-consolidation/README.md`).
+  history, children), same JSON as `mfinspect inspect`; and
+  `GET /api/workflows?script=&since=&until=[&plan_version=][&state=]` — bounded search returning
+  workflow summaries (id, script, state/state_name/disposition, created/updated timestamps,
+  terminal_reason, parent/root ids), each entry carrying an `href` to its `/api/workflow/<id>`
+  inspection. `script`+`since`+`until` are required (400 otherwise) — an unbounded scan is never
+  one typo away. Call-tree/timeline and stuck-reason endpoints are next (see
+  `work/viz-consolidation/README.md`).
 - **Read-only by permission:** every query is a SELECT, and running as `viz_ro` makes MariaDB itself
   reject anything else. `microflows-viz` is absorbing `microflows/tools/mfinspect`, which goes away
   once parity is reached.
@@ -97,6 +102,68 @@ MDB_ROOT_PWD=rootpw ./microflows-viz serve            # → http://127.0.0.1:837
 Develop with `just setup` / `just build` / `just test` (the test suite covers packaging, the viz_ro
 grant, and the HTTP surface; DB-backed tests use the standing dev fixture) — `just run serve ...`
 passes through to the venv console script.
+
+## Operator quickstart — answering "what ran?"
+
+Copy-paste flow: start the backend, find the workflow instances you care about, then inspect one.
+
+**1. Start the backend.**
+
+```bash
+# production posture — the SELECT-only viz_ro DB user:
+VIZ_RO_PWD=... ./microflows-viz serve --db-user viz_ro --db-password-env VIZ_RO_PWD
+
+# local dev against the fixture DB (127.0.0.1:34214, database `microflows`):
+MDB_ROOT_PWD=rootpw ./microflows-viz serve
+```
+
+**2. Confirm it can reach the DB.**
+
+```bash
+curl -s http://127.0.0.1:8377/api/health | jq .
+# {"database": "microflows", "ok": true}
+```
+
+**3. Search for workflow instances** (a script name is not an instance identity — many instances
+run the same script, so search first, then inspect one):
+
+```bash
+curl -s 'http://127.0.0.1:8377/api/workflows?script=checkout&since=2026-07-09%2000:00:00&until=2026-07-09%2023:59:59' | jq .
+```
+
+`script` + `since` + `until` are **all required** (HTTP 400 otherwise) — deliberately, so an
+accidental unbounded scan of the workflow table is impossible, not just discouraged. Narrow
+further with the optional filters:
+
+```bash
+# only completed instances (state accepts a name or numeric code — forward, reversing,
+# blocked_resolution, completed, reversed, resolved_exception, failed):
+curl -s 'http://127.0.0.1:8377/api/workflows?script=checkout&since=2026-07-09%2000:00:00&until=2026-07-09%2023:59:59&state=completed' | jq .
+
+# only instances pinned to a specific plan version:
+curl -s 'http://127.0.0.1:8377/api/workflows?script=checkout&since=2026-07-09%2000:00:00&until=2026-07-09%2023:59:59&plan_version=1.0.0' | jq .
+```
+
+Each result is a summary — `workflow_id`, `script_name`, `state`/`state_name`,
+`current_disposition`, `created_at`/`updated_at`, `terminal_reason`, parent/root ids — plus an
+`href` pointing straight at its inspection URL.
+
+**4. Inspect one instance** — either follow the returned `href`, or paste the `workflow_id`:
+
+```bash
+curl -s 'http://127.0.0.1:8377/api/workflow/<32-hex>?max_depth=10' | jq .
+```
+
+That returns the full durable state for the instance, unfiltered: the workflow row, plan pin +
+args, operations, call rows, checkpoint stack, the complete event history, and `children` nesting
+recursively into every child workflow (up to `max_depth`; deeper children come back as explicit
+`{"truncated": true}` stubs, never silently dropped). Useful `jq` starting points:
+`jq .workflow.state`, `jq .events[-1]`, `jq '.children[].workflow_id'`.
+
+**Scope note:** this slice answers *search/list* and *full raw inspection* (mfinspect parity).
+Slice 2 adds the derived operator views — call **tree**, event **timeline**, and a **stuck**
+endpoint that explains what a non-moving workflow is waiting on (lease, retry schedule, child,
+reconcile/redispatch, operator resolution) — see `work/viz-consolidation/README.md`.
 
 ## Alternative views (optional, hosted)
 
