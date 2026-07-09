@@ -43,7 +43,7 @@ follow-up, not dropped for lack of value (see work/mfinspect/Progress.md).
     "operations": [...tb_mf_operation rows ordered by operation_seq...],
     "calls": [...tb_mf_call rows ordered by operation_seq...],
     "checkpoints": [...tb_mf_workflow_checkpoint rows ordered by seq...],
-    "events": [...tb_mf_workflow_event rows ordered by event_seq, the full history...],
+    "events": [...tb_mf_workflow_event rows ordered by event_ts, the full history...],
     "children": [...recursively inspected child nodes, or a {"child_workflow_id":..., "truncated":
                   true} stub once --max-depth is reached -- never silently omitted...]
   }
@@ -246,7 +246,7 @@ def fetch_checkpoints(conn, wf_bytes: bytes):
 
 def fetch_events(conn, wf_bytes: bytes):
 	with conn.cursor() as c:
-		c.execute("SELECT * FROM tb_mf_workflow_event WHERE workflow_id = %s ORDER BY event_seq",
+		c.execute("SELECT * FROM tb_mf_workflow_event WHERE workflow_id = %s ORDER BY event_ts",
 		          (wf_bytes,))
 		rows = c.fetchall()
 	out = []

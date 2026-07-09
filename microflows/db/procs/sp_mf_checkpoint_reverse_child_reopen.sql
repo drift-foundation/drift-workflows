@@ -38,7 +38,6 @@ proc:BEGIN
 	DECLARE v_owner varbinary(16);
 	DECLARE v_token bigint;
 	DECLARE v_state tinyint;
-	DECLARE v_parent_event_seq bigint;
 	DECLARE v_parent_event_ts datetime(6);
 	DECLARE v_call_kind tinyint DEFAULT 1;
 	DECLARE v_missing tinyint(1) DEFAULT 0;
@@ -49,7 +48,6 @@ proc:BEGIN
 	DECLARE v_call_missing tinyint(1) DEFAULT 0;
 	DECLARE v_child_missing tinyint(1) DEFAULT 0;
 	DECLARE v_child_state tinyint;
-	DECLARE v_child_event_seq bigint;
 	DECLARE v_child_event_ts datetime(6);
 	DECLARE v_child_top_seq int DEFAULT NULL;
 
@@ -75,8 +73,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`
-		INTO v_owner, v_token, v_state, v_parent_event_seq, v_parent_event_ts
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_ts`
+		INTO v_owner, v_token, v_state, v_parent_event_ts
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
 		FOR UPDATE;
@@ -127,8 +125,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_child_missing = 1;
-		SELECT `state`, `current_event_seq`, `current_event_ts`
-		INTO v_child_state, v_child_event_seq, v_child_event_ts
+		SELECT `state`, `current_event_ts`
+		INTO v_child_state, v_child_event_ts
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = v_child_id
 		FOR UPDATE;
@@ -195,21 +193,18 @@ proc:BEGIN
 	END IF;
 
 	-- ONLY NOW -- every possible rejection already ruled out -- the write phase.
-	SET v_parent_event_seq = v_parent_event_seq + 1;
-	SET v_child_event_seq = v_child_event_seq + 1;
 
 	-- Parent: audit only -- state/continuation are NOT touched (the parent is still "at" this
 	-- checkpoint per its existing reverse cursor; only its event trail advances).
 	UPDATE `tb_mf_workflow`
-	SET `current_event_seq` = v_parent_event_seq,
-	    `current_event_ts` = arg_event_ts,
+	SET `current_event_ts` = arg_event_ts,
 	    `updated_at` = arg_event_ts
 	WHERE `workflow_id` = arg_workflow_id;
 
 	INSERT INTO `tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
-		arg_workflow_id, v_parent_event_seq, arg_event_ts, 'compensation_requested', arg_executor, NULL,
+		arg_workflow_id, arg_event_ts, 'compensation_requested', arg_executor, NULL,
 		JSON_OBJECT('seq', arg_seq, 'child_workflow_id', LOWER(HEX(v_child_id)))
 	);
 
@@ -231,15 +226,14 @@ proc:BEGIN
 	    `terminal_reason` = 'parent_compensation',
 	    `workflow_return_json` = NULL,
 	    `next_attempt_at` = arg_event_ts,
-	    `current_event_seq` = v_child_event_seq,
 	    `current_event_ts` = arg_event_ts,
 	    `updated_at` = arg_event_ts
 	WHERE `workflow_id` = v_child_id;
 
 	INSERT INTO `tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
-		v_child_id, v_child_event_seq, arg_event_ts, 'compensation_requested_by_parent', arg_executor, NULL,
+		v_child_id, arg_event_ts, 'compensation_requested_by_parent', arg_executor, NULL,
 		JSON_OBJECT('parent_workflow_id', LOWER(HEX(arg_workflow_id)), 'parent_operation_seq', CAST(arg_seq AS SIGNED))
 	);
 

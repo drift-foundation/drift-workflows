@@ -162,7 +162,7 @@ a clean ownership seam — participants own data+transactions+invariants+
 every HARD runtime guarantee already built is coordination, not substrate, and
   survives intact: leases, fencing, durable continuations, checkpoints,
   reverse-order compensation, blocked_resolution, cancellation, recovery,
-  event_seq ordering, and the §24.4 time/command discipline.
+  event_ts chronological ordering, and the §24.4 time/command discipline.
 ```
 
 ### 2.4 The honest new guarantee
@@ -234,7 +234,7 @@ cancellation as a direct fenced transition ............... prior §24.6
 crash recovery (expired lease = claimable work) .......... prior §24.1
 time/command discipline (no ambient nondeterminism,
   explicit IDs/timestamps fixed across retries,
-  event_seq is causal order, no AUTO_INCREMENT) .......... prior §24.4
+  event_ts is the chronological order, no AUTO_INCREMENT)  prior §24.4
 compilation: source -> verify -> portable interpreted IR;
   immutable script revisions; running instances pinned ... prior §22
 ```
@@ -566,8 +566,8 @@ each workflow retains current_event_ts; a transition requires
   new_event_ts > current_event_ts.
 a non-increasing timestamp indicates CLOCK SKEW: abort and DEFER the workflow
   (do NOT adjust the timestamp or immediately retry).
-event_seq remains the authoritative causal ordering; timestamps must remain
-  chronological alongside it.
+event_ts is the workflow-local ordering: strictly increasing per workflow
+  (enforced by the guard above), so history is ordered by chronology alone.
 ```
 
 ```text

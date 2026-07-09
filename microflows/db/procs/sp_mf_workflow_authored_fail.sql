@@ -31,7 +31,6 @@ proc:BEGIN
 	DECLARE v_owner varbinary(16);
 	DECLARE v_token bigint;
 	DECLARE v_state tinyint;
-	DECLARE v_event_seq bigint;
 	DECLARE v_event_ts datetime(6);
 	DECLARE v_trigger varbinary(16);
 	DECLARE v_top_seq int DEFAULT NULL;
@@ -59,8 +58,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`, `reversal_trigger_operation_id`, `terminal_reason`
-		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts, v_trigger, v_term_reason
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_ts`, `reversal_trigger_operation_id`, `terminal_reason`
+		INTO v_owner, v_token, v_state, v_event_ts, v_trigger, v_term_reason
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
 		FOR UPDATE;
@@ -99,9 +98,6 @@ proc:BEGIN
 	SELECT MAX(`seq`) INTO v_top_seq
 	FROM `tb_mf_workflow_checkpoint`
 	WHERE `workflow_id` = arg_workflow_id AND `reversal_state` = 1;
-
-	SET v_event_seq = v_event_seq + 1;
-
 	IF v_top_seq IS NULL THEN
 		-- Nothing to compensate -> terminal FAILED(7) (authored failure with NO completed
 		-- unwind), lease cleared. Durable state = failed, terminal_reason = the reason; the
@@ -115,15 +111,14 @@ proc:BEGIN
 		    `terminal_reason` = arg_reason,
 		    `lease_owner` = NULL,
 		    `lease_expires_at` = NULL,
-		    `current_event_seq` = v_event_seq,
 		    `current_event_ts` = arg_event_ts,
 		    `updated_at` = arg_event_ts
 		WHERE `workflow_id` = arg_workflow_id;
 
 		INSERT INTO `tb_mf_workflow_event` (
-			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+			`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 		) VALUES (
-			arg_workflow_id, v_event_seq, arg_event_ts, 'failed', arg_executor, NULL,
+			arg_workflow_id, arg_event_ts, 'failed', arg_executor, NULL,
 			JSON_OBJECT('reason', arg_reason, 'compensated', 0,
 				'source', 'authored_fail', 'fail_id', LOWER(HEX(arg_fail_id)))
 		);
@@ -140,15 +135,14 @@ proc:BEGIN
 	    `continuation` = JSON_OBJECT('pos', 'reverse', 'seq', v_top_seq),
 	    `reversal_trigger_operation_id` = arg_fail_id,
 	    `terminal_reason` = arg_reason,
-	    `current_event_seq` = v_event_seq,
 	    `current_event_ts` = arg_event_ts,
 	    `updated_at` = arg_event_ts
 	WHERE `workflow_id` = arg_workflow_id;
 
 	INSERT INTO `tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
-		arg_workflow_id, v_event_seq, arg_event_ts, 'reversal_begun', arg_executor, NULL,
+		arg_workflow_id, arg_event_ts, 'reversal_begun', arg_executor, NULL,
 		JSON_OBJECT('reason', arg_reason, 'top_seq', v_top_seq,
 			'source', 'authored_fail', 'fail_id', LOWER(HEX(arg_fail_id)))
 	);

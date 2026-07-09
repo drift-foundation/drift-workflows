@@ -13,7 +13,7 @@ DELIMITER $$
 -- by time, same no-clobber-on-stale-poll rule as sp_mf_call_hint_refresh) and the PARENT's
 -- next_attempt_at, PULLED EARLIER ONLY (LEAST(current, arg_event_ts) — a wake may accelerate the
 -- parent's next scan, never delay it). Never touches tb_mf_operation, never creates a checkpoint,
--- never appends a tb_mf_workflow_event row (event_seq derivation is a FENCED-transaction-only
+-- never appends a tb_mf_workflow_event row (event appends are a FENCED-transaction-only
 -- discipline; this unfenced call must not participate in it), never sets the parent's
 -- status/result_json/state/lease. The runner (via sp_mf_call_inspect) remains the single
 -- authority that actually settles or reverses the parent's call operation.

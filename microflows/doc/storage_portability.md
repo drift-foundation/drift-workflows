@@ -65,16 +65,17 @@ writes against one aggregate manifest.
    replacement: verify the expected head `storage_version` (the ETag) together with the
    domain precondition `(lease_owner, fencing_token, state)`; write the new head fields;
    record any **child transition** (see below); unique-create any new immutable child
-   objects; and, when the transition produces audit evidence, **append the event(s) with
-   `event_seq = current_event_seq + 1`** — all in one commit. The workhorse: every aggregate
-   transition is one such commit.
+   objects; and, when the transition produces audit evidence, **append the event(s) at
+   `event_ts` strictly greater than `current_event_ts`** — all in one commit. The workhorse:
+   every aggregate transition is one such commit.
 
    **Three distinct per-aggregate counters — do not conflate them.** `storage_version` is the
    optimistic-concurrency ETag; it changes on *every* head mutation, **including lease-only
-   ones (claim, heartbeat, release, defer) that append no event.** `current_event_seq` is
-   *only* causal event order and advances *only* when an event is appended. `fencing_token` is
-   the publish authority and is bumped *only* on claim. In particular `current_event_seq`
-   **cannot** serve as the head ETag — a lease mutation leaves it unchanged — so a
+   ones (claim, heartbeat, release, defer) that append no event.** `current_event_ts` is
+   *only* the event-chronology head (the latest event's timestamp) and advances *only* when an
+   event is appended. `fencing_token` is the publish authority and is bumped *only* on claim.
+   In particular `current_event_ts` **cannot** serve as the head ETag — a lease mutation
+   leaves it unchanged — so a
    conditional-write store needs a dedicated `storage_version`. (MariaDB has no such column
    today; it relies on the row lock instead — see Known portability debt.)
 
@@ -116,13 +117,15 @@ input, never causal identity.
 
 - **I1 — single-aggregate atomicity.** A transition writes only one workflow's head and its
   own children.
-- **I2 — `event_seq` is the only causal order.** `current_event_seq` is its head
-  projection; appends derive `event_seq = current_event_seq + 1` inside the commit.
-  Timestamps never order anything; nothing is `AUTO_INCREMENT` and no column has a
-  `DEFAULT`/`ON UPDATE` time. Causal order is **distinct from the head's optimistic-
-  concurrency version** (`storage_version`): a lease-only head mutation (claim, heartbeat,
-  release, defer) advances the head version but appends no event and so leaves
-  `current_event_seq` unchanged.
+- **I2 — `event_ts` chronology is the only event order.** `current_event_ts` is its head
+  projection (the latest event's timestamp); every append enforces its `event_ts` strictly
+  greater than `current_event_ts` inside the commit (a non-increasing supplied timestamp is
+  rejected as `event_time_skew` and the runner retries with a later DB-clock value). Nothing
+  is `AUTO_INCREMENT` and no column has a `DEFAULT`/`ON UPDATE` time; SQL never generates or
+  adjusts a timestamp. Event order is **distinct from the head's optimistic-concurrency
+  version** (`storage_version`): a lease-only head mutation (claim, heartbeat, release,
+  defer) advances the head version but appends no event and so leaves `current_event_ts`
+  unchanged.
 - **I3 — fencing.** `fencing_token` is a per-aggregate monotonic counter bumped only on
   claim (and direct intervention). A publish requires the matching token; a stale holder
   can compute but never commit.
@@ -208,11 +211,11 @@ current procedures are too fat by this test.)
 ```text
 Aggregate(workflow_id):
   head     = { storage_version,                      # ETag: bumped on EVERY head write
-               state, direction, disposition, current_event_seq, fencing_token,
+               state, direction, disposition, current_event_ts, fencing_token,
                lease_owner, lease_expires_at, next_attempt_at, continuation,
                reversal_trigger?, plan_pin?, active_stack_top?,
                op_refs[], checkpoint_refs[] }         # manifest selects current child versions
-  events[] = immutable, ordered by event_seq (causal authority; advances only on append)
+  events[] = immutable, ordered by event_ts (strictly monotonic per aggregate; advances only on append)
   ops[]    = immutable request + write-once result object (status "settled" ⇔ result exists)
   ckpts[]  = immutable payload + write-once reverse binding + write-once terminal record
              (reversal state derived from which terminal record exists)
@@ -229,7 +232,7 @@ Primitives:
                           | ckpt_bound(seq, reverse_binding)            # write-once binding
                           | ckpt_reversed(seq) | ckpt_blocked(seq, disposition)  ?,
          create = immutable child objects,
-         append = events[ event_seq = current_event_seq+1 ])   # only when evidence is produced
+         append = events[ event_ts > current_event_ts ])       # only when evidence is produced
         -> Committed(new_storage_version)
          | AlreadyApplied(stored_result)        # idempotent replay, read BEFORE fence
          | FenceLost | InvalidState(reason) | Conflict
@@ -259,8 +262,8 @@ match ∧ top-of-stack ∧ owner ∧ token ∧ state=2`.
   the `AlreadyApplied(stored_result)` arm of `commit` for settles. The identity keys (I4) are
   unique-create constraints in any store, and the already-applied result is read **before**
   the fence so dead-token retries still resolve.
-- **Ordering** → `current_event_seq` is the **causal event-order** authority
-  (`append: event_seq = current_event_seq+1`) and advances *only* when an event is appended. It
+- **Ordering** → `current_event_ts` is the **event-chronology** authority
+  (`append: event_ts > current_event_ts`, strictly) and advances *only* when an event is appended. It
   is **not** the concurrency-control version: optimistic concurrency uses the head's
   `storage_version` (bumped on every head write, including lease-only mutations that append no
   event), and publish authority uses `fencing_token` (bumped only on claim). Three separate
@@ -305,9 +308,9 @@ non-relational port.
 A head/manifest per `workflow_id` (the mutable workflow fields + `active_stack_top` + an
 embedded-or-referenced plan pin), conditionally replaced by its generation/ETag — the head's
 `storage_version` (which advances on every head write, including lease-only ones), NOT
-`current_event_seq` (causal event order, which a lease mutation leaves unchanged). Immutable
+`current_event_ts` (event chronology, which a lease mutation leaves unchanged). Immutable
 referenced objects: one event object per
-`event_seq` (the authority — ordered by sequence, never by time), per-operation
+`event_ts` (the authority — strictly monotonic per aggregate by the append guard), per-operation
 request/result objects keyed by `operation_id`, checkpoint objects with write-once
 payload/binding. A publication is one conditional PUT of the head that co-writes the new
 immutable child(ren); if the store cannot co-write atomically, the head flip is the single

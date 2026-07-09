@@ -110,7 +110,7 @@ def main():
     # rather than fall through and settle the parent as if compensated (review-caught regression).
     _DISP_DIR_BY_STATE = {1: (0, 1), 4: (1, 1), 2: (2, 2), 3: (2, 2), 5: (2, 2), 6: (2, 2), 7: (2, 2)}
 
-    def make_child_row(state, event_seq=1, event_ts=None, with_checkpoint=True, checkpoint_seq=1,
+    def make_child_row(state, event_ts=None, with_checkpoint=True, checkpoint_seq=1,
                         fencing_token=1):
         wf = os.urandom(16)
         all_workflow_ids.append(wf)
@@ -121,11 +121,11 @@ def main():
         term_reason = None if state in (1, 4) else "child-own-reason"
         cur.execute(
             "INSERT INTO tb_mf_workflow (workflow_id, script_name, script_revision, state, "
-            "execution_direction, current_disposition, current_event_seq, current_event_ts, "
+            "execution_direction, current_disposition, current_event_ts, "
             "fencing_token, lease_owner, lease_expires_at, next_attempt_at, current_operation_attempt, "
             "continuation, terminal_reason, workflow_return_json, created_at, updated_at) "
-            "VALUES (%s,%s,1,%s,%s,%s,%s,%s,%s,NULL,NULL,%s,0,'{\"pos\":\"x\"}',%s,%s,%s,%s)",
-            (wf, SCRIPT, state, direction, disp, event_seq, event_ts, fencing_token, event_ts,
+            "VALUES (%s,%s,1,%s,%s,%s,%s,%s,NULL,NULL,%s,0,'{\"pos\":\"x\"}',%s,%s,%s,%s)",
+            (wf, SCRIPT, state, direction, disp, event_ts, fencing_token, event_ts,
              term_reason, ret, event_ts, event_ts))
         if with_checkpoint:
             op_id = os.urandom(16)
@@ -135,7 +135,7 @@ def main():
                 (wf, checkpoint_seq, op_id, event_ts, event_ts))
         return wf
 
-    def make_parent_call_checkpoint(child_wf, seq, fencing_token, parent_event_seq=1, parent_event_ts=None):
+    def make_parent_call_checkpoint(child_wf, seq, fencing_token, parent_event_ts=None):
         """A parent workflow already in reversing(2) with a call_kind=2 checkpoint at `seq`,
         sidecar-linked to `child_wf` -- the fixture sp_mf_checkpoint_reverse_child_reopen/_settle
         operate on."""
@@ -145,11 +145,11 @@ def main():
             parent_event_ts = T(1)
         cur.execute(
             "INSERT INTO tb_mf_workflow (workflow_id, script_name, script_revision, state, "
-            "execution_direction, current_disposition, current_event_seq, current_event_ts, "
+            "execution_direction, current_disposition, current_event_ts, "
             "fencing_token, lease_owner, lease_expires_at, next_attempt_at, current_operation_attempt, "
             "continuation, created_at, updated_at) "
-            "VALUES (%s,%s,1,2,2,2,%s,%s,%s,%s,%s,%s,0,'{\"pos\":\"reverse\"}',%s,%s)",
-            (wf, SCRIPT, parent_event_seq, parent_event_ts, fencing_token, EXEC,
+            "VALUES (%s,%s,1,2,2,2,%s,%s,%s,%s,%s,0,'{\"pos\":\"reverse\"}',%s,%s)",
+            (wf, SCRIPT, parent_event_ts, fencing_token, EXEC,
              "2026-03-01 10:00:00.000000", parent_event_ts, parent_event_ts, parent_event_ts))
         op_id = os.urandom(16)
         cur.execute(
@@ -206,9 +206,9 @@ def main():
     row = cur.fetchone()
     check("submit_child_args_row", row and bytes(row[0]) == b'{"amount":10}', row)
 
-    cur.execute("SELECT event_seq, kind, payload FROM tb_mf_workflow_event WHERE workflow_id=%s", (child1,))
+    cur.execute("SELECT kind, payload FROM tb_mf_workflow_event WHERE workflow_id=%s", (child1,))
     row = cur.fetchone()
-    check("submit_child_created_event", row == (1, "created", '{"k":"child"}'), row)
+    check("submit_child_created_event", row == ("created", '{"k":"child"}'), row)
 
     cur.execute("SELECT child_workflow_id, child_script_name, child_plan_version, child_content_hash, "
                 "child_status, first_requested_at FROM tb_mf_call WHERE workflow_id=%s AND operation_seq=1", (wf1,))
@@ -217,14 +217,15 @@ def main():
           row[0] == child1 and row[1] == child1_script and row[2] == "2.0.0" and row[3] == child1_hash
           and row[4] == 1, row)
 
-    cur.execute("SELECT continuation, current_event_seq FROM tb_mf_workflow WHERE workflow_id=%s", (wf1,))
+    cur.execute("SELECT continuation, current_event_ts FROM tb_mf_workflow WHERE workflow_id=%s", (wf1,))
     row = cur.fetchone()
-    check("submit_parent_continuation_advanced", row == ('{"pos":"after_call"}', 2), row)
+    check("submit_parent_continuation_advanced",
+          row[0] == '{"pos":"after_call"}' and str(row[1]) == "2026-03-01 09:00:02", row)
 
-    cur.execute("SELECT event_seq, kind, actor, payload FROM tb_mf_workflow_event "
-                "WHERE workflow_id=%s AND event_seq=2", (wf1,))
+    cur.execute("SELECT kind, actor, payload FROM tb_mf_workflow_event "
+                "WHERE workflow_id=%s AND kind='call_submitted'", (wf1,))
     row = cur.fetchone()
-    check("submit_parent_event_appended", row == (2, "call_submitted", EXEC, '{"k":"parent"}'), row)
+    check("submit_parent_event_appended", row == ("call_submitted", EXEC, '{"k":"parent"}'), row)
 
     # ================================================================
     # 2. Malformed child inputs SIGNAL before any mutation.
@@ -392,7 +393,7 @@ def main():
     _, r = call(cur, "sp_mf_workflow_release", (wf8, EXEC, tok8, T(3), far_future))
     check("notify_setup_release", r and r["outcome"] == "released", r)
 
-    cur.execute("SELECT state, current_disposition, current_event_seq FROM tb_mf_workflow WHERE workflow_id=%s",
+    cur.execute("SELECT state, current_disposition, current_event_ts FROM tb_mf_workflow WHERE workflow_id=%s",
                 (wf8,))
     parent_before = cur.fetchone()
     cur.execute("SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id=%s", (wf8,))
@@ -412,7 +413,7 @@ def main():
     row = cur.fetchone()
     check("notify_wake_pulled_earlier", str(row[0]) == "2026-03-01 09:00:04", row)
 
-    cur.execute("SELECT state, current_disposition, current_event_seq FROM tb_mf_workflow WHERE workflow_id=%s",
+    cur.execute("SELECT state, current_disposition, current_event_ts FROM tb_mf_workflow WHERE workflow_id=%s",
                 (wf8,))
     parent_after = cur.fetchone()
     check("notify_never_settles_parent_state", parent_before == parent_after, (parent_before, parent_after))
@@ -459,8 +460,8 @@ def main():
     # 10. sp_mf_checkpoint_reverse_child_reopen ("T1") -- fresh reopen is a parent+child
     #     transaction, exactly-once idempotent, diagnoses failed(7), dual event-time skew.
     # ================================================================
-    child_a = make_child_row(state=4, event_seq=3, event_ts=T(10), checkpoint_seq=1, fencing_token=1)
-    parent_a = make_parent_call_checkpoint(child_a, seq=1, fencing_token=701, parent_event_seq=2, parent_event_ts=T(9))
+    child_a = make_child_row(state=4, event_ts=T(10), checkpoint_seq=1, fencing_token=1)
+    parent_a = make_parent_call_checkpoint(child_a, seq=1, fencing_token=701, parent_event_ts=T(9))
 
     cur.execute("SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id=%s", (parent_a,))
     parent_events_before = cur.fetchone()[0]
@@ -489,7 +490,7 @@ def main():
 
     cur.execute("SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id=%s", (child_a,))
     check("reopen_child_event_count", cur.fetchone()[0] == child_events_before + 1, "expected exactly 1 new child event")
-    cur.execute("SELECT kind, actor, payload FROM tb_mf_workflow_event WHERE workflow_id=%s ORDER BY event_seq DESC LIMIT 1",
+    cur.execute("SELECT kind, actor, payload FROM tb_mf_workflow_event WHERE workflow_id=%s ORDER BY event_ts DESC LIMIT 1",
                 (child_a,))
     row = cur.fetchone()
     check("reopen_child_event_kind", row[0] == "compensation_requested_by_parent", row)
@@ -500,7 +501,7 @@ def main():
 
     cur.execute("SELECT COUNT(*) FROM tb_mf_workflow_event WHERE workflow_id=%s", (parent_a,))
     check("reopen_parent_event_count", cur.fetchone()[0] == parent_events_before + 1, "expected exactly 1 new parent event")
-    cur.execute("SELECT kind, payload FROM tb_mf_workflow_event WHERE workflow_id=%s ORDER BY event_seq DESC LIMIT 1",
+    cur.execute("SELECT kind, payload FROM tb_mf_workflow_event WHERE workflow_id=%s ORDER BY event_ts DESC LIMIT 1",
                 (parent_a,))
     row = cur.fetchone()
     check("reopen_parent_event_kind", row[0] == "compensation_requested", row)
@@ -536,7 +537,7 @@ def main():
     check("reopen_idempotent_child_unchanged", cur.fetchone() == child_row_before2, "expected child row unchanged")
 
     # failed(7): diagnostic, never a benign skip -- corruption evidence, no write.
-    child_failed = make_child_row(state=7, event_seq=1, event_ts=T(1))
+    child_failed = make_child_row(state=7, event_ts=T(1))
     parent_failed = make_parent_call_checkpoint(child_failed, seq=1, fencing_token=702, parent_event_ts=T(1))
     _, r = call(cur, "sp_mf_checkpoint_reverse_child_reopen", (parent_failed, EXEC, 702, 1, T(2)))
     check("reopen_failed_child_diagnosed", r and r["outcome"] == "child_state_inconsistent" and r["child_state"] == 7, r)
@@ -545,14 +546,14 @@ def main():
 
     # Dual event-time skew: EITHER clock being ahead of the proposed event_ts must block, before
     # any mutation -- not just the parent's own.
-    child_c = make_child_row(state=4, event_seq=1, event_ts=T(5), checkpoint_seq=1)
+    child_c = make_child_row(state=4, event_ts=T(5), checkpoint_seq=1)
     parent_c = make_parent_call_checkpoint(child_c, seq=1, fencing_token=703, parent_event_ts=T(20))
     _, r = call(cur, "sp_mf_checkpoint_reverse_child_reopen", (parent_c, EXEC, 703, 1, T(10)))
     check("reopen_time_skew_parent_clock", r and r["outcome"] == "event_time_skew", r)
     cur.execute("SELECT state FROM tb_mf_workflow WHERE workflow_id=%s", (child_c,))
     check("reopen_time_skew_parent_clock_no_write", cur.fetchone()[0] == 4, "expected no mutation")
 
-    child_d = make_child_row(state=4, event_seq=1, event_ts=T(20), checkpoint_seq=1)
+    child_d = make_child_row(state=4, event_ts=T(20), checkpoint_seq=1)
     parent_d = make_parent_call_checkpoint(child_d, seq=1, fencing_token=704, parent_event_ts=T(5))
     _, r = call(cur, "sp_mf_checkpoint_reverse_child_reopen", (parent_d, EXEC, 704, 1, T(10)))
     check("reopen_time_skew_child_clock", r and r["outcome"] == "event_time_skew", r)
@@ -562,17 +563,17 @@ def main():
     # Reverse order (NULL-safe: this SP's idempotent check is on CHILD state, not checkpoint
     # state, so -- unlike settle -- v_top_seq is not already guaranteed non-NULL by an earlier
     # check; this pins that the order check handles it directly).
-    child_f1 = make_child_row(state=4, event_seq=1, event_ts=T(1), checkpoint_seq=1)
-    child_f2 = make_child_row(state=4, event_seq=1, event_ts=T(1), checkpoint_seq=1)
+    child_f1 = make_child_row(state=4, event_ts=T(1), checkpoint_seq=1)
+    child_f2 = make_child_row(state=4, event_ts=T(1), checkpoint_seq=1)
     wf_f = os.urandom(16)
     all_workflow_ids.append(wf_f)
     tok_f = 712
     cur.execute(
         "INSERT INTO tb_mf_workflow (workflow_id, script_name, script_revision, state, "
-        "execution_direction, current_disposition, current_event_seq, current_event_ts, "
+        "execution_direction, current_disposition, current_event_ts, "
         "fencing_token, lease_owner, lease_expires_at, next_attempt_at, current_operation_attempt, "
         "continuation, created_at, updated_at) "
-        "VALUES (%s,%s,1,2,2,2,1,%s,%s,%s,%s,%s,0,'{\"pos\":\"reverse\"}',%s,%s)",
+        "VALUES (%s,%s,1,2,2,2,%s,%s,%s,%s,%s,0,'{\"pos\":\"reverse\"}',%s,%s)",
         (wf_f, SCRIPT, T(1), tok_f, EXEC, "2026-03-01 10:00:00.000000", T(1), T(1), T(1)))
     op_f1, op_f2 = os.urandom(16), os.urandom(16)
     cur.execute(
@@ -625,7 +626,7 @@ def main():
     # an earlier (4,7)-only rejection form let state=1 fall through unnoticed and would have settled
     # the parent's checkpoint as if the child had actually compensated (review-caught regression;
     # this test pins it directly).
-    child_fwd = make_child_row(state=1, event_seq=1, event_ts=T(1))
+    child_fwd = make_child_row(state=1, event_ts=T(1))
     parent_fwd = make_parent_call_checkpoint(child_fwd, seq=1, fencing_token=713, parent_event_ts=T(1))
     _, r = call(cur, "sp_mf_checkpoint_reverse_child_settle", (parent_fwd, EXEC, 713, 1, T(2)))
     check("settle_refuses_forward", r and r["outcome"] == "child_not_compensated" and r["child_state"] == 1, r)
@@ -634,35 +635,35 @@ def main():
     cur.execute("SELECT state FROM tb_mf_workflow WHERE workflow_id=%s", (parent_fwd,))
     check("settle_refuses_forward_parent_untouched", cur.fetchone()[0] == 2, "expected parent still reversing(2), not settled")
 
-    child_rev = make_child_row(state=2, event_seq=1, event_ts=T(1))
+    child_rev = make_child_row(state=2, event_ts=T(1))
     parent_rev = make_parent_call_checkpoint(child_rev, seq=1, fencing_token=705, parent_event_ts=T(1))
     _, r = call(cur, "sp_mf_checkpoint_reverse_child_settle", (parent_rev, EXEC, 705, 1, T(2)))
     check("settle_refuses_reversing", r and r["outcome"] == "child_not_terminal" and r["child_state"] == 2, r)
     cur.execute("SELECT reversal_state FROM tb_mf_workflow_checkpoint WHERE workflow_id=%s AND seq=1", (parent_rev,))
     check("settle_refuses_reversing_checkpoint_untouched", cur.fetchone()[0] == 1, "expected reversal_state unchanged")
 
-    child_blocked = make_child_row(state=3, event_seq=1, event_ts=T(1))
+    child_blocked = make_child_row(state=3, event_ts=T(1))
     parent_blocked = make_parent_call_checkpoint(child_blocked, seq=1, fencing_token=706, parent_event_ts=T(1))
     _, r = call(cur, "sp_mf_checkpoint_reverse_child_settle", (parent_blocked, EXEC, 706, 1, T(2)))
     check("settle_refuses_blocked", r and r["outcome"] == "child_not_terminal" and r["child_state"] == 3, r)
     cur.execute("SELECT reversal_state FROM tb_mf_workflow_checkpoint WHERE workflow_id=%s AND seq=1", (parent_blocked,))
     check("settle_refuses_blocked_checkpoint_untouched", cur.fetchone()[0] == 1, "expected reversal_state unchanged")
 
-    child_still_completed = make_child_row(state=4, event_seq=1, event_ts=T(1), checkpoint_seq=1)
+    child_still_completed = make_child_row(state=4, event_ts=T(1), checkpoint_seq=1)
     parent_stc = make_parent_call_checkpoint(child_still_completed, seq=1, fencing_token=707, parent_event_ts=T(1))
     _, r = call(cur, "sp_mf_checkpoint_reverse_child_settle", (parent_stc, EXEC, 707, 1, T(2)))
     check("settle_refuses_completed", r and r["outcome"] == "child_not_compensated" and r["child_state"] == 4, r)
     cur.execute("SELECT reversal_state FROM tb_mf_workflow_checkpoint WHERE workflow_id=%s AND seq=1", (parent_stc,))
     check("settle_refuses_completed_checkpoint_untouched", cur.fetchone()[0] == 1, "expected reversal_state unchanged")
 
-    child_failed2 = make_child_row(state=7, event_seq=1, event_ts=T(1))
+    child_failed2 = make_child_row(state=7, event_ts=T(1))
     parent_f2 = make_parent_call_checkpoint(child_failed2, seq=1, fencing_token=708, parent_event_ts=T(1))
     _, r = call(cur, "sp_mf_checkpoint_reverse_child_settle", (parent_f2, EXEC, 708, 1, T(2)))
     check("settle_refuses_failed", r and r["outcome"] == "child_not_compensated" and r["child_state"] == 7, r)
     cur.execute("SELECT reversal_state FROM tb_mf_workflow_checkpoint WHERE workflow_id=%s AND seq=1", (parent_f2,))
     check("settle_refuses_failed_checkpoint_untouched", cur.fetchone()[0] == 1, "expected reversal_state unchanged")
 
-    child_rsd = make_child_row(state=5, event_seq=1, event_ts=T(1))
+    child_rsd = make_child_row(state=5, event_ts=T(1))
     parent_rsd = make_parent_call_checkpoint(child_rsd, seq=1, fencing_token=709, parent_event_ts=T(1))
     _, r = call(cur, "sp_mf_checkpoint_reverse_child_settle", (parent_rsd, EXEC, 709, 1, T(2)))
     check("settle_accepts_reversed", r and r["outcome"] == "reversed", r)
@@ -671,7 +672,7 @@ def main():
     cur.execute("SELECT state, lease_owner FROM tb_mf_workflow WHERE workflow_id=%s", (parent_rsd,))
     row = cur.fetchone()
     check("settle_accepts_reversed_parent_terminal", row == (5, None), row)
-    cur.execute("SELECT kind, payload FROM tb_mf_workflow_event WHERE workflow_id=%s ORDER BY event_seq DESC LIMIT 1",
+    cur.execute("SELECT kind, payload FROM tb_mf_workflow_event WHERE workflow_id=%s ORDER BY event_ts DESC LIMIT 1",
                 (parent_rsd,))
     row = cur.fetchone()
     check("settle_accepts_reversed_event", row[0] == "compensation_settled", row)
@@ -682,13 +683,13 @@ def main():
     check("settle_accepts_reversed_event_correlation",
           payload.get("child_workflow_id") == child_rsd.hex() and payload.get("child_state") == 5, payload)
 
-    child_rex = make_child_row(state=6, event_seq=1, event_ts=T(1))
+    child_rex = make_child_row(state=6, event_ts=T(1))
     parent_rex = make_parent_call_checkpoint(child_rex, seq=1, fencing_token=710, parent_event_ts=T(1))
     _, r = call(cur, "sp_mf_checkpoint_reverse_child_settle", (parent_rex, EXEC, 710, 1, T(2)))
     check("settle_accepts_resolved_exception", r and r["outcome"] == "reversed", r)
     cur.execute("SELECT state FROM tb_mf_workflow WHERE workflow_id=%s", (parent_rex,))
     check("settle_accepts_resolved_exception_parent_terminal", cur.fetchone()[0] == 5, "expected parent state=5")
-    cur.execute("SELECT payload FROM tb_mf_workflow_event WHERE workflow_id=%s ORDER BY event_seq DESC LIMIT 1",
+    cur.execute("SELECT payload FROM tb_mf_workflow_event WHERE workflow_id=%s ORDER BY event_ts DESC LIMIT 1",
                 (parent_rex,))
     payload = json.loads(cur.fetchone()[0])
     check("settle_accepts_resolved_exception_event_correlation",
@@ -698,17 +699,17 @@ def main():
     # out-of-order rejection, then descend (stays reversing, more to go), then the final settle
     # reaches the parent's own reversed(5) terminal. Two call checkpoints, both children already
     # reversed(5) (settle's own precondition, tested above, is not what this scenario is pinning).
-    child_e1 = make_child_row(state=5, event_seq=1, event_ts=T(1))
-    child_e2 = make_child_row(state=5, event_seq=1, event_ts=T(1))
+    child_e1 = make_child_row(state=5, event_ts=T(1))
+    child_e2 = make_child_row(state=5, event_ts=T(1))
     wf_e = os.urandom(16)
     all_workflow_ids.append(wf_e)
     tok_e = 711
     cur.execute(
         "INSERT INTO tb_mf_workflow (workflow_id, script_name, script_revision, state, "
-        "execution_direction, current_disposition, current_event_seq, current_event_ts, "
+        "execution_direction, current_disposition, current_event_ts, "
         "fencing_token, lease_owner, lease_expires_at, next_attempt_at, current_operation_attempt, "
         "continuation, created_at, updated_at) "
-        "VALUES (%s,%s,1,2,2,2,1,%s,%s,%s,%s,%s,0,'{\"pos\":\"reverse\"}',%s,%s)",
+        "VALUES (%s,%s,1,2,2,2,%s,%s,%s,%s,%s,0,'{\"pos\":\"reverse\"}',%s,%s)",
         (wf_e, SCRIPT, T(1), tok_e, EXEC, "2026-03-01 10:00:00.000000", T(1), T(1), T(1)))
     op_e1, op_e2 = os.urandom(16), os.urandom(16)
     cur.execute(
@@ -738,7 +739,7 @@ def main():
     check("settle_descends", r and r["outcome"] == "reversing" and r["next_seq"] == 1, r)
     cur.execute("SELECT state FROM tb_mf_workflow WHERE workflow_id=%s", (wf_e,))
     check("settle_descends_parent_still_reversing", cur.fetchone()[0] == 2, "expected parent still state=2 (more to compensate)")
-    cur.execute("SELECT payload FROM tb_mf_workflow_event WHERE workflow_id=%s ORDER BY event_seq DESC LIMIT 1", (wf_e,))
+    cur.execute("SELECT payload FROM tb_mf_workflow_event WHERE workflow_id=%s ORDER BY event_ts DESC LIMIT 1", (wf_e,))
     payload = json.loads(cur.fetchone()[0])
     check("settle_descends_event_correlation",
           payload.get("child_workflow_id") == child_e2.hex() and payload.get("child_state") == 5, payload)

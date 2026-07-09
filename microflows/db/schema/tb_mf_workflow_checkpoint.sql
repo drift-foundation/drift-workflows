@@ -45,9 +45,9 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow_checkpoint` (
 	`reverse_input_json` mediumtext NULL CHECK (`reverse_input_json` IS NULL OR (json_valid(`reverse_input_json`) AND json_type(`reverse_input_json`) = 'OBJECT')),
 	`reverse_input_hash` varchar(64) NULL,
 	`reversed_at` datetime(6) NULL,
-	-- event_seq of the event that disposed of this checkpoint when reversal
+	-- event_ts of the event that disposed of this checkpoint when reversal
 	-- needed resolution.
-	`resolution_event_seq` bigint NULL,
+	`resolution_event_ts` datetime(6) NULL,
 	`created_at` datetime(6) NOT NULL,
 	`updated_at` datetime(6) NOT NULL,
 	-- Durable bounded reconcile budget for a persistent route-404 on THIS checkpoint's compensation

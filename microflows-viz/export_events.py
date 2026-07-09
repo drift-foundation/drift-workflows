@@ -47,8 +47,8 @@ def main():
     a = ap.parse_args()
 
     sql = (
-        "SELECT event_seq, DATE_FORMAT(event_ts,'%Y-%m-%dT%H:%i:%s.%f'), kind, payload "
-        f"FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{a.workflow_id}') ORDER BY event_seq"
+        "SELECT DATE_FORMAT(event_ts,'%Y-%m-%dT%H:%i:%s.%f'), kind, payload "
+        f"FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{a.workflow_id}') ORDER BY event_ts"
     )
     cmd = [_client(), "-h", a.host, "-P", str(a.port), "-u", a.user]
     if a.password:
@@ -63,15 +63,15 @@ def main():
         sys.exit(f"no events for workflow {a.workflow_id} (is it the right id / database?)")
 
     print(f"\n--- REAL event log for {a.workflow_id} ({len(rows)} events) ---")
-    for seq, ts, kind, payload in rows:
-        print(f"  seq {seq:>3}  {ts}  {kind:<26} {payload}")
+    for ts, kind, payload in rows:
+        print(f"  {ts}  {kind:<26} {payload}")
 
     events, n = [], len(rows)
-    for i, (seq, ts, kind, payload) in enumerate(rows):
+    for i, (ts, kind, payload) in enumerate(rows):
         ev = KIND_TO_EVENT.get(kind)
         if ev is None:
             continue
-        if ev == "SETTLED" and i + 1 < n and rows[i + 1][2] == "workflow_completed":
+        if ev == "SETTLED" and i + 1 < n and rows[i + 1][1] == "workflow_completed":
             ev = "SETTLED_FINAL"
         try:
             p = json.loads(payload)

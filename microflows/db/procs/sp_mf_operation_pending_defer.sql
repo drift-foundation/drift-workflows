@@ -41,7 +41,6 @@ proc:BEGIN
 	DECLARE v_owner varbinary(16);
 	DECLARE v_token bigint;
 	DECLARE v_state tinyint;
-	DECLARE v_event_seq bigint;
 	DECLARE v_event_ts datetime(6);
 	DECLARE v_op_id varbinary(16);
 	DECLARE v_op_status tinyint;
@@ -51,7 +50,6 @@ proc:BEGIN
 	DECLARE v_anchor datetime(6);
 	DECLARE v_elapsed_ms bigint;
 	DECLARE v_new_count int;
-	DECLARE v_new_event_seq bigint;
 	DECLARE v_new_event_ts datetime(6);
 	DECLARE v_append tinyint(1) DEFAULT 1;
 	DECLARE v_missing tinyint(1) DEFAULT 0;
@@ -86,8 +84,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`
-		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_ts`
+		INTO v_owner, v_token, v_state, v_event_ts
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
 		FOR UPDATE;
@@ -135,10 +133,8 @@ proc:BEGIN
 	-- An event needs a strictly-advancing event_ts to order it (mirrors reconcile_defer's within-budget
 	-- defer). On skew, fold to no-append; the defer/redispatch still proceeds (neither is a terminal commit).
 	IF arg_event_ts <= v_event_ts THEN SET v_append = 0; END IF;
-	SET v_new_event_seq = v_event_seq;
 	SET v_new_event_ts = v_event_ts;
 	IF v_append = 1 THEN
-		SET v_new_event_seq = v_event_seq + 1;
 		SET v_new_event_ts = arg_event_ts;
 	END IF;
 
@@ -154,14 +150,13 @@ proc:BEGIN
 
 		IF v_append = 1 THEN
 			UPDATE `tb_mf_workflow`
-			SET `current_event_seq` = v_new_event_seq,
-			    `current_event_ts` = v_new_event_ts,
+			SET `current_event_ts` = v_new_event_ts,
 			    `updated_at` = arg_db_now
 			WHERE `workflow_id` = arg_workflow_id;
 			INSERT INTO `tb_mf_workflow_event` (
-				`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+				`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 			) VALUES (
-				arg_workflow_id, v_new_event_seq, arg_event_ts, 'pending_redispatch', arg_executor, NULL,
+				arg_workflow_id, arg_event_ts, 'pending_redispatch', arg_executor, NULL,
 				JSON_OBJECT('reason', 'pending_redispatch', 'operation_seq', arg_operation_seq,
 					'operation_id', LOWER(HEX(arg_operation_id)),
 					'redispatch_count', v_new_count, 'elapsed_ms', v_elapsed_ms)
@@ -183,16 +178,15 @@ proc:BEGIN
 	SET `lease_owner` = NULL,
 	    `lease_expires_at` = NULL,
 	    `next_attempt_at` = arg_next_attempt_at,
-	    `current_event_seq` = v_new_event_seq,
 	    `current_event_ts` = v_new_event_ts,
 	    `updated_at` = arg_db_now
 	WHERE `workflow_id` = arg_workflow_id;
 
 	IF v_append = 1 THEN
 		INSERT INTO `tb_mf_workflow_event` (
-			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+			`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 		) VALUES (
-			arg_workflow_id, v_new_event_seq, arg_event_ts, 'pending_deferred', arg_executor, NULL,
+			arg_workflow_id, arg_event_ts, 'pending_deferred', arg_executor, NULL,
 			JSON_OBJECT('reason', 'pending_deferred', 'operation_seq', arg_operation_seq,
 				'operation_id', LOWER(HEX(arg_operation_id)),
 				'redispatch_count', v_count, 'elapsed_ms', v_elapsed_ms)

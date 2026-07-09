@@ -134,7 +134,6 @@ fn scenario_lease_timeline() -> Int {
 			if wfc.execution_direction != 1 { return 230; }
 			if wfc.current_disposition != 0 { return 205; }
 			if wfc.script_revision != 1 { return 206; }
-			if wfc.current_event_seq != 1 { return 207; }
 			if wfc.current_operation_attempt != 0 { return 208; }
 			// continuation round-trips as a document
 			val cont = json.parse(&wfc.continuation_json).or_throw();

@@ -98,12 +98,12 @@ proc:BEGIN
 		DECLARE CONTINUE HANDLER FOR 1062 SET v_exists = 1;
 		INSERT INTO `tb_mf_workflow` (
 			`workflow_id`, `script_name`, `script_revision`, `state`, `execution_direction`,
-			`current_disposition`, `current_event_seq`, `current_event_ts`, `fencing_token`,
+			`current_disposition`, `current_event_ts`, `fencing_token`,
 			`lease_owner`, `lease_expires_at`, `next_attempt_at`, `current_operation_attempt`,
 			`continuation`, `created_at`, `updated_at`
 		) VALUES (
 			arg_workflow_id, arg_script_name, 1, 1, 1,
-			0, 1, arg_event_ts, 0,
+			0, arg_event_ts, 0,
 			NULL, NULL, arg_next_attempt_at, 0,
 			arg_continuation, arg_event_ts, arg_event_ts
 		);
@@ -160,9 +160,9 @@ proc:BEGIN
 	VALUES (arg_workflow_id, arg_args, arg_event_ts);
 
 	INSERT INTO `tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
-		arg_workflow_id, 1, arg_event_ts, 'created', NULL, NULL, arg_event_payload
+		arg_workflow_id, arg_event_ts, 'created', NULL, NULL, arg_event_payload
 	);
 
 	-- Return the freshly-pinned identity (= the supplied active generation). The caller

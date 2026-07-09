@@ -483,7 +483,7 @@ def main():
     call(cur, "sp_mf_operation_dispatch_defer",
          (wf4, EXEC, r["fencing_token"], T(17), T(22), T(17), "operation_request_absent"))
     cur.execute("SELECT JSON_UNQUOTE(JSON_EXTRACT(payload,'$.reason')) FROM tb_mf_workflow_event "
-                "WHERE workflow_id=%s AND kind='operation_dispatch_deferred' ORDER BY event_seq", (wf4,))
+                "WHERE workflow_id=%s AND kind='operation_dispatch_deferred' ORDER BY event_ts", (wf4,))
     reasons = [row[0] for row in cur.fetchall()]
     check("dispatch_defer_reason_change",
           reasons == ["pinned_contract_unavailable", "operation_request_absent"], reasons)

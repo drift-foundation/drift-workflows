@@ -31,7 +31,6 @@ proc:BEGIN
 	DECLARE v_owner varbinary(16);
 	DECLARE v_token bigint;
 	DECLARE v_state tinyint;
-	DECLARE v_event_seq bigint;
 	DECLARE v_event_ts datetime(6);
 	DECLARE v_cp_state tinyint;
 	DECLARE v_cp_revid varbinary(16);
@@ -40,7 +39,6 @@ proc:BEGIN
 	DECLARE v_first_seen datetime(6);
 	DECLARE v_elapsed_ms bigint;
 	DECLARE v_new_attempts int;
-	DECLARE v_new_event_seq bigint;
 	DECLARE v_new_event_ts datetime(6);
 	DECLARE v_append tinyint(1) DEFAULT 1;
 	DECLARE v_missing tinyint(1) DEFAULT 0;
@@ -73,8 +71,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`
-		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_ts`
+		INTO v_owner, v_token, v_state, v_event_ts
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
 		FOR UPDATE;
@@ -159,10 +157,9 @@ proc:BEGIN
 	IF v_elapsed_ms >= arg_max_elapsed_ms AND v_new_attempts >= arg_min_attempts THEN
 		-- EXHAUSTED -> reverse block (disposition indeterminate=4). Checkpoint resolution_required(3),
 		-- workflow blocked_resolution(3) RETAINING reverse direction; reason in the continuation.
-		SET v_new_event_seq = v_event_seq + 1;
 		UPDATE `tb_mf_workflow_checkpoint`
 		SET `reversal_state` = 3,
-		    `resolution_event_seq` = v_new_event_seq,
+		    `resolution_event_ts` = arg_event_ts,
 		    `updated_at` = arg_event_ts
 		WHERE `workflow_id` = arg_workflow_id AND `seq` = arg_seq;
 
@@ -172,15 +169,14 @@ proc:BEGIN
 		    `continuation` = JSON_OBJECT('pos', 'blocked', 'seq', CAST(arg_seq AS SIGNED), 'direction', 'reverse', 'reason', 'participant_route_unknown'),
 		    `lease_owner` = NULL,
 		    `lease_expires_at` = NULL,
-		    `current_event_seq` = v_new_event_seq,
 		    `current_event_ts` = arg_event_ts,
 		    `updated_at` = arg_event_ts
 		WHERE `workflow_id` = arg_workflow_id;
 
 		INSERT INTO `tb_mf_workflow_event` (
-			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+			`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 		) VALUES (
-			arg_workflow_id, v_new_event_seq, arg_event_ts, 'participant_route_unknown', arg_executor, NULL,
+			arg_workflow_id, arg_event_ts, 'participant_route_unknown', arg_executor, NULL,
 			JSON_OBJECT('reason', 'participant_route_unknown', 'seq', arg_seq, 'direction', 'reverse', 'disposition', 4,
 				'attempts', v_new_attempts, 'elapsed_ms', v_elapsed_ms)
 		);
@@ -191,10 +187,8 @@ proc:BEGIN
 
 	-- WITHIN BUDGET -> defer (state stays reversing(2)). Per-attempt warn unless clock skew.
 	IF arg_event_ts <= v_event_ts THEN SET v_append = 0; END IF;
-	SET v_new_event_seq = v_event_seq;
 	SET v_new_event_ts = v_event_ts;
 	IF v_append = 1 THEN
-		SET v_new_event_seq = v_event_seq + 1;
 		SET v_new_event_ts = arg_event_ts;
 	END IF;
 
@@ -202,16 +196,15 @@ proc:BEGIN
 	SET `lease_owner` = NULL,
 	    `lease_expires_at` = NULL,
 	    `next_attempt_at` = arg_next_attempt_at,
-	    `current_event_seq` = v_new_event_seq,
 	    `current_event_ts` = v_new_event_ts,
 	    `updated_at` = arg_db_now
 	WHERE `workflow_id` = arg_workflow_id;
 
 	IF v_append = 1 THEN
 		INSERT INTO `tb_mf_workflow_event` (
-			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+			`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 		) VALUES (
-			arg_workflow_id, v_new_event_seq, arg_event_ts, 'participant_route_404', arg_executor, NULL,
+			arg_workflow_id, arg_event_ts, 'participant_route_404', arg_executor, NULL,
 			JSON_OBJECT('reason', 'participant_route_404', 'seq', arg_seq, 'direction', 'reverse',
 				'attempt', v_new_attempts, 'elapsed_ms', v_elapsed_ms)
 		);

@@ -44,7 +44,7 @@ SET w.`terminal_reason` = COALESCE(
 		(SELECT JSON_UNQUOTE(JSON_EXTRACT(e.`payload`, '$.reason'))
 		 FROM `tb_mf_workflow_event` e
 		 WHERE e.`workflow_id` = w.`workflow_id` AND e.`kind` = 'reversal_begun'
-		 ORDER BY e.`event_seq` DESC LIMIT 1),
+		 ORDER BY e.`event_ts` DESC LIMIT 1),
 		'legacy_reversal')   -- FALLBACK (documented): no reversal_begun reason found.
 WHERE w.`state` = 5
   AND EXISTS (SELECT 1 FROM `tb_mf_workflow_event` e2
@@ -59,7 +59,7 @@ SET w.`state` = 7,
 		(SELECT JSON_UNQUOTE(JSON_EXTRACT(e.`payload`, '$.reason'))
 		 FROM `tb_mf_workflow_event` e
 		 WHERE e.`workflow_id` = w.`workflow_id` AND e.`kind` = 'reversed'
-		 ORDER BY e.`event_seq` DESC LIMIT 1),
+		 ORDER BY e.`event_ts` DESC LIMIT 1),
 		'legacy_empty_reversal')   -- FALLBACK (documented): no 'reversed' event reason found.
 WHERE w.`state` = 5
   AND NOT EXISTS (SELECT 1 FROM `tb_mf_workflow_event` e2

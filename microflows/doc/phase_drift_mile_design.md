@@ -18,7 +18,7 @@
 > record is [`microflows_design.md`](microflows_design.md)**. Many lifecycle
 > and runtime decisions here are **preserved** by the new design — leases,
 > fencing, durable continuations, checkpoints, reverse-order compensation,
-> `blocked_resolution`, cancellation, recovery, `event_seq` ordering, and the
+> `blocked_resolution`, cancellation, recovery, `event_ts` chronological ordering, and the
 > §24.4 time/command discipline — and are referenced from there rather than
 > duplicated.
 
@@ -1655,7 +1655,7 @@ lease_owner
 fencing_token
 lease has not expired
 expected lifecycle state
-event_seq derivation: event_seq = current_event_seq + 1 (§24.4)
+event ordering: arg_event_ts strictly > current_event_ts, enforced per append (§24.4)
 ```
 
 If validation fails, the transaction aborts. A stale worker may continue
@@ -1674,7 +1674,7 @@ no AUTO_INCREMENT anywhere: identifiers derive deterministically from
   (current state, stable command input)
 
 causal ordering is workflow-local:
-  event_seq = current_event_seq + 1, derived inside the fenced
+  event_ts strictly greater than current_event_ts, enforced inside the fenced
   publication transaction
 
 timestamps (event_ts, observed time, lease deadlines, next_attempt_at,
@@ -1700,7 +1700,7 @@ an already-committed command is resolved by its stable command ID
 
 This preserves reproducibility without auto-generated IDs or ambient time:
 replaying the same command stream against the same initial state produces
-identical history, and `event_seq` — not wall time — is the causal order of
+identical history, and `event_ts` — strictly monotonic per workflow by the append guard — is the order of
 record.
 
 ### 24.5 Sticky execution, heartbeat, discovery
@@ -1975,7 +1975,7 @@ behavior are explicit command parameters, **fixed across retries** of the
 same logical command/invocation: pinned when the command is created, not
 re-sampled per attempt. The runtime sources them (database clock in
 production, controlled clock in tests) and supplies them unchanged; they are
-audit/scheduling values, never causal ordering (`event_seq` orders). Exposure
+audit/scheduling values; `event_ts` (strictly monotonic per workflow) orders. Exposure
 inside `apply` remains a host capability, not an ambient read.
 
 ### 25.10 Workflow failure and cancellation triggers (open point D)

@@ -1,5 +1,5 @@
 DELIMITER $$
--- Create a workflow instance + its 'created' event (event_seq = 1) as one
+-- Create a workflow instance + its 'created' event as one
 -- atomic publication (§24.6 D4: every transition commits with its event).
 --
 -- Idempotent by stable command ID = workflow_id: the PK INSERT is the
@@ -55,7 +55,6 @@ proc:BEGIN
 			`state`,
 			`execution_direction`,
 			`current_disposition`,
-			`current_event_seq`,
 			`current_event_ts`,
 			`fencing_token`,
 			`lease_owner`,
@@ -72,7 +71,6 @@ proc:BEGIN
 			1,                       -- forward (state)
 			1,                       -- forward (execution_direction)
 			0,                       -- no disposition
-			1,                       -- event_seq of the 'created' event below
 			arg_event_ts,
 			0,
 			NULL,
@@ -92,9 +90,9 @@ proc:BEGIN
 	END IF;
 
 	INSERT INTO `tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
-		arg_workflow_id, 1, arg_event_ts, 'created', NULL, NULL, arg_event_payload
+		arg_workflow_id, arg_event_ts, 'created', NULL, NULL, arg_event_payload
 	);
 
 	SELECT JSON_OBJECT('outcome', 'created') AS result;

@@ -13,7 +13,7 @@ the server can never be talked into shipping pyproject.toml, src/, .venv/, or
 anything else that happens to live next to the UI files. Paths are resolved and
 prefix-checked against the static root as a second, independent guard.
 
-API (slice 1):
+API:
   GET /api/health                          -> {"ok": true, "database": ...}
   GET /api/workflow/<32-hex>?max_depth=N   -> mfinspect-`inspect`-parity JSON tree
   GET /api/workflows?script=&since=&until= -> mfinspect-`list`-parity summary array
@@ -21,6 +21,9 @@ API (slice 1):
                                                 the bounded-scan rule; each entry
                                                 carries an `href` to its
                                                 /api/workflow/<id> inspection)
+  GET /api/workflow/<32-hex>/tree?max_depth=N      -> skeletal call tree
+  GET /api/workflow/<32-hex>/timeline?max_depth=N  -> merged tree event timeline
+  GET /api/workflow/<32-hex>/stuck                 -> derived stuck/waiting verdict
 """
 from __future__ import annotations
 
@@ -48,7 +51,7 @@ CONTENT_TYPES = {
 	".ico": "image/x-icon",
 }
 
-_WORKFLOW_ROUTE = re.compile(r"/api/workflow/([0-9a-fA-F]{32})")
+_WORKFLOW_ROUTE = re.compile(r"/api/workflow/([0-9a-fA-F]{32})(?:/(tree|timeline|stuck))?")
 
 
 class VizServer(ThreadingHTTPServer):
@@ -132,7 +135,7 @@ class VizRequestHandler(BaseHTTPRequestHandler):
 			return
 		match = _WORKFLOW_ROUTE.fullmatch(parsed.path)
 		if match:
-			self._api_workflow(match.group(1), parsed.query)
+			self._api_workflow(match.group(1), match.group(2), parsed.query)
 			return
 		self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint", "path": parsed.path})
 
@@ -151,7 +154,7 @@ class VizRequestHandler(BaseHTTPRequestHandler):
 			return
 		self._send_json(HTTPStatus.OK, {"ok": True, "database": self.server.db_cfg.database})
 
-	def _api_workflow(self, workflow_id_hex: str, query: str) -> None:
+	def _api_workflow(self, workflow_id_hex: str, view: str | None, query: str) -> None:
 		params = urllib.parse.parse_qs(query)
 		raw_depth = params.get("max_depth", [str(dbq.DEFAULT_MAX_DEPTH)])[-1]
 		try:
@@ -167,7 +170,14 @@ class VizRequestHandler(BaseHTTPRequestHandler):
 		try:
 			conn = dbq.connect(self.server.db_cfg)
 			try:
-				node = dbq.inspect_workflow(conn, workflow_id_hex, max_depth)
+				if view == "tree":
+					node = dbq.tree_workflow(conn, workflow_id_hex, max_depth)
+				elif view == "timeline":
+					node = dbq.timeline_workflow(conn, workflow_id_hex, max_depth)
+				elif view == "stuck":
+					node = dbq.stuck_workflow(conn, workflow_id_hex)
+				else:
+					node = dbq.inspect_workflow(conn, workflow_id_hex, max_depth)
 			finally:
 				conn.close()
 		except dbq.MfvizError as exc:

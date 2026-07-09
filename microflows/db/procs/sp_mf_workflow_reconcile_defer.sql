@@ -36,7 +36,6 @@ proc:BEGIN
 	DECLARE v_owner varbinary(16);
 	DECLARE v_token bigint;
 	DECLARE v_state tinyint;
-	DECLARE v_event_seq bigint;
 	DECLARE v_event_ts datetime(6);
 	DECLARE v_op_id varbinary(16);
 	DECLARE v_op_status tinyint;
@@ -44,7 +43,6 @@ proc:BEGIN
 	DECLARE v_first_seen datetime(6);
 	DECLARE v_elapsed_ms bigint;
 	DECLARE v_new_attempts int;
-	DECLARE v_new_event_seq bigint;
 	DECLARE v_new_event_ts datetime(6);
 	DECLARE v_append tinyint(1) DEFAULT 1;
 	DECLARE v_missing tinyint(1) DEFAULT 0;
@@ -79,8 +77,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`
-		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_ts`
+		INTO v_owner, v_token, v_state, v_event_ts
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
 		FOR UPDATE;
@@ -143,7 +141,6 @@ proc:BEGIN
 
 	IF v_elapsed_ms >= arg_max_elapsed_ms AND v_new_attempts >= arg_min_attempts THEN
 		-- EXHAUSTED -> durable BLOCK. The reason lives in the continuation so inspect replay renders it.
-		SET v_new_event_seq = v_event_seq + 1;
 		UPDATE `tb_mf_workflow`
 		SET `state` = 3,
 		    `execution_direction` = 1,
@@ -153,15 +150,14 @@ proc:BEGIN
 		        'operation_id', LOWER(HEX(arg_operation_id))),
 		    `lease_owner` = NULL,
 		    `lease_expires_at` = NULL,
-		    `current_event_seq` = v_new_event_seq,
 		    `current_event_ts` = arg_event_ts,
 		    `updated_at` = arg_db_now
 		WHERE `workflow_id` = arg_workflow_id;
 
 		INSERT INTO `tb_mf_workflow_event` (
-			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+			`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 		) VALUES (
-			arg_workflow_id, v_new_event_seq, arg_event_ts, 'participant_route_unknown', arg_executor, NULL,
+			arg_workflow_id, arg_event_ts, 'participant_route_unknown', arg_executor, NULL,
 			JSON_OBJECT('reason', 'participant_route_unknown', 'operation_seq', arg_operation_seq,
 				'operation_id', LOWER(HEX(arg_operation_id)),
 				'attempts', v_new_attempts, 'elapsed_ms', v_elapsed_ms)
@@ -174,10 +170,8 @@ proc:BEGIN
 	-- WITHIN BUDGET -> defer. Per-attempt 'participant_route_404' warn event, unless a non-increasing
 	-- event_ts (clock skew) can't order it -> fold into no-append; the defer still proceeds.
 	IF arg_event_ts <= v_event_ts THEN SET v_append = 0; END IF;
-	SET v_new_event_seq = v_event_seq;
 	SET v_new_event_ts = v_event_ts;
 	IF v_append = 1 THEN
-		SET v_new_event_seq = v_event_seq + 1;
 		SET v_new_event_ts = arg_event_ts;
 	END IF;
 
@@ -185,16 +179,15 @@ proc:BEGIN
 	SET `lease_owner` = NULL,
 	    `lease_expires_at` = NULL,
 	    `next_attempt_at` = arg_next_attempt_at,
-	    `current_event_seq` = v_new_event_seq,
 	    `current_event_ts` = v_new_event_ts,
 	    `updated_at` = arg_db_now
 	WHERE `workflow_id` = arg_workflow_id;
 
 	IF v_append = 1 THEN
 		INSERT INTO `tb_mf_workflow_event` (
-			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+			`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 		) VALUES (
-			arg_workflow_id, v_new_event_seq, arg_event_ts, 'participant_route_404', arg_executor, NULL,
+			arg_workflow_id, arg_event_ts, 'participant_route_404', arg_executor, NULL,
 			JSON_OBJECT('reason', 'participant_route_404', 'operation_seq', arg_operation_seq,
 				'operation_id', LOWER(HEX(arg_operation_id)),
 				'attempt', v_new_attempts, 'elapsed_ms', v_elapsed_ms)

@@ -23,7 +23,6 @@ proc:BEGIN
 	DECLARE v_owner varbinary(16);
 	DECLARE v_token bigint;
 	DECLARE v_state tinyint;
-	DECLARE v_event_seq bigint;
 	DECLARE v_event_ts datetime(6);
 	DECLARE v_op_id varbinary(16);
 	DECLARE v_missing tinyint(1) DEFAULT 0;
@@ -56,8 +55,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`
-		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_ts`
+		INTO v_owner, v_token, v_state, v_event_ts
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
 		FOR UPDATE;
@@ -102,16 +101,12 @@ proc:BEGIN
 			'defer_until', DATE_FORMAT(v_event_ts + INTERVAL 5 SECOND, '%Y-%m-%d %H:%i:%s.%f')) AS result;
 		LEAVE proc;
 	END IF;
-
-	SET v_event_seq = v_event_seq + 1;
-
 	-- forward(1) -> blocked_resolution(3), disposition failed(2); direction stays
 	-- forward(1); clear the lease.
 	UPDATE `tb_mf_workflow`
 	SET `state` = 3,
 	    `current_disposition` = 2,
 	    `continuation` = arg_new_continuation,
-	    `current_event_seq` = v_event_seq,
 	    `current_event_ts` = arg_event_ts,
 	    `lease_owner` = NULL,
 	    `lease_expires_at` = NULL,
@@ -119,9 +114,9 @@ proc:BEGIN
 	WHERE `workflow_id` = arg_workflow_id;
 
 	INSERT INTO `tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
-		arg_workflow_id, v_event_seq, arg_event_ts, 'operation_failed', arg_executor, NULL, arg_event_payload
+		arg_workflow_id, arg_event_ts, 'operation_failed', arg_executor, NULL, arg_event_payload
 	);
 
 	SELECT JSON_OBJECT('outcome', 'blocked') AS result;

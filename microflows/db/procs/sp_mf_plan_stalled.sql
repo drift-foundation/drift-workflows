@@ -11,7 +11,7 @@ DELIMITER $$
 -- plan generation lets it continue automatically. This proc surfaces exactly that
 -- population for an operator — NOT a participant failure, NOT blocked_resolution.
 --
--- "Latest condition" = the event at w.current_event_seq (the durable latest-event
+-- "Latest condition" = the event at w.current_event_ts (the durable latest-event
 -- projection). We report a row only when THAT event is the revision_unavailable
 -- deferral, so a workflow that has since advanced (a newer event) drops off.
 --
@@ -36,7 +36,7 @@ proc:BEGIN
 	FROM `tb_mf_workflow` `w`
 	JOIN `tb_mf_workflow_plan` `p` ON `p`.`workflow_id` = `w`.`workflow_id`
 	JOIN `tb_mf_workflow_event` `e`
-		ON `e`.`workflow_id` = `w`.`workflow_id` AND `e`.`event_seq` = `w`.`current_event_seq`
+		ON `e`.`workflow_id` = `w`.`workflow_id` AND `e`.`event_ts` = `w`.`current_event_ts`
 	WHERE `w`.`state` IN (1, 2)
 	  -- Genuinely STALLED = the deferral's cleared lease is still cleared. A workflow that
 	  -- has since been reclaimed (lease_owner set) is actively retrying, not stalled, even

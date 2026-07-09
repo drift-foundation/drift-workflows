@@ -732,7 +732,7 @@ def main():
         # BEFORE seq 1 (terminal) — proving highest -> lowest compensation order.
         order = _mdb(f"SELECT JSON_UNQUOTE(JSON_EXTRACT(payload,'$.seq')) FROM tb_mf_workflow_event "
                      f"WHERE workflow_id = UNHEX('{WF_REVERSE_STACK}') "
-                     f"AND kind = 'compensation_settled' ORDER BY event_seq")
+                     f"AND kind = 'compensation_settled' ORDER BY event_ts")
         both_reversed = len(cps) == 2 and cps[0][1] == "2" and cps[1][1] == "2"
         ids_distinct = len(cps) == 2 and cps[0][2] != cps[1][2] and "" not in (cps[0][2], cps[1][2])
         inputs_ok = len(cps) == 2 and cps[0][3] == "b1" and cps[1][3] == "b2"
@@ -1506,7 +1506,7 @@ def main():
         # reserve, so exec would exceed 1), compensates the one checkpoint EXACTLY ONCE via
         # 'release' on its durable payload (brA), and reaches reversed in the reverse direction. The
         # graph IS present (its pin must verify), but the reverse path never consults it. The seed
-        # is transition-faithful (reversal_begun audit head matching current_event_seq, an args
+        # is transition-faithful (reversal_begun audit head matching current_event_ts, an args
         # child for the planned invariant); only the plan pin is inserted here, because its
         # content_hash is the runner's own digest of this exact config (asserted live, not frozen).
         rbrcfg = graph_cfg(rev_branch_graph(), argument_type=BRANCH_AT)
@@ -2025,7 +2025,7 @@ def main():
         wf = _mdb(f"SELECT state, execution_direction FROM tb_mf_workflow WHERE workflow_id = UNHEX('{wfd}')")
         cks = _mdb(f"SELECT reversal_state FROM tb_mf_workflow_checkpoint WHERE workflow_id = UNHEX('{wfd}')")
         evs = _mdb(f"SELECT kind FROM tb_mf_workflow_event WHERE workflow_id = UNHEX('{wfd}') "
-                   f"AND kind IN ('reversal_begun','compensation_settled') ORDER BY event_seq")
+                   f"AND kind IN ('reversal_begun','compensation_settled') ORDER BY event_ts")
         check("forward_fail_reverses_durable",
               wf == [["5", "2"]] and cks == [["2"]]
               and evs == [["reversal_begun"], ["compensation_settled"]], (wf, cks, evs))

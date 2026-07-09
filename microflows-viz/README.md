@@ -86,15 +86,19 @@ MDB_ROOT_PWD=rootpw ./microflows-viz serve            # → http://127.0.0.1:837
 - **DB connection** is the `--db-*` family, deliberately prefixed so it can never be confused with the
   HTTP bind: `--db-host` / `--db-port` / `--db-user` / `--db-password` / `--db-password-env`
   (preferred; default `MDB_ROOT_PWD`) / `--db-name`.
-- **API (so far):** `GET /api/health`; `GET /api/workflow/<32-hex>?max_depth=N` — the full
+- **API:** `GET /api/health`; `GET /api/workflow/<32-hex>?max_depth=N` — the full
   recursive workflow-tree dump (workflow, plan + args, operations, calls, checkpoints, full event
-  history, children), same JSON as `mfinspect inspect`; and
+  history, children), same JSON as `mfinspect inspect`;
   `GET /api/workflows?script=&since=&until=[&plan_version=][&state=]` — bounded search returning
   workflow summaries (id, script, state/state_name/disposition, created/updated timestamps,
   terminal_reason, parent/root ids), each entry carrying an `href` to its `/api/workflow/<id>`
-  inspection. `script`+`since`+`until` are required (400 otherwise) — an unbounded scan is never
-  one typo away. Call-tree/timeline and stuck-reason endpoints are next (see
-  `work/viz-consolidation/README.md`).
+  inspection (`script`+`since`+`until` are required, 400 otherwise — an unbounded scan is never
+  one typo away); plus the derived operator views:
+  `GET /api/workflow/<id>/tree` (skeletal call tree — ids, relation, depth, script,
+  state/state_name, disposition, terminal_reason; no payloads),
+  `GET /api/workflow/<id>/timeline` (the whole tree's event history merged in order — "what ran,
+  in what order?"), and `GET /api/workflow/<id>/stuck` (a verdict with evidence — "why is this
+  not moving?").
 - **Read-only by permission:** every query is a SELECT, and running as `viz_ro` makes MariaDB itself
   reject anything else. `microflows-viz` is absorbing `microflows/tools/mfinspect`, which goes away
   once parity is reached.
@@ -160,10 +164,27 @@ recursively into every child workflow (up to `max_depth`; deeper children come b
 `{"truncated": true}` stubs, never silently dropped). Useful `jq` starting points:
 `jq .workflow.state`, `jq .events[-1]`, `jq '.children[].workflow_id'`.
 
-**Scope note:** this slice answers *search/list* and *full raw inspection* (mfinspect parity).
-Slice 2 adds the derived operator views — call **tree**, event **timeline**, and a **stuck**
-endpoint that explains what a non-moving workflow is waiting on (lease, retry schedule, child,
-reconcile/redispatch, operator resolution) — see `work/viz-consolidation/README.md`.
+**5. Or ask the derived operator questions directly** (same `<32-hex>` id):
+
+```bash
+# who called whom, and where is each node — skeletal, no payloads:
+curl -s 'http://127.0.0.1:8377/api/workflow/<32-hex>/tree' | jq .
+
+# what ran, in what order — the whole tree's events merged (each entry carries
+# its owning workflow_id + depth):
+curl -s 'http://127.0.0.1:8377/api/workflow/<32-hex>/timeline' | jq '.events[] | {depth, kind, event_ts, workflow_id}'
+
+# why is this not moving — a verdict with the evidence it was derived from:
+curl -s 'http://127.0.0.1:8377/api/workflow/<32-hex>/stuck' | jq '{verdict, detail, path}'
+```
+
+`stuck` classifies to one of: `terminal`, `blocked_resolution` (operator resolution required —
+the offending checkpoints are listed), `running_under_lease`, `waiting_on_child` (descends to
+the deepest non-terminal descendant; `path` is the id chain and `waiting_on` nests that node's
+own verdict), `redispatch_pending`, `reconcile_pending`, `scheduled_retry`, `claimable_now`.
+Evidence always includes the raw columns the verdict came from (lease owner/expiry,
+`next_attempt_at`, state/disposition, `terminal_reason`, reconcile/redispatch counters and
+timestamps) plus `db_now`, the database clock every comparison used.
 
 ## Alternative views (optional, hosted)
 

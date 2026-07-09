@@ -116,7 +116,6 @@ pub struct ClaimedWorkflow {
 	pub current_disposition: Int,
 	pub script_name: String,
 	pub script_revision: Int,
-	pub current_event_seq: Int,
 	pub current_operation_attempt: Int,
 	pub continuation_json: String    // JSON object text (compact)
 }
@@ -1326,7 +1325,6 @@ implement MicroflowsHost for HostImpl {
 				val disp = _doc_int_req(&doc, &"current_disposition", "claim-no-disposition");
 				val sname = _doc_str_req(&doc, &"script_name", "claim-no-script-name");
 				val srev = _doc_int_req(&doc, &"script_revision", "claim-no-script-revision");
-				val eseq = _doc_int_req(&doc, &"current_event_seq", "claim-no-event-seq");
 				val attempt = _doc_int_req(&doc, &"current_operation_attempt", "claim-no-attempt");
 				val continuation = _doc_object_text_req(&doc, &"continuation");
 				return ClaimOutcome::Claimed(ClaimedWorkflow(
@@ -1337,7 +1335,6 @@ implement MicroflowsHost for HostImpl {
 					current_disposition = disp,
 					script_name = move sname,
 					script_revision = srev,
-					current_event_seq = eseq,
 					current_operation_attempt = attempt,
 					continuation_json = move continuation
 				));
@@ -2623,7 +2620,6 @@ fn _parse_claimed(doc: &json.JsonNode) -> ClaimedWorkflow {
 	val disp = _doc_int_req(doc, &"current_disposition", "claim-no-disposition");
 	val sname = _doc_str_req(doc, &"script_name", "claim-no-script-name");
 	val srev = _doc_int_req(doc, &"script_revision", "claim-no-script-revision");
-	val eseq = _doc_int_req(doc, &"current_event_seq", "claim-no-event-seq");
 	val attempt = _doc_int_req(doc, &"current_operation_attempt", "claim-no-attempt");
 	val continuation = _doc_object_text_req(doc, &"continuation");
 	return ClaimedWorkflow(
@@ -2634,7 +2630,6 @@ fn _parse_claimed(doc: &json.JsonNode) -> ClaimedWorkflow {
 		current_disposition = disp,
 		script_name = move sname,
 		script_revision = srev,
-		current_event_seq = eseq,
 		current_operation_attempt = attempt,
 		continuation_json = move continuation
 	);

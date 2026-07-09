@@ -26,20 +26,23 @@
 --   AND (lease_owner IS NULL OR lease_expires_at < :db_now)
 --
 -- TIME/ORDERING/COMMAND DISCIPLINE (§24.4): the database clock is the time
--- AUTHORITY but SQL is never the time GENERATOR, and timestamps never carry
--- ordering. No column has a DEFAULT/ON UPDATE timestamp and nothing is
--- AUTO_INCREMENT; the runtime supplies every timestamp (event_ts,
--- lease_expires_at, next_attempt_at, created_at, updated_at) as an explicit
--- command parameter, FIXED across retries of the same command, stored
--- unchanged. Causal ordering is current_event_seq; transitions are
--- idempotent and deterministic from (current state, stable command input),
--- and an already-committed command is resolved by its stable command ID
--- before any new event is derived or appended.
+-- AUTHORITY but SQL is never the time GENERATOR. No column has a DEFAULT/
+-- ON UPDATE timestamp and nothing is AUTO_INCREMENT; the runtime supplies
+-- every timestamp (event_ts, lease_expires_at, next_attempt_at, created_at,
+-- updated_at) as an explicit command parameter, FIXED across retries of the
+-- same command, stored unchanged. Per-workflow event ordering is CHRONOLOGY:
+-- every event append enforces arg_event_ts strictly greater than
+-- current_event_ts inside the fenced transaction (non-increasing values are
+-- rejected as event_time_skew; the runner retries with a later DB-clock
+-- timestamp), so event_ts is the workflow-local ordering key — there is no
+-- separate sequence column. Transitions are idempotent and deterministic
+-- from (current state, stable command input), and an already-committed
+-- command is resolved by its stable command ID before any new event is
+-- appended.
 --
 -- Every publication (phase commit, reverse commit, completion, backoff,
 -- transition) re-validates workflow_id + lease_owner + fencing_token +
--- unexpired lease + expected state INSIDE its transaction (§24.3), and
--- derives event_seq = current_event_seq + 1 there.
+-- unexpired lease + expected state INSIDE its transaction (§24.3).
 CREATE TABLE IF NOT EXISTS `tb_mf_workflow` (
 	`workflow_id` varbinary(16) NOT NULL,
 	-- Pinned immutable script revision (§22). Milestone 1: resolved against the
@@ -54,12 +57,10 @@ CREATE TABLE IF NOT EXISTS `tb_mf_workflow` (
 	-- known. Mirrors microflows.state ExecutionDirection.
 	`execution_direction` tinyint NOT NULL DEFAULT 1,
 	`current_disposition` tinyint NOT NULL DEFAULT 0,
-	-- Workflow-local causal sequence projection (D4, §24.4): event_seq of the
-	-- latest tb_mf_workflow_event row; 0 before the first event. Appends
-	-- derive event_seq = current_event_seq + 1 inside the fenced transaction.
-	`current_event_seq` bigint NOT NULL DEFAULT 0,
-	-- event_ts of the latest event (audit/scheduling projection; supplied
-	-- value, unchanged, fixed across retries). Never used for ordering.
+	-- event_ts of the LATEST event (supplied value, unchanged, fixed across
+	-- retries) — the workflow's latest-event pointer AND the monotonicity
+	-- fence: every event append requires its arg_event_ts to be strictly
+	-- greater than this value (else event_time_skew).
 	`current_event_ts` datetime(6) NOT NULL,
 	-- Fencing token: bumped on every claim and on direct intervention
 	-- transitions (cancellation). A stale holder can compute but cannot publish.

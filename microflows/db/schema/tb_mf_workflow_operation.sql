@@ -17,7 +17,8 @@
 --
 -- operation_id is the stable, caller(Microflows)-derived participant key,
 -- unique within a workflow run. Time discipline (§24.4): explicit timestamps,
--- no NOW(); event ordering is event_seq.
+-- no NOW(); event ordering is event_ts chronology (strictly monotonic per
+-- workflow, enforced at append).
 --
 -- call_kind codes (composition, 1b.1): 1 = participant (default), 2 = child_workflow. A
 -- child_workflow row reuses this table only for its idempotency spine (operation_id =

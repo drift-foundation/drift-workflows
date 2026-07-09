@@ -25,7 +25,6 @@ proc:BEGIN
 	DECLARE v_owner varbinary(16);
 	DECLARE v_token bigint;
 	DECLARE v_state tinyint;
-	DECLARE v_event_seq bigint;
 	DECLARE v_event_ts datetime(6);
 	DECLARE v_cp_state tinyint;
 	DECLARE v_cp_revid varbinary(16);
@@ -59,8 +58,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`, `terminal_reason`
-		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts, v_term_reason
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_ts`, `terminal_reason`
+		INTO v_owner, v_token, v_state, v_event_ts, v_term_reason
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
 		FOR UPDATE;
@@ -142,9 +141,6 @@ proc:BEGIN
 	SELECT MAX(`seq`) INTO v_next_seq
 	FROM `tb_mf_workflow_checkpoint`
 	WHERE `workflow_id` = arg_workflow_id AND `reversal_state` = 1;
-
-	SET v_event_seq = v_event_seq + 1;
-
 	IF v_next_seq IS NULL THEN
 		-- Whole stack compensated -> terminal reversed(5), lease cleared.
 		UPDATE `tb_mf_workflow`
@@ -152,15 +148,14 @@ proc:BEGIN
 		    `continuation` = JSON_OBJECT('pos', 'reversed'),
 		    `lease_owner` = NULL,
 		    `lease_expires_at` = NULL,
-		    `current_event_seq` = v_event_seq,
 		    `current_event_ts` = arg_event_ts,
 		    `updated_at` = arg_event_ts
 		WHERE `workflow_id` = arg_workflow_id;
 
 		INSERT INTO `tb_mf_workflow_event` (
-			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+			`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 		) VALUES (
-			arg_workflow_id, v_event_seq, arg_event_ts, 'compensation_settled', arg_executor, NULL,
+			arg_workflow_id, arg_event_ts, 'compensation_settled', arg_executor, NULL,
 			JSON_OBJECT('seq', arg_seq, 'terminal', 'reversed')
 		);
 
@@ -173,15 +168,14 @@ proc:BEGIN
 	-- More to compensate -> descend, stay reversing, lease RETAINED.
 	UPDATE `tb_mf_workflow`
 	SET `continuation` = JSON_OBJECT('pos', 'reverse', 'seq', v_next_seq),
-	    `current_event_seq` = v_event_seq,
 	    `current_event_ts` = arg_event_ts,
 	    `updated_at` = arg_event_ts
 	WHERE `workflow_id` = arg_workflow_id;
 
 	INSERT INTO `tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
-		arg_workflow_id, v_event_seq, arg_event_ts, 'compensation_settled', arg_executor, NULL,
+		arg_workflow_id, arg_event_ts, 'compensation_settled', arg_executor, NULL,
 		JSON_OBJECT('seq', arg_seq, 'next_seq', v_next_seq)
 	);
 

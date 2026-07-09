@@ -65,7 +65,6 @@ proc:BEGIN
 	DECLARE v_owner varbinary(16);
 	DECLARE v_token bigint;
 	DECLARE v_state tinyint;
-	DECLARE v_event_seq bigint;
 	DECLARE v_event_ts datetime(6);
 	DECLARE v_parent_root_id varbinary(16);
 	DECLARE v_parent_call_depth int DEFAULT NULL;
@@ -165,9 +164,9 @@ proc:BEGIN
 	-- second caller-supplied parameter that could desync from it.
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`,
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_ts`,
 		       `root_workflow_id`, `call_depth`
-		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts,
+		INTO v_owner, v_token, v_state, v_event_ts,
 		     v_parent_root_id, v_parent_call_depth
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
@@ -312,7 +311,6 @@ proc:BEGIN
 	END IF;
 
 	-- (4) ONLY NOW — every possible rejection already ruled out — the single write phase.
-	SET v_event_seq = v_event_seq + 1;
 	SET v_root_workflow_id = COALESCE(v_parent_root_id, arg_workflow_id);
 
 	-- Parent-side op row. schema_version=1 is the fixed CALL_OPERATION_SCHEMA_VERSION constant
@@ -329,13 +327,13 @@ proc:BEGIN
 	-- unit — exactly like sp_mf_workflow_create_planned), plus ancestry.
 	INSERT INTO `tb_mf_workflow` (
 		`workflow_id`, `script_name`, `script_revision`, `state`, `execution_direction`,
-		`current_disposition`, `current_event_seq`, `current_event_ts`, `fencing_token`,
+		`current_disposition`, `current_event_ts`, `fencing_token`,
 		`lease_owner`, `lease_expires_at`, `next_attempt_at`, `current_operation_attempt`,
 		`continuation`, `parent_workflow_id`, `parent_node_id`, `root_workflow_id`, `call_depth`,
 		`created_at`, `updated_at`
 	) VALUES (
 		arg_child_workflow_id, arg_child_script_name, 1, 1, 1,
-		0, 1, arg_event_ts, 0,
+		0, arg_event_ts, 0,
 		NULL, NULL, arg_child_next_attempt_at, 0,
 		arg_child_continuation, arg_workflow_id, arg_parent_node_id, v_root_workflow_id, v_child_depth,
 		arg_event_ts, arg_event_ts
@@ -348,9 +346,9 @@ proc:BEGIN
 	VALUES (arg_child_workflow_id, arg_input_json, arg_event_ts);
 
 	INSERT INTO `tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
-		arg_child_workflow_id, 1, arg_event_ts, 'created', NULL, NULL, arg_child_event_payload
+		arg_child_workflow_id, arg_event_ts, 'created', NULL, NULL, arg_child_event_payload
 	);
 
 	-- Sidecar.
@@ -368,15 +366,14 @@ proc:BEGIN
 	-- call operation is now pending, same as an ordinary intermediate operation_request.
 	UPDATE `tb_mf_workflow`
 	SET `continuation` = arg_new_continuation,
-	    `current_event_seq` = v_event_seq,
 	    `current_event_ts` = arg_event_ts,
 	    `updated_at` = arg_event_ts
 	WHERE `workflow_id` = arg_workflow_id;
 
 	INSERT INTO `tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
-		arg_workflow_id, v_event_seq, arg_event_ts, 'call_submitted', arg_executor, NULL, arg_event_payload
+		arg_workflow_id, arg_event_ts, 'call_submitted', arg_executor, NULL, arg_event_payload
 	);
 
 	SELECT JSON_OBJECT('outcome', 'submitted', 'child_workflow_id', LOWER(HEX(arg_child_workflow_id))) AS result;

@@ -2,10 +2,12 @@
 
 ## Status
 
-**Slice 1 COMPLETE (2026-07-08), review-verified.** `microflows-viz serve` covers mfinspect
-inspect/list parity (`/api/workflow/<id>`, `/api/workflows`), runs read-only as viz_ro, and the
-full suite (35/35, incl. the mfinspect parity harness) is wired into the root `test` gate with
-`MFVIZ_REQUIRE_DB=1`. Next up: slice 2 (tree / timeline / stuck endpoints).
+**Slices 1 and 2 COMPLETE (slice 1: 2026-07-08 review-verified; slice 2: 2026-07-09).**
+The full operator API surface required before any team-facing release is now present AND gated:
+search/list (`/api/workflows`), raw inspect (`/api/workflow/<id>`, mfinspect parity), call
+**tree**, event **timeline**, and the derived **stuck** verdict — all read-only as viz_ro,
+stdlib HTTP only, 49/49 tests through the root `test` gate with `MFVIZ_REQUIRE_DB=1`.
+Next up: slice 3 (browser UI live mode on top of /api).
 
 ## Slice tracker
 
@@ -14,8 +16,27 @@ full suite (35/35, incl. the mfinspect parity harness) is wired into the root `t
       serving, SELECT-only viz_ro grant (tests run against it), formal parity harness, and the
       suite wired into the root `test` gate with `MFVIZ_REQUIRE_DB=1` (parity harness is
       temporary — replaced by fixture-owned golden tests before slice 4).
-- [ ] Slice 2 — `/api/workflow/<id>/tree`, `/timeline`, `/stuck` (derived stuck/waiting verdict
-      incl. lease, next_attempt_at, reconcile + redispatch timestamps, resolution_required).
+- [x] Slice 2 — COMPLETE (2026-07-09). `/api/workflow/<id>/tree`, `/timeline`, `/stuck`
+      implemented per the plan below, fixture-backed tests for every stuck verdict, 49/49
+      through the root gate. Plan (2026-07-09, as executed):
+      - `tree`: skeletal recursion over tb_mf_call — per node workflow_id, parent_workflow_id,
+        depth, script_name, state/state_name, current_disposition, terminal_reason, children;
+        same max_depth/truncated/cycle stubs as inspect. Cheap: two narrow SELECTs per node.
+      - `timeline`: walk the same tree skeleton, then one events SELECT over all collected ids,
+        ORDER BY event_ts, workflow_id (event_ts is the workflow-local chronological key,
+        strictly monotonic per workflow; workflow_id is an internal cross-workflow tie-breaker);
+        each entry annotated with workflow_id/depth/script_name.
+      - `stuck`: verdict + evidence, classified in precedence order: terminal >
+        blocked_resolution (checkpoint reversal_state=3 evidence) > running_under_lease
+        (lease_owner set, lease_expires_at > db_now) > waiting_on_child (any non-terminal
+        child; descend recursively to the deepest non-terminal descendant, path recorded) >
+        redispatch_pending (op/ckpt redispatch_* set — the escalation, so it outranks) >
+        reconcile_pending (op/ckpt reconcile_* set on a pending row) > scheduled_retry
+        (next_attempt_at > db_now) > claimable_now. All time comparisons against DB NOW(6),
+        returned as `db_now` in the response. Evidence carries the raw columns used.
+      - Fixture-backed tests: one seeded workflow per stuck shape (all 8 verdicts) + tree
+        shape/truncation + timeline ordering, in the reserved `mfviz-slice2` script namespace,
+        FK-safe self-cleanup, run as viz_ro through the HTTP surface.
 - [ ] Slice 3 — live mode in the browser UI on top of `/api` (demo player stays).
 - [ ] Slice 4 — replace parity harness with fixture-owned API tests, then remove
       `microflows/tools/mfinspect/` + `work/mfinspect/`, sweep references.
@@ -50,22 +71,89 @@ full suite (35/35, incl. the mfinspect parity harness) is wired into the root `t
     passed a naive first-component allowlist and served pyproject.toml) — fixed by
     normalizing before the allowlist check; regression covered with 4 traversal shapes.
 
-## Verification
+- 2026-07-09 (slice 2 implemented + verified, endpoint by endpoint):
+  - `/tree` — skeletal recursion in `dbq.tree_workflow` (two narrow SELECTs per node — the
+    skeleton projection + child ids from tb_mf_call), per-node workflow_id /
+    parent_workflow_id / depth / script_name / state / state_name / current_disposition /
+    terminal_reason / children; inspect's max_depth/truncated/cycle semantics preserved.
+    Verified: nesting + fields + depths over a seeded P→(terminal TC, C→G) tree, truncation
+    stub at max_depth=1, 404 unknown id, 400 bad max_depth. No payload keys in the response.
+  - `/timeline` — flattens the tree skeleton to an id→{depth, script_name} map, then ONE
+    events SELECT over all ids, ORDER BY event_ts, workflow_id; each entry
+    annotated with workflow_id/depth/script_name; response carries the id map. Verified:
+    cross-workflow merge order (P@T0, C@T1, G@T2, P@T3), depth annotations 0/1/2/0, payload
+    decode, and max_depth=1 excluding the grandchild's node + events.
+  - `/stuck` — `dbq.stuck_workflow` verdict + evidence, precedence: terminal >
+    blocked_resolution > running_under_lease > waiting_on_child (recursive descent, path
+    recorded) > redispatch_pending > reconcile_pending > scheduled_retry > claimable_now.
+    Evidence = raw columns used (state/disposition/direction, terminal_reason, lease
+    owner/expiry, next_attempt_at, attempt counter, updated_at) + attention rows (pending /
+    reconcile / redispatch ops and non-forward-held checkpoints) + `db_now` (DB clock, used
+    for every comparison). Verified with one seeded workflow per verdict — all 8 — including
+    redispatch outranking a simultaneously-set reconcile budget, and descent skipping a
+    terminal sibling to reach the deepest non-terminal descendant (path [P, C, G], nested
+    verdicts waiting_on_child → waiting_on_child → claimable_now).
+  - Suite: 49/49 standalone AND via root `just _test-viz` (schema reset, mariachi python,
+    MFVIZ_REQUIRE_DB=1); zipapp rebuilt (byte-identity enforced). README: quickstart step 5
+    (tree/timeline/stuck curl examples + verdict glossary) and the API summary updated; the
+    "slice 2 will add" scope note removed. Release precondition met: list/search + inspect +
+    tree + timeline + stuck all present and gated.
 
-- `just test` in `microflows-viz/`: **29/29 pass** — 15 packaging tests (incl.
-  committed-artifact byte-identity vs fresh build; static UI deliberately NOT bundled in the
-  zip), 2 grant tests, 12 serve/API tests. The DB-backed tests skip cleanly when the fixture
-  DB (127.0.0.1:34214, `microflows`) is down.
-- Grant enforced BY PERMISSION: tests apply the committed `viz_ro.sql` verbatim
-  ({{SCHEMA}}-substituted) as root, then prove SELECT works and INSERT/UPDATE/DELETE all fail
-  with ER_TABLEACCESS_DENIED (1142) as `viz_ro`; the server test suite runs the backend as
-  `viz_ro` throughout.
-- End-to-end through the committed zipapp, standalone (no venv/PYTHONPATH), as `viz_ro`:
-  `/api/health` 200; `/` serves index.html byte-exact; `/vendor/mermaid.min.js` (3.5 MB) 200;
-  `/pyproject.toml` and `--path-as-is /vendor/../pyproject.toml` both 404.
-- Parity spot-check: `GET /api/workflow/<id>?max_depth=5` vs
-  `mfinspect inspect <id> --max-depth 5` on the same live workflow — **key-sorted JSON
-  identical** (the formal seeded-fixture harness is still owed within slice 1).
+- 2026-07-09 (design change folded into the slice-2 landing: **event_seq removed as an
+  ordering concept** — event_ts is the workflow-local chronological key; pre-production, so
+  storage + API cleaned in place rather than migrated):
+  - Schema: `tb_mf_workflow_event.event_seq` dropped, PK now `(workflow_id, event_ts)`;
+    `tb_mf_workflow.current_event_seq` dropped (`current_event_ts` stays as the latest-event
+    pointer AND the append monotonicity fence); checkpoint `resolution_event_seq` →
+    `resolution_event_ts`.
+  - All 16 event-appending SPs reworked: no seq derivation, event INSERT without seq,
+    `current_event_ts` advance only; the existing `arg_event_ts > current_event_ts` guard
+    (event_time_skew + defer_until, runner retries with a later DB-clock ts) is the ONLY
+    ordering mechanism — no second fallback. Defer-family SPs keep their fold-to-no-append
+    skew behavior. Readers: dispatch_defer `ORDER BY event_ts DESC`; plan_stalled joins the
+    latest event via `current_event_ts`; claim SPs no longer project a seq.
+  - Runtime: `ClaimedWorkflow.current_event_seq` removed (host.drift, both parse sites);
+    live_lease_test assertion dropped.
+  - Tests/tools: sp_call_test (seed helpers, direct INSERTs, assertions now select by kind /
+    order by event_ts / check current_event_ts), sp_operation_test, seed proc, integration
+    test.py, export_events.py, migration 0001 backfill query — all seq-free. mfinspect +
+    mfviz inspect order events by event_ts; `/timeline` responses carry NO event_seq (order
+    is event_ts chronology; workflow_id is an internal equal-ts tie-breaker only), with a
+    negative assertion pinning that. Both zipapps rebuilt. Design docs
+    (microflows_design/phase_drift_mile_design/storage_portability) updated — I2 is now
+    "event_ts chronology is the only event order".
+  - The first full-gate run caught two missed fixture surfaces (the sweep's grep excluded
+    .csv): the coordinator-fixtures scenario CSVs still carried the seq columns AND had
+    same-timestamp event rows that collide on the new `(workflow_id, event_ts)` PK — fixed
+    by dropping the columns, moving wf 01/02/04's second event to `.000001`, and advancing
+    those rows' `current_event_ts`/`updated_at` to stay head-consistent (plan_stalled now
+    joins the latest event via `current_event_ts`). The integration-harness failure was
+    downstream (FK on the unloaded fixture row). Also a lesson re-learned: piping a gate to
+    `tail` masks its exit code — the first background run "completed (exit 0)" while the
+    gate inside had failed; reruns capture `EXIT=$?` explicitly.
+  - Verified: schema + all procs apply cleanly via mariachi; SP regressions **156/156 +
+    131/131**; viz suite 49/49; full root `just test` GREEN end-to-end (combined drift plan
+    61 jobs incl. rebuilt host.drift, e2e, coordinator-singular integration; then the viz
+    gate 49/49; EXIT=0).
+
+## Verification (current)
+
+- `microflows-viz/just test`: **49/49** — 16 packaging tests (incl. committed-artifact
+  byte-identity; static UI deliberately NOT bundled in the zip), 12 grant + serve/API tests,
+  7 mfinspect-parity tests (seeded fixture tree), 14 slice-2 tests (all 8 stuck verdicts +
+  tree/timeline shapes). DB-backed tests skip only in LOCAL runs without the
+  fixture DB; the root gate exports `MFVIZ_REQUIRE_DB=1`, making absence a hard failure.
+- Read-only enforced BY PERMISSION: the suites apply the committed `viz_ro.sql` verbatim
+  ({{SCHEMA}}-substituted) as root, prove INSERT/UPDATE/DELETE all fail with
+  ER_TABLEACCESS_DENIED (1142) as `viz_ro`, and run every server test as `viz_ro`.
+- Formal parity harness (slice 1) supersedes the early live-data spot-check: API ==
+  committed mfinspect zipapp on a seeded deterministic tree, inspect (full + truncated) and
+  list (unfiltered/state/plan_version), modulo the two documented additive fields.
+- Repo gate: root `just test` = combined drift plan (61 jobs) + `_test-viz` under one DB
+  lock — last full run GREEN end-to-end (EXIT=0) on certified driftc 0.33.77, including the
+  event_ts redesign (SP regressions 156/156 + 131/131 inside the plan).
+
+## Review-history log
 
 - 2026-07-07 (review follow-up, 2 findings fixed):
   - README.md now documents the operator entrypoint before this slice is called landed: new
@@ -113,9 +201,7 @@ full suite (35/35, incl. the mfinspect parity harness) is wired into the root `t
 
 ## Next literal action
 
-Slice 2: implement `GET /api/workflow/<id>/tree` (skeletal call tree: ids/states/depths
-only), `GET /api/workflow/<id>/timeline` (merged event timeline), and
-`GET /api/workflow/<id>/stuck` (derived waiting/stuck verdict from lease, next_attempt_at,
-reconcile_*/redispatch_* columns, checkpoint resolution_required, and deepest non-terminal
-descendant), with fixture-backed tests for each stuck shape per the charter's verification
-criteria.
+Slice 3: live mode in the browser UI on top of `/api` — a search form (`/api/workflows`),
+a workflow page (tree + timeline + stuck verdict), reusing the existing sequence/state-machine
+rendering where it fits; the canned-tape demo player stays functional. Before starting, decide
+whether `export_events.py` is retired in this slice (its replacement, `/timeline`, now exists).

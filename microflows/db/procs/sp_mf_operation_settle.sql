@@ -8,7 +8,7 @@ DELIMITER $$
 -- crash-before-settle (or a lost-ack reconcile) finds the operation already
 -- status=succeeded and returns 'already_settled' with the recorded result —
 -- the operation is settled exactly once. Time discipline (§24.4): caller
--- event_ts strictly greater than current_event_ts; ordering is event_seq.
+-- event_ts strictly greater than current_event_ts; event_ts is the ordering key.
 --
 -- arg_is_final distinguishes the LAST operation of a (manual-IR) plan from an
 -- intermediate one:
@@ -50,7 +50,6 @@ proc:BEGIN
 	DECLARE v_owner varbinary(16);
 	DECLARE v_token bigint;
 	DECLARE v_state tinyint;
-	DECLARE v_event_seq bigint;
 	DECLARE v_event_ts datetime(6);
 	DECLARE v_op_status tinyint;
 	DECLARE v_op_id varbinary(16);
@@ -109,8 +108,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`
-		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_ts`
+		INTO v_owner, v_token, v_state, v_event_ts
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
 		FOR UPDATE;
@@ -198,9 +197,6 @@ proc:BEGIN
 			'defer_until', DATE_FORMAT(v_event_ts + INTERVAL 5 SECOND, '%Y-%m-%d %H:%i:%s.%f')) AS result;
 		LEAVE proc;
 	END IF;
-
-	SET v_event_seq = v_event_seq + 1;
-
 	UPDATE `tb_mf_operation`
 	SET `status` = 2,
 	    `result_json` = arg_result_json,
@@ -225,7 +221,6 @@ proc:BEGIN
 		SET `continuation` = arg_new_continuation,
 		    `state` = 4,
 		    `current_disposition` = 1,
-		    `current_event_seq` = v_event_seq,
 		    `current_event_ts` = arg_event_ts,
 		    `lease_owner` = NULL,
 		    `lease_expires_at` = NULL,
@@ -234,9 +229,9 @@ proc:BEGIN
 		WHERE `workflow_id` = arg_workflow_id;
 
 		INSERT INTO `tb_mf_workflow_event` (
-			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+			`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 		) VALUES (
-			arg_workflow_id, v_event_seq, arg_event_ts, 'workflow_completed', arg_executor, NULL, arg_event_payload
+			arg_workflow_id, arg_event_ts, 'workflow_completed', arg_executor, NULL, arg_event_payload
 		);
 	ELSE
 		-- Intermediate operation: stay forward(1), advance the continuation, RETAIN
@@ -244,15 +239,14 @@ proc:BEGIN
 		-- stays unchanged (the workflow is not yet completed).
 		UPDATE `tb_mf_workflow`
 		SET `continuation` = arg_new_continuation,
-		    `current_event_seq` = v_event_seq,
 		    `current_event_ts` = arg_event_ts,
 		    `updated_at` = arg_event_ts
 		WHERE `workflow_id` = arg_workflow_id;
 
 		INSERT INTO `tb_mf_workflow_event` (
-			`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+			`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 		) VALUES (
-			arg_workflow_id, v_event_seq, arg_event_ts, 'operation_settled', arg_executor, NULL, arg_event_payload
+			arg_workflow_id, arg_event_ts, 'operation_settled', arg_executor, NULL, arg_event_payload
 		);
 	END IF;
 

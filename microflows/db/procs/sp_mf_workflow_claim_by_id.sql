@@ -67,7 +67,6 @@ proc:BEGIN
 		'current_disposition', `current_disposition`,
 		'script_name', `script_name`,
 		'script_revision', `script_revision`,
-		'current_event_seq', `current_event_seq`,
 		'current_operation_attempt', `current_operation_attempt`,
 		'continuation', JSON_EXTRACT(`continuation`, '$')
 	) AS result

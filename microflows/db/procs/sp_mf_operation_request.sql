@@ -12,8 +12,8 @@ DELIMITER $$
 -- (operation_id, operation_name, input_hash) match; otherwise operation_conflict.
 -- The persisted workflow continuation is the authority for resume position, so
 -- a replay does not re-advance it. Time discipline (§24.4): caller event_ts
--- strictly greater than current_event_ts (else event_time_skew); event_seq
--- orders. input_hash is the CANONICAL input identity (the dispatcher hashes
+-- strictly greater than current_event_ts (else event_time_skew) — event_ts is
+-- the ordering key. input_hash is the CANONICAL input identity (the dispatcher hashes
 -- the canonical input), so it is the comparison of record for the input.
 CREATE PROCEDURE `sp_mf_operation_request`(
 	IN arg_workflow_id varbinary(16),
@@ -33,7 +33,6 @@ proc:BEGIN
 	DECLARE v_owner varbinary(16);
 	DECLARE v_token bigint;
 	DECLARE v_state tinyint;
-	DECLARE v_event_seq bigint;
 	DECLARE v_event_ts datetime(6);
 	DECLARE v_missing tinyint(1) DEFAULT 0;
 	DECLARE v_op_missing tinyint(1) DEFAULT 0;
@@ -83,8 +82,8 @@ proc:BEGIN
 
 	BEGIN
 		DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_missing = 1;
-		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_seq`, `current_event_ts`
-		INTO v_owner, v_token, v_state, v_event_seq, v_event_ts
+		SELECT `lease_owner`, `fencing_token`, `state`, `current_event_ts`
+		INTO v_owner, v_token, v_state, v_event_ts
 		FROM `tb_mf_workflow`
 		WHERE `workflow_id` = arg_workflow_id
 		FOR UPDATE;
@@ -171,8 +170,6 @@ proc:BEGIN
 		LEAVE proc;
 	END IF;
 
-	SET v_event_seq = v_event_seq + 1;
-
 	INSERT INTO `tb_mf_operation` (
 		`workflow_id`, `operation_seq`, `operation_id`, `operation_name`, `schema_version`,
 		`input_json`, `input_hash`, `status`, `result_json`, `created_at`, `updated_at`
@@ -183,15 +180,14 @@ proc:BEGIN
 
 	UPDATE `tb_mf_workflow`
 	SET `continuation` = arg_new_continuation,
-	    `current_event_seq` = v_event_seq,
 	    `current_event_ts` = arg_event_ts,
 	    `updated_at` = arg_event_ts
 	WHERE `workflow_id` = arg_workflow_id;
 
 	INSERT INTO `tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
-		arg_workflow_id, v_event_seq, arg_event_ts, 'operation_requested', arg_executor, NULL, arg_event_payload
+		arg_workflow_id, arg_event_ts, 'operation_requested', arg_executor, NULL, arg_event_payload
 	);
 
 	SELECT JSON_OBJECT('outcome', 'requested', 'operation_id', LOWER(HEX(arg_operation_id))) AS result;

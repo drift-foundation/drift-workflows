@@ -18,12 +18,12 @@ CREATE PROCEDURE `sp_mf_test_seed_reversing`(
 BEGIN
 	INSERT INTO `microflows`.`tb_mf_workflow` (
 		`workflow_id`, `script_name`, `script_revision`, `state`, `execution_direction`,
-		`current_disposition`, `current_event_seq`, `current_event_ts`, `fencing_token`,
+		`current_disposition`, `current_event_ts`, `fencing_token`,
 		`lease_owner`, `lease_expires_at`, `next_attempt_at`, `current_operation_attempt`,
 		`continuation`, `reversal_trigger_operation_id`, `created_at`, `updated_at`
 	) VALUES (
 		arg_workflow_id, arg_script, 1, 2, 2,
-		2, 1, arg_ts, 1,
+		2, arg_ts, 1,
 		NULL, NULL, arg_ts, 0,
 		JSON_OBJECT('pos', 'reverse', 'seq', 1), arg_trigger_op_id, arg_ts, arg_ts
 	);
@@ -35,9 +35,9 @@ BEGIN
 		arg_ts, arg_ts
 	);
 	INSERT INTO `microflows`.`tb_mf_workflow_event` (
-		`workflow_id`, `event_seq`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
+		`workflow_id`, `event_ts`, `kind`, `actor`, `request_id`, `payload`
 	) VALUES (
-		arg_workflow_id, 1, arg_ts, 'reversal_begun', NULL, NULL, JSON_OBJECT('seeded', 1)
+		arg_workflow_id, arg_ts, 'reversal_begun', NULL, NULL, JSON_OBJECT('seeded', 1)
 	);
 END $$
 DELIMITER ;

@@ -71,18 +71,18 @@ def _seed(conn) -> None:
 		# Parent: forward (state 1, disposition 0), top-level (ancestry NULLs).
 		c.execute(
 			"INSERT INTO tb_mf_workflow (workflow_id, script_name, script_revision, state, "
-			"execution_direction, current_disposition, current_event_seq, current_event_ts, "
+			"execution_direction, current_disposition, current_event_ts, "
 			"fencing_token, next_attempt_at, current_operation_attempt, continuation, "
-			"created_at, updated_at) VALUES (%s, %s, 1, 1, 1, 0, 2, %s, 1, %s, 0, '{}', %s, %s)",
+			"created_at, updated_at) VALUES (%s, %s, 1, 1, 1, 0, %s, 1, %s, 0, '{}', %s, %s)",
 			(PARENT_ID, SCRIPT, T2, T0, T0, T2))
 		# Child: completed (state 4, disposition 1, return doc required), depth 1.
 		c.execute(
 			"INSERT INTO tb_mf_workflow (workflow_id, script_name, script_revision, state, "
-			"execution_direction, current_disposition, current_event_seq, current_event_ts, "
+			"execution_direction, current_disposition, current_event_ts, "
 			"fencing_token, next_attempt_at, current_operation_attempt, continuation, "
 			"workflow_return_json, parent_workflow_id, parent_node_id, root_workflow_id, "
 			"call_depth, created_at, updated_at) "
-			"VALUES (%s, %s, 1, 4, 1, 1, 2, %s, 1, %s, 0, '{}', '{}', %s, 'n1', %s, 1, %s, %s)",
+			"VALUES (%s, %s, 1, 4, 1, 1, %s, 1, %s, 0, '{}', '{}', %s, 'n1', %s, 1, %s, %s)",
 			(CHILD_ID, SCRIPT, T2, T1, PARENT_ID, PARENT_ID, T1, T2))
 		for wf_id, hash_byte in ((PARENT_ID, b"\x01"), (CHILD_ID, b"\x02")):
 			c.execute(
@@ -114,11 +114,11 @@ def _seed(conn) -> None:
 		# Event history: two per node.
 		for wf_id, kinds in ((PARENT_ID, ("created", "operation_requested")),
 		                     (CHILD_ID, ("created", "completed"))):
-			for seq, kind in enumerate(kinds, start=1):
+			for i, kind in enumerate(kinds):
 				c.execute(
-					"INSERT INTO tb_mf_workflow_event (workflow_id, event_seq, event_ts, kind, "
-					"payload) VALUES (%s, %s, %s, %s, '{}')",
-					(wf_id, seq, T2 if seq == 2 else T0, kind))
+					"INSERT INTO tb_mf_workflow_event (workflow_id, event_ts, kind, "
+					"payload) VALUES (%s, %s, %s, '{}')",
+					(wf_id, T2 if i == 1 else T0, kind))
 
 
 def _mfinspect(*args: str) -> object:
