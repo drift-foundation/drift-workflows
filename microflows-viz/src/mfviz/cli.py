@@ -156,6 +156,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
 		password=_resolve_password(args), database=args.db_name,
 	)
 	static_root = _resolve_static_root(args.static_root).resolve()
+	# Startup probe: a non-UTC coordinator DB is a configuration error — fail
+	# fast here rather than 502 on every request (connect() also enforces this
+	# per-request, so a DB that changes underneath us still fails closed). A DB
+	# that is merely unreachable stays non-fatal: endpoints 502 until it is up.
+	try:
+		dbq.connect(db_cfg).close()
+	except dbq.DbNotUtcError as exc:
+		raise dbq.MfvizError(str(exc)) from exc
+	except Exception as exc:
+		print(f"microflows-viz: warning: DB not reachable at startup ({exc}); "
+		      "endpoints will return 502 until it is", file=sys.stderr)
 	httpd = server.create_server(host, port, db_cfg, static_root)
 	bound_host, bound_port = httpd.server_address[0], httpd.server_address[1]
 	print(

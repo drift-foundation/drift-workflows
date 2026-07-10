@@ -21,6 +21,13 @@ nests recursively):
     "operations": [...tb_mf_operation rows ordered by operation_seq...],
     "calls": [...tb_mf_call rows ordered by operation_seq...],
     "checkpoints": [...tb_mf_workflow_checkpoint rows ordered by seq...],
+      NB (consumer-hardening F2): operations[] and checkpoints[] both carry
+      reconcile_*/redispatch_* counters and they are NOT duplicates —
+      operations[] counters are authoritative for FORWARD dispatch of that
+      operation; the same-named checkpoints[] counters track the checkpoint's
+      own COMPENSATION (reverse) dispatch and are legitimately 0/null on any
+      workflow that never reversed. Read forward retry/reclaim/redispatch
+      state from operations[], never from checkpoints[].
     "events": [...tb_mf_workflow_event rows ordered by event_ts, full history...],
     "children": [...recursive child nodes, or {"child_workflow_id":...,
                   "truncated": true} stubs once max_depth is reached -- never
@@ -60,6 +67,12 @@ class MfvizError(Exception):
 	"""Base exception for user-facing errors."""
 
 
+class DbNotUtcError(Exception):
+	"""The coordinator DB clock is not UTC, so the API's Z-designated timestamps
+	would be FALSE. Raised by connect() before any timestamped payload can be
+	built — the backend fails closed (502) instead of emitting wrong data."""
+
+
 def resolve_state(value: str | None) -> int | None:
 	"""A state filter, by numeric code or name; None passes through (no filter)."""
 	if value is None:
@@ -89,9 +102,27 @@ class DbConfig:
 def connect(cfg: DbConfig):
 	if pymysql is None:  # pragma: no cover - captured at runtime
 		raise MfvizError("PyMySQL is not available in this interpreter")
-	return pymysql.connect(host=cfg.host, port=cfg.port, user=cfg.user,
+	conn = pymysql.connect(host=cfg.host, port=cfg.port, user=cfg.user,
 	                       password=cfg.password, database=cfg.database,
 	                       autocommit=True, cursorclass=DictCursor)
+	_assert_db_utc(conn)
+	return conn
+
+
+def _assert_db_utc(conn) -> None:
+	"""ENFORCE the timestamp contract, not just report it: every connection is
+	checked before use, so a non-UTC DB/session can never produce a Z-designated
+	payload. /api/health's db_utc_offset_seconds is the observable; this is the
+	guard (fail closed with a config error, per consumer-hardening F1 review)."""
+	with conn.cursor() as c:
+		c.execute("SELECT TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), NOW(6)) AS off")
+		off = int(c.fetchone()["off"])
+	if off != 0:
+		conn.close()
+		raise DbNotUtcError(
+			f"coordinator DB clock is not UTC (NOW() is {off:+d}s from UTC_TIMESTAMP()); "
+			"refusing to serve Z-designated timestamps — fix the DB/session time zone "
+			"(the deployment contract requires the coordinator database to run UTC)")
 
 
 def _hex_bytes(value_hex: str, field: str) -> bytes:
@@ -107,13 +138,19 @@ def _hex_bytes(value_hex: str, field: str) -> bytes:
 
 
 def _decode_value(v):
-	"""Render a raw DB value JSON-safely: bytes -> lowercase hex, datetime -> ISO 8601."""
+	"""Render a raw DB value JSON-safely: bytes -> lowercase hex, datetime ->
+	ISO 8601 **UTC with a trailing Z at fixed microsecond precision**
+	(consumer-hardening F1). Fixed precision matters: mixed shapes break
+	lexicographic chronology within a second ("…00Z" would sort AFTER
+	"…00.123456Z" despite being earlier), so every timestamp renders exactly
+	six fractional digits. The Z is truthful because connect() fails closed on
+	a non-UTC DB (_assert_db_utc); /api/health reports the offset observable."""
 	if v is None:
 		return None
 	if isinstance(v, (bytes, bytearray)):
 		return bytes(v).hex()
 	if isinstance(v, datetime):
-		return v.isoformat()
+		return v.isoformat(timespec="microseconds") + "Z"
 	return v
 
 
@@ -448,8 +485,7 @@ def stuck_workflow(conn, workflow_id_hex: str, seen=None, now=None):
 	node = {
 		"workflow_id": workflow_id_hex,
 		"script_name": row["script_name"],
-		# deterministic full precision (isoformat() alone drops ".000000")
-		"db_now": now.isoformat(timespec="microseconds"),
+		"db_now": _decode_value(now),  # the one rendering path: …\.\d{6}Z
 		"evidence": evidence,
 		"operations": operations,
 		"checkpoints": checkpoints,

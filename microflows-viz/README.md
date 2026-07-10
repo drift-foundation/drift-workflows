@@ -99,6 +99,17 @@ MDB_ROOT_PWD=rootpw ./microflows-viz serve            # → http://127.0.0.1:837
   `GET /api/workflow/<id>/timeline` (the whole tree's event history merged in order — "what ran,
   in what order?"), and `GET /api/workflow/<id>/stuck` (a verdict with evidence — "why is this
   not moving?").
+- **Timestamps are ISO-8601 UTC with a trailing `Z` at fixed microsecond precision** — every
+  timestamp in every JSON response (event/created/updated times, lease expiry, `next_attempt_at`,
+  reconcile/redispatch stamps, `db_now`) renders exactly six fractional digits, so lexicographic
+  order IS chronological order. Coordinator timestamps are DB-clock values, so this rests on one
+  deployment requirement: **the coordinator database runs UTC** (the dev fixture does) — and the
+  backend **enforces it, fail-closed**: every DB connection verifies the clock and a non-UTC
+  DB/session gets a 502 `db_not_utc` config error (plus a fail-fast check at `serve` startup)
+  instead of ever emitting a falsely-designated timestamp. `/api/health.db_utc_offset_seconds`
+  is the observable (always 0 when the API answers). The single deliberate exception: health's
+  `default_since`/`default_until` are form-shaped (no designator, whole seconds) for the live
+  UI's `datetime-local` inputs — same UTC frame, just unsuffixed.
 - **Read-only by permission:** every query is a SELECT, and running as `viz_ro` makes MariaDB itself
   reject anything else. `microflows-viz` is the SUCCESSOR to the retired `mfinspect` CLI — the
   single operator tool for "what ran?" and "where is this stuck?"; its inspect/list JSON contracts
@@ -141,12 +152,14 @@ Everything below is the same flow over curl, for scripts and headless boxes.
 
 ```bash
 curl -s http://127.0.0.1:8377/api/health | jq .
-# {"database": "microflows", "db_now": "2026-07-10T11:16:42.845750",
+# {"database": "microflows", "db_now": "2026-07-10T11:16:42.845750Z", "db_utc_offset_seconds": 0,
 #  "default_since": "2026-07-09T11:16:42", "default_until": "2026-07-10T11:16:43", "ok": true}
 ```
 
-`db_now` is the database clock (the time authority for every bound and verdict);
-`default_since`/`default_until` are the SQL-computed last-24h search bounds the live UI copies.
+`db_now` is the database clock (the time authority for every bound and verdict; UTC, like every
+API timestamp — `db_utc_offset_seconds` must be 0 in a correct deployment);
+`default_since`/`default_until` are the SQL-computed last-24h search bounds the live UI copies
+(form-shaped, so no `Z` — the one deliberate exception to the timestamp contract).
 
 **3. Search for workflow instances** (a script name is not an instance identity — many instances
 run the same script, so search first, then inspect one):
@@ -182,7 +195,14 @@ curl -s 'http://127.0.0.1:8377/api/workflow/<32-hex>?max_depth=10' | jq .
 That returns the full durable state for the instance, unfiltered: the workflow row, plan pin +
 args, operations, call rows, checkpoint stack, the complete event history, and `children` nesting
 recursively into every child workflow (up to `max_depth`; deeper children come back as explicit
-`{"truncated": true}` stubs, never silently dropped). Useful `jq` starting points:
+`{"truncated": true}` stubs, never silently dropped).
+
+**Counter authority — read this before consuming reconcile/redispatch counters:** `operations[]`
+and `checkpoints[]` both carry `reconcile_*`/`redispatch_*` fields and they are *not* duplicates.
+`operations[]` counters are authoritative for **forward** dispatch (a participant's
+retry/reclaim/redispatch state lives there); the same-named `checkpoints[]` counters track that
+checkpoint's own **compensation (reverse)** dispatch and are legitimately `0`/`null` on any
+workflow that never reversed. Reading forward state from `checkpoints[]` silently yields zeros. Useful `jq` starting points:
 `jq .workflow.state`, `jq .events[-1]`, `jq '.children[].workflow_id'`.
 
 **5. Or ask the derived operator questions directly** (same `<32-hex>` id):

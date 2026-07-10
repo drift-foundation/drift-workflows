@@ -7,7 +7,7 @@
 operator-facing tool — browser live mode (search → stuck verdict → tree → timeline → raw
 inspect) over the gated read-only API, and **mfinspect is retired** (package + work notes
 deleted; JSON contracts pinned by fixture-owned goldens minted mfinspect-equal at
-retirement). 59/59 tests through the root `test` gate with `MFVIZ_REQUIRE_DB=1`.
+retirement). 62/62 tests through the root `test` gate with `MFVIZ_REQUIRE_DB=1`.
 Remaining: commit the landing; per work/README.md convention this folder is deleted when
 the effort lands (commit history becomes the record).
 
@@ -277,13 +277,58 @@ the effort lands (commit history becomes the record).
   post-retirement under the same ported truncation semantics. Re-verified: suite 59/59;
   root `just _test-viz` 59/59 EXIT=0.
 
+- 2026-07-10 (consumer-hardening: PushCoin bookkeeper-harness footguns F1/F2 addressed
+  pre-publish, per the batch in /tmp/drift-announce/20260710T182452Z-…-footguns.md):
+  - **F1 — timestamps are now ISO-8601 UTC with a trailing `Z`** across every endpoint
+    (inspect, list, tree/timeline/stuck evidence, operation/checkpoint stamps, db_now).
+    DECISION + rationale: coordinator DATETIME(6) values are DB-clock writes, so the `Z` is
+    truthful iff the DB runs UTC — verified the fixture does (system tz UTC, NOW(6) ==
+    UTC_TIMESTAMP(6)), made "coordinator DB runs UTC" an explicit deployment requirement in
+    the README, and added `/api/health.db_utc_offset_seconds` (TIMESTAMPDIFF vs
+    UTC_TIMESTAMP, must be 0) as the runtime proof. The DELIBERATE exception:
+    `default_since`/`default_until` stay form-shaped (no designator) because the live UI's
+    datetime-local inputs cannot hold one — same UTC frame, documented in README, health
+    docstring, and the page itself; labels now read "(DB time, UTC)". No browser-clock or
+    client date arithmetic reintroduced (lints unchanged). Goldens re-minted (+ a mint-time
+    sweep asserting no bare timestamp remains); health test pins the `Z`, the offset==0, and
+    the bounds' bare shape.
+  - **F2 — checkpoint counters KEPT, authority documented** (removal rejected as unsound):
+    the checkpoints[] reconcile_*/redispatch_* fields are NOT duplicates of operations[] —
+    they are the compensation(reverse)-side timers (uflowsd-pending-redispatch machinery)
+    and are legitimately 0/null on forward-only flows like the reporter's; deleting them
+    would gut reverse-direction stuck evidence. Documented the authority split ("read
+    forward retry/reclaim/redispatch state from operations[], never checkpoints[]") in the
+    README quickstart (before the counters are first mentioned) and dbq's inspect-shape
+    docstring.
+  - Verified: suite 59/59; root `just _test-viz` 59/59 EXIT=0; zipapp health smoke shows
+    `db_now …Z` + `db_utc_offset_seconds: 0` + bare form bounds.
+- 2026-07-10 (F1 review round 2, 2 findings fixed — the contract is now ENFORCED and uniform):
+  - **Fail closed on a non-UTC DB**: `dbq.connect()` now runs `_assert_db_utc` on every
+    connection (the single chokepoint every timestamped payload passes through) and raises
+    `DbNotUtcError` — endpoints return a distinct 502 `db_not_utc` config error, health
+    included, and `serve` fail-fasts at startup on the same violation (a merely-unreachable
+    DB stays non-fatal). `db_utc_offset_seconds` remains the observable but is no longer
+    load-bearing: the API can never emit a falsely-Z-designated timestamp. Tested with a
+    real `+05:00` session (guard raises) and endpoint-level mocks (all four routes 502
+    `db_not_utc`).
+  - **Fixed microsecond precision everywhere**: `_decode_value` renders
+    `isoformat(timespec="microseconds") + "Z"`, and health/stuck `db_now` now use that same
+    single path — zero-microsecond values render `…00.000000Z`, so lexicographic order is
+    chronological order within a second (mixed shapes previously sorted "…00Z" after
+    "…00.123456Z"). Goldens re-minted; a committed golden test pins every timestamp to
+    `\d{6}Z`.
+  - Verified: suite 62/62 (59 + 3 new); root `just _test-viz` 62/62 EXIT=0. README contract
+    bullet updated (enforced, fail-closed, fixed precision).
+
 ## Verification (current)
 
-- `microflows-viz/just test`: **59/59** — 16 packaging tests (incl. committed-artifact
-  byte-identity; static UI deliberately NOT bundled in the zip), 12 grant + serve/API tests,
-  8 golden tests (fixture-owned inspect/list JSON contracts + error surface; superseded the
-  parity harness), 14 slice-2 tests (all 8 stuck verdicts + tree/timeline shapes), 9 live-UI
-  tests (self-containment + no-browser-clock lints, served-over-HTTP checks). DB-backed tests skip only in LOCAL runs without the
+- `microflows-viz/just test`: **62/62** — 16 packaging tests (incl. committed-artifact
+  byte-identity; static UI deliberately NOT bundled in the zip), 14 grant + serve/API tests
+  (incl. the non-UTC fail-closed guard + endpoint 502 db_not_utc checks), 9 golden tests
+  (fixture-owned inspect/list JSON contracts + error surface + uniform-timestamp pin;
+  superseded the parity harness), 14 slice-2 tests (all 8 stuck verdicts + tree/timeline
+  shapes), 9 live-UI tests (self-containment + no-browser-clock lints, served-over-HTTP
+  checks). DB-backed tests skip only in LOCAL runs without the
   fixture DB; the root gate exports `MFVIZ_REQUIRE_DB=1`, making absence a hard failure.
 - Read-only enforced BY PERMISSION: the suites apply the committed `viz_ro.sql` verbatim
   ({{SCHEMA}}-substituted) as root, prove INSERT/UPDATE/DELETE all fail with

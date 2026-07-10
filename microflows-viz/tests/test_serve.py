@@ -131,6 +131,25 @@ class VizRoGrantTests(unittest.TestCase):
 		finally:
 			conn.close()
 
+	def test_non_utc_session_fails_closed(self) -> None:
+		"""The timestamp contract is ENFORCED, not just reported: a connection
+		whose session clock is not UTC is rejected before any payload can be
+		built (consumer-hardening F1 review — a non-UTC DB must never emit
+		Z-designated timestamps)."""
+		conn = pymysql.connect(host=DB_HOST, port=DB_PORT, user=ROOT_USER,
+		                       password=ROOT_PWD, database=DB_NAME, autocommit=True,
+		                       cursorclass=dbq.DictCursor,
+		                       init_command="SET time_zone = '+05:00'")
+		try:
+			with self.assertRaises(dbq.DbNotUtcError) as ctx:
+				dbq._assert_db_utc(conn)
+			self.assertIn("not UTC", str(ctx.exception))
+		finally:
+			try:
+				conn.close()
+			except pymysql.MySQLError:
+				pass  # _assert_db_utc already closed it
+
 	def test_writes_are_denied_by_the_grant(self) -> None:
 		conn = self._viz_conn()
 		try:
@@ -243,12 +262,17 @@ class ServeTests(unittest.TestCase):
 		# db_now is the DB clock (NOW(6)); default_since/default_until are the
 		# SQL-computed search bounds the live UI copies verbatim (since = -24h
 		# floored; until = +1s floored, covering the current fractional second).
-		# full precision, deterministic: exactly six fractional digits always
-		self.assertRegex(payload["db_now"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$")
-		shape = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$"  # datetime-local, whole seconds
+		# Timestamp contract (consumer-hardening F1): deterministic full
+		# precision AND an explicit UTC designator — every API timestamp carries
+		# a trailing Z; the DB must run UTC and db_utc_offset_seconds proves it.
+		self.assertRegex(payload["db_now"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
+		self.assertEqual(payload["db_utc_offset_seconds"], 0)
+		# The bounds are the DELIBERATE exception: form-shaped for the live UI's
+		# datetime-local inputs (same UTC frame, no designator).
+		shape = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$"
 		self.assertRegex(payload["default_since"], shape)
 		self.assertRegex(payload["default_until"], shape)
-		self.assertLess(payload["default_since"], payload["db_now"])
+		self.assertLess(payload["default_since"], payload["db_now"][:19])
 		self.assertGreater(payload["default_until"], payload["db_now"][:19])
 
 	def test_unknown_endpoint_is_404(self) -> None:
@@ -275,6 +299,20 @@ class ServeTests(unittest.TestCase):
 			status, payload = self._get_json(f"/api/workflow/{MISSING_ID}?max_depth={bad}")
 			self.assertEqual(status, 400, bad)
 			self.assertEqual(payload["error"], "bad_request", bad)
+
+	def test_endpoints_502_db_not_utc_when_guard_trips(self) -> None:
+		# Simulate a non-UTC DB at the chokepoint: every endpoint fails closed
+		# with a distinct config error, never a Z-stamped payload.
+		from unittest import mock
+		with mock.patch.object(dbq, "connect",
+		                       side_effect=dbq.DbNotUtcError("clock is not UTC (test)")):
+			for path in ("/api/health",
+			             "/api/workflows?script=x&since=2026-01-01%2000:00:00&until=2026-01-02%2000:00:00",
+			             f"/api/workflow/{MISSING_ID}",
+			             f"/api/workflow/{MISSING_ID}/stuck"):
+				status, payload = self._get_json(path)
+				self.assertEqual(status, 502, path)
+				self.assertEqual(payload["error"], "db_not_utc", path)
 
 	def test_mutating_methods_are_rejected(self) -> None:
 		conn = http.client.HTTPConnection("127.0.0.1", self.port)

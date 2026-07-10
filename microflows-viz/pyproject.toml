@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "microflows-viz"
-version = "0.1.0"
+version = "0.2.0"
 description = "Operator-facing viewer for Microflows workflow state: `serve` backend (read-only MariaDB) + browser UI."
 authors = [
 	{ name = "PushCoin" }

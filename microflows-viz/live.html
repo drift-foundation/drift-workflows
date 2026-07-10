@@ -97,9 +97,9 @@
       <form class="search" id="searchForm">
         <div class="req" style="grid-column: span 2"><label for="f_script">script</label>
           <input id="f_script" placeholder="e.g. checkout" required></div>
-        <div class="req"><label for="f_since">since <span class="muted">(DB time)</span></label>
+        <div class="req"><label for="f_since">since <span class="muted">(DB time, UTC)</span></label>
           <input id="f_since" type="datetime-local" step="1" required></div>
-        <div class="req"><label for="f_until">until <span class="muted">(DB time)</span></label>
+        <div class="req"><label for="f_until">until <span class="muted">(DB time, UTC)</span></label>
           <input id="f_until" type="datetime-local" step="1" required></div>
         <div><label for="f_state">state</label>
           <select id="f_state">
@@ -119,8 +119,10 @@
       </div>
       <div class="muted" style="margin-top:.6em; font-size:.85em">
         script + since + until are required — the backend refuses unbounded scans.
-        Bounds compare against <code>created_at</code> in DB time; the defaults are computed
-        by the database clock (<code>/api/health</code> <code>default_since</code>/<code>default_until</code>),
+        Bounds compare against <code>created_at</code> in DB time (UTC — every API timestamp
+        carries a trailing <code>Z</code>; these form fields are the same frame, unsuffixed
+        because <code>datetime-local</code> cannot hold a designator). Defaults are computed by
+        the database clock (<code>/api/health</code> <code>default_since</code>/<code>default_until</code>),
         never the browser clock, and the until bound is inclusive of its whole second.
       </div>
     </div>

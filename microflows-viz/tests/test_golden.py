@@ -261,6 +261,21 @@ class GoldenTests(unittest.TestCase):
 		self.assertEqual(payload["error"], "bad_request")
 		self.assertIn("unknown state name", payload["detail"])
 
+	def test_golden_timestamps_uniform_utc(self) -> None:
+		"""F1 contract over the committed goldens: every timestamp renders at
+		fixed microsecond precision with a trailing Z — mixed shapes would break
+		lexicographic chronology within a second."""
+		import re
+		ts_any = re.compile(r'"(\d{4}-\d{2}-\d{2}T[0-9:.]+Z?)"')
+		full_shape = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
+		for name in ("inspect_full.json", "inspect_truncated.json", "list_unfiltered.json",
+		             "list_state_completed.json", "list_plan_version.json"):
+			text = (GOLDENS / name).read_text(encoding="utf-8")
+			stamps = ts_any.findall(text)
+			self.assertTrue(stamps, name)
+			bad = [s for s in stamps if not full_shape.match(s)]
+			self.assertEqual(bad, [], (name, bad[:3]))
+
 	def test_inspect_not_found_and_bad_depth(self) -> None:
 		status, payload = self._api(f"/api/workflow/{'0' * 32}")
 		self.assertEqual(status, 404)

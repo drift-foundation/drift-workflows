@@ -149,28 +149,41 @@ class VizRequestHandler(BaseHTTPRequestHandler):
 		#   default_until = NOW(6) + 1s, floored — i.e. rounded UP past the
 		#     current fractional second, so a created_at later in the current
 		#     second still falls inside `created_at <= until`.
+		# Timestamp contract (consumer-hardening F1): every JSON timestamp is
+		# ISO-8601 UTC with a trailing Z. That is truthful iff the DB runs UTC —
+		# a deployment REQUIREMENT this endpoint verifies and reports as
+		# db_utc_offset_seconds (0 on a correct deployment). default_since/
+		# default_until are the DELIBERATE exception: they are form-shaped for
+		# the live UI's datetime-local inputs (which cannot hold a designator);
+		# they are the same UTC frame, just unsuffixed.
 		try:
-			conn = dbq.connect(self.server.db_cfg)
+			conn = dbq.connect(self.server.db_cfg)  # fails closed on a non-UTC DB
 			try:
 				with conn.cursor() as c:
 					# no execute() args -> pymysql performs no %-interpolation,
 					# so DATE_FORMAT's % specifiers pass through as written
 					c.execute(
 						"SELECT NOW(6) AS now, "
+						"TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), NOW(6)) AS utc_offset, "
 						"DATE_FORMAT(NOW(6) - INTERVAL 24 HOUR, '%Y-%m-%dT%H:%i:%S') AS default_since, "
 						"DATE_FORMAT(NOW(6) + INTERVAL 1 SECOND, '%Y-%m-%dT%H:%i:%S') AS default_until")
 					row = c.fetchone()
 			finally:
 				conn.close()
+		except dbq.DbNotUtcError as exc:
+			self._send_json(HTTPStatus.BAD_GATEWAY,
+			                {"ok": False, "error": "db_not_utc", "detail": str(exc)})
+			return
 		except Exception as exc:
 			self._send_json(HTTPStatus.BAD_GATEWAY,
 			                {"ok": False, "error": "db_unreachable", "detail": str(exc)})
 			return
 		self._send_json(HTTPStatus.OK, {
 			"ok": True, "database": self.server.db_cfg.database,
-			# full precision, rendered deterministically (isoformat() alone drops
-			# ".000000" when the fractional part is exactly zero)
-			"db_now": row["now"].isoformat(timespec="microseconds"),
+			"db_now": dbq._decode_value(row["now"]),  # the one rendering path: …\.\d{6}Z
+			# always 0 when this response is reachable (connect() enforces it);
+			# kept as the documented observable of the UTC deployment contract
+			"db_utc_offset_seconds": int(row["utc_offset"]),
 			"default_since": row["default_since"],
 			"default_until": row["default_until"],
 		})
@@ -203,6 +216,9 @@ class VizRequestHandler(BaseHTTPRequestHandler):
 				conn.close()
 		except dbq.MfvizError as exc:
 			self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad_request", "detail": str(exc)})
+			return
+		except dbq.DbNotUtcError as exc:
+			self._send_json(HTTPStatus.BAD_GATEWAY, {"error": "db_not_utc", "detail": str(exc)})
 			return
 		except Exception as exc:
 			self._send_json(HTTPStatus.BAD_GATEWAY, {"error": "db_error", "detail": str(exc)})
@@ -243,6 +259,9 @@ class VizRequestHandler(BaseHTTPRequestHandler):
 				conn.close()
 		except dbq.MfvizError as exc:
 			self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad_request", "detail": str(exc)})
+			return
+		except dbq.DbNotUtcError as exc:
+			self._send_json(HTTPStatus.BAD_GATEWAY, {"error": "db_not_utc", "detail": str(exc)})
 			return
 		except Exception as exc:
 			self._send_json(HTTPStatus.BAD_GATEWAY, {"error": "db_error", "detail": str(exc)})
