@@ -2,12 +2,14 @@
 
 ## Status
 
-**Slices 1 and 2 COMPLETE (slice 1: 2026-07-08 review-verified; slice 2: 2026-07-09).**
-The full operator API surface required before any team-facing release is now present AND gated:
-search/list (`/api/workflows`), raw inspect (`/api/workflow/<id>`, mfinspect parity), call
-**tree**, event **timeline**, and the derived **stuck** verdict — all read-only as viz_ro,
-stdlib HTTP only, 49/49 tests through the root `test` gate with `MFVIZ_REQUIRE_DB=1`.
-Next up: slice 3 (browser UI live mode on top of /api).
+**ALL FOUR SLICES COMPLETE (slice 1: 2026-07-08; slices 2+3: 2026-07-09; slice 4:
+2026-07-10). The charter objective is delivered:** microflows-viz is the single
+operator-facing tool — browser live mode (search → stuck verdict → tree → timeline → raw
+inspect) over the gated read-only API, and **mfinspect is retired** (package + work notes
+deleted; JSON contracts pinned by fixture-owned goldens minted mfinspect-equal at
+retirement). 59/59 tests through the root `test` gate with `MFVIZ_REQUIRE_DB=1`.
+Remaining: commit the landing; per work/README.md convention this folder is deleted when
+the effort lands (commit history becomes the record).
 
 ## Slice tracker
 
@@ -37,9 +39,49 @@ Next up: slice 3 (browser UI live mode on top of /api).
       - Fixture-backed tests: one seeded workflow per stuck shape (all 8 verdicts) + tree
         shape/truncation + timeline ordering, in the reserved `mfviz-slice2` script namespace,
         FK-safe self-cleanup, run as viz_ro through the HTTP surface.
-- [ ] Slice 3 — live mode in the browser UI on top of `/api` (demo player stays).
-- [ ] Slice 4 — replace parity harness with fixture-owned API tests, then remove
-      `microflows/tools/mfinspect/` + `work/mfinspect/`, sweep references.
+- [x] Slice 3 — COMPLETE (2026-07-09). Live mode in the browser UI on top of `/api`
+      (demo player stays). Implemented per the plan below; 57/57 through the root gate.
+      Plan (2026-07-09, as executed):
+      - New self-contained `live.html` (inline CSS/JS, zero deps, no network beyond `/api/*`
+        on the serving origin) added to the static allowlist; `index.html` (demo player)
+        untouched except an optional header link. Hash routing: `#/` search, `#/wf/<id>`.
+      - Search view: form with required script/since/until (datetime-local), optional
+        state (dropdown of the 7 names) + plan_version; results table from `/api/workflows`
+        (id → detail link via each entry's `href`-derived id, script, state_name,
+        disposition, created/updated, terminal_reason). 400s render the API's own `detail`;
+        empty result set says so explicitly.
+      - Detail view for one id: **stuck verdict first** (verdict pill + `detail` + evidence
+        table + path chain links + nested `waiting_on`, and the resolution/redispatch/
+        reconcile row lists when present), then the `/tree` skeleton (recursive list, state
+        badges, truncation stubs shown), then the `/timeline` (event_ts chronology exactly
+        as returned — no client-side reordering, no event_seq anywhere), plus a link to the
+        raw `/api/workflow/<id>` inspect JSON.
+      - Error surfaces: 404 → "not found" panel; fetch/5xx/502 → error banner carrying the
+        API's `detail`; bounded-list 400 → inline form error.
+      - Tests (repo pattern = Python unittest over HTTP; no browser engine in the deps):
+        live.html served + allowlisted; self-containment lint (no external src/href, no
+        DB host/credential strings, fetches only `/api/` paths); no `event_seq` in UI code;
+        demo player still served byte-exact.
+      - export_events.py: left in place per decision (README already marks `/timeline` as
+        its successor).
+- [x] Slice 4 — COMPLETE (2026-07-10). Retired mfinspect per the plan below; 59/59
+      through the root gate. Plan (2026-07-10, as executed):
+      - `tests/test_golden.py` replaces `tests/test_parity.py`: same deterministic seeded
+        fixture tree, but asserted against COMMITTED golden JSON files
+        (`tests/goldens/*.json`) instead of live mfinspect output. Goldens are minted from
+        the API while the parity harness is still green, so their provenance is
+        "mfinspect-equal at retirement". Covers: inspect (full + truncated depth), list
+        (unfiltered / state / plan_version), and the error surface that lived in the parity
+        tests (bounded-scan 400 combos, unknown-state 400) plus 404/bad-depth bounds.
+      - Delete `microflows/tools/mfinspect/` (package, zipapp, docs) and `work/mfinspect/`.
+        mfinspect is wired into NO gate (verified: no test-plan emitter or justfile runs
+        it), so no gate rewiring is needed beyond the viz suite itself.
+      - Reference sweep: mfviz code/test/justfile docstrings reworded (successor language,
+        no pointers at deleted paths); root justfile gate comments (parity → goldens);
+        microflows_design.md §observability + roadmap.md now name microflows-viz as the
+        operator tool (mfinspect noted as absorbed); runner.drift comment updated.
+        Historical mentions in work/viz-consolidation Progress/README stay (diary/charter).
+      - microflows-viz README states it is the successor/operator tool.
 
 ## Completed steps
 
@@ -136,19 +178,120 @@ Next up: slice 3 (browser UI live mode on top of /api).
     61 jobs incl. rebuilt host.drift, e2e, coordinator-singular integration; then the viz
     gate 49/49; EXIT=0).
 
+- 2026-07-09 (slice 3 implemented + verified):
+  - `live.html` — one self-contained page (inline CSS/JS, zero dependencies, dark operator
+    styling), hash-routed: `#/` search, `#/wf/<32-hex>` detail. All network I/O goes through
+    a single `api()` helper fetching same-origin `/api/*` only. Added to the server's static
+    allowlist; the demo player gained one "Live mode →" header link and is otherwise
+    untouched (byte-exactness asserted in tests).
+  - Search view: required script/since/until (datetime-local, defaulting to the last 24 h)
+    + optional state/plan_version; results table with state pills and detail links. API 400s
+    (incl. the bounded-scan refusal) render the API's own `detail`; empty results say so.
+  - Detail view, stuck verdict FIRST: verdict pill + detail + evidence key/values + waiting
+    chain links + nested `waiting_on` verdicts + resolution/redispatch/reconcile row tables;
+    then the `/tree` skeleton (recursive list, truncation/cycle stubs rendered); then the
+    `/timeline` exactly in the API's event_ts chronology (no client-side reordering, no
+    event_seq anywhere — negative-asserted); plus a "full inspect JSON ↗" link to
+    `/api/workflow/<id>`. 404 → clear not-found panel; backend failure → error banner.
+  - Tests (+8 → 57 total): source-level lints (self-containment: zero external URLs, single
+    fetch call site, all api() targets under `/api/`; no DB host/port/credential strings; no
+    `event_seq`; inspect link present) + served-over-HTTP checks (live.html byte-exact,
+    demo player byte-exact with the live link). No browser engine exists in the deps or on
+    the host, so rendered-DOM verification is out of scope — the data path was smoke-tested
+    end-to-end instead: committed zipapp serving the exact requests the page issues against
+    seeded slice-2 fixtures (search incl. state filter, stuck path [P,C,G], tree children,
+    timeline order, bounded-scan 400).
+  - README quickstart is now browser-first (step 2 = open /live.html; curl flow kept for
+    headless boxes); Files table lists live.html. `export_events.py` stays per decision —
+    not made dead by this slice (the demo player's tape workflow still references it).
+  - Verified: `microflows-viz/just test` 57/57; root `just _test-viz` (schema reset,
+    mariachi python, MFVIZ_REQUIRE_DB=1) 57/57, EXIT=0 captured explicitly.
+
+- 2026-07-09 (slice-3 review follow-up, 2 findings fixed):
+  - Search bounds now seed from the DATABASE clock, not the browser clock: `/api/health`
+    returns `db_now` (NOW(6)); live.html initializes until=db_now / since=db_now−24h using
+    Date only for calendar arithmetic on the DB-clock components, leaves the fields blank
+    if health is unavailable, and labels both fields "(DB time)" with a note that bounds
+    compare against created_at in DB time. Health test pins `db_now`'s presence/shape.
+  - test_live_ui's serve tests now mirror ServeTests' posture: grant applied idempotently,
+    server created as viz_ro (root creds no longer reach the server), so a future
+    accidental API call from that suite cannot hide behind elevated permissions.
+  - Re-verified: suite 57/57; root `just _test-viz` 57/57 EXIT=0; `db_now` smoke-checked
+    through the committed zipapp.
+- 2026-07-10 (slice-3 review follow-up round 2 — DB-time bounds fully backend-owned):
+  - `/api/health` now returns SQL-computed `default_since` (NOW(6) − 24h, floored to the
+    second) and `default_until` (NOW(6) + 1s, floored — rounded UP past the current
+    fractional second so a created_at later in the same second still matches
+    `created_at <= until` on DATETIME(6)). live.html copies both verbatim: ALL Date
+    arithmetic removed from the page (lint-pinned: no `new Date(`/`Date.now(`), so browser
+    timezone/DST normalization can never distort DB-time bounds.
+  - Any user-entered until is now inclusive of its whole second too: the query param
+    appends `.999999` (sinceParam/untilParam split; since stays a floor).
+  - Caught during verification: the first cut doubled `%` in the DATE_FORMAT pattern
+    (pymysql only %-interpolates when execute() gets args; without args `%%` reaches SQL
+    and DATE_FORMAT emits literal text) — health returned the format string itself. Fixed
+    to single `%`; the health-shape test now pins real datetime values (since < db_now <
+    until) so this class of regression fails in the gate.
+  - Verified: suite 58/58; root `just _test-viz` 58/58 EXIT=0; zipapp health smoke shows
+    correct bounds (−24h floor / +1s ceil around db_now).
+
+- 2026-07-10 (slice-3 review round 3, 2 findings fixed): the stale 57/57 in "Verification
+  (current)" corrected to 58/58 (dated historical entries left as accurate snapshots); and
+  `db_now` is now rendered deterministically at full precision —
+  `isoformat(timespec="microseconds")` in both `/api/health` and `/stuck` (plain isoformat()
+  drops ".000000" when the fraction is exactly zero) — with the health test pinning
+  `\.\d{6}$`.
+- 2026-07-10 (**slice 4 executed — mfinspect retired**):
+  - Goldens minted (tests/goldens/: inspect_full, inspect_truncated, list_unfiltered,
+    list_state_completed, list_plan_version) from the API over the parity fixture tree,
+    WITH provenance proof: at mint time each was asserted equal to the committed mfinspect
+    zipapp's own output (inspect exact; list modulo the two documented additive fields).
+  - `tests/test_golden.py` (8 tests) owns the fixture seeding and asserts the API against
+    the committed goldens, plus the error surface inherited from the parity harness
+    (bounded-scan 400 combos, unknown-state 400, 404/bad-depth). `tests/test_parity.py`
+    deleted.
+  - `microflows/tools/mfinspect/` (package + committed zipapp + docs) and `work/mfinspect/`
+    deleted. Verified first that no gate/test-plan emitter runs mfinspect — no gate
+    rewiring needed.
+  - Reference sweep: root justfile gate comments (parity → goldens); mfviz
+    __init__/cli/dbq/server docstrings, justfile, test_serve/test_zipapp/build_zipapp
+    headers — successor language only, no pointers at deleted paths;
+    microflows_design.md §16.5 Observability + §16.6 MVP scope and roadmap.md now name
+    microflows-viz as the operator tool; runner.drift correlation comment updated.
+    Remaining "mfinspect" mentions are deliberate: retirement/successor statements and this
+    effort's own charter/diary.
+  - microflows-viz README states it is the successor/operator tool with golden-pinned
+    contracts.
+  - Verified: suite 59/59 (58 − 7 parity + 8 golden); root `just _test-viz` 59/59 EXIT=0;
+    zipapp rebuilt (byte-identity enforced).
+- 2026-07-10 (slice-4 review finding fixed — truncation golden was vacuous): with only
+  parent→child, max_depth=1 truncates nothing (stubs require depth+1 > max_depth), so
+  inspect_full and inspect_truncated were byte-identical. Fixture extended to
+  parent→child→grandchild (grandchild completed at depth 2, with its own plan/args/events
+  and the child's settled call + sidecar); goldens re-minted (full 9,483 B vs truncated
+  7,326 B; list goldens now 3 rows). Structural guards added alongside the golden equality
+  so the blind spot cannot recur: the truncated response must contain exactly
+  `{"child_workflow_id": <grandchild>, "truncated": true}` and must differ from the full
+  golden; the full response must expand the grandchild. Provenance note updated honestly:
+  the original two-node goldens were mfinspect-equal at mint; the grandchild extension is
+  post-retirement under the same ported truncation semantics. Re-verified: suite 59/59;
+  root `just _test-viz` 59/59 EXIT=0.
+
 ## Verification (current)
 
-- `microflows-viz/just test`: **49/49** — 16 packaging tests (incl. committed-artifact
+- `microflows-viz/just test`: **59/59** — 16 packaging tests (incl. committed-artifact
   byte-identity; static UI deliberately NOT bundled in the zip), 12 grant + serve/API tests,
-  7 mfinspect-parity tests (seeded fixture tree), 14 slice-2 tests (all 8 stuck verdicts +
-  tree/timeline shapes). DB-backed tests skip only in LOCAL runs without the
+  8 golden tests (fixture-owned inspect/list JSON contracts + error surface; superseded the
+  parity harness), 14 slice-2 tests (all 8 stuck verdicts + tree/timeline shapes), 9 live-UI
+  tests (self-containment + no-browser-clock lints, served-over-HTTP checks). DB-backed tests skip only in LOCAL runs without the
   fixture DB; the root gate exports `MFVIZ_REQUIRE_DB=1`, making absence a hard failure.
 - Read-only enforced BY PERMISSION: the suites apply the committed `viz_ro.sql` verbatim
   ({{SCHEMA}}-substituted) as root, prove INSERT/UPDATE/DELETE all fail with
   ER_TABLEACCESS_DENIED (1142) as `viz_ro`, and run every server test as `viz_ro`.
-- Formal parity harness (slice 1) supersedes the early live-data spot-check: API ==
-  committed mfinspect zipapp on a seeded deterministic tree, inspect (full + truncated) and
-  list (unfiltered/state/plan_version), modulo the two documented additive fields.
+- Fixture-owned goldens (tests/goldens/*.json) pin the inspect + list JSON contracts;
+  provenance: minted from the API on 2026-07-10 while the parity harness was still green,
+  each asserted equal to mfinspect's own output at mint time. A deliberate contract change
+  means re-minting the goldens and reviewing the diff.
 - Repo gate: root `just test` = combined drift plan (61 jobs) + `_test-viz` under one DB
   lock — last full run GREEN end-to-end (EXIT=0) on certified driftc 0.33.77, including the
   event_ts redesign (SP regressions 156/156 + 131/131 inside the plan).
@@ -201,7 +344,7 @@ Next up: slice 3 (browser UI live mode on top of /api).
 
 ## Next literal action
 
-Slice 3: live mode in the browser UI on top of `/api` — a search form (`/api/workflows`),
-a workflow page (tree + timeline + stuck verdict), reusing the existing sequence/state-machine
-rendering where it fits; the canned-tape demo player stays functional. Before starting, decide
-whether `export_events.py` is retired in this slice (its replacement, `/timeline`, now exists).
+Land the effort: commit the slice-3 review fixes + slice 4 (goldens, deletions, reference
+sweep), then — per work/README.md ("when an effort LANDS, delete its folder") — remove
+`work/viz-consolidation/` in the landing commit or immediately after; the commit history is
+the durable record.

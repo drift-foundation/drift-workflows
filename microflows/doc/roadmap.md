@@ -102,7 +102,7 @@ reverses, its call checkpoint drives **reverse-child compensation**: the (alread
 durably reopened into its own reversal and asked to compensate itself — recursively, through
 arbitrarily nested call chains, via the same generic reversal machinery every level already has, with
 no parent enumeration of a child's internal checkpoints (`work/workflow-composition/1c-design.md`).
-`mfinspect` (`microflows/tools/mfinspect/`), a read-only DB inspector for a workflow's full call/event
+`microflows-viz` (`microflows-viz/`, successor to the retired `mfinspect` CLI), a read-only operator tool for a workflow's full call/event
 tree, was pulled forward ahead of this work since the reversal-across-a-tree integration debugging
 needed it immediately. Full gate green — `microflows` unit/e2e/SP/integration suites (SP regression
 131/131, runner-level `call_integration_test.py` 50/50, including a nested A→B→C acceptance case with

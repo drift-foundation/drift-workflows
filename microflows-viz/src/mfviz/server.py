@@ -15,8 +15,8 @@ prefix-checked against the static root as a second, independent guard.
 
 API:
   GET /api/health                          -> {"ok": true, "database": ...}
-  GET /api/workflow/<32-hex>?max_depth=N   -> mfinspect-`inspect`-parity JSON tree
-  GET /api/workflows?script=&since=&until= -> mfinspect-`list`-parity summary array
+  GET /api/workflow/<32-hex>?max_depth=N   -> full recursive inspect JSON tree
+  GET /api/workflows?script=&since=&until= -> bounded search: summary array
       [&plan_version=][&state=]               (script+since+until REQUIRED -> 400,
                                                 the bounded-scan rule; each entry
                                                 carries an `href` to its
@@ -38,7 +38,8 @@ from pathlib import Path
 
 from . import dbq
 
-STATIC_ALLOWLIST = {"index.html", "scenarios.js", "microflows.machine.js", "vendor", "plans"}
+STATIC_ALLOWLIST = {"index.html", "live.html", "scenarios.js", "microflows.machine.js",
+                    "vendor", "plans"}
 
 CONTENT_TYPES = {
 	".html": "text/html; charset=utf-8",
@@ -140,19 +141,39 @@ class VizRequestHandler(BaseHTTPRequestHandler):
 		self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint", "path": parsed.path})
 
 	def _api_health(self) -> None:
+		# The DB clock is the time authority. Besides db_now (NOW(6)), health
+		# returns SQL-computed default search bounds so the live UI copies them
+		# verbatim — no browser-clock reads, no client-side date arithmetic
+		# (timezone/DST normalization must not distort DB-time bounds):
+		#   default_since = NOW(6) - 24h, floored to the whole second;
+		#   default_until = NOW(6) + 1s, floored — i.e. rounded UP past the
+		#     current fractional second, so a created_at later in the current
+		#     second still falls inside `created_at <= until`.
 		try:
 			conn = dbq.connect(self.server.db_cfg)
 			try:
 				with conn.cursor() as c:
-					c.execute("SELECT 1")
-					c.fetchone()
+					# no execute() args -> pymysql performs no %-interpolation,
+					# so DATE_FORMAT's % specifiers pass through as written
+					c.execute(
+						"SELECT NOW(6) AS now, "
+						"DATE_FORMAT(NOW(6) - INTERVAL 24 HOUR, '%Y-%m-%dT%H:%i:%S') AS default_since, "
+						"DATE_FORMAT(NOW(6) + INTERVAL 1 SECOND, '%Y-%m-%dT%H:%i:%S') AS default_until")
+					row = c.fetchone()
 			finally:
 				conn.close()
 		except Exception as exc:
 			self._send_json(HTTPStatus.BAD_GATEWAY,
 			                {"ok": False, "error": "db_unreachable", "detail": str(exc)})
 			return
-		self._send_json(HTTPStatus.OK, {"ok": True, "database": self.server.db_cfg.database})
+		self._send_json(HTTPStatus.OK, {
+			"ok": True, "database": self.server.db_cfg.database,
+			# full precision, rendered deterministically (isoformat() alone drops
+			# ".000000" when the fractional part is exactly zero)
+			"db_now": row["now"].isoformat(timespec="microseconds"),
+			"default_since": row["default_since"],
+			"default_until": row["default_until"],
+		})
 
 	def _api_workflow(self, workflow_id_hex: str, view: str | None, query: str) -> None:
 		params = urllib.parse.parse_qs(query)
@@ -204,7 +225,7 @@ class VizRequestHandler(BaseHTTPRequestHandler):
 		missing = [name for name, value in
 		           (("script", script), ("since", since), ("until", until)) if value is None]
 		if missing:
-			# The bounded-scan rule, enforced structurally (mfinspect `list` parity):
+			# The bounded-scan rule, enforced structurally:
 			# an unbounded search of tb_mf_workflow is never one typo away.
 			self._send_json(HTTPStatus.BAD_REQUEST, {
 				"error": "bad_request",

@@ -88,7 +88,7 @@ MDB_ROOT_PWD=rootpw ./microflows-viz serve            # → http://127.0.0.1:837
   (preferred; default `MDB_ROOT_PWD`) / `--db-name`.
 - **API:** `GET /api/health`; `GET /api/workflow/<32-hex>?max_depth=N` — the full
   recursive workflow-tree dump (workflow, plan + args, operations, calls, checkpoints, full event
-  history, children), same JSON as `mfinspect inspect`;
+  history, children), the golden-pinned inspect contract;
   `GET /api/workflows?script=&since=&until=[&plan_version=][&state=]` — bounded search returning
   workflow summaries (id, script, state/state_name/disposition, created/updated timestamps,
   terminal_reason, parent/root ids), each entry carrying an `href` to its `/api/workflow/<id>`
@@ -100,8 +100,9 @@ MDB_ROOT_PWD=rootpw ./microflows-viz serve            # → http://127.0.0.1:837
   in what order?"), and `GET /api/workflow/<id>/stuck` (a verdict with evidence — "why is this
   not moving?").
 - **Read-only by permission:** every query is a SELECT, and running as `viz_ro` makes MariaDB itself
-  reject anything else. `microflows-viz` is absorbing `microflows/tools/mfinspect`, which goes away
-  once parity is reached.
+  reject anything else. `microflows-viz` is the SUCCESSOR to the retired `mfinspect` CLI — the
+  single operator tool for "what ran?" and "where is this stuck?"; its inspect/list JSON contracts
+  are pinned by fixture-owned goldens minted at mfinspect's retirement (`tests/test_golden.py`).
 
 Develop with `just setup` / `just build` / `just test` (the test suite covers packaging, the viz_ro
 grant, and the HTTP surface; DB-backed tests use the standing dev fixture) — `just run serve ...`
@@ -121,12 +122,31 @@ VIZ_RO_PWD=... ./microflows-viz serve --db-user viz_ro --db-password-env VIZ_RO_
 MDB_ROOT_PWD=rootpw ./microflows-viz serve
 ```
 
-**2. Confirm it can reach the DB.**
+**2. Open live mode in the browser — the primary operator path.**
+
+Open <http://127.0.0.1:8377/live.html> (the demo player at `/` links to it as "Live mode →").
+Search with script + a bounded time range (required — the form mirrors the API's bounded-scan
+rule) plus optional state/plan_version filters, or paste a 32-hex workflow_id directly. Time
+bounds are **DB time** (they compare against `created_at` on the database's clock): the form
+pre-fills the last 24 hours from `/api/health`'s SQL-computed `default_since`/`default_until`,
+never the browser clock. A
+workflow's page answers the operator questions in order: the **stuck verdict first** (with
+evidence, the waiting chain, and nested child verdicts), then the **call tree**, then the
+**timeline** in event_ts chronology, plus a link to the full raw inspect JSON. The page is
+self-contained and talks ONLY to `/api/*` on this origin — the browser never sees the DB.
+
+Everything below is the same flow over curl, for scripts and headless boxes.
+
+**2b. Confirm the backend can reach the DB.**
 
 ```bash
 curl -s http://127.0.0.1:8377/api/health | jq .
-# {"database": "microflows", "ok": true}
+# {"database": "microflows", "db_now": "2026-07-10T11:16:42.845750",
+#  "default_since": "2026-07-09T11:16:42", "default_until": "2026-07-10T11:16:43", "ok": true}
 ```
+
+`db_now` is the database clock (the time authority for every bound and verdict);
+`default_since`/`default_until` are the SQL-computed last-24h search bounds the live UI copies.
 
 **3. Search for workflow instances** (a script name is not an instance identity — many instances
 run the same script, so search first, then inspect one):
@@ -136,8 +156,9 @@ curl -s 'http://127.0.0.1:8377/api/workflows?script=checkout&since=2026-07-09%20
 ```
 
 `script` + `since` + `until` are **all required** (HTTP 400 otherwise) — deliberately, so an
-accidental unbounded scan of the workflow table is impossible, not just discouraged. Narrow
-further with the optional filters:
+accidental unbounded scan of the workflow table is impossible, not just discouraged. The bounds
+are **DB time** (compared against `created_at`); take defaults from `/api/health` rather than a
+local clock. Narrow further with the optional filters:
 
 ```bash
 # only completed instances (state accepts a name or numeric code — forward, reversing,
@@ -231,6 +252,7 @@ machine event). Drop that in `scenarios.js` and Play.
 | `vendor/mermaid.min.js` | Embedded Mermaid 11.16.0 (~3.5 MB) — renders the IR-graph flowchart in-page; no outside calls. |
 | `plans/*.mf` | The `.mf` sources whose `--emit-graph` output is embedded as the IR graphs. |
 | `export_events.py` | Replay a real `tb_mf_workflow_event` log as a tape. *Direct-DB; slated for replacement by the backend's timeline endpoint (work/viz-consolidation).* |
+| `live.html` | **Live operator mode** — search / stuck verdict / tree / timeline over `/api` (self-contained; fetches only same-origin `/api/*`). |
 | `microflows-viz` | The committed backend zipapp — `serve` = static UI + read-only `/api` (see "Run the live backend"). |
 | `src/mfviz/`, `tools/`, `tests/`, `justfile`, `pyproject.toml` | Backend package source, zipapp builder, test suite (packaging + viz_ro grant + HTTP surface). |
 

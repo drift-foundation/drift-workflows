@@ -3142,7 +3142,7 @@ fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 // state is untouched either way. The only difference is the reported reason: "compensation_pending"
 // matches the convention already used elsewhere in this file for reverse-side waits
 // (_checkpoint_pending_redispatch_or_defer, _compensate's PendingObserved/PendingUncertain arms),
-// rather than the forward-flavored "operation_pending", so a log reader / mfinspect correlation can
+// rather than the forward-flavored "operation_pending", so a log reader / microflows-viz correlation can
 // tell which direction the wait is in.
 fn _defer_reverse_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, child_workflow_id_hex: &String, admission: &AdmissionState) -> Outcome {
 	if !_admission_accepting(admission) { return _drain_release(host, workflow_id, fencing_token, admission); }

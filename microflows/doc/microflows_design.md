@@ -1575,12 +1575,14 @@ per-nesting-depth special case exists anywhere in this path.
 
 ### 16.5 Observability
 
-`mfinspect` (`microflows/tools/mfinspect/`, packaged as a self-contained zipapp like `mariachi`) gives
-read-only recursive JSON dumps of a workflow's full call/event/checkpoint tree — `inspect
-<workflow_id>` for one known instance, `list --script NAME --since TS --until TS` to find candidates
-first. Every T1/settle event carries `child_workflow_id` (and, on the child's own reopen event,
-`parent_workflow_id` + the triggering `operation_seq`), so a durable event, a service log line, and an
-`mfinspect` dump can all be joined by the same identifiers.
+`microflows-viz` (`microflows-viz/`, the successor to — and sole replacement for — the retired
+`mfinspect` CLI) is the operator tool: its `serve` backend (read-only, viz_ro) exposes
+`GET /api/workflow/<workflow_id>` for a full recursive JSON dump of a workflow's
+call/event/checkpoint tree, `GET /api/workflows?script&since&until` to find candidates first, and the
+derived tree/timeline/stuck views, with a browser live mode on top. Every T1/settle event carries
+`child_workflow_id` (and, on the child's own reopen event, `parent_workflow_id` + the triggering
+`operation_seq`), so a durable event, a service log line, and an inspect dump can all be joined by
+the same identifiers.
 
 ### 16.6 Tests, MVP scope, and explicit exclusions
 
@@ -1589,7 +1591,8 @@ Full gate green — `microflows`'s unit/e2e suite (including host-wiring proofs 
 runner-level integration suite (`call_integration_test.py`, **50/50** — including a nested A→B→C
 acceptance case asserting the full chain's final states *and* that no level's audit trail references
 a grandchild's identifiers). **MVP scope**: a single async workflow call, typed args/return, no block
-cascade, reverse-child compensation, and `mfinspect` inspection. **Explicitly deferred** (not
+cascade, reverse-child compensation, and workflow-tree inspection (now via `microflows-viz`).
+**Explicitly deferred** (not
 forgotten — tracked in `work/workflow-composition/PROGRESS.md`'s backlog): fan-out (parallel/multiple
 concurrent calls from one parent), `on failed`/failure-as-data (surfacing a child's rejection as a
 branchable value instead of always driving reversal), a stuck-child liveness budget, and a separate

@@ -240,6 +240,16 @@ class ServeTests(unittest.TestCase):
 		self.assertEqual(status, 200, payload)
 		self.assertTrue(payload["ok"])
 		self.assertEqual(payload["database"], DB_NAME)
+		# db_now is the DB clock (NOW(6)); default_since/default_until are the
+		# SQL-computed search bounds the live UI copies verbatim (since = -24h
+		# floored; until = +1s floored, covering the current fractional second).
+		# full precision, deterministic: exactly six fractional digits always
+		self.assertRegex(payload["db_now"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$")
+		shape = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$"  # datetime-local, whole seconds
+		self.assertRegex(payload["default_since"], shape)
+		self.assertRegex(payload["default_until"], shape)
+		self.assertLess(payload["default_since"], payload["db_now"])
+		self.assertGreater(payload["default_until"], payload["db_now"][:19])
 
 	def test_unknown_endpoint_is_404(self) -> None:
 		status, payload = self._get_json("/api/nope")
@@ -277,11 +287,11 @@ class ServeTests(unittest.TestCase):
 		finally:
 			conn.close()
 
-	# NOTE: real-data inspection correctness lives in tests/test_parity.py, which
-	# seeds its own deterministic fixture tree and compares the API against both
-	# the query layer and the committed mfinspect zipapp — no data-dependent
-	# skip in the gate. (An earlier opportunistic "inspect whatever row exists"
-	# test here skipped on a freshly reset schema and was removed for that.)
+	# NOTE: real-data inspection correctness lives in tests/test_golden.py, which
+	# seeds its own deterministic fixture tree and asserts the API against
+	# committed golden JSON — no data-dependent skip in the gate. (An earlier
+	# opportunistic "inspect whatever row exists" test here skipped on a freshly
+	# reset schema and was removed for that.)
 
 
 if __name__ == "__main__":  # pragma: no cover

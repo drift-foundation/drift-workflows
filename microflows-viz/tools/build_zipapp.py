@@ -23,8 +23,8 @@ with a fixed timestamp and fixed permissions, so two builds of identical inputs
 produce identical SHA-256 hashes. The committed `./microflows-viz` is therefore
 verifiable against a fresh build (see tests/test_zipapp.py).
 
-Modeled directly on ../../microflows/tools/mfinspect/tools/build_zipapp.py (itself
-modeled on mariachi's) — keep the packaging contract in sync across the three.
+Modeled directly on ../mariachi/tools/build_zipapp.py — keep the packaging
+contract in sync across the two.
 """
 from __future__ import annotations
 

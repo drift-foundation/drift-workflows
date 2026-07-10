@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>μFlows-viz — live mode</title>
+<!--
+  Live operator mode (work/viz-consolidation slice 3).
+
+  SELF-CONTAINED and BACKEND-ONLY: this page ships no external resources and
+  performs no network I/O except fetch() of /api/* on its own serving origin
+  (the `microflows-viz serve` backend). The browser never sees a DB host,
+  port, or credential — the backend owns all DB access, read-only as viz_ro.
+
+  Ordering: event timelines render in event_ts chronology exactly as the API
+  returns them (event_ts is the workflow-local ordering key; there is no
+  sequence-number concept anywhere in the UI or the API).
+-->
+<style>
+  :root {
+    --bg: #10151c; --panel: #171f29; --panel2: #1d2733; --line: #2b3a4c;
+    --fg: #d7e1ec; --dim: #8299b1; --acc: #58a6ff; --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --ok: #3fb950; --warn: #d29922; --bad: #f85149; --info: #58a6ff; --wait: #bc8cff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: baseline; gap: 1em; padding: .7em 1.2em;
+           background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 1.05em; margin: 0; }
+  header small { color: var(--dim); font-weight: normal; }
+  header a { color: var(--acc); text-decoration: none; margin-left: auto; }
+  main { max-width: 1100px; margin: 0 auto; padding: 1em 1.2em 4em; }
+  h2 { font-size: .95em; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--dim); margin: 1.6em 0 .5em; }
+  a { color: var(--acc); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+           padding: 1em; margin: .8em 0; }
+  form.search { display: grid; grid-template-columns: repeat(6, 1fr); gap: .6em .8em; align-items: end; }
+  form.search label { display: block; font-size: .78em; color: var(--dim); margin-bottom: .25em; }
+  form.search .req label::after { content: " *"; color: var(--warn); }
+  input, select, button { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+                          border-radius: 6px; padding: .45em .6em; font: inherit; width: 100%; }
+  button.go { background: #1f6feb; border-color: #1f6feb; color: #fff; cursor: pointer; }
+  .idrow { display: flex; gap: .6em; margin-top: .8em; }
+  .idrow input { font-family: var(--mono); }
+  .idrow button { width: auto; white-space: nowrap; }
+  table { border-collapse: collapse; width: 100%; margin-top: .6em; }
+  th, td { text-align: left; padding: .4em .6em; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { color: var(--dim); font-weight: 600; font-size: .8em; text-transform: uppercase;
+       letter-spacing: .05em; }
+  td.mono, .mono { font-family: var(--mono); font-size: .92em; }
+  .pill { display: inline-block; padding: .12em .6em; border-radius: 99px; font-size: .82em;
+          font-weight: 600; border: 1px solid transparent; }
+  .pill.terminal, .pill.completed { background: #12341c; color: var(--ok); }
+  .pill.blocked_resolution, .pill.failed { background: #3d1418; color: var(--bad); }
+  .pill.running_under_lease, .pill.forward { background: #0f2b4a; color: var(--info); }
+  .pill.waiting_on_child, .pill.reversing { background: #2d1e46; color: var(--wait); }
+  .pill.redispatch_pending, .pill.reconcile_pending, .pill.scheduled_retry,
+  .pill.reversed, .pill.resolved_exception { background: #3a2b10; color: var(--warn); }
+  .pill.claimable_now { background: #23303f; color: var(--fg); }
+  .verdict { font-size: 1.05em; }
+  .detailline { color: var(--dim); margin: .5em 0 0; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: .25em 1.2em; margin-top: .7em; }
+  .kv div:nth-child(odd) { color: var(--dim); }
+  .kv div:nth-child(even) { font-family: var(--mono); font-size: .92em; overflow-wrap: anywhere; }
+  .banner { border-radius: 8px; padding: .7em 1em; margin: .8em 0; }
+  .banner.err { background: #3d1418; color: #ffb4ad; border: 1px solid #6e2a2f; }
+  .banner.info { background: #16222e; color: var(--dim); border: 1px solid var(--line); }
+  ul.tree, ul.tree ul { list-style: none; margin: 0; padding-left: 1.4em;
+                        border-left: 1px solid var(--line); }
+  ul.tree { border-left: none; padding-left: 0; }
+  ul.tree li { margin: .35em 0; }
+  .depthpad { color: var(--dim); }
+  details pre { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+                padding: .6em; overflow-x: auto; font-size: .85em; margin: .4em 0 0; }
+  details summary { cursor: pointer; color: var(--dim); }
+  .path a { font-family: var(--mono); }
+  .path .sep { color: var(--dim); padding: 0 .35em; }
+  .nested { border-left: 3px solid var(--line); padding-left: 1em; margin-top: .8em; }
+  .hidden { display: none; }
+  .toolrow { display: flex; gap: 1em; align-items: center; margin: .4em 0 0; }
+  .toolrow .spacer { flex: 1; }
+  .muted { color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>μFlows-viz <small>live mode — real coordinator state via the serve backend</small></h1>
+  <a href="index.html">← Demo player</a>
+</header>
+<main>
+  <section id="searchView">
+    <h2>Find workflow instances</h2>
+    <div class="panel">
+      <form class="search" id="searchForm">
+        <div class="req" style="grid-column: span 2"><label for="f_script">script</label>
+          <input id="f_script" placeholder="e.g. checkout" required></div>
+        <div class="req"><label for="f_since">since <span class="muted">(DB time)</span></label>
+          <input id="f_since" type="datetime-local" step="1" required></div>
+        <div class="req"><label for="f_until">until <span class="muted">(DB time)</span></label>
+          <input id="f_until" type="datetime-local" step="1" required></div>
+        <div><label for="f_state">state</label>
+          <select id="f_state">
+            <option value="">any</option>
+            <option>forward</option><option>reversing</option>
+            <option>blocked_resolution</option><option>completed</option>
+            <option>reversed</option><option>resolved_exception</option>
+            <option>failed</option>
+          </select></div>
+        <div><label for="f_plan">plan_version</label>
+          <input id="f_plan" placeholder="e.g. 1.0.0"></div>
+        <div style="grid-column: span 6"><button class="go" type="submit">Search</button></div>
+      </form>
+      <div class="idrow">
+        <input id="f_id" placeholder="…or paste a 32-hex workflow_id" maxlength="32">
+        <button class="go" id="openId" type="button">Open</button>
+      </div>
+      <div class="muted" style="margin-top:.6em; font-size:.85em">
+        script + since + until are required — the backend refuses unbounded scans.
+        Bounds compare against <code>created_at</code> in DB time; the defaults are computed
+        by the database clock (<code>/api/health</code> <code>default_since</code>/<code>default_until</code>),
+        never the browser clock, and the until bound is inclusive of its whole second.
+      </div>
+    </div>
+    <div id="searchOut"></div>
+  </section>
+
+  <section id="detailView" class="hidden">
+    <div class="toolrow">
+      <a href="#/">← Search</a>
+      <span class="mono" id="d_id"></span>
+      <span class="spacer"></span>
+      <a id="d_inspect" target="_blank" rel="noopener">full inspect JSON ↗</a>
+    </div>
+    <h2>Why is this (not) moving? <span class="muted">/stuck</span></h2>
+    <div id="stuckOut" class="panel"></div>
+    <h2>Call tree <span class="muted">/tree</span></h2>
+    <div id="treeOut" class="panel"></div>
+    <h2>Timeline <span class="muted">/timeline — event_ts chronology</span></h2>
+    <div id="timelineOut" class="panel"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// The ONLY network surface of this page: same-origin /api/*.
+async function api(path) {
+  let resp;
+  try { resp = await fetch(path, {headers: {"Accept": "application/json"}}); }
+  catch (e) { return {status: 0, body: {error: "backend_unreachable", detail: String(e)}}; }
+  let body = null;
+  try { body = await resp.json(); }
+  catch { body = {error: "bad_response", detail: "response was not JSON"}; }
+  return {status: resp.status, body};
+}
+
+const errBanner = (b) =>
+  `<div class="banner err"><strong>${esc(b.body?.error || "error")}</strong>` +
+  `${b.status ? ` (HTTP ${b.status})` : ""}` +
+  `${b.body?.detail ? ` — ${esc(b.body.detail)}` : ""}</div>`;
+
+const pill = (name) => `<span class="pill ${esc(name)}">${esc(name)}</span>`;
+const wfLink = (id) => `<a class="mono" href="#/wf/${esc(id)}">${esc(id)}</a>`;
+
+function kv(pairs) {
+  return `<div class="kv">` + pairs.map(([k, v]) =>
+    `<div>${esc(k)}</div><div>${v === null || v === undefined ? '<span class="muted">null</span>' : esc(v)}</div>`
+  ).join("") + `</div>`;
+}
+
+// ===== search =====
+
+// "2026-07-09T12:00[:30]" -> "2026-07-09 12:00:30". The until bound gets
+// .999999 appended so a whole-second value is INCLUSIVE of its entire second
+// (created_at is DATETIME(6); a bare "…:30" would exclude "…:30.000001+").
+function sinceParam(localValue) {
+  const v = localValue.replace("T", " ");
+  return v.length === 16 ? v + ":00" : v;
+}
+const untilParam = (localValue) => sinceParam(localValue) + ".999999";
+
+async function runSearch(ev) {
+  ev.preventDefault();
+  const q = new URLSearchParams({
+    script: $("f_script").value.trim(),
+    since: sinceParam($("f_since").value),
+    until: untilParam($("f_until").value),
+  });
+  if ($("f_state").value) q.set("state", $("f_state").value);
+  if ($("f_plan").value.trim()) q.set("plan_version", $("f_plan").value.trim());
+  const out = $("searchOut");
+  out.innerHTML = `<div class="banner info">searching…</div>`;
+  const r = await api(`/api/workflows?${q}`);
+  if (r.status !== 200) { out.innerHTML = errBanner(r); return; }
+  if (!r.body.length) {
+    out.innerHTML = `<div class="banner info">No workflows matched — widen the time range,
+      check the script name, or drop the filters.</div>`;
+    return;
+  }
+  out.innerHTML = `<div class="panel"><table><thead><tr>
+      <th>workflow</th><th>state</th><th>disposition</th><th>created</th>
+      <th>updated</th><th>terminal_reason</th></tr></thead><tbody>` +
+    r.body.map((w) => `<tr>
+      <td>${wfLink(w.workflow_id)}<div class="muted" style="font-size:.85em">${esc(w.script_name)}
+        ${w.plan_version ? "@ " + esc(w.plan_version) : ""}</div></td>
+      <td>${pill(w.state_name)}</td>
+      <td class="mono">${esc(w.current_disposition)}</td>
+      <td class="mono">${esc(w.created_at)}</td>
+      <td class="mono">${esc(w.updated_at)}</td>
+      <td class="mono">${w.terminal_reason ? esc(w.terminal_reason) : '<span class="muted">—</span>'}</td>
+    </tr>`).join("") + `</tbody></table></div>`;
+}
+
+// ===== detail: stuck =====
+
+function attentionRows(title, rows) {
+  if (!rows || !rows.length) return "";
+  const cols = Object.keys(rows[0]);
+  return `<h3 style="margin:1em 0 .2em; font-size:.85em; color:var(--dim)">${esc(title)}</h3>
+    <table><thead><tr>${cols.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>` +
+    rows.map((r) => `<tr>${cols.map((c) =>
+      `<td class="mono">${r[c] === null ? '<span class="muted">—</span>' : esc(r[c])}</td>`).join("")}</tr>`).join("") +
+    `</tbody></table>`;
+}
+
+function renderStuckNode(v, nested) {
+  const ev = v.evidence || {};
+  let html = `<div class="verdict">${pill(v.verdict)} <span class="mono">${esc(v.workflow_id)}</span>
+      <span class="muted">(${esc(v.script_name)})</span></div>
+    <p class="detailline">${esc(v.detail)}</p>`;
+  if (v.path) {
+    html += `<div class="path" style="margin-top:.5em">waiting chain:
+      ${v.path.map(wfLink).join('<span class="sep">→</span>')}</div>`;
+  }
+  html += kv([
+    ["state", `${ev.state} (${ev.state_name})`], ["disposition", ev.current_disposition],
+    ["terminal_reason", ev.terminal_reason], ["lease_owner", ev.lease_owner],
+    ["lease_expires_at", ev.lease_expires_at], ["next_attempt_at", ev.next_attempt_at],
+    ["attempt", ev.current_operation_attempt], ["updated_at", ev.updated_at],
+    ["db_now", v.db_now],
+  ]);
+  html += attentionRows("resolution required (checkpoints)", v.resolution_required);
+  html += attentionRows("redispatch timers", v.redispatch);
+  html += attentionRows("reconcile budget", v.reconcile);
+  if (v.waiting_on) {
+    html += `<div class="nested"><div class="muted" style="margin-bottom:.3em">waiting on ↓</div>
+      ${renderStuckNode(v.waiting_on, true)}</div>`;
+  }
+  return html;
+}
+
+// ===== detail: tree =====
+
+function renderTreeNode(n) {
+  if (n.truncated) return `<li>${wfLink(n.child_workflow_id)}
+    <span class="muted">(deeper than max_depth — open directly)</span></li>`;
+  if (n.cycle_detected) return `<li>${wfLink(n.child_workflow_id)}
+    <span class="pill failed">cycle_detected</span></li>`;
+  return `<li>${wfLink(n.workflow_id)} ${pill(n.state_name)}
+    <span class="muted">depth ${esc(n.depth)} · ${esc(n.script_name)}
+    ${n.terminal_reason ? "· " + esc(n.terminal_reason) : ""}</span>
+    ${n.children && n.children.length ? `<ul>${n.children.map(renderTreeNode).join("")}</ul>` : ""}</li>`;
+}
+
+// ===== detail: timeline =====
+
+function renderTimeline(t) {
+  if (!t.events.length) return `<div class="banner info">No events recorded.</div>`;
+  return `<table><thead><tr><th>event_ts</th><th>depth</th><th>kind</th>
+      <th>workflow</th><th>payload</th></tr></thead><tbody>` +
+    t.events.map((e) => `<tr>
+      <td class="mono">${esc(e.event_ts)}</td>
+      <td class="mono"><span class="depthpad">${"·".repeat(e.depth)}</span> ${esc(e.depth)}</td>
+      <td>${esc(e.kind)}</td>
+      <td>${wfLink(e.workflow_id)}<div class="muted" style="font-size:.85em">${esc(e.script_name)}</div></td>
+      <td>${Object.keys(e.payload || {}).length
+            ? `<details><summary>payload</summary><pre>${esc(JSON.stringify(e.payload, null, 2))}</pre></details>`
+            : '<span class="muted">{}</span>'}</td>
+    </tr>`).join("") + `</tbody></table>`;
+}
+
+// ===== detail assembly =====
+
+async function showDetail(id) {
+  $("searchView").classList.add("hidden");
+  $("detailView").classList.remove("hidden");
+  $("d_id").textContent = id;
+  $("d_inspect").href = `/api/workflow/${id}`;
+  $("stuckOut").innerHTML = $("treeOut").innerHTML = $("timelineOut").innerHTML =
+    `<div class="banner info">loading…</div>`;
+  const [stuck, tree, timeline] = await Promise.all([
+    api(`/api/workflow/${id}/stuck`),
+    api(`/api/workflow/${id}/tree`),
+    api(`/api/workflow/${id}/timeline`),
+  ]);
+  $("stuckOut").innerHTML = stuck.status === 200 ? renderStuckNode(stuck.body, false)
+    : stuck.status === 404 ? `<div class="banner err">Workflow <span class="mono">${esc(id)}</span> not found.</div>`
+    : errBanner(stuck);
+  $("treeOut").innerHTML = tree.status === 200
+    ? `<ul class="tree">${renderTreeNode(tree.body)}</ul>` : errBanner(tree);
+  $("timelineOut").innerHTML = timeline.status === 200
+    ? renderTimeline(timeline.body) : errBanner(timeline);
+}
+
+// ===== hash router =====
+
+function route() {
+  const m = location.hash.match(/^#\/wf\/([0-9a-fA-F]{32})$/);
+  if (m) { showDetail(m[1].toLowerCase()); return; }
+  $("detailView").classList.add("hidden");
+  $("searchView").classList.remove("hidden");
+}
+
+$("searchForm").addEventListener("submit", runSearch);
+$("openId").addEventListener("click", () => {
+  const id = $("f_id").value.trim().toLowerCase();
+  if (/^[0-9a-f]{32}$/.test(id)) location.hash = `#/wf/${id}`;
+  else $("searchOut").innerHTML =
+    `<div class="banner err">A workflow_id is 32 hex characters (16 bytes).</div>`;
+});
+window.addEventListener("hashchange", route);
+
+// Default bounds come from the BACKEND, computed in SQL from NOW(6)
+// (/api/health default_since = -24h floored, default_until = +1s floored,
+// i.e. rounded up past the current fractional second). The UI copies them
+// verbatim: no browser-clock reads and no client-side date arithmetic at all
+// (timezone/DST normalization must never distort DB-time bounds). If health
+// is unavailable the fields stay blank (still labeled DB time).
+(async () => {
+  const r = await api("/api/health");
+  if (r.status !== 200) return;
+  if (r.body.default_until) $("f_until").value = r.body.default_until;
+  if (r.body.default_since) $("f_since").value = r.body.default_since;
+})();
+route();
+</script>
+</body>
+</html>

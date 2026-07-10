@@ -7,7 +7,7 @@
 DB connection flags are deliberately `--db-`-prefixed (accepted decision,
 work/viz-consolidation): on an operator-facing serve command a bare
 `--host`/`--port` must never silently mean "database" — the HTTP bind is
-`--listen`, the database is `--db-*`. Env defaults match mfinspect/mariachi
+`--listen`, the database is `--db-*`. Env defaults match mariachi's convention
 (DB_HOST/DB_PORT/DB_USER/DB_NAME/MDB_ROOT_PWD), and --db-password-env is
 preferred over --db-password so a secret never lands in shell history or a
 process listing.

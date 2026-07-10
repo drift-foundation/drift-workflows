@@ -1,10 +1,10 @@
 """Read-only coordinator-DB query layer for the microflows-viz backend.
 
-Ported (mostly unchanged, per work/viz-consolidation slice 1) from
-microflows/tools/mfinspect/src/mfinspect/mfinspect.py — the connection, decode,
-and fetch helpers plus the recursive `inspect_workflow` tree walk. mfinspect is
-prototype query logic scheduled for removal once microflows-viz reaches parity;
-until then, keep the two in sync if the schema contract changes.
+The connection, decode, and fetch helpers plus the recursive
+`inspect_workflow` tree walk originated in the retired mfinspect CLI
+(work/viz-consolidation slices 1–4); microflows-viz is its successor and the
+single operator tool. The JSON contracts are pinned by fixture-owned golden
+tests (tests/test_golden.py) minted at mfinspect's retirement.
 
 READ-ONLY BY DESIGN, ENFORCED BY PERMISSIONS: every query below is a SELECT, and
 the backend is meant to run as the SELECT-only `viz_ro` DB user
@@ -133,7 +133,7 @@ def _decode_json_field(row, key: str):
 	return json.loads(raw)
 
 
-# ===== exact-instance inspection (mfinspect `inspect` parity) =====
+# ===== exact-instance inspection (golden-pinned JSON contract) =====
 
 def fetch_workflow(conn, wf_bytes: bytes):
 	with conn.cursor() as c:
@@ -448,7 +448,8 @@ def stuck_workflow(conn, workflow_id_hex: str, seen=None, now=None):
 	node = {
 		"workflow_id": workflow_id_hex,
 		"script_name": row["script_name"],
-		"db_now": _decode_value(now),
+		# deterministic full precision (isoformat() alone drops ".000000")
+		"db_now": now.isoformat(timespec="microseconds"),
 		"evidence": evidence,
 		"operations": operations,
 		"checkpoints": checkpoints,
@@ -533,7 +534,7 @@ def stuck_workflow(conn, workflow_id_hex: str, seen=None, now=None):
 	            "scanning this script")
 
 
-# ===== bounded search/list (mfinspect `list` parity) =====
+# ===== bounded search/list (golden-pinned JSON contract) =====
 
 def list_workflows(conn, script: str, since: str, until: str,
                    plan_version: str | None = None, state: str | None = None):
@@ -542,10 +543,9 @@ def list_workflows(conn, script: str, since: str, until: str,
 	scan) plus optional plan_version/state. Returns a summary dict per matching row -- never a
 	tree (use inspect_workflow for that).
 
-	Parity note: the field set is mfinspect `list`'s summary (workflow_id, script_name,
-	plan_version, state/state_name/execution_direction/current_disposition, parent/root ids,
-	created_at, current_event_ts, terminal_reason) plus one documented additive field,
-	`updated_at` (the row's last-write timestamp; mfinspect never exposed it)."""
+	Summary field set (golden-pinned): workflow_id, script_name, plan_version,
+	state/state_name/execution_direction/current_disposition, parent/root ids,
+	created_at, updated_at, current_event_ts, terminal_reason."""
 	where = ["w.script_name = %s", "w.created_at >= %s", "w.created_at <= %s"]
 	params: list = [script, since, until]
 

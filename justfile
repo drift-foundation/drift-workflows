@@ -56,8 +56,8 @@ _test-locked:
 	just _test-viz
 
 # PRIVATE: microflows-viz backend gate (work/viz-consolidation slice 1) — the
-# viz_ro read-only-grant proof, serve/API tests, and the mfinspect parity
-# harness. Runs ONLY under the shared lock (it resets the microflows schema via
+# viz_ro read-only-grant proof, serve/API tests, and the fixture-owned API
+# golden tests. Runs ONLY under the shared lock (it resets the microflows schema via
 # the component's PRIVATE _db-load-schema, bypassing its lock-acquiring public
 # wrapper). MFVIZ_REQUIRE_DB=1 turns DB absence into a hard failure — this
 # suite must never silently skip in a gate. Interpreter: the mariachi venv's
@@ -67,7 +67,7 @@ _test-viz:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source tools/cert-env.sh
-	echo "=== [root] test: microflows-viz backend (viz_ro grant + serve/API + mfinspect parity) ==="
+	echo "=== [root] test: microflows-viz backend (viz_ro grant + serve/API + goldens) ==="
 	MARIACHI_PY="$(dirname "$MARIACHI_BIN")/python"
 	[[ -x "$MARIACHI_PY" ]] || { echo "error: mariachi venv python (with pymysql) not found at $MARIACHI_PY -- required for microflows-viz's DB-backed tests (set MARIACHI_BIN to the venv's mariachi binary)" >&2; exit 1; }
 	( cd microflows && just _db-load-schema )

@@ -6,7 +6,7 @@
 #   src/mfviz/                  — package source (editable install)
 #   ./microflows-viz            — standalone zipapp executable (`just build`, committed)
 #
-# Modeled on ../microflows/tools/mfinspect/justfile (itself on ../mariachi/justfile).
+# Modeled on ../mariachi/justfile (via the since-retired mfinspect tool's).
 # All commands resolve Python from the venv; no system-python or ambient PYTHONPATH is read.
 #
 # positional-arguments is required for `run`'s *ARGS to forward correctly: plain {{ARGS}}

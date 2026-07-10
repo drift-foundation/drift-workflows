@@ -4,7 +4,7 @@ Covers the contract a consumer relies on: a single `./microflows-viz` file that
 runs on Python 3.10+ with no virtualenv and no package install — reporting the
 right version, showing help, bundling PyMySQL, and rebuilding cleanly.
 
-Modeled directly on ../../microflows/tools/mfinspect/tests/test_zipapp.py.
+Modeled directly on ../mariachi's packaging suite (via the retired mfinspect tool's).
 """
 import hashlib
 import os
