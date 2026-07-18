@@ -1713,7 +1713,7 @@ fn _registry_build(cfg: &json.JsonNode, allow_calls: Bool) -> ScriptRegistry {
 			val ch = _content_hash(cfg, &graph, &arg_type, &return_type);
 			revs.push(ScriptRevision(name = move name, version = move version,
 			                         graph = move graph, arg_type = move arg_type, return_type = move return_type,
-			                         content_hash = ch, plan_length = plan_length));
+			                         content_hash = move ch, plan_length = plan_length));
 		},
 		Optional::None => {}
 	}
@@ -4568,7 +4568,7 @@ fn _service_run(manifest_path: &String, port: Int, log_level: log.Level) throws 
 			val adm0 = _admission_from_env();
 			val app = conc.arc(ServiceApp(host = move host, registry = conc.mutex(conc.arc(ms)),
 			                              admission = conc.atomic_int(_admission_to_int(&adm0)), manifest_path = _dup(manifest_path),
-				                              logger = logger));
+				                              logger = move logger));
 
 			var ab = rest.new_app_builder();
 			rest.bind(ab, "0.0.0.0", port);

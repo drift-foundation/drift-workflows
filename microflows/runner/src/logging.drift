@@ -56,7 +56,7 @@ pub fn push_request_context(req: String) nothrow -> Optional<rt.ScopeGuard<log.L
 			var ctx = log.log_context();
 			ctx.put("req", req);
 			var guard = st.ctx.push(ctx);
-			return Optional::Some(guard);
+			return Optional::Some(move guard);
 		},
 		None => {
 			return Optional<type rt.ScopeGuard<log.LogContext>>::None();

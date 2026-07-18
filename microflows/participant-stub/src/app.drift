@@ -325,7 +325,7 @@ implement StubApp {
 		val claim_time = time.now_utc();
 		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(&claim_time) + _lease_ttl_seconds() * 1000000);
 		match self.gateway.get().start_checked(&key, &item_meta, &"{}", &claim_time, &lease_expires, &token) {
-			core.Result::Err(kind) => { return _retriable_response_or_rejected(kind); },
+			core.Result::Err(kind) => { return _retriable_response_or_rejected(move kind); },
 			core.Result::Ok(start_outcome) => {
 				match start_outcome {
 					singular.StartOutcome::Granted(lease) => {
@@ -346,7 +346,7 @@ implement StubApp {
 						}
 						val settle_time = time.now_utc();
 						match self.gateway.get().complete_checked(&lease, &settle_time, &result_json) {
-							core.Result::Err(kind) => { return _retriable_response_or_rejected(kind); },
+							core.Result::Err(kind) => { return _retriable_response_or_rejected(move kind); },
 							core.Result::Ok(settle_outcome) => {
 								match settle_outcome {
 									singular.SettleOutcome::Settled(tr) => {
@@ -385,9 +385,9 @@ implement StubApp {
 								val r_claim = time.now_utc();
 								val r_expires = time.utc_from_unix_micros(time.utc_unix_micros(&r_claim) + _lease_ttl_seconds() * 1000000);
 								val recovery = Optional<singular.RecoveryLease>::Some(singular.RecoveryLease(
-									lease_meta_json = "{}", event_time = r_claim, lease_expires_at = r_expires, lease_token = r_token));
+									lease_meta_json = "{}", event_time = move r_claim, lease_expires_at = move r_expires, lease_token = move r_token));
 								match self.gateway.get().resume_checked(&key, &recovery) {
-									core.Result::Err(kind) => { return _retriable_response_or_rejected(kind); },
+									core.Result::Err(kind) => { return _retriable_response_or_rejected(move kind); },
 									core.Result::Ok(resume_outcome) => {
 										match resume_outcome {
 											singular.ResumeOutcome::Terminal(tr) => { return _json(200, _envelope_terminal(&tr)); },
@@ -396,7 +396,7 @@ implement StubApp {
 												val result_json = self.run_idempotent(op_id, op, &eff);
 												val settle_time = time.now_utc();
 												match self.gateway.get().complete_checked(&rlease, &settle_time, &result_json) {
-													core.Result::Err(kind) => { return _retriable_response_or_rejected(kind); },
+													core.Result::Err(kind) => { return _retriable_response_or_rejected(move kind); },
 													core.Result::Ok(settle_outcome) => {
 														match settle_outcome {
 															singular.SettleOutcome::Settled(tr) => { return _json(200, _envelope_terminal(&tr)); },
@@ -1060,7 +1060,7 @@ fn _envelope_terminal(tr: &singular.TerminalResult) -> String {
 					match n.get(&"__omit_result__") { Optional::Some(_) => { omit = true; }, Optional::None => {} }
 					match n.get(&"__invalid_result__") { Optional::Some(_) => { invalid = true; }, Optional::None => {} }
 					if invalid { o.set("result", json.JsonNode::String("not-an-object")); }
-					else { if !omit { o.set("result", n); } }
+					else { if !omit { o.set("result", move n); } }
 				},
 				core.Result::Err(_) => {}
 			}
@@ -1077,7 +1077,7 @@ fn _envelope_terminal(tr: &singular.TerminalResult) -> String {
 			var r = json.new_object();
 			r.set("status", json.JsonNode::String("failed"));
 			match json.parse(payload) {
-				core.Result::Ok(n) => { r.set("error", n); },
+				core.Result::Ok(n) => { r.set("error", move n); },
 				core.Result::Err(_) => {}
 			}
 			o.set("result", r.to_node());
