@@ -126,10 +126,7 @@ fn _tc_ok(g: &ir.IrGraph, at: &ir.IrType, cs: &Array<ir.OpContract>) nothrow -> 
 }
 
 fn _seq(a: &String, b: &String) nothrow -> Bool {
-	if a.byte_length() != b.byte_length() { return false; }
-	var i = 0;
-	while i < a.byte_length() { if a.byte_at(i) != b.byte_at(i) { return false; } i = i + 1; }
-	return true;
+	return *a == *b;
 }
 
 fn _p0() nothrow -> Array<String> { var p: Array<String> = []; return move p; }

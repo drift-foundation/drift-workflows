@@ -90,7 +90,6 @@ import std.core as core;
 import std.json as json;
 import std.text as text;
 import std.format as fmt;
-import std.io as io;
 import std.iter as iter;
 use trait iter.SinglePassIterator;
 
@@ -260,27 +259,41 @@ struct Cursor {
 
 fn _eof(c: &Cursor) nothrow -> Bool { return c.pos >= c.src.byte_length(); }
 
+// Byte at a PROVEN-IN-RANGE index (0.33.88: `byte_at` returns Result — bounds failure is data).
+// Every caller below guards with `_eof` / `i < n` FIRST (the cursor invariant), so the Err arm is
+// unreachable; it FAILS CLOSED via `assert` (aborts with the message) — the trailing return exists
+// only for typing and is never reached.
+fn _byte(s: &String, i: Int) nothrow -> Byte {
+	match s.byte_at(i) {
+		core.Result::Ok(b) => { return b; },
+		core.Result::Err(_) => {
+			assert(false, "internal: proven-range String.byte_at failed");
+			return cast<Byte>(0);   // unreachable: the assert above aborts
+		}
+	}
+}
+
 // Skip whitespace AND comments. Comment syntax is C-family: `//` to end-of-line and `/* … */`
 // (non-nesting). There is NO `#` comment. An unterminated `/*` is recorded on the cursor
 // (open_comment_at) and surfaced as a precise error by parse_source/lower — `_skip_ws` stays nothrow.
 fn _skip_ws(c: &mut Cursor) nothrow -> Void {
 	val n = c.src.byte_length();
 	while !_eof(c) {
-		val b = c.src.byte_at(c.pos);
+		val b = _byte(&c.src, c.pos);
 		if text.is_space(b) {
 			c.pos = c.pos + 1;
 		} else if cast<Int>(b) == 47 {   // '/': maybe a `//` line or `/*` block comment
-			if c.pos + 1 < n and cast<Int>(c.src.byte_at(c.pos + 1)) == 47 {
+			if c.pos + 1 < n and cast<Int>(_byte(&c.src, c.pos + 1)) == 47 {
 				// `//` line comment -> skip to end of line
 				c.pos = c.pos + 2;
-				while !_eof(c) and cast<Int>(c.src.byte_at(c.pos)) != 10 { c.pos = c.pos + 1; }
-			} else if c.pos + 1 < n and cast<Int>(c.src.byte_at(c.pos + 1)) == 42 {
+				while !_eof(c) and cast<Int>(_byte(&c.src, c.pos)) != 10 { c.pos = c.pos + 1; }
+			} else if c.pos + 1 < n and cast<Int>(_byte(&c.src, c.pos + 1)) == 42 {
 				// `/* … */` block comment (non-nesting)
 				val start = c.pos;
 				c.pos = c.pos + 2;
 				var closed = false;
 				while !_eof(c) {
-					if cast<Int>(c.src.byte_at(c.pos)) == 42 and c.pos + 1 < n and cast<Int>(c.src.byte_at(c.pos + 1)) == 47 {
+					if cast<Int>(_byte(&c.src, c.pos)) == 42 and c.pos + 1 < n and cast<Int>(_byte(&c.src, c.pos + 1)) == 47 {
 						c.pos = c.pos + 2;
 						closed = true;
 						break;
@@ -311,18 +324,18 @@ fn _is_ident_char(b: Byte) nothrow -> Bool {
 // Read an identifier ([A-Za-z_][A-Za-z0-9_-]*) after skipping leading whitespace.
 fn _read_ident(c: &mut Cursor) -> String {
 	_skip_ws(c);
-	if _eof(c) or !_is_ident_start(c.src.byte_at(c.pos)) {
+	if _eof(c) or !_is_ident_start(_byte(&c.src, c.pos)) {
 		throw ParseError(code = "expected-identifier", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an identifier");
 	}
 	val start = c.pos;
-	while !_eof(c) and _is_ident_char(c.src.byte_at(c.pos)) { c.pos = c.pos + 1; }
+	while !_eof(c) and _is_ident_char(_byte(&c.src, c.pos)) { c.pos = c.pos + 1; }
 	return _slice(c, start, c.pos - start);
 }
 
 // Require the next non-whitespace byte to equal `code` (a single-char token); consume it.
 fn _expect(c: &mut Cursor, code: Int, what: &String) -> Void {
 	_skip_ws(c);
-	if _eof(c) or cast<Int>(c.src.byte_at(c.pos)) != code {
+	if _eof(c) or cast<Int>(_byte(&c.src, c.pos)) != code {
 		throw ParseError(code = "expected-token", byte_offset = c.pos, line = 0, column = 0, expected = _dup(what), found = "", message = "expected " + _dup(what));
 	}
 	c.pos = c.pos + 1;
@@ -331,7 +344,7 @@ fn _expect(c: &mut Cursor, code: Int, what: &String) -> Void {
 // Consume the next non-whitespace byte iff it equals `code`; report whether it did.
 fn _accept(c: &mut Cursor, code: Int) nothrow -> Bool {
 	_skip_ws(c);
-	if !_eof(c) and cast<Int>(c.src.byte_at(c.pos)) == code { c.pos = c.pos + 1; return true; }
+	if !_eof(c) and cast<Int>(_byte(&c.src, c.pos)) == code { c.pos = c.pos + 1; return true; }
 	return false;
 }
 
@@ -404,7 +417,7 @@ fn _parse_type(c: &mut Cursor) -> json.JsonNode {
 fn _parse_base_type(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
 	if _eof(c) { throw ParseError(code = "expected-type", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a type"); }
-	val b = c.src.byte_at(c.pos);
+	val b = _byte(&c.src, c.pos);
 	if cast<Int>(b) == 123 { return _parse_object_type(c); }   // '{'
 	if cast<Int>(b) == 91 {                                     // '[' array
 		c.pos = c.pos + 1;
@@ -573,7 +586,7 @@ fn _parse_fail_reason(c: &mut Cursor) -> json.JsonNode {
 	if _eof(c) {
 		throw ParseError(code = "expected-fail-reason", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a fail reason (string literal or result/local path)");
 	}
-	val b = cast<Int>(c.src.byte_at(c.pos));
+	val b = cast<Int>(_byte(&c.src, c.pos));
 	if b == 34 {   // '"' — a JSON string literal, lowered as a const expression
 		val v = _parse_json_value(c);
 		var o = json.new_object();
@@ -589,7 +602,7 @@ fn _parse_let(c: &mut Cursor, var id: String) -> Stmt {
 	_expect(c, 61, &"'='");   // '='
 	_skip_ws(c);
 	var is_expr = false;
-	if !_eof(c) and cast<Int>(c.src.byte_at(c.pos)) == 123 { is_expr = true; }   // '{'
+	if !_eof(c) and cast<Int>(_byte(&c.src, c.pos)) == 123 { is_expr = true; }   // '{'
 	else {
 		val w = _peek_ident(c);
 		if _is_expr_keyword(&w) { is_expr = true; }
@@ -623,7 +636,7 @@ fn _parse_call(c: &mut Cursor, var id: String, var bind: Optional<String>) -> St
 	_expect(c, 64, &"'@'");   // '@'
 	val ver = _parse_plan_version(c);
 	_skip_ws(c);
-	if _eof(c) or cast<Int>(c.src.byte_at(c.pos)) != 123 {   // '{'
+	if _eof(c) or cast<Int>(_byte(&c.src, c.pos)) != 123 {   // '{'
 		throw ParseError(code = "expected-call-input", byte_offset = c.pos, line = 0, column = 0, expected = "{", found = "", message = "`call` requires an input object `{ … }`");
 	}
 	val input = _parse_value_expr(c);
@@ -659,11 +672,11 @@ fn _parse_plan_version(c: &mut Cursor) -> String {
 
 fn _read_uint_str(c: &mut Cursor) -> String {
 	_skip_ws(c);
-	if _eof(c) or !_is_digit_b(c.src.byte_at(c.pos)) {
+	if _eof(c) or !_is_digit_b(_byte(&c.src, c.pos)) {
 		throw ParseError(code = "expected-plan-version", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a semantic plan version (major.minor.patch)");
 	}
 	val start = c.pos;
-	while !_eof(c) and _is_digit_b(c.src.byte_at(c.pos)) { c.pos = c.pos + 1; }
+	while !_eof(c) and _is_digit_b(_byte(&c.src, c.pos)) { c.pos = c.pos + 1; }
 	return _slice(c, start, c.pos - start);
 }
 
@@ -703,12 +716,12 @@ fn _peek_merge_clause(c: &mut Cursor) nothrow -> Bool {
 	val w1 = _peek_ident(c);
 	if !_str_eq(&w1, &"merge") { c.pos = save; return false; }
 	// advance past 'merge' (c.pos is at the ident start after _peek_ident's skip_ws)
-	while !_eof(c) and _is_ident_char(c.src.byte_at(c.pos)) { c.pos = c.pos + 1; }
+	while !_eof(c) and _is_ident_char(_byte(&c.src, c.pos)) { c.pos = c.pos + 1; }
 	val w2 = _peek_ident(c);
 	if w2.byte_length() == 0 { c.pos = save; return false; }
-	while !_eof(c) and _is_ident_char(c.src.byte_at(c.pos)) { c.pos = c.pos + 1; }
+	while !_eof(c) and _is_ident_char(_byte(&c.src, c.pos)) { c.pos = c.pos + 1; }
 	_skip_ws(c);
-	val ok = !_eof(c) and cast<Int>(c.src.byte_at(c.pos)) == 61;   // '='
+	val ok = !_eof(c) and cast<Int>(_byte(&c.src, c.pos)) == 61;   // '='
 	c.pos = save;
 	return ok;
 }
@@ -717,11 +730,11 @@ fn _peek_merge_clause(c: &mut Cursor) nothrow -> Bool {
 // the next token is not an identifier.
 fn _peek_ident(c: &mut Cursor) nothrow -> String {
 	_skip_ws(c);
-	if _eof(c) or !_is_ident_start(c.src.byte_at(c.pos)) { return ""; }
+	if _eof(c) or !_is_ident_start(_byte(&c.src, c.pos)) { return ""; }
 	val start = c.pos;
 	var i = c.pos;
 	val n = c.src.byte_length();
-	while i < n and _is_ident_char(c.src.byte_at(i)) { i = i + 1; }
+	while i < n and _is_ident_char(_byte(&c.src, i)) { i = i + 1; }
 	match text.substring(&c.src, start, i - start) {
 		core.Result::Ok(s) => { return move s; },
 		core.Result::Err(_) => { return ""; }
@@ -763,10 +776,10 @@ fn _res_lookup(c: &Cursor, name: &String) nothrow -> Optional<String> {
 fn _parse_value_expr(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
 	if _eof(c) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an expression"); }
-	val b0 = cast<Int>(c.src.byte_at(c.pos));
+	val b0 = cast<Int>(_byte(&c.src, c.pos));
 	if b0 == 123 { return _parse_object_construction(c); }   // '{'
 	if b0 == 91 { return _parse_array_construction(c); }     // '['
-	if !_is_ident_start(c.src.byte_at(c.pos)) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an expression"); }
+	if !_is_ident_start(_byte(&c.src, c.pos)) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an expression"); }
 	val kw_start = c.pos;
 	val kw = _read_ident(c);
 	if _str_eq(&kw, &"const") {
@@ -874,10 +887,10 @@ fn _parse_array_construction(c: &mut Cursor) -> json.JsonNode {
 fn _parse_constr_value(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
 	if _eof(c) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a value"); }
-	val b = cast<Int>(c.src.byte_at(c.pos));
+	val b = cast<Int>(_byte(&c.src, c.pos));
 	if b == 123 { return _parse_object_construction(c); }   // '{'
 	if b == 91 { return _parse_array_construction(c); }     // '['
-	if _is_ident_start(c.src.byte_at(c.pos)) {
+	if _is_ident_start(_byte(&c.src, c.pos)) {
 		val kw_start = c.pos;
 		val kw = _read_ident(c);
 		if _str_eq(&kw, &"const") { val v = _parse_json_value(c); var o = json.new_object(); o.set("const", move v); return o.to_node(); }
@@ -909,14 +922,14 @@ fn _parse_constr_value(c: &mut Cursor) -> json.JsonNode {
 fn _parse_field_key(c: &mut Cursor) -> String {
 	_skip_ws(c);
 	if _eof(c) { throw ParseError(code = "expected-field-key", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an object field name"); }
-	if cast<Int>(c.src.byte_at(c.pos)) == 34 {   // '"' quoted key
+	if cast<Int>(_byte(&c.src, c.pos)) == 34 {   // '"' quoted key
 		val v = _parse_json_value(c);
 		match v.as_string() {
 			Optional::Some(s) => { return move s; },
 			Optional::None => { throw ParseError(code = "expected-field-key", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "object field key must be a string"); }
 		}
 	}
-	if _is_ident_start(c.src.byte_at(c.pos)) { return _read_ident(c); }
+	if _is_ident_start(_byte(&c.src, c.pos)) { return _read_ident(c); }
 	throw ParseError(code = "expected-field-key", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an object field name (identifier or \"string\")");
 }
 
@@ -976,7 +989,7 @@ fn _local_expr(segs: &Array<String>) -> json.JsonNode {
 // _check_expr (dominance) then rejects a branch-local result/local that no merge carries.
 fn _parse_selector(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
-	if _eof(c) or !_is_ident_start(c.src.byte_at(c.pos)) {
+	if _eof(c) or !_is_ident_start(_byte(&c.src, c.pos)) {
 		throw ParseError(code = "expected-selector", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a branch selector (arg/result/local path)");
 	}
 	val save = c.pos;
@@ -1008,7 +1021,7 @@ fn _selector_path_follows(c: &mut Cursor) nothrow -> Bool {
 	val save = c.pos;
 	_skip_ws(c);
 	var r = false;
-	if !_eof(c) and _is_ident_start(c.src.byte_at(c.pos)) { r = true; }
+	if !_eof(c) and _is_ident_start(_byte(&c.src, c.pos)) { r = true; }
 	c.pos = save;
 	return r;
 }
@@ -1126,9 +1139,9 @@ fn _parse_arg_path(c: &mut Cursor) -> Array<String> {
 fn _accept_keyword(c: &mut Cursor, kw: &String) nothrow -> Bool {
 	val save = c.pos;
 	_skip_ws(c);
-	if _eof(c) or !_is_ident_start(c.src.byte_at(c.pos)) { c.pos = save; return false; }
+	if _eof(c) or !_is_ident_start(_byte(&c.src, c.pos)) { c.pos = save; return false; }
 	val start = c.pos;
-	while !_eof(c) and _is_ident_char(c.src.byte_at(c.pos)) { c.pos = c.pos + 1; }
+	while !_eof(c) and _is_ident_char(_byte(&c.src, c.pos)) { c.pos = c.pos + 1; }
 	var matched = false;
 	match text.substring(&c.src, start, c.pos - start) {
 		core.Result::Ok(s) => { if _str_eq(&s, kw) { matched = true; } },
@@ -1161,14 +1174,14 @@ fn _parse_json_value(c: &mut Cursor) -> json.JsonNode {
 // Scan a single JSON value span from c.pos: a balanced object/array, a string, or a bare token
 // (number/true/false/null up to whitespace or a structural byte). Advances the cursor past it.
 fn _scan_json_value(c: &mut Cursor) -> Int {
-	val b = cast<Int>(c.src.byte_at(c.pos));
+	val b = cast<Int>(_byte(&c.src, c.pos));
 	if b == 123 or b == 91 { return _scan_balanced(c); }   // '{' or '['
 	if b == 34 { return _scan_string(c); }                 // '"'
 	val n = c.src.byte_length();
 	var i = c.pos;
 	while i < n {
-		val ch = cast<Int>(c.src.byte_at(i));
-		if text.is_space(c.src.byte_at(i)) or ch == 123 or ch == 125 or ch == 44 or ch == 93 or ch == 91 { break; }
+		val ch = cast<Int>(_byte(&c.src, i));
+		if text.is_space(_byte(&c.src, i)) or ch == 123 or ch == 125 or ch == 44 or ch == 93 or ch == 91 { break; }
 		i = i + 1;
 	}
 	if i == c.pos { throw ParseError(code = "empty-json-value", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "empty JSON value"); }
@@ -1184,7 +1197,7 @@ fn _scan_balanced(c: &mut Cursor) -> Int {
 	var in_str = false;
 	var esc = false;
 	while i < n {
-		val ch = cast<Int>(c.src.byte_at(i));
+		val ch = cast<Int>(_byte(&c.src, i));
 		if in_str {
 			if esc { esc = false; }
 			else if ch == 92 { esc = true; }
@@ -1208,7 +1221,7 @@ fn _scan_string(c: &mut Cursor) -> Int {
 	var i = c.pos + 1;
 	var esc = false;
 	while i < n {
-		val ch = cast<Int>(c.src.byte_at(i));
+		val ch = cast<Int>(_byte(&c.src, i));
 		if esc { esc = false; }
 		else if ch == 92 { esc = true; }
 		else if ch == 34 { c.pos = i + 1; return i + 1; }
@@ -1742,23 +1755,11 @@ fn _op_strip_contracts(item: &json.JsonNode) -> json.JsonObject {
 fn _jstr(s: String) nothrow -> json.JsonNode { return json.JsonNode::String(value = move s); }
 
 fn _str_eq(a: &String, b: &String) nothrow -> Bool {
-	if a.byte_length() != b.byte_length() { return false; }
-	var i = 0;
-	while i < a.byte_length() {
-		if a.byte_at(i) != b.byte_at(i) { return false; }
-		i = i + 1;
-	}
-	return true;
+	return *a == *b;
 }
 
 fn _dup(s: &String) nothrow -> String {
-	val n = s.byte_length();
-	if n == 0 { return ""; }
-	var buf = io.buffer(n);
-	var i = 0;
-	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
-	val ptr = io.buffer_ptr(&buf);
-	return core.string_from_utf8_bytes(ptr, n);
+	return s.clone();
 }
 
 // ===== structured source diagnostics =====
@@ -1786,13 +1787,13 @@ fn _finalize(source: &String, code: &String, off: Int, expected: &String, found:
 		var line_start = 0;
 		var i = 0;
 		while i < p {
-			if cast<Int>(source.byte_at(i)) == 10 { line = line + 1; line_start = i + 1; }   // '\n'
+			if cast<Int>(_byte(source, i)) == 10 { line = line + 1; line_start = i + 1; }   // '\n'
 			i = i + 1;
 		}
 		col = 1;
 		var j = line_start;
 		while j < p {
-			val b = cast<Int>(source.byte_at(j));
+			val b = cast<Int>(_byte(source, j));
 			if b < 128 or b >= 192 { col = col + 1; }   // count scalar starts (skip 0b10xxxxxx continuation bytes)
 			j = j + 1;
 		}
@@ -1817,11 +1818,11 @@ pub fn render_diagnostic(source: &String, e: &ParseError) nothrow -> String {
 	var line_start = 0;
 	var i = 0;
 	while i < p {
-		if cast<Int>(source.byte_at(i)) == 10 { line_start = i + 1; }
+		if cast<Int>(_byte(source, i)) == 10 { line_start = i + 1; }
 		i = i + 1;
 	}
 	var line_end = line_start;
-	while line_end < n and cast<Int>(source.byte_at(line_end)) != 10 { line_end = line_end + 1; }
+	while line_end < n and cast<Int>(_byte(source, line_end)) != 10 { line_end = line_end + 1; }
 	var excerpt: String = "";
 	match text.substring(source, line_start, line_end - line_start) {
 		core.Result::Ok(s) => { excerpt = move s; },

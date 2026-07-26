@@ -2,8 +2,8 @@ module microflows.runner.ir;
 
 import std.core as core;
 import std.json as json;
+import std.text as txt;
 import std.format as fmt;
-import std.io as io;
 import std.float as float;
 import std.iter as iter;
 use trait iter.SinglePassIterator;
@@ -3117,10 +3117,24 @@ fn _reject_unknown_opt_path(n: &json.JsonNode, required: &String) -> Void {
 // A JSON number literal is FLOAT-shaped iff its raw text carries a fractional point or an
 // exponent ('.', 'e', or 'E'); otherwise it is integer-shaped. (No numeric coercion: Int and
 // Float partition number literals by shape.)
+// Byte at a PROVEN-IN-RANGE index (0.33.88: `byte_at` returns Result — bounds failure is data).
+// Every caller below guards with a `< byte_length()` bound FIRST, so the Err arm is unreachable;
+// it FAILS CLOSED via `assert` (aborts with the message) — the trailing return exists
+// only for typing and is never reached.
+fn _byte(s: &String, i: Int) nothrow -> Byte {
+	match s.byte_at(i) {
+		core.Result::Ok(b) => { return b; },
+		core.Result::Err(_) => {
+			assert(false, "internal: proven-range String.byte_at failed");
+			return cast<Byte>(0);   // unreachable: the assert above aborts
+		}
+	}
+}
+
 fn _is_float_shaped(raw: &String) nothrow -> Bool {
 	var i = 0;
 	while i < raw.byte_length() {
-		val c = raw.byte_at(i);
+		val c = _byte(raw, i);
 		if c == 46 or c == 101 or c == 69 { return true; }   // '.', 'e', 'E'
 		i = i + 1;
 	}
@@ -3172,34 +3186,14 @@ fn _check_no_dup_fields(fields: &Array<IrField>) -> Void {
 }
 
 fn _str_eq(a: &String, b: &String) nothrow -> Bool {
-	if a.byte_length() != b.byte_length() { return false; }
-	var i = 0;
-	while i < a.byte_length() {
-		if a.byte_at(i) != b.byte_at(i) { return false; }
-		i = i + 1;
-	}
-	return true;
+	return *a == *b;
 }
 
 // Unsigned-byte lexicographic less-than.
 fn _str_lt(a: &String, b: &String) nothrow -> Bool {
-	val na = a.byte_length();
-	val nb = b.byte_length();
-	var i = 0;
-	while i < na and i < nb {
-		val ca = a.byte_at(i);
-		val cb = b.byte_at(i);
-		if ca < cb { return true; }
-		if ca > cb { return false; }
-		i = i + 1;
-	}
-	return na < nb;
+	return *a < *b;
 }
 
 fn _dup(s: &String) nothrow -> String {
-	val n = s.byte_length();
-	var buf = io.buffer(n);
-	var i = 0;
-	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
-	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), n);
+	return s.clone();
 }

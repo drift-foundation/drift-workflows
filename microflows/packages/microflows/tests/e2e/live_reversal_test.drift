@@ -18,7 +18,6 @@ module microflows.tests.e2e.live_reversal_test;
 
 import std.core as core;
 import std.core.arc as arc;
-import std.io as io;
 import std.json as json;
 import std.env as env;
 import std.parse as parse;
@@ -54,14 +53,7 @@ fn _ns() nothrow -> String {
 }
 
 fn _concat(a: &String, b: &String) nothrow -> String {
-	val na = a.byte_length();
-	val nb = b.byte_length();
-	var buf = io.buffer(na + nb);
-	var i = 0;
-	while i < na { io.buffer_write(&mut buf, i, a.byte_at(i)); i = i + 1; }
-	var j = 0;
-	while j < nb { io.buffer_write(&mut buf, na + j, b.byte_at(j)); j = j + 1; }
-	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), na + nb);
+	return a.clone() + b.clone();
 }
 
 fn _dup_str(s: &String) nothrow -> String { return _concat(s, &""); }

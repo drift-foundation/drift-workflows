@@ -12,6 +12,7 @@ module singular.uuid;
 
 import std.core as core;
 import std.io as io;
+import std.text as txt;
 import std.codec as codec;
 import std.crypto as crypto;
 
@@ -34,6 +35,20 @@ implement core.Diagnostic for UuidError {
 	}
 }
 
+// Byte at a PROVEN-IN-RANGE index (0.33.88: `byte_at` returns Result — bounds failure is data).
+// Every caller below guards the index against the string's byte_length FIRST, so the Err arm is
+// unreachable; it FAILS CLOSED via `assert` (aborts with the message) — the trailing return exists
+// only for typing and is never reached.
+fn _byte(s: &String, i: Int) nothrow -> Byte {
+	match s.byte_at(i) {
+		core.Result::Ok(b) => { return b; },
+		core.Result::Err(_) => {
+			assert(false, "internal: proven-range String.byte_at failed");
+			return cast<Byte>(0);   // unreachable: the assert above aborts
+		}
+	}
+}
+
 // Parse a UUID string into 16 bytes (big-endian MSB+LSB).
 // Input must be 36 characters: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 pub fn uuid_to_bytes(s: &String) nothrow -> core.Result<Array<Byte>, UuidError> {
@@ -44,15 +59,15 @@ pub fn uuid_to_bytes(s: &String) nothrow -> core.Result<Array<Byte>, UuidError> 
 	var si = 0;
 	while si < 36 {
 		if si == 8 or si == 13 or si == 18 or si == 23 {
-			if s.byte_at(si) != cast<Byte>(45) {
+			if _byte(s, si) != cast<Byte>(45) {
 				return core.Result::Err(UuidError(tag = "uuid-invalid-format", message = "expected dash"));
 			}
 			si = si + 1;
 			continue;
 		}
-		val hi = _hex_val(s.byte_at(si));
+		val hi = _hex_val(_byte(s, si));
 		if hi < 0 { return core.Result::Err(UuidError(tag = "uuid-invalid-hex", message = "bad hex digit")); }
-		val lo = _hex_val(s.byte_at(si + 1));
+		val lo = _hex_val(_byte(s, si + 1));
 		if lo < 0 { return core.Result::Err(UuidError(tag = "uuid-invalid-hex", message = "bad hex digit")); }
 		out.push(cast<Byte>(hi * 16 + lo));
 		si = si + 2;
@@ -74,7 +89,7 @@ pub fn bytes_to_uuid(bytes: &Array<Byte>) nothrow -> core.Result<String, UuidErr
 			io.buffer_write(&mut buf, bi, cast<Byte>(45));
 			bi = bi + 1;
 		}
-		io.buffer_write(&mut buf, bi, hex.byte_at(hi));
+		io.buffer_write(&mut buf, bi, _byte(&hex, hi));
 		hi = hi + 1;
 		bi = bi + 1;
 	}
@@ -110,8 +125,5 @@ fn _hex_val(b: Byte) nothrow -> Int {
 }
 
 fn _string_to_bytes(s: &String) nothrow -> Array<Byte> {
-	var out: Array<Byte> = Array<type Byte>::with_capacity(s.byte_length());
-	var i = 0;
-	while i < s.byte_length() { out.push(s.byte_at(i)); i = i + 1; }
-	return move out;
+	return core.string_to_utf8_bytes(s);
 }

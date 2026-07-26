@@ -38,6 +38,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -281,11 +282,30 @@ def emit_test():
     ]}
 
 
+def check_version_sync():
+    """Root drift/manifest.json is the version AUTHORITY; runner.drift's RUNNER_VERSION is the
+    runtime echo reported by `--version` (drift has no build-time version injection). A mismatch
+    ships a binary that misreports its version, so fail HERE — plan emission runs first in every
+    local `just test` AND cert invocation (a comment alone is not a gate)."""
+    manifest = json.loads((ROOT / "drift" / "manifest.json").read_text())
+    uflowsd = next(a for a in manifest["artifacts"] if a["name"] == "uflowsd")
+    src = (RUNNER_ROOT / "src" / "runner.drift").read_text()
+    m = re.search(r'const RUNNER_VERSION: String = "([^"]+)";', src)
+    if not m:
+        sys.exit("error: RUNNER_VERSION constant not found in microflows/runner/src/runner.drift "
+                 "(it must exist and match drift/manifest.json's uflowsd version)")
+    if m.group(1) != uflowsd["version"]:
+        sys.exit(f"error: version drift: drift/manifest.json uflowsd={uflowsd['version']!r} but "
+                 f"runner.drift RUNNER_VERSION={m.group(1)!r} — bump them together "
+                 "(the root manifest is the authority)")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Emit ONE combined drift_test_run.py plan for the root `just test` gate.")
     ap.add_argument("gate", choices=["test"])
     ap.add_argument("--out", default="-", help="output path for the plan JSON (default: stdout)")
     args = ap.parse_args()
+    check_version_sync()
     plan = emit_test()
     text = json.dumps(plan, indent=2)
     if args.out == "-":

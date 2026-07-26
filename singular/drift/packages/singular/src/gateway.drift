@@ -26,6 +26,7 @@ import std.concurrent as conc;
 import std.io as io;
 import std.json as json;
 import std.codec as codec;
+import std.text as txt;
 import std.mem as mem;
 import std.random as random;
 import std.uuid as uuid;
@@ -725,11 +726,21 @@ fn _read_optional_positive_int(node: &json.JsonNode, key: &String, default_val: 
 }
 
 fn _dup(s: &String) nothrow -> String {
-    val n = s.byte_length();
-    var buf = io.buffer(n);
-    var i = 0;
-    while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
-    return core.string_from_utf8_bytes(io.buffer_ptr(&buf), n);
+    return s.clone();
+}
+
+// Byte at a PROVEN-IN-RANGE index (0.33.88: `byte_at` returns Result — bounds failure is data).
+// The only caller (_utc_to_db) iterates within the string's byte_length, so the Err arm is
+// unreachable; it FAILS CLOSED via `assert` (aborts with the message) — the trailing return exists
+// only for typing and is never reached.
+fn _byte(s: &String, i: Int) nothrow -> Byte {
+    match s.byte_at(i) {
+        core.Result::Ok(b) => { return b; },
+        core.Result::Err(_) => {
+            assert(false, "internal: proven-range String.byte_at failed");
+            return cast<Byte>(0);   // unreachable: the assert above aborts
+        }
+    }
 }
 
 fn _managed_err_tag(e: &managed.ManagedError) nothrow -> String { return _dup(&e.tag); }
@@ -737,18 +748,22 @@ fn _managed_err_tag(e: &managed.ManagedError) nothrow -> String { return _dup(&e
 // 0.5: format a caller UtcTimestamp as a MySQL DATETIME(6) literal 'YYYY-MM-DD HH:MM:SS.ffffff' for
 // the SP datetime(6) arg. ISO-8601 from std.time is the fixed shape 'YYYY-MM-DDTHH:MM:SS.ffffffZ':
 // date = bytes[0..10), 'T' at [10], time.frac = bytes[11..n-1), 'Z' at [n-1]. We rebuild it positionally
-// with io.buffer (no std.text dependency): copy the date, write ' ' for the 'T', copy the time, drop the
+// with io.buffer: copy the date, write ' ' for the 'T', copy the time, drop the
 // trailing 'Z'. Microsecond precision is preserved (datetime(6) == UtcTimestamp granularity).
 fn _utc_to_db(ts: &time.UtcTimestamp) nothrow -> String {
     val iso = time.format_iso8601_utc(ts);
     val n = iso.byte_length();
+    // Pin the fixed-format premise BEFORE positional access: the reads below assume the exact
+    // 27-byte 'YYYY-MM-DDTHH:MM:SS.ffffffZ' shape — fail closed on formatter contract drift
+    // instead of emitting a malformed datetime.
+    assert(n == 27, "internal: format_iso8601_utc shape changed");
     var buf = io.buffer(n - 1);   // 'T'->' ' is length-neutral; dropping 'Z' is -1
     var k = 0;
     var i = 0;
-    while i < 10 { io.buffer_write(&mut buf, k, iso.byte_at(i)); k = k + 1; i = i + 1; }   // YYYY-MM-DD
-    io.buffer_write(&mut buf, k, " ".byte_at(0)); k = k + 1;                                // ' ' (was 'T')
+    while i < 10 { io.buffer_write(&mut buf, k, _byte(&iso, i)); k = k + 1; i = i + 1; }   // YYYY-MM-DD
+    io.buffer_write(&mut buf, k, cast<Byte>(32)); k = k + 1;                                // ' ' (was 'T')
     i = 11;
-    while i < n - 1 { io.buffer_write(&mut buf, k, iso.byte_at(i)); k = k + 1; i = i + 1; } // HH:MM:SS.ffffff (drop 'Z')
+    while i < n - 1 { io.buffer_write(&mut buf, k, _byte(&iso, i)); k = k + 1; i = i + 1; } // HH:MM:SS.ffffff (drop 'Z')
     return core.string_from_utf8_bytes(io.buffer_ptr(&buf), k);
 }
 

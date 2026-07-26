@@ -1173,9 +1173,5 @@ fn _config_str(cfg: &json.JsonNode, key: &String, default_val: String) nothrow -
 pub error StubError { message: String }
 
 fn _dup(s: &String) nothrow -> String {
-	val n = s.byte_length();
-	var buf = io.buffer(n);
-	var i = 0;
-	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
-	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), n);
+	return s.clone();
 }

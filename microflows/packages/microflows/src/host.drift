@@ -19,7 +19,6 @@ module microflows.host;
 import std.core as core;
 import std.core.arc as arc;
 import std.concurrent as conc;
-import std.io as io;
 import std.json as json;
 import std.codec as codec;
 import std.mem as mem;
@@ -2701,11 +2700,7 @@ fn _canonical_input_hash(canonical: &String) nothrow -> String {
 
 // UTF-8 bytes of a String (for a binary RPC argument).
 fn _utf8_bytes(s: &String) nothrow -> Array<Byte> {
-	val n = s.byte_length();
-	var out: Array<Byte> = [];
-	var i = 0;
-	while i < n { out.push(s.byte_at(i)); i = i + 1; }
-	return move out;
+	return core.string_to_utf8_bytes(s);
 }
 
 // Required JSON object document argument (continuation): empty/malformed/
@@ -2740,11 +2735,7 @@ fn _json_object_or_null_arg(field: String, opt: &Optional<String>) -> rpc.RpcArg
 }
 
 fn _dup(s: &String) nothrow -> String {
-	val n = s.byte_length();
-	var buf = io.buffer(n);
-	var i = 0;
-	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
-	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), n);
+	return s.clone();
 }
 
 fn _dup_bytes(b: &Array<Byte>) nothrow -> Array<Byte> {

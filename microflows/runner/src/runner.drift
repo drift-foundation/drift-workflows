@@ -48,6 +48,11 @@ import std.env as env;
 import std.iter as iter;
 use trait iter.SinglePassIterator;
 
+// Artifact version echoed by `--version` (and the cli help header) for BOTH binaries built from
+// this module (uflowsd service + mfrunner dev CLI). The ROOT drift/manifest.json is the version
+// AUTHORITY (uflowsd entry) — bump this constant together with every manifest version bump.
+const RUNNER_VERSION: String = "0.7.1";
+
 const SCRIPT_NAME: String = "protocol_spike";
 // Legacy single-op pin (tb_mf_workflow.script_revision); the plan model keys on a
 // semantic version instead (PLAN_VERSION_DEFAULT, overridable via config "plan_version").
@@ -326,7 +331,15 @@ variant CompStep {
 }
 
 pub fn main(argv: Array<String>) nothrow -> Int {
-	var p = cli.parser("mfrunner", "0.1.0", "Microflows coordinator runner (first slice)");
+	// `--version` pre-scan (before cli.parse, mirroring uflowsd where required options would
+	// otherwise reject a bare `--version` invocation).
+	var vi = 0;
+	while vi < argv.len {
+		if argv[vi] == "--version" or argv[vi] == "-V" { console.println("mfrunner " + RUNNER_VERSION); return 0; }
+		vi = vi + 1;
+	}
+	var p = cli.parser("mfrunner", RUNNER_VERSION, "Microflows coordinator runner (first slice)");
+	val _ = p.flag("version", "V", "print version and exit");
 	val _ = p.option_string("config", "c", "FILE", "JSON config: db + participants + operations registries (or use --manifest)", false);
 	val _ = p.option_string("workflow-id", "w", "HEX", "32-hex-char workflow id", false);
 	val _ = p.option_string("operation", "o", "NAME", "operation to submit (required ONLY for a fresh LEGACY workflow; a resume uses the durable request)", false);
@@ -1084,16 +1097,30 @@ struct ManifestSet {
 	pub scripts: Array<ManifestScript>
 }
 
+// Byte at a PROVEN-IN-RANGE index (0.33.88: `byte_at` returns Result — bounds failure is data).
+// Every caller below guards with a `< byte_length()` bound FIRST, so the Err arm is unreachable;
+// it FAILS CLOSED via `assert` (aborts with the message) — the trailing return exists
+// only for typing and is never reached.
+fn _byte(s: &String, i: Int) nothrow -> Byte {
+	match s.byte_at(i) {
+		core.Result::Ok(b) => { return b; },
+		core.Result::Err(_) => {
+			assert(false, "internal: proven-range String.byte_at failed");
+			return cast<Byte>(0);   // unreachable: the assert above aborts
+		}
+	}
+}
+
 // The directory portion of a path (everything up to the last '/'), or "" if the path has no '/'.
 fn _dirname(path: &String) nothrow -> String {
 	val n = path.byte_length();
 	var last = -1;
 	var i = 0;
-	while i < n { if cast<Int>(path.byte_at(i)) == 47 { last = i; } i = i + 1; }   // '/'
+	while i < n { if cast<Int>(_byte(path, i)) == 47 { last = i; } i = i + 1; }   // '/'
 	if last <= 0 { if last == 0 { return "/"; } return ""; }
 	var buf = io.buffer(last);
 	var j = 0;
-	while j < last { io.buffer_write(&mut buf, j, path.byte_at(j)); j = j + 1; }
+	while j < last { io.buffer_write(&mut buf, j, _byte(path, j)); j = j + 1; }
 	val ptr = io.buffer_ptr(&buf);
 	return core.string_from_utf8_bytes(ptr, last);
 }
@@ -1102,7 +1129,7 @@ fn _dirname(path: &String) nothrow -> String {
 // resolved against the MANIFEST FILE's directory (so a manifest is portable — not tied to the
 // runner's cwd). A manifest with no directory component (bare name in cwd) leaves the path relative.
 fn _resolve_script_path(manifest_path: &String, spath: &String) nothrow -> String {
-	if spath.byte_length() > 0 and cast<Int>(spath.byte_at(0)) == 47 { return _dup(spath); }   // absolute
+	if spath.byte_length() > 0 and cast<Int>(_byte(spath, 0)) == 47 { return _dup(spath); }   // absolute
 	val dir = _dirname(manifest_path);
 	if dir.byte_length() == 0 { return _dup(spath); }
 	return dir + "/" + _dup(spath);
@@ -1845,7 +1872,7 @@ fn _validate_semver(version: &String) -> Void {
 	var comp_len = 0;   // bytes in the current component
 	var i = 0;
 	while i < n {
-		val c = version.byte_at(i);
+		val c = _byte(version, i);
 		if c == 46 {        // '.'
 			if comp_len == 0 { throw RunnerError(message = "invalid plan_version (empty component): " + _dup(version)); }
 			dots = dots + 1;
@@ -2051,11 +2078,7 @@ fn _canonical_json(input_json: &String) -> String {
 }
 
 fn _str_bytes(s: &String) nothrow -> Array<Byte> {
-	val n = s.byte_length();
-	var out: Array<Byte> = [];
-	var i = 0;
-	while i < n { out.push(s.byte_at(i)); i = i + 1; }
-	return move out;
+	return core.string_to_utf8_bytes(s);
 }
 
 // Length-prefix one field: "{byte_length}:{value};" — so concatenated fields can't
@@ -4189,19 +4212,11 @@ fn _contains(arr: &Array<String>, s: &String) nothrow -> Bool {
 }
 
 fn _str_eq(a: &String, b: &String) nothrow -> Bool {
-	val n = a.byte_length();
-	if n != b.byte_length() { return false; }
-	var i = 0;
-	while i < n { if a.byte_at(i) != b.byte_at(i) { return false; } i = i + 1; }
-	return true;
+	return *a == *b;
 }
 
 fn _starts_with(s: &String, prefix: &String) nothrow -> Bool {
-	val pn = prefix.byte_length();
-	if s.byte_length() < pn { return false; }
-	var i = 0;
-	while i < pn { if s.byte_at(i) != prefix.byte_at(i) { return false; } i = i + 1; }
-	return true;
+	return txt.starts_with(s, prefix);
 }
 
 fn _is_http_url(s: &String) nothrow -> Bool {
@@ -4223,7 +4238,7 @@ fn _is_op_name_safe(s: &String) nothrow -> Bool {
 	if _str_eq(s, &".") or _str_eq(s, &"..") { return false; }
 	var i = 0;
 	while i < n {
-		val b = s.byte_at(i);
+		val b = _byte(s, i);
 		val ok: Bool = (b >= 48 and b <= 57)        // 0-9
 		            or (b >= 65 and b <= 90)        // A-Z
 		            or (b >= 97 and b <= 122)       // a-z
@@ -4339,11 +4354,7 @@ fn _copy_bytes(b: &Array<Byte>) nothrow -> Array<Byte> {
 }
 
 fn _dup(s: &String) nothrow -> String {
-	val n = s.byte_length();
-	var buf = io.buffer(n);
-	var i = 0;
-	while i < n { io.buffer_write(&mut buf, i, s.byte_at(i)); i = i + 1; }
-	return core.string_from_utf8_bytes(io.buffer_ptr(&buf), n);
+	return s.clone();
 }
 
 // ===== ScriptRegistry SERVICE shell (roadmap item 3b: long-running web.rest front-door) =====
@@ -4507,7 +4518,15 @@ implement ServiceApp {
 
 // The long-running service: `--manifest FILE` [`--port N`]. A second artifact (uflowsd).
 pub fn service_main(argv: Array<String>) nothrow -> Int {
-	var p = cli.parser("uflowsd", "0.1.0", "Microflows coordinator service (manifest-driven, long-running)");
+	// `--version` pre-scan: --manifest is a REQUIRED option, so cli.parse would reject a bare
+	// `uflowsd --version` with missing-required before the flag could be observed.
+	var vi = 0;
+	while vi < argv.len {
+		if argv[vi] == "--version" or argv[vi] == "-V" { console.println("uflowsd " + RUNNER_VERSION); return 0; }
+		vi = vi + 1;
+	}
+	var p = cli.parser("uflowsd", RUNNER_VERSION, "Microflows coordinator service (manifest-driven, long-running)");
+	val _ = p.flag("version", "V", "print version and exit");
 	val _ = p.option_string("manifest", "m", "FILE", "deployment manifest (named scripts + shared deployment routing)", true);
 	val _ = p.option_int("port", "p", "PORT", "listening port (default 8088)", false);
 	val _ = p.option_string("log-level", "l", "LEVEL", "log level: debug | info | error (default: info)", false);
