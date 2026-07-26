@@ -331,15 +331,7 @@ variant CompStep {
 }
 
 pub fn main(argv: Array<String>) nothrow -> Int {
-	// `--version` pre-scan (before cli.parse, mirroring uflowsd where required options would
-	// otherwise reject a bare `--version` invocation).
-	var vi = 0;
-	while vi < argv.len {
-		if argv[vi] == "--version" or argv[vi] == "-V" { console.println("mfrunner " + RUNNER_VERSION); return 0; }
-		vi = vi + 1;
-	}
 	var p = cli.parser("mfrunner", RUNNER_VERSION, "Microflows coordinator runner (first slice)");
-	val _ = p.flag("version", "V", "print version and exit");
 	val _ = p.option_string("config", "c", "FILE", "JSON config: db + participants + operations registries (or use --manifest)", false);
 	val _ = p.option_string("workflow-id", "w", "HEX", "32-hex-char workflow id", false);
 	val _ = p.option_string("operation", "o", "NAME", "operation to submit (required ONLY for a fresh LEGACY workflow; a resume uses the durable request)", false);
@@ -380,7 +372,11 @@ pub fn main(argv: Array<String>) nothrow -> Int {
 			match parsed.get_string("script", p) { Some(v) => { script_name = _dup(v); has_script = true; }, None => {} }
 			emit_hash = parsed.has_flag("emit-content-hash", p);
 		},
-		core.Result::Err(_) => {
+		core.Result::Err(e) => {
+			// std.cli provides --help/-h and --version/-V natively ("version"/"V" are RESERVED
+			// registration names); both surface as special Err tags the caller renders.
+			if e.tag == "cli-help-requested" { console.println(p.help_text()); return 0; }
+			if e.tag == "cli-version-requested" { console.println("mfrunner " + RUNNER_VERSION); return 0; }
 			console.eprintln("runner: bad arguments");
 			return 2;
 		}
@@ -4518,15 +4514,7 @@ implement ServiceApp {
 
 // The long-running service: `--manifest FILE` [`--port N`]. A second artifact (uflowsd).
 pub fn service_main(argv: Array<String>) nothrow -> Int {
-	// `--version` pre-scan: --manifest is a REQUIRED option, so cli.parse would reject a bare
-	// `uflowsd --version` with missing-required before the flag could be observed.
-	var vi = 0;
-	while vi < argv.len {
-		if argv[vi] == "--version" or argv[vi] == "-V" { console.println("uflowsd " + RUNNER_VERSION); return 0; }
-		vi = vi + 1;
-	}
 	var p = cli.parser("uflowsd", RUNNER_VERSION, "Microflows coordinator service (manifest-driven, long-running)");
-	val _ = p.flag("version", "V", "print version and exit");
 	val _ = p.option_string("manifest", "m", "FILE", "deployment manifest (named scripts + shared deployment routing)", true);
 	val _ = p.option_int("port", "p", "PORT", "listening port (default 8088)", false);
 	val _ = p.option_string("log-level", "l", "LEVEL", "log level: debug | info | error (default: info)", false);
@@ -4547,7 +4535,14 @@ pub fn service_main(argv: Array<String>) nothrow -> Int {
 				None => {}
 			}
 		},
-		core.Result::Err(_) => { console.eprintln("uflowsd: bad arguments"); return 2; }
+		core.Result::Err(e) => {
+			// std.cli's native --help/-h and --version/-V (token scan runs BEFORE required-option
+			// validation, so a bare `uflowsd --version` works despite --manifest being required).
+			if e.tag == "cli-help-requested" { console.println(p.help_text()); return 0; }
+			if e.tag == "cli-version-requested" { console.println("uflowsd " + RUNNER_VERSION); return 0; }
+			console.eprintln("uflowsd: bad arguments");
+			return 2;
+		}
 	}
 	return try _service_run(&manifest_path, port, log_level) catch unexpected { console.eprintln("uflowsd: fatal"); 1 };
 }
