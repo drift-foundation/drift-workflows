@@ -163,6 +163,15 @@ pub fn main(argv: Array<String>) nothrow -> Int {
 }
 
 fn _run(config_path: String, port_cli: Optional<Int>, service_group_default: String, worker_id_default: String) throws -> Int {
+	// Same guard as uflowsd's _service_run: request handlers run on the serve fiber, whose stack
+	// comes from the process-default executor (256 KiB std.concurrent default) — debug-lane frames
+	// (handler -> singular gateway -> rpc -> json parse) can overflow it even with 0.33.90's
+	// iterative std.json parser. Install the default executor first with the same policy but
+	// 2 MiB stacks.
+	var xb = conc.executor_policy_builder();
+	val _ = xb.stack_bytes(2097152);
+	conc.set_default_executor(conc.build_executor(xb.build()));
+
 	val cfg = _load_config_json(&config_path);
 
 	// port precedence: --port wins, else config.port, else default.

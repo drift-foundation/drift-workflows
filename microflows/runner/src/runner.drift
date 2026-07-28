@@ -51,7 +51,7 @@ use trait iter.SinglePassIterator;
 // Artifact version echoed by `--version` (and the cli help header) for BOTH binaries built from
 // this module (uflowsd service + mfrunner dev CLI). The ROOT drift/manifest.json is the version
 // AUTHORITY (uflowsd entry) — bump this constant together with every manifest version bump.
-const RUNNER_VERSION: String = "0.7.1";
+const RUNNER_VERSION: String = "0.7.2";
 
 const SCRIPT_NAME: String = "protocol_spike";
 // Legacy single-op pin (tb_mf_workflow.script_revision); the plan model keys on a
@@ -4548,6 +4548,15 @@ pub fn service_main(argv: Array<String>) nothrow -> Int {
 }
 
 fn _service_run(manifest_path: &String, port: Int, log_level: log.Level) throws -> Int {
+	// Every request runs on the web server's serve fiber, whose stack comes from the process-default
+	// executor (256 KiB std.concurrent default). The full drive chain (rest dispatch -> runner drive ->
+	// host -> rpc -> json parse) overflows that in a debug-lane build (fat frames), which segfaults on
+	// the fiber's guard page — still reproduces on 0.33.90's iterative std.json parser, so the whole
+	// chain, not parser recursion, is what busts the budget. Install the default executor FIRST —
+	// before any lazy spawn materializes the 256 KiB one — same policy, 2 MiB stacks.
+	var xb = conc.executor_policy_builder();
+	val _ = xb.stack_bytes(2097152);
+	conc.set_default_executor(conc.build_executor(xb.build()));
 	// Operational logger (Bookkeeper-style): JSON ISO-8601 to stderr; a VT request-context resolver so
 	// bare logger calls carry req/workflow_id/script automatically. Shared via ServiceApp.logger.
 	var cfgb = log.config_builder();
