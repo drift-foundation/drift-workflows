@@ -19,7 +19,7 @@ import microflows.runner.ir as ir;
 fn _pg_rejects(text: &String) -> Bool {
 	match json.parse_strict(text) {
 		core.Result::Ok(n) => {
-			match ir.parse_graph(&n) {
+			match ir.parse_graph(n) {
 				core.Result::Err(e) => { return true; },
 				core.Result::Ok(g) => { return false; }
 			}
@@ -30,7 +30,7 @@ fn _pg_rejects(text: &String) -> Bool {
 fn _pg_accepts(text: &String) -> Bool {
 	match json.parse_strict(text) {
 		core.Result::Ok(n) => {
-			match ir.parse_graph(&n) {
+			match ir.parse_graph(n) {
 				core.Result::Ok(g) => { return true; },
 				core.Result::Err(e) => { return false; }
 			}
@@ -44,9 +44,9 @@ fn _pg_accepts(text: &String) -> Bool {
 fn _pgv_rejects(text: &String) -> Bool {
 	match json.parse_strict(text) {
 		core.Result::Ok(n) => {
-			match ir.parse_graph(&n) {
+			match ir.parse_graph(n) {
 				core.Result::Ok(g) => {
-					match ir.validate_graph(&g) { Optional::Some(m) => { return true; }, Optional::None => { return false; } }
+					match ir.validate_graph(g) { Optional::Some(m) => { return true; }, Optional::None => { return false; } }
 				},
 				core.Result::Err(e) => { return true; }
 			}
@@ -57,9 +57,9 @@ fn _pgv_rejects(text: &String) -> Bool {
 fn _pgv_accepts(text: &String) -> Bool {
 	match json.parse_strict(text) {
 		core.Result::Ok(n) => {
-			match ir.parse_graph(&n) {
+			match ir.parse_graph(n) {
 				core.Result::Ok(g) => {
-					match ir.validate_graph(&g) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
+					match ir.validate_graph(g) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
 				},
 				core.Result::Err(e) => { return false; }
 			}
@@ -75,8 +75,8 @@ fn _pgv_accepts(text: &String) -> Bool {
 fn _vrc(text: &String, rt: &Optional<ir.IrType>) -> Optional<String> {
 	match json.parse_strict(text) {
 		core.Result::Ok(n) => {
-			match ir.parse_graph(&n) {
-				core.Result::Ok(g) => { return ir.validate_return_contract(&g, rt); },
+			match ir.parse_graph(n) {
+				core.Result::Ok(g) => { return ir.validate_return_contract(g, rt); },
 				core.Result::Err(e) => { return Optional<String>::Some("parse-failed"); }
 			}
 		},
@@ -99,8 +99,8 @@ fn _tc_rt(text: &String, rt: &Optional<ir.IrType>) -> Optional<String> {
 	val no_contracts: Array<ir.OpContract> = [];
 	match json.parse_strict(text) {
 		core.Result::Ok(n) => {
-			match ir.parse_graph(&n) {
-				core.Result::Ok(g) => { return ir.type_check_graph(&g, &at, &no_contracts, rt, &Optional<Array<ir.CallTarget>>::None()); },
+			match ir.parse_graph(n) {
+				core.Result::Ok(g) => { return ir.type_check_graph(g, at, no_contracts, rt, Optional<Array<ir.CallTarget>>::None()); },
 				core.Result::Err(e) => { return Optional<String>::Some("parse-failed"); }
 			}
 		},
@@ -117,12 +117,12 @@ fn _tc_rt_accepts(text: &String, rt: &Optional<ir.IrType>) -> Bool {
 // Parse an IR value type from its JSON encoding (for type-checker tests).
 fn _pt(text: &String) -> ir.IrType {
 	match json.parse_strict(text) {
-		core.Result::Ok(n) => { return ir.parse_type(&n); },
+		core.Result::Ok(n) => { return ir.parse_type(n); },
 		core.Result::Err(e) => { return ir.empty_object_type(); }
 	}
 }
 fn _tc_ok(g: &ir.IrGraph, at: &ir.IrType, cs: &Array<ir.OpContract>) nothrow -> Bool {
-	match ir.type_check_graph(g, at, cs, &Optional<ir.IrType>::None(), &Optional<Array<ir.CallTarget>>::None()) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
+	match ir.type_check_graph(g, at, cs, Optional<ir.IrType>::None(), Optional<Array<ir.CallTarget>>::None()) { Optional::None => { return true; }, Optional::Some(m) => { return false; } }
 }
 
 fn _seq(a: &String, b: &String) nothrow -> Bool {
@@ -180,15 +180,15 @@ fn scenario() -> Int {
 	flat.push(ir.FlatStep(operation = "beta", input_json = "{\"b\":2}"));
 	var gd_ok = false;
 	var gd = _graph_b();   // placeholder; overwritten below
-	match ir.flat_to_graph(&flat) {
+	match ir.flat_to_graph(flat) {
 		core.Result::Ok(g) => { gd = move g; gd_ok = true; },
 		core.Result::Err(e) => {}
 	}
 	if !gd_ok { return 1; }
-	if !_ok_validate(&gd) { return 2; }
+	if !_ok_validate(gd) { return 2; }
 
 	val gb = _graph_b();
-	if !_ok_validate(&gb) { return 3; }
+	if !_ok_validate(gb) { return 3; }
 
 	// ===== validation: defect classes rejected =====
 	// duplicate id
@@ -196,34 +196,34 @@ fn scenario() -> Int {
 	dup.push(ir.IrNode::NOperation(id = "x", operation = "a", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "x"));
 	dup.push(ir.IrNode::NReturn(id = "x", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val g_dup = ir.IrGraph(nodes = move dup, entry = "x");
-	if !_rejects(&g_dup) { return 10; }
+	if !_rejects(g_dup) { return 10; }
 
 	// missing entry
 	var me: Array<ir.IrNode> = [];
 	me.push(ir.IrNode::NReturn(id = "n0", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val g_me = ir.IrGraph(nodes = move me, entry = "zzz");
-	if !_rejects(&g_me) { return 11; }
+	if !_rejects(g_me) { return 11; }
 
 	// dangling edge target
 	var de: Array<ir.IrNode> = [];
 	de.push(ir.IrNode::NOperation(id = "n0", operation = "a", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "ghost"));
 	de.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val g_de = ir.IrGraph(nodes = move de, entry = "n0");
-	if !_rejects(&g_de) { return 12; }
+	if !_rejects(g_de) { return 12; }
 
 	// cycle
 	var cy: Array<ir.IrNode> = [];
 	cy.push(ir.IrNode::NOperation(id = "n0", operation = "a", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n1"));
 	cy.push(ir.IrNode::NOperation(id = "n1", operation = "b", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n0"));
 	val g_cy = ir.IrGraph(nodes = move cy, entry = "n0");
-	if !_rejects(&g_cy) { return 13; }
+	if !_rejects(g_cy) { return 13; }
 
 	// EResult -> non-operation (references a NReturn)
 	var er: Array<ir.IrNode> = [];
 	er.push(ir.IrNode::NLet(id = "n0", name = "v", value = ir.IrExpr::EResult(node = "n1", path = _p0()), next = "n1"));
 	er.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val g_er = ir.IrGraph(nodes = move er, entry = "n0");
-	if !_rejects(&g_er) { return 14; }
+	if !_rejects(g_er) { return 14; }
 
 	// EResult -> non-prior (forward reference to a later op)
 	var fwd: Array<ir.IrNode> = [];
@@ -231,28 +231,28 @@ fn scenario() -> Int {
 	fwd.push(ir.IrNode::NOperation(id = "n1", operation = "b", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n2"));
 	fwd.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val g_fwd = ir.IrGraph(nodes = move fwd, entry = "n0");
-	if !_rejects(&g_fwd) { return 15; }
+	if !_rejects(g_fwd) { return 15; }
 
 	// ELocal unbound
 	var ul: Array<ir.IrNode> = [];
 	ul.push(ir.IrNode::NOperation(id = "n0", operation = "a", input = ir.IrExpr::ELocal(name = "ghost", path = _p0()), next = "n1"));
 	ul.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val g_ul = ir.IrGraph(nodes = move ul, entry = "n0");
-	if !_rejects(&g_ul) { return 16; }
+	if !_rejects(g_ul) { return 16; }
 
 	// finite-loop shape: map loop carrying an accumulator is rejected
 	var ml: Array<ir.IrNode> = [];
 	ml.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EArg(path = _p1("xs")), elem = "e", acc = "acc", init = ir.IrExpr::EConst(canonical_json = "0"), body = ir.IrExpr::ELocal(name = "e", path = _p0()), next = "n1"));
 	ml.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val g_ml = ir.IrGraph(nodes = move ml, entry = "n0");
-	if !_rejects(&g_ml) { return 17; }
+	if !_rejects(g_ml) { return 17; }
 
 	// a well-formed fold loop validates
 	var fl: Array<ir.IrNode> = [];
 	fl.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LFold(), source = ir.IrExpr::EArg(path = _p1("xs")), elem = "e", acc = "acc", init = ir.IrExpr::EConst(canonical_json = "0"), body = ir.IrExpr::ELocal(name = "acc", path = _p0()), next = "n1"));
 	fl.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val g_fl = ir.IrGraph(nodes = move fl, entry = "n0");
-	if !_ok_validate(&g_fl) { return 18; }
+	if !_ok_validate(g_fl) { return 18; }
 
 	// duplicate NCase match_const rejected
 	var dc: Array<ir.IrNode> = [];
@@ -264,7 +264,7 @@ fn scenario() -> Int {
 	dc.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "2")));
 	dc.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "0")));
 	val g_dc = ir.IrGraph(nodes = move dc, entry = "n0");
-	if !_rejects(&g_dc) { return 19; }
+	if !_rejects(g_dc) { return 19; }
 
 	// duplicate NLet local name rejected
 	var dl: Array<ir.IrNode> = [];
@@ -272,7 +272,7 @@ fn scenario() -> Int {
 	dl.push(ir.IrNode::NLet(id = "n1", name = "v", value = ir.IrExpr::EArg(path = _p1("b")), next = "n2"));   // dup name
 	dl.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::ELocal(name = "v", path = _p0())));
 	val g_dl = ir.IrGraph(nodes = move dl, entry = "n0");
-	if !_rejects(&g_dl) { return 60; }
+	if !_rejects(g_dl) { return 60; }
 
 	// unreachable node rejected (nothing targets n2)
 	var ur: Array<ir.IrNode> = [];
@@ -280,20 +280,20 @@ fn scenario() -> Int {
 	ur.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	ur.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val g_ur = ir.IrGraph(nodes = move ur, entry = "n0");
-	if !_rejects(&g_ur) { return 61; }
+	if !_rejects(g_ur) { return 61; }
 
 	// EConst with NON-CANONICAL JSON (reordered keys) rejected
 	var nc: Array<ir.IrNode> = [];
 	nc.push(ir.IrNode::NOperation(id = "n0", operation = "a", input = ir.IrExpr::EConst(canonical_json = "{\"b\":2,\"a\":1}"), next = "n1"));
 	nc.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val g_nc = ir.IrGraph(nodes = move nc, entry = "n0");
-	if !_rejects(&g_nc) { return 62; }
+	if !_rejects(g_nc) { return 62; }
 
 	// EConst with INVALID JSON rejected
 	var iv: Array<ir.IrNode> = [];
 	iv.push(ir.IrNode::NReturn(id = "n0", value = ir.IrExpr::EConst(canonical_json = "{bad")));
 	val g_iv = ir.IrGraph(nodes = move iv, entry = "n0");
-	if !_rejects(&g_iv) { return 63; }
+	if !_rejects(g_iv) { return 63; }
 
 	// NCase match_const with NON-CANONICAL JSON rejected
 	var mc: Array<ir.IrNode> = [];
@@ -302,53 +302,53 @@ fn scenario() -> Int {
 	mc.push(ir.IrNode::NCase(id = "n0", scrutinee = ir.IrExpr::EArg(path = _p1("m")), arms = move mca, default_node = "n1"));
 	mc.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "0")));
 	val g_mc = ir.IrGraph(nodes = move mc, entry = "n0");
-	if !_rejects(&g_mc) { return 64; }
+	if !_rejects(g_mc) { return 64; }
 
 	// ===== interpreter: degenerate graph replay =====
 	var none: Array<ir.OpResult> = [];
-	val o0 = ir.advance(&gd, &"{}", &none);
-	if !_is_need(&o0, &"n0", &"alpha", &"{\"a\":1}") { return 20; }
+	val o0 = ir.advance(gd, "{}", none);
+	if !_is_need(o0, "n0", "alpha", "{\"a\":1}") { return 20; }
 
 	var s1: Array<ir.OpResult> = [];
 	s1.push(ir.OpResult(node_id = "n0", result_json = "{\"r\":1}"));
-	val o1 = ir.advance(&gd, &"{}", &s1);
-	if !_is_need(&o1, &"n1", &"beta", &"{\"b\":2}") { return 21; }
+	val o1 = ir.advance(gd, "{}", s1);
+	if !_is_need(o1, "n1", "beta", "{\"b\":2}") { return 21; }
 
 	var s2: Array<ir.OpResult> = [];
 	s2.push(ir.OpResult(node_id = "n0", result_json = "{\"r\":1}"));
 	s2.push(ir.OpResult(node_id = "n1", result_json = "{\"r\":2}"));
-	val o2 = ir.advance(&gd, &"{}", &s2);
-	if !_is_completed(&o2, &"null") { return 22; }
+	val o2 = ir.advance(gd, "{}", s2);
+	if !_is_completed(o2, "null") { return 22; }
 
 	// ===== interpreter: branching + EArg/EResult/ELocal projection (graph B) =====
 	// step 1: needs fetch with input projected from args.payload
-	val b0 = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &none);
-	if !_is_need(&b0, &"n0", &"fetch", &"{\"k\":1}") { return 30; }
+	val b0 = ir.advance(gb, "{\"payload\":{\"k\":1}}", none);
+	if !_is_need(b0, "n0", "fetch", "{\"k\":1}") { return 30; }
 
 	// step 2 (true branch): n0 settled ok=true -> let flag=true -> if true -> commit(fetch.data)
 	var bs1: Array<ir.OpResult> = [];
 	bs1.push(ir.OpResult(node_id = "n0", result_json = "{\"data\":{\"d\":9},\"ok\":true}"));
-	val b1 = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &bs1);
-	if !_is_need(&b1, &"n3", &"commit", &"{\"d\":9}") { return 31; }
+	val b1 = ir.advance(gb, "{\"payload\":{\"k\":1}}", bs1);
+	if !_is_need(b1, "n3", "commit", "{\"d\":9}") { return 31; }
 
 	// step 3: n0 + n3 settled -> return fetch.data
 	var bs2: Array<ir.OpResult> = [];
 	bs2.push(ir.OpResult(node_id = "n0", result_json = "{\"data\":{\"d\":9},\"ok\":true}"));
 	bs2.push(ir.OpResult(node_id = "n3", result_json = "{\"done\":1}"));
-	val b2 = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &bs2);
-	if !_is_completed(&b2, &"{\"d\":9}") { return 32; }
+	val b2 = ir.advance(gb, "{\"payload\":{\"k\":1}}", bs2);
+	if !_is_completed(b2, "{\"d\":9}") { return 32; }
 
 	// false branch: n0 settled ok=false -> if false -> return "aborted"
 	var bf: Array<ir.OpResult> = [];
 	bf.push(ir.OpResult(node_id = "n0", result_json = "{\"data\":{\"d\":9},\"ok\":false}"));
-	val bfo = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &bf);
-	if !_is_completed(&bfo, &"\"aborted\"") { return 33; }
+	val bfo = ir.advance(gb, "{\"payload\":{\"k\":1}}", bf);
+	if !_is_completed(bfo, "\"aborted\"") { return 33; }
 
 	// ===== restart determinism: same (args, settled) -> identical outcome =====
-	val r_a = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &bs1);
-	val r_b = ir.advance(&gb, &"{\"payload\":{\"k\":1}}", &bs1);
-	if !_is_need(&r_a, &"n3", &"commit", &"{\"d\":9}") { return 40; }
-	if !_is_need(&r_b, &"n3", &"commit", &"{\"d\":9}") { return 41; }
+	val r_a = ir.advance(gb, "{\"payload\":{\"k\":1}}", bs1);
+	val r_b = ir.advance(gb, "{\"payload\":{\"k\":1}}", bs1);
+	if !_is_need(r_a, "n3", "commit", "{\"d\":9}") { return 40; }
+	if !_is_need(r_b, "n3", "commit", "{\"d\":9}") { return 41; }
 
 	// ===== NCase =====
 	var cn: Array<ir.IrNode> = [];
@@ -360,15 +360,15 @@ fn scenario() -> Int {
 	cn.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "2")));
 	cn.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "0")));
 	val gc = ir.IrGraph(nodes = move cn, entry = "n0");
-	if !_ok_validate(&gc) { return 50; }
-	val c_b = ir.advance(&gc, &"{\"mode\":\"b\"}", &none);
-	if !_is_completed(&c_b, &"2") { return 51; }
-	val c_def = ir.advance(&gc, &"{\"mode\":\"z\"}", &none);
-	if !_is_completed(&c_def, &"0") { return 52; }
+	if !_ok_validate(gc) { return 50; }
+	val c_b = ir.advance(gc, "{\"mode\":\"b\"}", none);
+	if !_is_completed(c_b, "2") { return 51; }
+	val c_def = ir.advance(gc, "{\"mode\":\"z\"}", none);
+	if !_is_completed(c_def, "0") { return 52; }
 
 	// ===== op_depth: uniform per-path operation count (durable seq model) =====
 	// straight-line 2-op graph -> depth 2.
-	match ir.op_depth(&gd, false) {
+	match ir.op_depth(gd, false) {
 		core.Result::Ok(d) => { if d != 2 { return 70; } },
 		core.Result::Err(e) => { return 71; }
 	}
@@ -379,8 +379,8 @@ fn scenario() -> Int {
 	bnodes.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
 	bnodes.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val bal = ir.IrGraph(nodes = move bnodes, entry = "n0");
-	if !_ok_validate(&bal) { return 72; }
-	match ir.op_depth(&bal, false) {
+	if !_ok_validate(bal) { return 72; }
+	match ir.op_depth(bal, false) {
 		core.Result::Ok(d) => { if d != 1 { return 73; } },
 		core.Result::Err(e) => { return 74; }
 	}
@@ -392,42 +392,42 @@ fn scenario() -> Int {
 	unodes.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
 	unodes.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val unbal = ir.IrGraph(nodes = move unodes, entry = "n0");
-	if !_ok_validate(&unbal) { return 75; }
-	match ir.op_depth(&unbal, false) {
+	if !_ok_validate(unbal) { return 75; }
+	match ir.op_depth(unbal, false) {
 		core.Result::Err(e) => {},
 		core.Result::Ok(d) => { return 76; }
 	}
 
 	// ===== nonfinal_operations: NOperations before the final execution position (must be compensable) =====
 	// straight-line [alpha, beta]: alpha is non-final (seq1 < plan_length 2), beta is final.
-	match ir.nonfinal_operations(&gd, false) {
+	match ir.nonfinal_operations(gd, false) {
 		core.Result::Ok(nf) => {
 			if nf.len != 1 { return 77; }
-			if !_seq(&nf[0], &"alpha") { return 78; }
+			if !_seq(nf[0], "alpha") { return 78; }
 		},
 		core.Result::Err(e) => { return 79; }
 	}
 	// balanced if (1 op per branch, plan_length 1): both branch ops are FINAL -> none non-final.
-	match ir.nonfinal_operations(&bal, false) {
+	match ir.nonfinal_operations(bal, false) {
 		core.Result::Ok(nf) => { if nf.len != 0 { return 80; } },
 		core.Result::Err(e) => { return 81; }
 	}
 
 	// ===== parse_graph strictness (graph config is content-hashed identity) =====
 	// valid if-graph accepted.
-	if !_pg_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"f\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":2}}]}") { return 82; }
+	if !_pg_accepts("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"f\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":2}}]}") { return 82; }
 	// unknown/extra key on a node rejected.
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":1},\"bogus\":1}]}") { return 83; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":1},\"bogus\":1}]}") { return 83; }
 	// expression with TWO variant keys rejected (no silent priority).
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":1,\"arg\":[\"f\"]}}]}") { return 84; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":1,\"arg\":[\"f\"]}}]}") { return 84; }
 	// expression with an unknown variant key rejected.
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"konst\":1}}]}") { return 85; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"konst\":1}}]}") { return 85; }
 	// unknown top-level graph key rejected.
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"extra\":1,\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":1}}]}") { return 86; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"extra\":1,\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":1}}]}") { return 86; }
 	// result expr with an unknown key (path omitted) rejected — count-only would have admitted {node, bogus}.
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"result\":{\"node\":\"n1\",\"bogus\":1}}}]}") { return 87; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"result\":{\"node\":\"n1\",\"bogus\":1}}}]}") { return 87; }
 	// local expr with an unknown key (path omitted) rejected.
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"local\":{\"name\":\"x\",\"bogus\":1}}}]}") { return 88; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"local\":{\"name\":\"x\",\"bogus\":1}}}]}") { return 88; }
 
 	// ===== finite array expressions: map / filter / fold (NLoop execution) =====
 	// map: ys = [ x.v for x in args.xs ]; return ys.
@@ -437,15 +437,15 @@ fn scenario() -> Int {
 	                         body = ir.IrExpr::ELocal(name = "x", path = _p1("v")), next = "n1"));
 	mp.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "ys", path = _p0())));
 	val gmap = ir.IrGraph(nodes = move mp, entry = "n0");
-	if !_ok_validate(&gmap) { return 100; }
-	val mo = ir.advance(&gmap, &"{\"xs\":[{\"v\":1},{\"v\":2},{\"v\":3}]}", &none);
-	if !_is_completed(&mo, &"[1,2,3]") { return 101; }
+	if !_ok_validate(gmap) { return 100; }
+	val mo = ir.advance(gmap, "{\"xs\":[{\"v\":1},{\"v\":2},{\"v\":3}]}", none);
+	if !_is_completed(mo, "[1,2,3]") { return 101; }
 	// map over an empty source -> [].
-	val moe = ir.advance(&gmap, &"{\"xs\":[]}", &none);
-	if !_is_completed(&moe, &"[]") { return 102; }
+	val moe = ir.advance(gmap, "{\"xs\":[]}", none);
+	if !_is_completed(moe, "[]") { return 102; }
 	// source not an array -> clean Fault (no panic).
-	val mof = ir.advance(&gmap, &"{\"xs\":5}", &none);
-	if !_is_fault(&mof) { return 103; }
+	val mof = ir.advance(gmap, "{\"xs\":5}", none);
+	if !_is_fault(mof) { return 103; }
 
 	// filter: keep ORIGINAL elements whose .keep is true.
 	var fl: Array<ir.IrNode> = [];
@@ -454,12 +454,12 @@ fn scenario() -> Int {
 	                         body = ir.IrExpr::ELocal(name = "x", path = _p1("keep")), next = "n1"));
 	fl.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "kept", path = _p0())));
 	val gfilter = ir.IrGraph(nodes = move fl, entry = "n0");
-	if !_ok_validate(&gfilter) { return 104; }
-	val fo = ir.advance(&gfilter, &"{\"xs\":[{\"id\":1,\"keep\":true},{\"id\":2,\"keep\":false},{\"id\":3,\"keep\":true}]}", &none);
-	if !_is_completed(&fo, &"[{\"id\":1,\"keep\":true},{\"id\":3,\"keep\":true}]") { return 105; }
+	if !_ok_validate(gfilter) { return 104; }
+	val fo = ir.advance(gfilter, "{\"xs\":[{\"id\":1,\"keep\":true},{\"id\":2,\"keep\":false},{\"id\":3,\"keep\":true}]}", none);
+	if !_is_completed(fo, "[{\"id\":1,\"keep\":true},{\"id\":3,\"keep\":true}]") { return 105; }
 	// filter body not a bool -> clean Fault.
-	val fof = ir.advance(&gfilter, &"{\"xs\":[{\"id\":1,\"keep\":7}]}", &none);
-	if !_is_fault(&fof) { return 106; }
+	val fof = ir.advance(gfilter, "{\"xs\":[{\"id\":1,\"keep\":7}]}", none);
+	if !_is_fault(fof) { return 106; }
 
 	// fold-A: body overwrites the accumulator with the element -> final = last element (acc is WRITTEN).
 	var fdA: Array<ir.IrNode> = [];
@@ -468,9 +468,9 @@ fn scenario() -> Int {
 	                          body = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n1"));
 	fdA.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "a", path = _p0())));
 	val gfoldA = ir.IrGraph(nodes = move fdA, entry = "n0");
-	if !_ok_validate(&gfoldA) { return 107; }
-	val foldA = ir.advance(&gfoldA, &"{\"xs\":[1,2,3]}", &none);
-	if !_is_completed(&foldA, &"3") { return 108; }
+	if !_ok_validate(gfoldA) { return 107; }
+	val foldA = ir.advance(gfoldA, "{\"xs\":[1,2,3]}", none);
+	if !_is_completed(foldA, "3") { return 108; }
 
 	// fold-B: body keeps the accumulator -> final = init, unchanged (acc is THREADED from init).
 	var fdB: Array<ir.IrNode> = [];
@@ -479,12 +479,12 @@ fn scenario() -> Int {
 	                          body = ir.IrExpr::ELocal(name = "a", path = _p0()), next = "n1"));
 	fdB.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "a", path = _p0())));
 	val gfoldB = ir.IrGraph(nodes = move fdB, entry = "n0");
-	if !_ok_validate(&gfoldB) { return 109; }
-	val foldB = ir.advance(&gfoldB, &"{\"xs\":[1,2,3]}", &none);
-	if !_is_completed(&foldB, &"7") { return 110; }
+	if !_ok_validate(gfoldB) { return 109; }
+	val foldB = ir.advance(gfoldB, "{\"xs\":[1,2,3]}", none);
+	if !_is_completed(foldB, "7") { return 110; }
 	// fold over an empty source -> init.
-	val foldBe = ir.advance(&gfoldB, &"{\"xs\":[]}", &none);
-	if !_is_completed(&foldBe, &"7") { return 111; }
+	val foldBe = ir.advance(gfoldB, "{\"xs\":[]}", none);
+	if !_is_completed(foldBe, "7") { return 111; }
 
 	// a loop result feeds an OPERATION input: map -> op(input = local ys) -> return result(op).
 	var lo: Array<ir.IrNode> = [];
@@ -494,15 +494,15 @@ fn scenario() -> Int {
 	lo.push(ir.IrNode::NOperation(id = "n1", operation = "sink", input = ir.IrExpr::ELocal(name = "ys", path = _p0()), next = "n2"));
 	lo.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EResult(node = "n1", path = _p0())));
 	val gloop_op = ir.IrGraph(nodes = move lo, entry = "n0");
-	if !_ok_validate(&gloop_op) { return 112; }
+	if !_ok_validate(gloop_op) { return 112; }
 	// step 1: the loop recomputes the operation input from durable args (no settled results yet).
-	val lop0 = ir.advance(&gloop_op, &"{\"xs\":[{\"v\":1},{\"v\":2}]}", &none);
-	if !_is_need(&lop0, &"n1", &"sink", &"[1,2]") { return 113; }
+	val lop0 = ir.advance(gloop_op, "{\"xs\":[{\"v\":1},{\"v\":2}]}", none);
+	if !_is_need(lop0, "n1", "sink", "[1,2]") { return 113; }
 	// resume: op settled -> recompute the loop identically + return the operation's durable result.
 	var ls: Array<ir.OpResult> = [];
 	ls.push(ir.OpResult(node_id = "n1", result_json = "{\"ok\":1}"));
-	val lop1 = ir.advance(&gloop_op, &"{\"xs\":[{\"v\":1},{\"v\":2}]}", &ls);
-	if !_is_completed(&lop1, &"{\"ok\":1}") { return 114; }
+	val lop1 = ir.advance(gloop_op, "{\"xs\":[{\"v\":1},{\"v\":2}]}", ls);
+	if !_is_completed(lop1, "{\"ok\":1}") { return 114; }
 
 	// ===== loop validation + parse strictness =====
 	// element and result names must DIFFER.
@@ -512,7 +512,7 @@ fn scenario() -> Int {
 	                           body = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n1"));
 	same.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "x", path = _p0())));
 	val gsame = ir.IrGraph(nodes = move same, entry = "n0");
-	if !_rejects(&gsame) { return 115; }
+	if !_rejects(gsame) { return 115; }
 	// map/filter init must be null (non-null init rejected).
 	var bi: Array<ir.IrNode> = [];
 	bi.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EArg(path = _p1("xs")),
@@ -520,7 +520,7 @@ fn scenario() -> Int {
 	                         body = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n1"));
 	bi.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::ELocal(name = "ys", path = _p0())));
 	val gbi = ir.IrGraph(nodes = move bi, entry = "n0");
-	if !_rejects(&gbi) { return 116; }
+	if !_rejects(gbi) { return 116; }
 	// element name must NOT shadow a VISIBLE (dominating) local: `let x` then `map ... elem x ...`
 	// is rejected (else body `local x` reads the outer x at runtime while validation expects elem).
 	var sh: Array<ir.IrNode> = [];
@@ -530,7 +530,7 @@ fn scenario() -> Int {
 	                         body = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n2"));
 	sh.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::ELocal(name = "ys", path = _p0())));
 	val gsh = ir.IrGraph(nodes = move sh, entry = "n0");
-	if !_rejects(&gsh) { return 122; }
+	if !_rejects(gsh) { return 122; }
 	// element-name collision is PATH-INSENSITIVE: `if c then (let x; loop elem x) else (loop elem x)`
 	// — the let x is bound on only the true path (does NOT dominate the loop), yet at runtime the
 	// true path carries outer x before elem x, so the body would read the outer value. Rejected.
@@ -542,30 +542,30 @@ fn scenario() -> Int {
 	                          body = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n4"));
 	psh.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "ys", path = _p0())));
 	val gpsh = ir.IrGraph(nodes = move psh, entry = "n0");
-	if !_rejects(&gpsh) { return 123; }
+	if !_rejects(gpsh) { return 123; }
 	// valid map + fold configs PARSE.
-	if !_pg_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"ys\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"ys\"}}}]}") { return 117; }
-	if !_pg_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"fold\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"a\",\"init\":{\"const\":0},\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"a\"}}}]}") { return 118; }
+	if !_pg_accepts("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"ys\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"ys\"}}}]}") { return 117; }
+	if !_pg_accepts("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"fold\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"a\",\"init\":{\"const\":0},\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"a\"}}}]}") { return 118; }
 	// map with an UNKNOWN extra key rejected.
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"ys\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\",\"bogus\":1},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"ys\"}}}]}") { return 119; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"ys\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\",\"bogus\":1},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"ys\"}}}]}") { return 119; }
 	// map MISSING the 'as' result-binding key rejected.
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"ys\"}}}]}") { return 120; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"ys\"}}}]}") { return 120; }
 	// fold MISSING 'init' rejected.
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"fold\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"a\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"a\"}}}]}") { return 121; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"fold\",\"id\":\"n0\",\"source\":{\"arg\":[\"xs\"]},\"elem\":\"x\",\"as\":\"a\",\"body\":{\"local\":{\"name\":\"x\"}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"a\"}}}]}") { return 121; }
 
 	// ===== case config parsing + hardening =====
 	// valid case parses AND validates.
-	if !_pgv_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"mode\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"},{\"match\":\"b\",\"target\":\"n2\"}],\"default\":\"n3\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":2}},{\"kind\":\"return\",\"id\":\"n3\",\"value\":{\"const\":0}}]}") { return 124; }
+	if !_pgv_accepts("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"mode\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"},{\"match\":\"b\",\"target\":\"n2\"}],\"default\":\"n3\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":2}},{\"kind\":\"return\",\"id\":\"n3\",\"value\":{\"const\":0}}]}") { return 124; }
 	// DUPLICATE arm constants (different spelling, SAME canonical) rejected at validate.
-	if !_pgv_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":{\"a\":1,\"b\":2},\"target\":\"n1\"},{\"match\":{\"b\":2,\"a\":1},\"target\":\"n2\"}],\"default\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":2}}]}") { return 125; }
+	if !_pgv_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":{\"a\":1,\"b\":2},\"target\":\"n1\"},{\"match\":{\"b\":2,\"a\":1},\"target\":\"n2\"}],\"default\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":2}}]}") { return 125; }
 	// case MISSING 'default' rejected (parse).
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"}]},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 126; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"}]},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 126; }
 	// case arm with an UNKNOWN key rejected (parse).
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\",\"bogus\":1}],\"default\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 127; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\",\"bogus\":1}],\"default\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 127; }
 	// case arm MISSING 'match' rejected (parse).
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"target\":\"n1\"}],\"default\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 128; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"target\":\"n1\"}],\"default\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 128; }
 	// case node with an UNKNOWN extra key rejected (parse).
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"}],\"default\":\"n1\",\"bogus\":1},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 129; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"m\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"}],\"default\":\"n1\",\"bogus\":1},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":1}}]}") { return 129; }
 
 	// ===== cross-branch result merge (NMerge phi) =====
 	// if flag then opA else opB -> merge picked = result(taken branch) -> return picked.
@@ -579,17 +579,17 @@ fn scenario() -> Int {
 	mrg.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move mrgs, next = "n4"));
 	mrg.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
 	val gmrg = ir.IrGraph(nodes = move mrg, entry = "n0");
-	if !_ok_validate(&gmrg) { return 130; }
+	if !_ok_validate(gmrg) { return 130; }
 	// true branch: opA settled -> merge picks result(n1).
 	var mt: Array<ir.OpResult> = [];
 	mt.push(ir.OpResult(node_id = "n1", result_json = "{\"x\":1}"));
-	val mto = ir.advance(&gmrg, &"{\"flag\":true}", &mt);
-	if !_is_completed(&mto, &"{\"x\":1}") { return 131; }
+	val mto = ir.advance(gmrg, "{\"flag\":true}", mt);
+	if !_is_completed(mto, "{\"x\":1}") { return 131; }
 	// false branch: opB settled -> merge picks result(n2). (Same config, selection by taken path.)
 	var mf2: Array<ir.OpResult> = [];
 	mf2.push(ir.OpResult(node_id = "n2", result_json = "{\"y\":2}"));
-	val mfo = ir.advance(&gmrg, &"{\"flag\":false}", &mf2);
-	if !_is_completed(&mfo, &"{\"y\":2}") { return 132; }
+	val mfo = ir.advance(gmrg, "{\"flag\":false}", mf2);
+	if !_is_completed(mfo, "{\"y\":2}") { return 132; }
 
 	// validation: a merge MISSING a source for one predecessor (only n1 sourced) is rejected.
 	var ms1: Array<ir.IrNode> = [];
@@ -601,7 +601,7 @@ fn scenario() -> Int {
 	ms1.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move ms1s, next = "n4"));
 	ms1.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
 	val gms1 = ir.IrGraph(nodes = move ms1, entry = "n0");
-	if !_rejects(&gms1) { return 133; }
+	if !_rejects(gms1) { return 133; }
 
 	// validation: a merge source whose value references the OTHER branch's result (not available on
 	// this predecessor's path) is rejected — result(n2) sourced from n1.
@@ -615,7 +615,7 @@ fn scenario() -> Int {
 	ms2.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move ms2s, next = "n4"));
 	ms2.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
 	val gms2 = ir.IrGraph(nodes = move ms2, entry = "n0");
-	if !_rejects(&gms2) { return 134; }
+	if !_rejects(gms2) { return 134; }
 
 	// validation: DUPLICATE source 'from' (two sources from n1) is rejected — ambiguous selection.
 	var ms3: Array<ir.IrNode> = [];
@@ -629,7 +629,7 @@ fn scenario() -> Int {
 	ms3.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move ms3s, next = "n4"));
 	ms3.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
 	val gms3 = ir.IrGraph(nodes = move ms3, entry = "n0");
-	if !_rejects(&gms3) { return 138; }
+	if !_rejects(gms3) { return 138; }
 
 	// validation: a source whose 'from' is NOT an immediate predecessor (here n0, the if itself,
 	// which edges to n1/n2 — not to the merge) is rejected.
@@ -644,38 +644,38 @@ fn scenario() -> Int {
 	ms4.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move ms4s, next = "n4"));
 	ms4.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
 	val gms4 = ir.IrGraph(nodes = move ms4, entry = "n0");
-	if !_rejects(&gms4) { return 139; }
+	if !_rejects(gms4) { return 139; }
 
 	// ===== typed expression validation (type_check_graph) =====
 	var no_contracts: Array<ir.OpContract> = [];
 	// valid: arg.flag is Bool -> NIf condition OK.
-	val at_bool = _pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"flag\",\"type\":{\"type\":\"bool\"}}]}");
+	val at_bool = _pt("{\"type\":\"object\",\"fields\":[{\"name\":\"flag\",\"type\":{\"type\":\"bool\"}}]}");
 	var ty1: Array<ir.IrNode> = [];
 	ty1.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
 	ty1.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "1")));
 	ty1.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "2")));
 	val gty1 = ir.IrGraph(nodes = move ty1, entry = "n0");
-	if !_tc_ok(&gty1, &at_bool, &no_contracts) { return 140; }
+	if !_tc_ok(gty1, at_bool, no_contracts) { return 140; }
 	// invalid: arg.flag is Int -> NIf condition is not Bool -> rejected.
-	val at_int = _pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"flag\",\"type\":{\"type\":\"int\"}}]}");
+	val at_int = _pt("{\"type\":\"object\",\"fields\":[{\"name\":\"flag\",\"type\":{\"type\":\"int\"}}]}");
 	var ty2: Array<ir.IrNode> = [];
 	ty2.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
 	ty2.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "1")));
 	ty2.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "2")));
 	val gty2 = ir.IrGraph(nodes = move ty2, entry = "n0");
-	if _tc_ok(&gty2, &at_int, &no_contracts) { return 141; }
+	if _tc_ok(gty2, at_int, no_contracts) { return 141; }
 	// invalid op input: reserve declares input {reservation:string}; a const {reservation:5} (int) is rejected.
 	var rc: Array<ir.OpContract> = [];
-	rc.push(ir.OpContract(name = "reserve", input_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"reservation\",\"type\":{\"type\":\"string\"}}]}")), result_type = Optional<ir.IrType>::None()));
+	rc.push(ir.OpContract(name = "reserve", input_type = Optional<ir.IrType>::Some(_pt("{\"type\":\"object\",\"fields\":[{\"name\":\"reservation\",\"type\":{\"type\":\"string\"}}]}")), result_type = Optional<ir.IrType>::None()));
 	var ty3: Array<ir.IrNode> = [];
 	ty3.push(ir.IrNode::NOperation(id = "n0", operation = "reserve", input = ir.IrExpr::EConst(canonical_json = "{\"reservation\":5}"), next = "n1"));
 	ty3.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gty3 = ir.IrGraph(nodes = move ty3, entry = "n0");
-	if _tc_ok(&gty3, &at_bool, &rc) { return 142; }
+	if _tc_ok(gty3, at_bool, rc) { return 142; }
 	// invalid merge: op A result {x:int}, op B result {x:string} -> merge sources disagree on type.
 	var mc: Array<ir.OpContract> = [];
-	mc.push(ir.OpContract(name = "A", input_type = Optional<ir.IrType>::None(), result_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"x\",\"type\":{\"type\":\"int\"}}]}"))));
-	mc.push(ir.OpContract(name = "B", input_type = Optional<ir.IrType>::None(), result_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"x\",\"type\":{\"type\":\"string\"}}]}"))));
+	mc.push(ir.OpContract(name = "A", input_type = Optional<ir.IrType>::None(), result_type = Optional<ir.IrType>::Some(_pt("{\"type\":\"object\",\"fields\":[{\"name\":\"x\",\"type\":{\"type\":\"int\"}}]}"))));
+	mc.push(ir.OpContract(name = "B", input_type = Optional<ir.IrType>::None(), result_type = Optional<ir.IrType>::Some(_pt("{\"type\":\"object\",\"fields\":[{\"name\":\"x\",\"type\":{\"type\":\"string\"}}]}"))));
 	var ty4: Array<ir.IrNode> = [];
 	ty4.push(ir.IrNode::NIf(id = "n0", cond = ir.IrExpr::EArg(path = _p1("flag")), then_node = "n1", else_node = "n2"));
 	ty4.push(ir.IrNode::NOperation(id = "n1", operation = "A", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n3"));
@@ -686,7 +686,7 @@ fn scenario() -> Int {
 	ty4.push(ir.IrNode::NMerge(id = "n3", name = "picked", sources = move ty4s, next = "n4"));
 	ty4.push(ir.IrNode::NReturn(id = "n4", value = ir.IrExpr::ELocal(name = "picked", path = _p0())));
 	val gty4 = ir.IrGraph(nodes = move ty4, entry = "n0");
-	if _tc_ok(&gty4, &at_bool, &mc) { return 143; }
+	if _tc_ok(gty4, at_bool, mc) { return 143; }
 	// bypass-through-binder regression: an object const reaching a typed op input THROUGH a let is
 	// still checked. let x = {reservation:5} (int) ; reserve(local x) with reserve input
 	// {reservation:string} -> ELocal x infers {reservation:int} -> mismatch -> rejected.
@@ -695,7 +695,7 @@ fn scenario() -> Int {
 	ty5.push(ir.IrNode::NOperation(id = "n1", operation = "reserve", input = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n2"));
 	ty5.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gty5 = ir.IrGraph(nodes = move ty5, entry = "n0");
-	if _tc_ok(&gty5, &at_bool, &rc) { return 144; }
+	if _tc_ok(gty5, at_bool, rc) { return 144; }
 	// imprecise-field object through a binder: let x = {reservation:[]} (empty array field -> object
 	// infers as Imprecise) ; reserve(local x). The static const is checked by VALUE, so {reservation:[]}
 	// is still rejected against {reservation:string} (not waved through).
@@ -704,29 +704,29 @@ fn scenario() -> Int {
 	ty6.push(ir.IrNode::NOperation(id = "n1", operation = "reserve", input = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n2"));
 	ty6.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gty6 = ir.IrGraph(nodes = move ty6, entry = "n0");
-	if _tc_ok(&gty6, &at_bool, &rc) { return 145; }
+	if _tc_ok(gty6, at_bool, rc) { return 145; }
 	// optional/null through a binder: let x = {maybe:null} ; op input {maybe:Optional<string>}. The
 	// static const validates (null satisfies Optional<string>), so it is ACCEPTED.
 	var oc: Array<ir.OpContract> = [];
-	oc.push(ir.OpContract(name = "opM", input_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"maybe\",\"type\":{\"type\":\"optional\",\"inner\":{\"type\":\"string\"}}}]}")), result_type = Optional<ir.IrType>::None()));
+	oc.push(ir.OpContract(name = "opM", input_type = Optional<ir.IrType>::Some(_pt("{\"type\":\"object\",\"fields\":[{\"name\":\"maybe\",\"type\":{\"type\":\"optional\",\"inner\":{\"type\":\"string\"}}}]}")), result_type = Optional<ir.IrType>::None()));
 	var ty7: Array<ir.IrNode> = [];
 	ty7.push(ir.IrNode::NLet(id = "n0", name = "x", value = ir.IrExpr::EConst(canonical_json = "{\"maybe\":null}"), next = "n1"));
 	ty7.push(ir.IrNode::NOperation(id = "n1", operation = "opM", input = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n2"));
 	ty7.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gty7 = ir.IrGraph(nodes = move ty7, entry = "n0");
-	if !_tc_ok(&gty7, &at_bool, &oc) { return 146; }
+	if !_tc_ok(gty7, at_bool, oc) { return 146; }
 	// non-const ASSIGNABILITY: op A result {m:string} -> let y = result(A) -> op B input
 	// {m:Optional<string>}. The inferred {m:string} is ASSIGNABLE to {m:Optional<string>} -> ACCEPTED.
 	var ac: Array<ir.OpContract> = [];
-	ac.push(ir.OpContract(name = "A", input_type = Optional<ir.IrType>::None(), result_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"m\",\"type\":{\"type\":\"string\"}}]}"))));
-	ac.push(ir.OpContract(name = "B", input_type = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"m\",\"type\":{\"type\":\"optional\",\"inner\":{\"type\":\"string\"}}}]}")), result_type = Optional<ir.IrType>::None()));
+	ac.push(ir.OpContract(name = "A", input_type = Optional<ir.IrType>::None(), result_type = Optional<ir.IrType>::Some(_pt("{\"type\":\"object\",\"fields\":[{\"name\":\"m\",\"type\":{\"type\":\"string\"}}]}"))));
+	ac.push(ir.OpContract(name = "B", input_type = Optional<ir.IrType>::Some(_pt("{\"type\":\"object\",\"fields\":[{\"name\":\"m\",\"type\":{\"type\":\"optional\",\"inner\":{\"type\":\"string\"}}}]}")), result_type = Optional<ir.IrType>::None()));
 	var ty8: Array<ir.IrNode> = [];
 	ty8.push(ir.IrNode::NOperation(id = "n0", operation = "A", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n1"));
 	ty8.push(ir.IrNode::NLet(id = "n1", name = "y", value = ir.IrExpr::EResult(node = "n0", path = _p0()), next = "n2"));
 	ty8.push(ir.IrNode::NOperation(id = "n2", operation = "B", input = ir.IrExpr::ELocal(name = "y", path = _p0()), next = "n3"));
 	ty8.push(ir.IrNode::NReturn(id = "n3", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gty8 = ir.IrGraph(nodes = move ty8, entry = "n0");
-	if !_tc_ok(&gty8, &at_bool, &ac) { return 147; }
+	if !_tc_ok(gty8, at_bool, ac) { return 147; }
 	// imprecise const through an NMerge binder: both arms merge {reservation:[]} (imprecise) into x,
 	// then reserve(local x) against {reservation:string}. The merge is Imprecise (not Unknown), so it
 	// is REJECTED at the boundary rather than waved through.
@@ -741,10 +741,10 @@ fn scenario() -> Int {
 	ty9.push(ir.IrNode::NOperation(id = "n4", operation = "reserve", input = ir.IrExpr::ELocal(name = "x", path = _p0()), next = "n5"));
 	ty9.push(ir.IrNode::NReturn(id = "n5", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gty9 = ir.IrGraph(nodes = move ty9, entry = "n0");
-	if _tc_ok(&gty9, &at_bool, &rc) { return 148; }
+	if _tc_ok(gty9, at_bool, rc) { return 148; }
 	// imprecise const through an NLoop binder: map xs body {reservation:[]} -> result is Imprecise ->
 	// reserve(local ys) is REJECTED (not waved through).
-	val at_xs = _pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"xs\",\"type\":{\"type\":\"array\",\"elem\":{\"type\":\"int\"}}}]}");
+	val at_xs = _pt("{\"type\":\"object\",\"fields\":[{\"name\":\"xs\",\"type\":{\"type\":\"array\",\"elem\":{\"type\":\"int\"}}}]}");
 	var ty10: Array<ir.IrNode> = [];
 	ty10.push(ir.IrNode::NLoop(id = "n0", kind = ir.LoopKind::LMap(), source = ir.IrExpr::EArg(path = _p1("xs")),
 	                           elem = "e", acc = "ys", init = ir.IrExpr::EConst(canonical_json = "null"),
@@ -752,7 +752,7 @@ fn scenario() -> Int {
 	ty10.push(ir.IrNode::NOperation(id = "n1", operation = "reserve", input = ir.IrExpr::ELocal(name = "ys", path = _p0()), next = "n2"));
 	ty10.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gty10 = ir.IrGraph(nodes = move ty10, entry = "n0");
-	if _tc_ok(&gty10, &at_xs, &rc) { return 149; }
+	if _tc_ok(gty10, at_xs, rc) { return 149; }
 	// a STATIC non-array loop source is rejected at type-check (not left to a replay fault): the
 	// const {"xs":[]} is an object (infers Imprecise), but a loop source must BE an array.
 	var ty11: Array<ir.IrNode> = [];
@@ -761,7 +761,7 @@ fn scenario() -> Int {
 	                           body = ir.IrExpr::ELocal(name = "e", path = _p0()), next = "n1"));
 	ty11.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gty11 = ir.IrGraph(nodes = move ty11, entry = "n0");
-	if _tc_ok(&gty11, &at_bool, &no_contracts) { return 150; }
+	if _tc_ok(gty11, at_bool, no_contracts) { return 150; }
 	// a non-array imprecise literal LAUNDERED through a merge into a loop source is also rejected:
 	// both arms merge {"xs":[]} (Imprecise) into m, then map over local m — the merge result is
 	// Imprecise and not statically an array, so the loop source is rejected (not left to replay).
@@ -778,12 +778,12 @@ fn scenario() -> Int {
 	                           body = ir.IrExpr::ELocal(name = "e", path = _p0()), next = "n5"));
 	ty12.push(ir.IrNode::NReturn(id = "n5", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gty12 = ir.IrGraph(nodes = move ty12, entry = "n0");
-	if _tc_ok(&gty12, &at_bool, &no_contracts) { return 151; }
+	if _tc_ok(gty12, at_bool, no_contracts) { return 151; }
 
 	// merge config: valid merge parses + validates; unknown source key / missing 'from' rejected.
-	if !_pgv_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"f\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"A\",\"input\":{\"const\":{}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"B\",\"input\":{\"const\":{}},\"next\":\"n3\"},{\"kind\":\"merge\",\"id\":\"n3\",\"name\":\"picked\",\"sources\":[{\"from\":\"n1\",\"value\":{\"result\":{\"node\":\"n1\"}}},{\"from\":\"n2\",\"value\":{\"result\":{\"node\":\"n2\"}}}],\"next\":\"n4\"},{\"kind\":\"return\",\"id\":\"n4\",\"value\":{\"local\":{\"name\":\"picked\"}}}]}") { return 135; }
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"merge\",\"id\":\"n0\",\"name\":\"p\",\"sources\":[{\"from\":\"n1\",\"value\":{\"const\":1},\"bogus\":1}],\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"p\"}}}]}") { return 136; }
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"merge\",\"id\":\"n0\",\"name\":\"p\",\"sources\":[{\"value\":{\"const\":1}}],\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"p\"}}}]}") { return 137; }
+	if !_pgv_accepts("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"f\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"A\",\"input\":{\"const\":{}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"B\",\"input\":{\"const\":{}},\"next\":\"n3\"},{\"kind\":\"merge\",\"id\":\"n3\",\"name\":\"picked\",\"sources\":[{\"from\":\"n1\",\"value\":{\"result\":{\"node\":\"n1\"}}},{\"from\":\"n2\",\"value\":{\"result\":{\"node\":\"n2\"}}}],\"next\":\"n4\"},{\"kind\":\"return\",\"id\":\"n4\",\"value\":{\"local\":{\"name\":\"picked\"}}}]}") { return 135; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"merge\",\"id\":\"n0\",\"name\":\"p\",\"sources\":[{\"from\":\"n1\",\"value\":{\"const\":1},\"bogus\":1}],\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"p\"}}}]}") { return 136; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"merge\",\"id\":\"n0\",\"name\":\"p\",\"sources\":[{\"value\":{\"const\":1}}],\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"local\":{\"name\":\"p\"}}}]}") { return 137; }
 
 	// ===== expression object/array construction (EObject / EArray) =====
 	var c_no: Array<ir.OpResult> = [];
@@ -795,9 +795,9 @@ fn scenario() -> Int {
 	co1.push(ir.IrNode::NOperation(id = "n0", operation = "reserve", input = ir.IrExpr::EObject(fields = move co1f), next = "n1"));
 	co1.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gco1 = ir.IrGraph(nodes = move co1, entry = "n0");
-	if !_ok_validate(&gco1) { return 152; }
-	val co1o = ir.advance(&gco1, &"{\"req\":\"order-9\"}", &c_no);
-	if !_is_need(&co1o, &"n0", &"reserve", &"{\"reservation\":\"order-9\"}") { return 153; }
+	if !_ok_validate(gco1) { return 152; }
+	val co1o = ir.advance(gco1, "{\"req\":\"order-9\"}", c_no);
+	if !_is_need(co1o, "n0", "reserve", "{\"reservation\":\"order-9\"}") { return 153; }
 
 	// (2) EArray eval: op `pack` input = [ arg a, const 2 ] -> [1,2] (order preserved).
 	var co2: Array<ir.IrNode> = [];
@@ -807,14 +807,14 @@ fn scenario() -> Int {
 	co2.push(ir.IrNode::NOperation(id = "n0", operation = "pack", input = ir.IrExpr::EArray(elems = move co2e), next = "n1"));
 	co2.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gco2 = ir.IrGraph(nodes = move co2, entry = "n0");
-	val co2o = ir.advance(&gco2, &"{\"a\":1}", &c_no);
-	if !_is_need(&co2o, &"n0", &"pack", &"[1,2]") { return 154; }
+	val co2o = ir.advance(gco2, "{\"a\":1}", c_no);
+	if !_is_need(co2o, "n0", "pack", "[1,2]") { return 154; }
 
 	// (3) parse_graph + validate accept {object:{...}} and {array:[...]} configs; malformed rejected.
-	if !_pgv_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"object\":{\"reservation\":{\"arg\":[\"req\"]}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 155; }
-	if !_pgv_accepts(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"pack\",\"input\":{\"array\":[{\"arg\":[\"a\"]},{\"const\":2}]},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 156; }
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"object\":5},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 157; }
-	if !_pg_rejects(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"pack\",\"input\":{\"array\":5},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 158; }
+	if !_pgv_accepts("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"object\":{\"reservation\":{\"arg\":[\"req\"]}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 155; }
+	if !_pgv_accepts("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"pack\",\"input\":{\"array\":[{\"arg\":[\"a\"]},{\"const\":2}]},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 156; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"object\":5},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 157; }
+	if !_pg_rejects("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"pack\",\"input\":{\"array\":5},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}") { return 158; }
 
 	// (4) graph_canonical is KEY-ORDER independent for EObject (fields sorted by key).
 	var co4a: Array<ir.IrNode> = [];
@@ -831,27 +831,27 @@ fn scenario() -> Int {
 	co4b.push(ir.IrNode::NOperation(id = "n0", operation = "op", input = ir.IrExpr::EObject(fields = move co4bf), next = "n1"));
 	co4b.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gco4b = ir.IrGraph(nodes = move co4b, entry = "n0");
-	val cc4a = ir.graph_canonical(&gco4a);
-	val cc4b = ir.graph_canonical(&gco4b);
-	if !_seq(&cc4a, &cc4b) { return 159; }
+	val cc4a = ir.graph_canonical(gco4a);
+	val cc4b = ir.graph_canonical(gco4b);
+	if !_seq(cc4a, cc4b) { return 159; }
 
 	// (5) typed: reserve input {reservation:string}. Constructed {reservation: arg s} (s:string) PASSES;
 	//     {reservation: arg n} (n:int) is REJECTED before dispatch (field type recursed into).
-	val at_sn = _pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"s\",\"type\":{\"type\":\"string\"}},{\"name\":\"n\",\"type\":{\"type\":\"int\"}}]}");
+	val at_sn = _pt("{\"type\":\"object\",\"fields\":[{\"name\":\"s\",\"type\":{\"type\":\"string\"}},{\"name\":\"n\",\"type\":{\"type\":\"int\"}}]}");
 	var co5: Array<ir.IrNode> = [];
 	var co5f: Array<ir.ExprField> = [];
 	co5f.push(ir.ExprField(key = "reservation", value = ir.IrExpr::EArg(path = _p1("s"))));
 	co5.push(ir.IrNode::NOperation(id = "n0", operation = "reserve", input = ir.IrExpr::EObject(fields = move co5f), next = "n1"));
 	co5.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gco5 = ir.IrGraph(nodes = move co5, entry = "n0");
-	if !_tc_ok(&gco5, &at_sn, &rc) { return 160; }
+	if !_tc_ok(gco5, at_sn, rc) { return 160; }
 	var co6: Array<ir.IrNode> = [];
 	var co6f: Array<ir.ExprField> = [];
 	co6f.push(ir.ExprField(key = "reservation", value = ir.IrExpr::EArg(path = _p1("n"))));
 	co6.push(ir.IrNode::NOperation(id = "n0", operation = "reserve", input = ir.IrExpr::EObject(fields = move co6f), next = "n1"));
 	co6.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gco6 = ir.IrGraph(nodes = move co6, entry = "n0");
-	if _tc_ok(&gco6, &at_sn, &rc) { return 161; }
+	if _tc_ok(gco6, at_sn, rc) { return 161; }
 
 	// (6) dominance recurses into construction: a field referencing a NON-prior op result is rejected.
 	var co7: Array<ir.IrNode> = [];
@@ -861,7 +861,7 @@ fn scenario() -> Int {
 	co7.push(ir.IrNode::NOperation(id = "n1", operation = "reserve", input = ir.IrExpr::EConst(canonical_json = "{}"), next = "n2"));
 	co7.push(ir.IrNode::NReturn(id = "n2", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gco7 = ir.IrGraph(nodes = move co7, entry = "n0");
-	if !_rejects(&gco7) { return 162; }
+	if !_rejects(gco7) { return 162; }
 
 	// (7) EArray is ORDER-sensitive: [arg x, arg y] and [arg y, arg x] have DISTINCT canonical forms.
 	var co8a: Array<ir.IrNode> = [];
@@ -878,9 +878,9 @@ fn scenario() -> Int {
 	co8b.push(ir.IrNode::NOperation(id = "n0", operation = "op", input = ir.IrExpr::EArray(elems = move co8be), next = "n1"));
 	co8b.push(ir.IrNode::NReturn(id = "n1", value = ir.IrExpr::EConst(canonical_json = "null")));
 	val gco8b = ir.IrGraph(nodes = move co8b, entry = "n0");
-	val cc8a = ir.graph_canonical(&gco8a);
-	val cc8b = ir.graph_canonical(&gco8b);
-	if _seq(&cc8a, &cc8b) { return 163; }
+	val cc8a = ir.graph_canonical(gco8a);
+	val cc8b = ir.graph_canonical(gco8b);
+	if _seq(cc8a, cc8b) { return 163; }
 
 	// ===== composition 1b.0a (step 1): workflow return-contract validation =====
 	// UNIT = no declared return type (fall-through allowed); NON-UNIT = a declared object type
@@ -895,22 +895,22 @@ fn scenario() -> Int {
 	val g_if_fail = "{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"const\":true},\"then\":\"t\",\"else\":\"e\"},{\"kind\":\"return\",\"id\":\"t\",\"value\":{\"const\":{\"x\":1}}},{\"kind\":\"fail\",\"id\":\"e\",\"reason\":{\"const\":\"nope\"}}]}";
 	val g_only_fail = "{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"fail\",\"id\":\"n0\",\"reason\":{\"const\":\"nope\"}}]}";
 	// unit: a `return null` (unit) fall-through terminal is fine.
-	if !_vrc_accepts(&g_ret_null, &rt_unit) { return 170; }
+	if !_vrc_accepts(g_ret_null, rt_unit) { return 170; }
 	// non-unit: a unit fall-through on a successful path is REJECTED.
-	if !_vrc_rejects(&g_ret_null, &rt_obj) { return 171; }
+	if !_vrc_rejects(g_ret_null, rt_obj) { return 171; }
 	// non-unit: an explicit object return is accepted.
-	if !_vrc_accepts(&g_ret_obj, &rt_obj) { return 172; }
+	if !_vrc_accepts(g_ret_obj, rt_obj) { return 172; }
 	// non-unit: one branch returns an object, the other falls through to unit -> REJECTED
 	// (stricter than "no reachable return").
-	if !_vrc_rejects(&g_if_mixed, &rt_obj) { return 173; }
+	if !_vrc_rejects(g_if_mixed, rt_obj) { return 173; }
 	// non-unit: `fail` is the unsuccessful terminal and is EXEMPT; the only successful sink returns.
-	if !_vrc_accepts(&g_if_fail, &rt_obj) { return 174; }
+	if !_vrc_accepts(g_if_fail, rt_obj) { return 174; }
 	// non-unit: a workflow that only ever fails has NO successful sink -> vacuously satisfied.
-	if !_vrc_accepts(&g_only_fail, &rt_obj) { return 175; }
+	if !_vrc_accepts(g_only_fail, rt_obj) { return 175; }
 	// object-only: a non-unit, non-object return type is rejected outright.
-	if !_vrc_rejects(&g_ret_obj, &rt_scalar) { return 176; }
+	if !_vrc_rejects(g_ret_obj, rt_scalar) { return 176; }
 	// unit: fall-through is allowed on any path (mixed graph accepted under unit).
-	if !_vrc_accepts(&g_if_mixed, &rt_unit) { return 177; }
+	if !_vrc_accepts(g_if_mixed, rt_unit) { return 177; }
 
 	// ===== composition 1b.0a (step 3 follow-up): STRUCTURAL return-expression check =====
 	// validate_return_contract (above) only checks TERMINAL SHAPE (is there an explicit return at
@@ -920,9 +920,9 @@ fn scenario() -> Int {
 	// discovered later at the host/SP boundary (a scalar or wrong-shaped object would otherwise
 	// SIGNAL mid-settle instead of failing invalid_config at build).
 	val g_ret_scalar = "{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":5}}]}";
-	val rt_obj_x = Optional<ir.IrType>::Some(_pt(&"{\"type\":\"object\",\"fields\":[{\"name\":\"x\",\"type\":{\"type\":\"int\"}}]}"));
+	val rt_obj_x = Optional<ir.IrType>::Some(_pt("{\"type\":\"object\",\"fields\":[{\"name\":\"x\",\"type\":{\"type\":\"int\"}}]}"));
 	// positive control: the returned object EXACTLY matches the declared shape -> accepted.
-	if !_tc_rt_accepts(&g_ret_obj, &rt_obj_x) { return 178; }
+	if !_tc_rt_accepts(g_ret_obj, rt_obj_x) { return 178; }
 	// UNIT (return_type=None) is DELIBERATELY NOT structurally constrained here — `type_check_graph`
 	// is the general-purpose graph type-checker, used by a large body of PRE-EXISTING tests that
 	// author arbitrary manual graphs (unrelated to 1b.0a) with `return <expr>` under no declared
@@ -934,15 +934,15 @@ fn scenario() -> Int {
 	// runner.drift ignores the graph's return value entirely for a unit script) — so here, an
 	// explicit non-`{}` object return under unit is simply not rejected; the runner never
 	// consults it.
-	if !_tc_rt_accepts(&g_ret_obj, &rt_unit) { return 179; }
+	if !_tc_rt_accepts(g_ret_obj, rt_unit) { return 179; }
 	// non-unit object return type + a SCALAR return -> REJECTED.
-	if !_tc_rt_rejects(&g_ret_scalar, &rt_obj_x) { return 180; }
+	if !_tc_rt_rejects(g_ret_scalar, rt_obj_x) { return 180; }
 	// non-unit object return type + WRONG object shape (declared empty, returned has extra field
 	// "x") -> REJECTED. (validate_return_contract accepts this same pairing at line 172/905 above —
 	// it only checks terminal shape; type_check_graph is what catches the field mismatch.)
-	if !_tc_rt_rejects(&g_ret_obj, &rt_obj) { return 181; }
+	if !_tc_rt_rejects(g_ret_obj, rt_obj) { return 181; }
 	// unit: the pure fall-through sentinel is still accepted (unchanged).
-	if !_tc_rt_accepts(&g_ret_null, &rt_unit) { return 182; }
+	if !_tc_rt_accepts(g_ret_null, rt_unit) { return 182; }
 
 	return 0;
 }

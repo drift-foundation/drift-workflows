@@ -3,7 +3,7 @@
 #  justfile builds the Microflows package; milestone 1: MariaDB reference host.)
 #
 # Environment:
-#   DRIFT_TOOLCHAIN_ROOT — required for test gates (just test). Toolchain >= 0.33.17.
+#   DRIFT_TOOLCHAIN_ROOT — required for test gates (just test). Toolchain >= 0.33.91.
 #   DRIFT_PKG_ROOT       — foundation-libs root for resolving external deps
 #                          (default: $HOME/opt/drift/certified/current/pkgs).
 #   DRIFT_SIGN_KEY_FILE  — Ed25519 author-claim signer (The Drift Foundation identity)
@@ -45,7 +45,7 @@ test:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source "../tools/cert-env.sh"
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
 	# Runner-owned unit tests (the V1 control-flow graph IR in runner/src/ir.drift) are
 	# DB-free — run them as part of THIS component gate, before taking the DB lock. (ir.drift
 	# is Microflows code; this is its component home.)
@@ -60,7 +60,7 @@ _test-locked:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source "../tools/cert-env.sh"
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
 	export DRIFT_PKG_ROOT="{{_pkg-root}}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
@@ -83,7 +83,7 @@ _test-locked:
 check-one FILE:
 	#!/usr/bin/env bash
 	set -uo pipefail
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
 	export DRIFT_PKG_ROOT="{{_pkg-root}}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
@@ -97,7 +97,7 @@ check-one FILE:
 compile-check FILE="packages/microflows/src/lib.drift":
 	#!/usr/bin/env bash
 	set -uo pipefail
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
 	export DRIFT_PKG_ROOT="{{_pkg-root}}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }

@@ -69,15 +69,15 @@ fn _config_json() -> json.JsonNode {
 	val user = _db_user();
 	val pwd = _db_pwd();
 	val text: String = "{\"backend\":\"mariadb\",\"host\":\"" + host + "\",\"port\":" + port + ",\"user\":\"" + user + "\",\"password\":\"" + pwd + "\",\"database\":\"singular\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
-	return json.parse(&text).or_throw();
+	return json.parse(text).or_throw();
 }
 
 fn _build_gw() -> arc.Arc<gw.SingularGateway> {
 	val cfg = _config_json();
-	val identity = gw.identity_from_worker_name("singular-stress", &"contender");
+	val identity = gw.identity_from_worker_name("singular-stress", "contender");
 	var b = gw.new_gateway_builder();
-	gw.with_json(&mut b, &cfg);
-	gw.with_identity(&mut b, move identity);
+	gw.with_json(b, cfg);
+	gw.with_identity(b, move identity);
 	return gw.build_gateway(move b).or_throw();
 }
 
@@ -94,11 +94,11 @@ fn _worker(g: arc.Arc<gw.SingularGateway>, key: Array<Byte>, round_idx: Int) not
 	try {
 		val tok = gw.new_lease_token();
 		val claim_time = time.now_utc();
-		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(&claim_time) + TIMEOUT_S * 1000000);
-		match g.get().start(&key, &"{\"t\":\"stress\"}", &"{}", &claim_time, &lease_expires, &tok) {
+		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(claim_time) + TIMEOUT_S * 1000000);
+		match g.get().start(key, "{\"t\":\"stress\"}", "{}", claim_time, lease_expires, tok) {
 			gw.StartOutcome::Granted(lease) => {
 				val settle_time = time.now_utc();
-				match g.get().complete(&lease, &settle_time, &expected) {
+				match g.get().complete(lease, settle_time, expected) {
 					gw.SettleOutcome::Settled(_) => { rc = 1; },
 					gw.SettleOutcome::TokenStale => { rc = -11; },
 					gw.SettleOutcome::NotFound => { rc = -12; }
@@ -108,7 +108,7 @@ fn _worker(g: arc.Arc<gw.SingularGateway>, key: Array<Byte>, round_idx: Int) not
 				var tries = 0;
 				var done = false;
 				while !done and tries < POLL_TRIES {
-					match g.get().inspect(&key) {
+					match g.get().inspect(key) {
 						gw.InspectOutcome::Terminal(r, _) => {
 							match r {
 								gw.TerminalResult::Done(resp) => { if resp == expected { rc = 0; } else { rc = -21; } },
@@ -130,7 +130,7 @@ fn _worker(g: arc.Arc<gw.SingularGateway>, key: Array<Byte>, round_idx: Int) not
 
 // One contention round: spawn WORKERS racers on `key`; require exactly ONE winner + no violation.
 fn _round(g: arc.Arc<gw.SingularGateway>, round_idx: Int) nothrow -> Int {
-	val key = _key(&("singular-stress-" + fmt.format_int(round_idx)));
+	val key = _key(("singular-stress-" + fmt.format_int(round_idx)));
 	var dq = containers.deque<type VtInt>();
 	var i = 0;
 	while i < WORKERS {

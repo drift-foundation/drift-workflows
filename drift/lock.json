@@ -60,7 +60,7 @@
           "dep_type": "transitive"
         },
         "microflows": {
-          "version": "0.8.1",
+          "version": "0.8.2",
           "sha256": "",
           "author_key": "",
           "source_content_id": "",

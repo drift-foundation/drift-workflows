@@ -50,7 +50,7 @@ fn _config_json() -> json.JsonNode {
 	val user = _env_or("DB_USER", "root");
 	val pwd = _env_or("MDB_ROOT_PWD", "rootpw");
 	val text: String = "{\"backend\":\"mariadb\",\"host\":\"" + db_host + "\",\"port\":" + port + ",\"user\":\"" + user + "\",\"password\":\"" + pwd + "\",\"database\":\"microflows\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
-	return json.parse(&text).or_throw();
+	return json.parse(text).or_throw();
 }
 
 fn _ns() nothrow -> String {
@@ -69,24 +69,24 @@ fn _build_host(worker_name: &String) -> arc.Arc<host.MicroflowsHost> {
 	val cfg = _config_json();
 	val identity = host.identity_from_worker_name(worker_name);
 	var b = host.new_host_builder();
-	host.with_json(&mut b, &cfg);
-	host.with_identity(&mut b, move identity);
+	host.with_json(b, cfg);
+	host.with_identity(b, move identity);
 	return host.build_host(move b).or_throw();
 }
 
 // Per-run derived workflow id (16 bytes).
 fn _wf_id(seed: &String) nothrow -> Array<Byte> {
 	val ns = _ns();
-	val combined = _concat(&ns, seed);
-	val u: uuid.Uuid = uuid.v3_from_string(&combined);
-	return uuid.to_bytes(&u);
+	val combined = _concat(ns, seed);
+	val u: uuid.Uuid = uuid.v3_from_string(combined);
+	return uuid.to_bytes(u);
 }
 
 // ============================================================
 // 1. clock_read shape: now + derived deadline, both present, distinct.
 // ============================================================
 fn scenario_clock_read() -> Int {
-	val h = _build_host(&"pd-lease-w1");
+	val h = _build_host("pd-lease-w1");
 	val reading = h.get().clock_read(30);
 	if reading.now.byte_length() == 0 { return 101; }
 	if reading.deadline.byte_length() == 0 { return 102; }
@@ -98,28 +98,28 @@ fn scenario_clock_read() -> Int {
 // 2. Full fabricated lease timeline.
 // ============================================================
 fn scenario_lease_timeline() -> Int {
-	val h1 = _build_host(&"pd-lease-w1");
-	val h2 = _build_host(&"pd-lease-w2");
+	val h1 = _build_host("pd-lease-w1");
+	val h2 = _build_host("pd-lease-w2");
 	val script = _ns();   // per-run script name == claim isolation namespace
-	val wf = _wf_id(&"-wf1");
-	val other = _wf_id(&"-never-created");
+	val wf = _wf_id("-wf1");
+	val other = _wf_id("-never-created");
 
 	// --- create: Created, then Exists (idempotent by command ID) ---
-	val created = h1.get().create_workflow(&wf, &script, 1,
-		&"2026-01-01 10:00:00.000000", &"2026-01-01 10:00:00.000000",
-		&"{\"pos\":\"start\"}", &"{\"args\":{\"x\":1}}");
+	val created = h1.get().create_workflow(wf, script, 1,
+		"2026-01-01 10:00:00.000000", "2026-01-01 10:00:00.000000",
+		"{\"pos\":\"start\"}", "{\"args\":{\"x\":1}}");
 	val ok_created = match created { host.CreateOutcome::Created => { true }, host.CreateOutcome::Exists => { false } };
 	if !ok_created { return 201; }
 
-	val replay = h1.get().create_workflow(&wf, &script, 1,
-		&"2026-01-01 10:00:00.000000", &"2026-01-01 10:00:00.000000",
-		&"{\"pos\":\"start\"}", &"{\"args\":{\"x\":1}}");
+	val replay = h1.get().create_workflow(wf, script, 1,
+		"2026-01-01 10:00:00.000000", "2026-01-01 10:00:00.000000",
+		"{\"pos\":\"start\"}", "{\"args\":{\"x\":1}}");
 	val ok_exists = match replay { host.CreateOutcome::Exists => { true }, host.CreateOutcome::Created => { false } };
 	if !ok_exists { return 202; }
 
 	// --- w1 claims: token 1, forward state, continuation intact ---
 	var token1 = 0;
-	match h1.get().claim_next(&script, &"2026-01-01 10:00:01.000000", &"2026-01-01 10:00:31.000000") {
+	match h1.get().claim_next(script, "2026-01-01 10:00:01.000000", "2026-01-01 10:00:31.000000") {
 		host.ClaimOutcome::Claimed(wfc) => {
 			if wfc.fencing_token != 1 { return 203; }
 			if wfc.state_code != 1 { return 204; }
@@ -128,8 +128,8 @@ fn scenario_lease_timeline() -> Int {
 			if wfc.script_revision != 1 { return 206; }
 			if wfc.current_operation_attempt != 0 { return 208; }
 			// continuation round-trips as a document
-			val cont = json.parse(&wfc.continuation_json).or_throw();
-			match cont.get(&"pos") {
+			val cont = json.parse(wfc.continuation_json).or_throw();
+			match cont.get("pos") {
 				Optional::Some(n) => {
 					match n.as_string() {
 						Optional::Some(s) => { if s != "start" { return 209; } },
@@ -144,38 +144,38 @@ fn scenario_lease_timeline() -> Int {
 	}
 
 	// --- w2 claim while leased: NoneDue (SKIP LOCKED / predicate) ---
-	match h2.get().claim_next(&script, &"2026-01-01 10:00:02.000000", &"2026-01-01 10:00:32.000000") {
+	match h2.get().claim_next(script, "2026-01-01 10:00:02.000000", "2026-01-01 10:00:32.000000") {
 		host.ClaimOutcome::Claimed(_) => { return 213; },
 		host.ClaimOutcome::NoneDue => {}
 	}
 
 	// --- heartbeat: correct fence extends ---
-	match h1.get().heartbeat(&wf, token1, &"2026-01-01 10:00:05.000000", &"2026-01-01 10:00:35.000000") {
+	match h1.get().heartbeat(wf, token1, "2026-01-01 10:00:05.000000", "2026-01-01 10:00:35.000000") {
 		host.HeartbeatOutcome::Extended => {},
 		default => { return 214; }
 	}
 
 	// --- heartbeat: stale token -> FenceLost ---
-	match h1.get().heartbeat(&wf, 99, &"2026-01-01 10:00:05.000000", &"2026-01-01 10:00:36.000000") {
+	match h1.get().heartbeat(wf, 99, "2026-01-01 10:00:05.000000", "2026-01-01 10:00:36.000000") {
 		host.HeartbeatOutcome::FenceLost => {},
 		default => { return 215; }
 	}
 
 	// --- heartbeat: wrong executor -> FenceLost ---
-	match h2.get().heartbeat(&wf, token1, &"2026-01-01 10:00:06.000000", &"2026-01-01 10:00:36.000000") {
+	match h2.get().heartbeat(wf, token1, "2026-01-01 10:00:06.000000", "2026-01-01 10:00:36.000000") {
 		host.HeartbeatOutcome::FenceLost => {},
 		default => { return 216; }
 	}
 
 	// --- heartbeat: unknown workflow -> NotFound ---
-	match h1.get().heartbeat(&other, 1, &"2026-01-01 10:00:06.000000", &"2026-01-01 10:00:36.000000") {
+	match h1.get().heartbeat(other, 1, "2026-01-01 10:00:06.000000", "2026-01-01 10:00:36.000000") {
 		host.HeartbeatOutcome::NotFound => {},
 		default => { return 217; }
 	}
 
 	// --- expiry recovery: w2 reclaims past 10:00:35; fencing bumps to 2 ---
 	var token2 = 0;
-	match h2.get().claim_next(&script, &"2026-01-01 10:00:40.000000", &"2026-01-01 10:01:10.000000") {
+	match h2.get().claim_next(script, "2026-01-01 10:00:40.000000", "2026-01-01 10:01:10.000000") {
 		host.ClaimOutcome::Claimed(wfc) => {
 			if wfc.fencing_token != 2 { return 218; }
 			token2 = wfc.fencing_token;
@@ -184,25 +184,25 @@ fn scenario_lease_timeline() -> Int {
 	}
 
 	// --- the stale holder (w1, token 1) is fenced out forever ---
-	match h1.get().heartbeat(&wf, token1, &"2026-01-01 10:00:41.000000", &"2026-01-01 10:01:11.000000") {
+	match h1.get().heartbeat(wf, token1, "2026-01-01 10:00:41.000000", "2026-01-01 10:01:11.000000") {
 		host.HeartbeatOutcome::FenceLost => {},
 		default => { return 220; }
 	}
 
 	// --- fenced release with backoff to 10:05:00 ---
-	match h2.get().release(&wf, token2, &"2026-01-01 10:00:42.000000", &"2026-01-01 10:05:00.000000") {
+	match h2.get().release(wf, token2, "2026-01-01 10:00:42.000000", "2026-01-01 10:05:00.000000") {
 		host.ReleaseOutcome::Released => {},
 		default => { return 221; }
 	}
 
 	// --- not due yet: NoneDue ---
-	match h1.get().claim_next(&script, &"2026-01-01 10:00:43.000000", &"2026-01-01 10:01:13.000000") {
+	match h1.get().claim_next(script, "2026-01-01 10:00:43.000000", "2026-01-01 10:01:13.000000") {
 		host.ClaimOutcome::Claimed(_) => { return 222; },
 		host.ClaimOutcome::NoneDue => {}
 	}
 
 	// --- due after backoff: claimed, fencing 3 ---
-	match h1.get().claim_next(&script, &"2026-01-01 10:05:01.000000", &"2026-01-01 10:05:31.000000") {
+	match h1.get().claim_next(script, "2026-01-01 10:05:01.000000", "2026-01-01 10:05:31.000000") {
 		host.ClaimOutcome::Claimed(wfc) => {
 			if wfc.fencing_token != 3 { return 223; }
 		},
@@ -210,13 +210,13 @@ fn scenario_lease_timeline() -> Int {
 	}
 
 	// --- release with the superseded token (2): FenceLost ---
-	match h2.get().release(&wf, token2, &"2026-01-01 10:05:02.000000", &"2026-01-01 10:05:32.000000") {
+	match h2.get().release(wf, token2, "2026-01-01 10:05:02.000000", "2026-01-01 10:05:32.000000") {
 		host.ReleaseOutcome::FenceLost => {},
 		default => { return 225; }
 	}
 
 	// --- release unknown workflow: NotFound ---
-	match h1.get().release(&other, 1, &"2026-01-01 10:05:02.000000", &"2026-01-01 10:05:32.000000") {
+	match h1.get().release(other, 1, "2026-01-01 10:05:02.000000", "2026-01-01 10:05:32.000000") {
 		host.ReleaseOutcome::NotFound => {},
 		default => { return 226; }
 	}

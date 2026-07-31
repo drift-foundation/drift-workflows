@@ -51,7 +51,7 @@ use trait iter.SinglePassIterator;
 // Artifact version echoed by `--version` (and the cli help header) for BOTH binaries built from
 // this module (uflowsd service + mfrunner dev CLI). The ROOT drift/manifest.json is the version
 // AUTHORITY (uflowsd entry) — bump this constant together with every manifest version bump.
-const RUNNER_VERSION: String = "0.7.2";
+const RUNNER_VERSION: String = "0.7.3";
 
 const SCRIPT_NAME: String = "protocol_spike";
 // Legacy single-op pin (tb_mf_workflow.script_revision); the plan model keys on a
@@ -106,8 +106,8 @@ const ADMISSION_PENDING_RESTART_EXIT: Int = 11;  // an in-flight resume could no
 fn _admission_from_env() nothrow -> AdmissionState {
 	match env.get("MICROFLOWS_ADMISSION") {
 		Optional::Some(v) => {
-			if _str_eq(&v, &"draining") { return AdmissionState::Draining(); }
-			if _str_eq(&v, &"stopped") { return AdmissionState::Stopped(); }
+			if _str_eq(v, "draining") { return AdmissionState::Draining(); }
+			if _str_eq(v, "stopped") { return AdmissionState::Stopped(); }
 			return AdmissionState::Accepting();
 		},
 		Optional::None => { return AdmissionState::Accepting(); }
@@ -221,8 +221,8 @@ fn _oc_exit(o: &Outcome) nothrow -> Int {
 // PASS-A adapter: render the outcome and return its exit code, preserving the prior inline behavior
 // EXACTLY. (Pass B moves the render to `main` and lets the drive functions return `Outcome` directly.)
 fn _emit(o: Outcome) nothrow -> Int {
-	console.println(_oc_render(&o));
-	return _oc_exit(&o);
+	console.println(_oc_render(o));
+	return _oc_exit(o);
 }
 
 // While draining/stopped, a resume that cannot finish RELEASES the lease at `now` (no future retry
@@ -230,7 +230,7 @@ fn _emit(o: Outcome) nothrow -> Int {
 // retry work. The workflow stays in its durable state, resumable once admission returns to accepting.
 fn _drain_release(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, a: &AdmissionState) -> Outcome {
 	val clock = host.clock_read(LEASE_SECONDS);
-	match host.release(workflow_id, fencing_token, &clock.now, &clock.now) {
+	match host.release(workflow_id, fencing_token, clock.now, clock.now) {
 		mf.ReleaseOutcome::Released => {
 			return Outcome::PendingRestart(reason = _admission_label(a));
 		},
@@ -384,21 +384,21 @@ pub fn main(argv: Array<String>) nothrow -> Int {
 	// Parser/IR test-driver mode: parse a .mf source and print a canonical JSON outcome, then exit.
 	// DB-free and registry-free — the golden-fixture driver for the parser unit suite.
 	if parse_check_path.byte_length() != 0 {
-		return try _parse_check(&parse_check_path) catch { console.eprintln("runner: parse-check failed"); 1 };
+		return try _parse_check(parse_check_path) catch { console.eprintln("runner: parse-check failed"); 1 };
 	}
 	if emit_graph_path.byte_length() != 0 {
-		return try _emit_graph(&emit_graph_path) catch { console.eprintln("runner: emit-graph failed"); 1 };
+		return try _emit_graph(emit_graph_path) catch { console.eprintln("runner: emit-graph failed"); 1 };
 	}
 	// Frontend mode: lower a .mf source file into a runnable config (base routing from --config),
 	// print the merged config JSON, then exit. Pure front end — no DB, no claim, no dispatch.
 	if lower_source_path.byte_length() != 0 {
 		if config_path.byte_length() == 0 { console.eprintln("runner: --config (base routing) required for --lower-source"); return 2; }
-		return try _lower_source(&lower_source_path, &config_path) catch { console.eprintln("runner: lower-source failed"); 1 };
+		return try _lower_source(lower_source_path, config_path) catch { console.eprintln("runner: lower-source failed"); 1 };
 	}
 	// Fixture-tooling mode: print the active revision's content_hash for --config, then exit.
 	if emit_hash {
 		if config_path.byte_length() == 0 { console.eprintln("runner: --config required for --emit-content-hash"); return 2; }
-		return try _emit_content_hash(&config_path) catch { console.eprintln("runner: emit-content-hash failed"); 1 };
+		return try _emit_content_hash(config_path) catch { console.eprintln("runner: emit-content-hash failed"); 1 };
 	}
 	val manifest_mode = manifest_path.byte_length() != 0;
 	if workflow_hex.byte_length() != 32 or (!manifest_mode and config_path.byte_length() == 0) {
@@ -416,9 +416,9 @@ pub fn main(argv: Array<String>) nothrow -> Int {
 	var outcome: Outcome = Outcome::Error(reason = "runner-fatal");
 	try {
 		if manifest_mode {
-			outcome = _run_manifest(&manifest_path, &workflow_hex, &script_name, has_script, &operation_name, &input_json, &arguments_json, has_arguments, &admission);
+			outcome = _run_manifest(manifest_path, workflow_hex, script_name, has_script, operation_name, input_json, arguments_json, has_arguments, admission);
 		} else {
-			outcome = _run(&config_path, &workflow_hex, &operation_name, &input_json, &arguments_json, has_arguments, &admission);
+			outcome = _run(config_path, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
 		}
 	} catch unexpected {
 		console.eprintln("runner: fatal");
@@ -432,13 +432,13 @@ pub fn main(argv: Array<String>) nothrow -> Int {
 // reimplementation. Validates the registry first so an emit over a bad config fails loudly.
 fn _emit_content_hash(config_path: &String) throws -> Int {
 	val cfg = _load_config_json(config_path);
-	_validate_registry(&cfg);
-	val reg = _registry_build(&cfg, false);
+	_validate_registry(cfg);
+	val reg = _registry_build(cfg, false);
 	if reg.revisions.len == 0 {
 		console.eprintln("runner: --config has no 'plan' (nothing to hash)");
 		return 2;
 	}
-	console.println(_bytes_to_hex(&reg.revisions[0].content_hash));
+	console.println(_bytes_to_hex(reg.revisions[0].content_hash));
 	return 0;
 }
 
@@ -453,29 +453,29 @@ fn _emit_content_hash(config_path: &String) throws -> Int {
 // `type_check` reflects type_check_graph over the source-declared contracts + argument_type.
 fn _parse_check(source_path: &String) -> Int {
 	val source = _read_text(source_path);
-	match parser.parse_source(&source) {
+	match parser.parse_source(source) {
 		core.Result::Err(e) => {
 			var o = json.new_object();
 			o.set("status", json.JsonNode::String(value = "parse-error"));
-			o.set("code", json.JsonNode::String(value = _dup(&e.code)));
+			o.set("code", json.JsonNode::String(value = _dup(e.code)));
 			o.set("byte_offset", json.JsonNode::Number(raw = fmt.format_int(e.byte_offset)));
 			o.set("line", json.JsonNode::Number(raw = fmt.format_int(e.line)));
 			o.set("column", json.JsonNode::Number(raw = fmt.format_int(e.column)));
-			o.set("expected", json.JsonNode::String(value = _dup(&e.expected)));
-			o.set("found", json.JsonNode::String(value = _dup(&e.found)));
+			o.set("expected", json.JsonNode::String(value = _dup(e.expected)));
+			o.set("found", json.JsonNode::String(value = _dup(e.found)));
 			val node = o.to_node();
-			console.println(json.encode_compact(&node));
+			console.println(json.encode_compact(node));
 			return 0;
 		},
 		core.Result::Ok(pw) => {
 			var o = json.new_object();
 			o.set("status", json.JsonNode::String(value = "ok"));
 			o.set("is_graph", json.JsonNode::Bool(value = pw.is_graph));
-			o.set("canonical", json.JsonNode::String(value = _pc_canon(&pw.body, pw.is_graph)));
-			o.set("validate", json.JsonNode::String(value = _pc_validate(&pw.body, pw.is_graph)));
-			o.set("type_check", json.JsonNode::String(value = _pc_typecheck(&pw)));
+			o.set("canonical", json.JsonNode::String(value = _pc_canon(pw.body, pw.is_graph)));
+			o.set("validate", json.JsonNode::String(value = _pc_validate(pw.body, pw.is_graph)));
+			o.set("type_check", json.JsonNode::String(value = _pc_typecheck(pw)));
 			val node = o.to_node();
-			console.println(json.encode_compact(&node));
+			console.println(json.encode_compact(node));
 			return 0;
 		}
 	}
@@ -485,16 +485,16 @@ fn _parse_check(source_path: &String) -> Int {
 // flat_to_graph (the degenerate-graph identity the runner pins). Mirrors the old test helpers.
 fn _emit_graph(source_path: &String) -> Int {
 	val source = _read_text(source_path);
-	match parser.parse_source(&source) {
+	match parser.parse_source(source) {
 		core.Result::Err(e) => {
-			console.eprintln("emit-graph: parse error " + _dup(&e.code) + " at line " + fmt.format_int(e.line));
+			console.eprintln("emit-graph: parse error " + _dup(e.code) + " at line " + fmt.format_int(e.line));
 			return 1;
 		},
 		core.Result::Ok(pw) => {
 			if pw.is_graph {
-				match ir.parse_graph(&pw.body) {
-					core.Result::Ok(g) => { console.println(ir.emit_mermaid(&g)); return 0; },
-					core.Result::Err(e) => { console.eprintln("emit-graph: bad graph: " + _dup(&e.message)); return 1; }
+				match ir.parse_graph(pw.body) {
+					core.Result::Ok(g) => { console.println(ir.emit_mermaid(g)); return 0; },
+					core.Result::Err(e) => { console.eprintln("emit-graph: bad graph: " + _dup(e.message)); return 1; }
 				}
 			}
 			var steps: Array<ir.FlatStep> = [];
@@ -503,18 +503,18 @@ fn _emit_graph(source_path: &String) -> Int {
 					var i = 0;
 					while i < items.len {
 						var op: String = "";
-						match items[i].get(&"operation") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { op = move s; }, Optional::None => {} } }, Optional::None => {} }
+						match items[i].get("operation") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { op = move s; }, Optional::None => {} } }, Optional::None => {} }
 						var inp: String = "{}";
-						match items[i].get(&"input") { Optional::Some(n) => { inp = json.encode_compact(n); }, Optional::None => {} }
+						match items[i].get("input") { Optional::Some(n) => { inp = json.encode_compact(n); }, Optional::None => {} }
 						steps.push(ir.FlatStep(operation = move op, input_json = move inp));
 						i = i + 1;
 					}
 				},
 				Optional::None => {}
 			}
-			match ir.flat_to_graph(&steps) {
-				core.Result::Ok(g) => { console.println(ir.emit_mermaid(&g)); return 0; },
-				core.Result::Err(e) => { console.eprintln("emit-graph: " + _dup(&e.message)); return 1; }
+			match ir.flat_to_graph(steps) {
+				core.Result::Ok(g) => { console.println(ir.emit_mermaid(g)); return 0; },
+				core.Result::Err(e) => { console.eprintln("emit-graph: " + _dup(e.message)); return 1; }
 			}
 		}
 	}
@@ -523,7 +523,7 @@ fn _emit_graph(source_path: &String) -> Int {
 fn _pc_canon(body: &json.JsonNode, is_graph: Bool) -> String {
 	if is_graph {
 		match ir.parse_graph(body) {
-			core.Result::Ok(g) => { return ir.graph_canonical(&g); },
+			core.Result::Ok(g) => { return ir.graph_canonical(g); },
 			core.Result::Err(_) => { return "<bad-graph>"; }
 		}
 	}
@@ -533,17 +533,17 @@ fn _pc_canon(body: &json.JsonNode, is_graph: Bool) -> String {
 			var i = 0;
 			while i < items.len {
 				var op: String = "";
-				match items[i].get(&"operation") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { op = move s; }, Optional::None => {} } }, Optional::None => {} }
+				match items[i].get("operation") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { op = move s; }, Optional::None => {} } }, Optional::None => {} }
 				var inp: String = "{}";
-				match items[i].get(&"input") { Optional::Some(n) => { inp = json.encode_compact(n); }, Optional::None => {} }
+				match items[i].get("input") { Optional::Some(n) => { inp = json.encode_compact(n); }, Optional::None => {} }
 				steps.push(ir.FlatStep(operation = move op, input_json = move inp));
 				i = i + 1;
 			}
 		},
 		Optional::None => {}
 	}
-	match ir.flat_to_graph(&steps) {
-		core.Result::Ok(g) => { return ir.graph_canonical(&g); },
+	match ir.flat_to_graph(steps) {
+		core.Result::Ok(g) => { return ir.graph_canonical(g); },
 		core.Result::Err(_) => { return "<err>"; }
 	}
 }
@@ -553,7 +553,7 @@ fn _pc_validate(body: &json.JsonNode, is_graph: Bool) -> String {
 	if !is_graph { return "ok"; }
 	match ir.parse_graph(body) {
 		core.Result::Ok(g) => {
-			match ir.validate_graph(&g) { Optional::Some(_) => { return "reject"; }, Optional::None => { return "ok"; } }
+			match ir.validate_graph(g) { Optional::Some(_) => { return "reject"; }, Optional::None => { return "ok"; } }
 		},
 		core.Result::Err(_) => { return "bad-graph"; }
 	}
@@ -563,9 +563,9 @@ fn _pc_validate(body: &json.JsonNode, is_graph: Bool) -> String {
 // argument_type + per-op contracts from the SOURCE's own declarations (what `lower` would overlay).
 fn _pc_typecheck(pw: &parser.ParsedWorkflow) -> String {
 	if !pw.is_graph { return "n/a"; }
-	match ir.parse_graph(&pw.body) {
+	match ir.parse_graph(pw.body) {
 		core.Result::Ok(g) => {
-			match ir.validate_graph(&g) { Optional::Some(_) => { return "n/a"; }, Optional::None => {} }
+			match ir.validate_graph(g) { Optional::Some(_) => { return "n/a"; }, Optional::None => {} }
 			var at = ir.empty_object_type();
 			match &pw.arg_type {
 				Optional::Some(n) => { match ir.parse_object_type(n) { core.Result::Ok(t) => { at = move t; }, core.Result::Err(_) => { return "n/a"; } } },
@@ -578,7 +578,7 @@ fn _pc_typecheck(pw: &parser.ParsedWorkflow) -> String {
 				match &pw.contracts[i].input_type { Optional::Some(n) => { inty = Optional<ir.IrType>::Some(ir.parse_type(n)); }, Optional::None => {} }
 				var outy: Optional<ir.IrType> = Optional<ir.IrType>::None();
 				match &pw.contracts[i].result_type { Optional::Some(n) => { outy = Optional<ir.IrType>::Some(ir.parse_type(n)); }, Optional::None => {} }
-				ocs.push(ir.OpContract(name = _dup(&pw.contracts[i].name), input_type = move inty, result_type = move outy));
+				ocs.push(ir.OpContract(name = _dup(pw.contracts[i].name), input_type = move inty, result_type = move outy));
 				i = i + 1;
 			}
 			// `returns.type` is manifest/config-sourced only — there is no `.mf`-level `returns`
@@ -588,7 +588,7 @@ fn _pc_typecheck(pw: &parser.ParsedWorkflow) -> String {
 			// against unit; the manifest/config path (`lower_source`/`--lower-source`) is where a
 			// real declared `returns.type` gets validated — see the `coordinator-singular` "C5l"
 			// integration tests.
-			match ir.type_check_graph(&g, &at, &ocs, &Optional<ir.IrType>::None(), &Optional<Array<ir.CallTarget>>::None()) { Optional::Some(_) => { return "reject"; }, Optional::None => { return "ok"; } }
+			match ir.type_check_graph(g, at, ocs, Optional<ir.IrType>::None(), Optional<Array<ir.CallTarget>>::None()) { Optional::Some(_) => { return "reject"; }, Optional::None => { return "ok"; } }
 		},
 		core.Result::Err(_) => { return "n/a"; }
 	}
@@ -603,7 +603,7 @@ fn _pc_typecheck(pw: &parser.ParsedWorkflow) -> String {
 fn _lower_source(source_path: &String, config_path: &String) throws -> Int {
 	val source = _read_text(source_path);
 	val base = _load_config_json(config_path);
-	match parser.lower(&source, &base) {
+	match parser.lower(source, base) {
 		core.Result::Ok(merged) => {
 			// VALIDATE the lowered config through the SAME build path a real run/--emit-content-hash
 			// uses (registry + graph structure + types + contracts + compensation), so a semantically
@@ -611,20 +611,20 @@ fn _lower_source(source_path: &String, config_path: &String) throws -> Int {
 			// args field, a type-contract error) fails HERE — still DB-free, no claim, no dispatch —
 			// rather than emitting a config that only blows up later. Only then is the printed config
 			// genuinely "runnable / hashable unchanged".
-			val ok = try _validate_lowered(&merged) catch RunnerError(e) {
+			val ok = try _validate_lowered(merged) catch RunnerError(e) {
 				console.eprintln("runner: lower-source: invalid lowered config: " + e.message);
 				false
 			};
 			if !ok { return 3; }
-			console.println(json.encode_compact(&merged));
+			console.println(json.encode_compact(merged));
 			return 0;
 		},
 		core.Result::Err(e) => {
 			// The parser returns a STRUCTURED diagnostic event. Emit it through std.log (stable code +
 			// position fields — the machine-readable log, mirroring the bookkeeper logging pattern), and
 			// ALSO print a concise human render (code + line/column + caret excerpt) for the CLI user.
-			_log_parse_diagnostic(&e);
-			console.eprintln(parser.render_diagnostic(&source, &e));
+			_log_parse_diagnostic(e);
+			console.eprintln(parser.render_diagnostic(source, e));
 			return 3;
 		}
 	}
@@ -641,13 +641,13 @@ fn _log_parse_diagnostic(e: &parser.ParseError) nothrow -> Void {
 	cfgb.formatter(log.FormatterKind::JsonIso8601());
 	val logger = log.create_logger("mfrunner", cfgb.build());
 	logger.error("lower-source-parse-error", {
-		"code": _dup(&e.code),
+		"code": _dup(e.code),
 		"byte_offset": fmt.format_int(e.byte_offset),
 		"line": fmt.format_int(e.line),
 		"column": fmt.format_int(e.column),
-		"expected": _dup(&e.expected),
-		"found": _dup(&e.found),
-		"message": _dup(&e.message)
+		"expected": _dup(e.expected),
+		"found": _dup(e.found),
+		"message": _dup(e.message)
 	});
 	val _ = logger.flush(conc.Duration(millis = 1000));
 }
@@ -678,16 +678,16 @@ fn _run_cfg(cfg: &json.JsonNode, workflow_hex: &String,
         operation_name: &String, input_json: &String,
         arguments_json: &String, has_arguments: Bool, admission: &AdmissionState) throws -> Outcome {
 	val db_sub = _require_db(cfg);
-	val worker_id = _config_str(cfg, &"worker_id", "runner-1");
-	val identity = mf.identity_from_worker_name(&worker_id);
+	val worker_id = _config_str(cfg, "worker_id", "runner-1");
+	val identity = mf.identity_from_worker_name(worker_id);
 	var b = mf.new_host_builder();
-	mf.with_json(&mut b, &db_sub);
-	mf.with_identity(&mut b, move identity);
+	mf.with_json(b, db_sub);
+	mf.with_identity(b, move identity);
 	val host = _build_host(move b);
 	// Legacy single-config mode has no sibling manifest — a reachable `call` node is already a
 	// build-time reject here (allow_calls=false), so this is never consulted; empty is the correct sentinel.
 	val no_call_scripts: Array<ManifestScript> = [];
-	return _run_core(&host, cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, &no_call_scripts, admission);
+	return _run_core(host, cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, no_call_scripts, admission);
 }
 
 // Best-effort wake for the PARENT of a just-terminated workflow (1b.1 terminal push): fires AFTER
@@ -713,7 +713,7 @@ fn _notify_terminal_if_child(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>
 	if status == 0 { return; }
 	match _advisory_now(host) {
 		Optional::Some(t) => {
-			_log_best_effort("child_terminal_notify", &_bytes_to_hex(workflow_id), host.child_terminal_notify_best_effort(workflow_id, status, &t));
+			_log_best_effort("child_terminal_notify", _bytes_to_hex(workflow_id), host.child_terminal_notify_best_effort(workflow_id, status, t));
 		},
 		Optional::None => {}
 	}
@@ -749,7 +749,7 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// Derive the operation id from the CANONICAL lowercase hex of the decoded
 	// workflow bytes (not the supplied hex spelling), so upper/lower spellings
 	// of the same workflow yield the same operation id.
-	val workflow_canon_hex = _bytes_to_hex(&workflow_id);
+	val workflow_canon_hex = _bytes_to_hex(workflow_id);
 
 	// STORAGE-FIRST mode selection (static-review item 1): the workflow's MODE
 	// (planned vs legacy) and its pinned plan come from the DURABLE pin, NOT from
@@ -759,10 +759,10 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// the legacy single-op path. Only a workflow with NO durable pin consults config to
 	// decide fresh-planned (config has a plan) vs legacy (no plan).
 	var pin = PinView(present = false, name = "", version = "", hash_hex = "", plan_length = 0);
-	match host.get().plan_get(&workflow_id) {
+	match host.get().plan_get(workflow_id) {
 		mf.PlanGetOutcome::Found(p) => {
-			pin = PinView(present = true, name = _dup(&p.script_name), version = _dup(&p.plan_version),
-			              hash_hex = _dup(&p.content_hash), plan_length = p.plan_length);
+			pin = PinView(present = true, name = _dup(p.script_name), version = _dup(p.plan_version),
+			              hash_hex = _dup(p.content_hash), plan_length = p.plan_length);
 		},
 		mf.PlanGetOutcome::NotFound => {}
 	}
@@ -783,16 +783,16 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	if pin.present {
 		// Existing planned workflow: resume, or REASSERT if this is a submission (so a reused
 		// id with changed arguments surfaces workflow_conflict instead of silently resuming).
-		val oc = _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, is_submission, arguments_json, call_scripts, admission);
-		_notify_terminal_if_child(host.get(), &workflow_id, &oc);
+		val oc = _run_planned(host.get(), cfg, workflow_id, workflow_canon_hex, pin, is_submission, arguments_json, call_scripts, admission);
+		_notify_terminal_if_child(host.get(), workflow_id, oc);
 		return oc;
 	}
 	if is_submission {
 		// Fresh planned SUBMISSION: requires a planned config — a flat "plan" OR a manual-IR
 		// "graph" (the legacy single-op path takes --operation, not --arguments).
 		if _is_planned_config(cfg) {
-			val oc = _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, true, arguments_json, call_scripts, admission);
-			_notify_terminal_if_child(host.get(), &workflow_id, &oc);
+			val oc = _run_planned(host.get(), cfg, workflow_id, workflow_canon_hex, pin, true, arguments_json, call_scripts, admission);
+			_notify_terminal_if_child(host.get(), workflow_id, oc);
 			return oc;
 		}
 		return Outcome::Aborted(reason = "arguments_require_planned_config", code = 2);
@@ -801,8 +801,8 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// "graph") => a resume of a planned workflow (which, absent a pin, claim resolves to
 	// not_found); otherwise the legacy single-op path below.
 	if _is_planned_config(cfg) {
-		val oc = _run_planned(host.get(), cfg, &workflow_id, &workflow_canon_hex, &pin, false, arguments_json, call_scripts, admission);
-		_notify_terminal_if_child(host.get(), &workflow_id, &oc);
+		val oc = _run_planned(host.get(), cfg, workflow_id, workflow_canon_hex, pin, false, arguments_json, call_scripts, admission);
+		_notify_terminal_if_child(host.get(), workflow_id, oc);
 		return oc;
 	}
 
@@ -815,9 +815,9 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	var eff_operation_name: String = _dup(operation_name);
 	var eff_input_json: String = _dup(input_json);
 	var eff_schema_version: Int = 0;
-	var operation_id: Array<Byte> = _operation_id(&workflow_canon_hex, OPERATION_SEQ);
-	var operation_id_hex: String = _bytes_to_hex(&operation_id);
-	var input_hash: String = _input_hash(&eff_input_json);
+	var operation_id: Array<Byte> = _operation_id(workflow_canon_hex, OPERATION_SEQ);
+	var operation_id_hex: String = _bytes_to_hex(operation_id);
+	var input_hash: String = _input_hash(eff_input_json);
 
 	// Is this a fresh SUBMISSION (--operation given) or a resume by id alone?
 	val fresh: Bool = operation_name.byte_length() > 0;
@@ -827,15 +827,15 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// (see the post-claim reload). It lets us skip create for a resume and
 	// pre-validate a fresh submission cheaply. ---
 	var recovered: Bool = false;
-	match host.get().operation_request_get(&workflow_id, OPERATION_SEQ) {
+	match host.get().operation_request_get(workflow_id, OPERATION_SEQ) {
 		mf.OperationRequestGetOutcome::Found(rec) => {
 			recovered = true;
-			eff_operation_name = _dup(&rec.operation_name);
-			eff_input_json = _dup(&rec.input_json);
+			eff_operation_name = _dup(rec.operation_name);
+			eff_input_json = _dup(rec.input_json);
 			eff_schema_version = rec.schema_version;
-			operation_id = _copy_bytes(&rec.operation_id);
-			operation_id_hex = _bytes_to_hex(&operation_id);
-			input_hash = _dup(&rec.input_hash);
+			operation_id = _copy_bytes(rec.operation_id);
+			operation_id_hex = _bytes_to_hex(operation_id);
+			input_hash = _dup(rec.input_hash);
 		},
 		mf.OperationRequestGetOutcome::NotFound => {}
 	}
@@ -848,9 +848,9 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	if fresh and !recovered {
 		var ok = false;
 		try {
-			val r = _resolve_operation(cfg, &eff_operation_name, Optional<Int>::None());
+			val r = _resolve_operation(cfg, eff_operation_name, Optional<Int>::None());
 			eff_schema_version = r.schema_version;
-			base_url = _dup(&r.base_url);
+			base_url = _dup(r.base_url);
 			ok = true;
 		} catch RunnerError(e) {
 			console.eprintln(e.message);
@@ -865,8 +865,8 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// so a resume-by-id of a non-existent workflow never creates a row. ---
 	if fresh {
 		val t_create = _now(host.get());
-		match host.get().create_workflow(&workflow_id, &SCRIPT_NAME, SCRIPT_REVISION,
-		                                 &t_create, &t_create, &"{\"pos\":\"start\"}", &"{}") {
+		match host.get().create_workflow(workflow_id, SCRIPT_NAME, SCRIPT_REVISION,
+		                                 t_create, t_create, "{\"pos\":\"start\"}", "{}") {
 			mf.CreateOutcome::Created => {},
 			mf.CreateOutcome::Exists => {}
 		}
@@ -876,7 +876,7 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	val clock = _clock(host.get());
 	var fencing_token: Int = 0;
 	var claimed_state: Int = 0;
-	match host.get().claim_workflow(&workflow_id, &clock.now, &clock.deadline) {
+	match host.get().claim_workflow(workflow_id, clock.now, clock.deadline) {
 		mf.ClaimByIdOutcome::Claimed(wf) => { fencing_token = wf.fencing_token; claimed_state = wf.state_code; },
 		mf.ClaimByIdOutcome::NotFound => {
 			if fresh {
@@ -889,7 +889,7 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 		},
 		mf.ClaimByIdOutcome::NotClaimable => {
 			// Not claimable: INSPECT to distinguish terminal / active / deferred.
-			return _inspect_report(host.get(), &workflow_id, &operation_id_hex, OPERATION_SEQ);
+			return _inspect_report(host.get(), workflow_id, operation_id_hex, OPERATION_SEQ);
 		}
 	}
 
@@ -897,7 +897,7 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// forward dispatch. claim_by_id claims state IN (1,2); the reverse loop reads the
 	// authoritative checkpoint stack (reverse_head), never the continuation.
 	if claimed_state == STATE_REVERSING {
-		return _run_reversal(host.get(), cfg, &workflow_id, &workflow_canon_hex, fencing_token, admission);
+		return _run_reversal(host.get(), cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 	}
 
 	// --- 2a. AUTHORITATIVE post-claim reload (closes the probe/claim race). Now
@@ -906,15 +906,15 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// our claim. Adopting it flips a would-be "fresh" run to a resume so CLI-derived
 	// fields cannot drive a spurious operation_conflict, AND prevents a resume-by-id
 	// from spuriously aborting operation_required. ---
-	match host.get().operation_request_get(&workflow_id, OPERATION_SEQ) {
+	match host.get().operation_request_get(workflow_id, OPERATION_SEQ) {
 		mf.OperationRequestGetOutcome::Found(rec) => {
 			recovered = true;
-			eff_operation_name = _dup(&rec.operation_name);
-			eff_input_json = _dup(&rec.input_json);
+			eff_operation_name = _dup(rec.operation_name);
+			eff_input_json = _dup(rec.input_json);
 			eff_schema_version = rec.schema_version;
-			operation_id = _copy_bytes(&rec.operation_id);
-			operation_id_hex = _bytes_to_hex(&operation_id);
-			input_hash = _dup(&rec.input_hash);
+			operation_id = _copy_bytes(rec.operation_id);
+			operation_id_hex = _bytes_to_hex(operation_id);
+			input_hash = _dup(rec.input_hash);
 		},
 		mf.OperationRequestGetOutcome::NotFound => {}
 	}
@@ -924,7 +924,7 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// than hold the lease — a re-submit with --operation, or a concurrently
 	// persisting request, auto-recovers it on the next poll. ---
 	if !recovered and !fresh {
-		return _defer_dispatch(host.get(), &workflow_id, fencing_token, "operation_request_absent", admission);
+		return _defer_dispatch(host.get(), workflow_id, fencing_token, "operation_request_absent", admission);
 	}
 
 	// --- 2c. RESUME resolution, AFTER claim (only when claimable). The durable
@@ -939,22 +939,22 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	if recovered {
 		var ok = false;
 		try {
-			val r = _resolve_operation(cfg, &eff_operation_name, Optional<Int>::Some(eff_schema_version));
-			base_url = _dup(&r.base_url);
+			val r = _resolve_operation(cfg, eff_operation_name, Optional<Int>::Some(eff_schema_version));
+			base_url = _dup(r.base_url);
 			ok = true;
 		} catch RunnerError(e) {
 			console.eprintln(e.message);
 		}
 		if !ok {
-			return _defer_dispatch(host.get(), &workflow_id, fencing_token, "pinned_contract_unavailable", admission);
+			return _defer_dispatch(host.get(), workflow_id, fencing_token, "pinned_contract_unavailable", admission);
 		}
 	}
 
 	// --- 3. persist operation request + suspended continuation BEFORE dispatch ---
 	val t_req = _now(host.get());
-	match host.get().operation_request(&workflow_id, fencing_token, OPERATION_SEQ, &operation_id,
-	                                   &eff_operation_name, eff_schema_version, &eff_input_json, &input_hash,
-	                                   &"{\"pos\":\"op:1:dispatched\",\"operation_seq\":1}", &t_req, &"{}") {
+	match host.get().operation_request(workflow_id, fencing_token, OPERATION_SEQ, operation_id,
+	                                   eff_operation_name, eff_schema_version, eff_input_json, input_hash,
+	                                   "{\"pos\":\"op:1:dispatched\",\"operation_seq\":1}", t_req, "{}") {
 		mf.OperationRequestOutcome::Requested(_) => {},
 		mf.OperationRequestOutcome::Exists(_) => {},
 		mf.OperationRequestOutcome::FenceLost => {
@@ -967,7 +967,7 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 		mf.OperationRequestOutcome::EventTimeSkew(defer_until) => {
 			// Non-increasing timestamp = clock skew: release/defer until the last
 			// accepted event time + margin, don't retry now.
-			return _defer(host.get(), &workflow_id, fencing_token, &defer_until, "request_event_time_skew", admission);
+			return _defer(host.get(), workflow_id, fencing_token, defer_until, "request_event_time_skew", admission);
 		},
 		default => {
 			throw RunnerError(message = "operation_request unexpected outcome");
@@ -979,7 +979,7 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	// the lease) until the next poll, never throw while holding it; 400/409 ->
 	// definite rejection (abort, no poll/resubmit); transport/5xx -> reconcile. ---
 	var result_json: String = "";
-	var eff_dr = _classify_dispatch(&base_url, &eff_operation_name, &operation_id_hex, &eff_input_json);
+	var eff_dr = _classify_dispatch(base_url, eff_operation_name, operation_id_hex, eff_input_json);
 	// A RECOVERED + CONFIRMED-pending op escalates via the durable re-dispatch timer (case [12]): the
 	// participant may have committed and crashed before complete, so escalate toward a byte-identical
 	// re-PUT (which the participant reclaims). The escalation may REPLACE eff_dr with the re-PUT's
@@ -990,7 +990,7 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 		var observed = false;
 		match &eff_dr { DispatchResult::PendingObserved => { observed = true; }, default => {} }
 		if observed {
-			match _pending_redispatch_or_defer(host.get(), cfg, &workflow_id, fencing_token, OPERATION_SEQ, &operation_id, &base_url, &eff_operation_name, &operation_id_hex, &eff_input_json, admission) {
+			match _pending_redispatch_or_defer(host.get(), cfg, workflow_id, fencing_token, OPERATION_SEQ, operation_id, base_url, eff_operation_name, operation_id_hex, eff_input_json, admission) {
 				RedispatchStep::Done(r) => { eff_dr = DispatchResult::Done(move r); },
 				RedispatchStep::Reject(reason) => { eff_dr = DispatchResult::Rejected(move reason); },
 				RedispatchStep::Route404 => { eff_dr = DispatchResult::Route404(); },
@@ -1002,22 +1002,22 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 		DispatchResult::Done(r) => { result_json = move r; },
 		DispatchResult::PendingObserved => {
 			// A FRESH confirmed pending: release the lease and become due again to re-poll.
-			return _defer_pending(host.get(), &workflow_id, fencing_token, &"", admission);
+			return _defer_pending(host.get(), workflow_id, fencing_token, "", admission);
 		},
 		DispatchResult::PendingUncertain => {
 			// Unreachable/uncertain: defer + re-poll, never escalate the timer.
-			return _defer_pending(host.get(), &workflow_id, fencing_token, &"", admission);
+			return _defer_pending(host.get(), workflow_id, fencing_token, "", admission);
 		},
 		DispatchResult::Rejected(reason) => {
 			// Definite rejection is NON-RETRYABLE: persist the failure (forward ->
 			// blocked_resolution, lease cleared) so the workflow stops advancing and
 			// cannot repeat after lease expiry. Never exit still forward/requested.
-			return _fail_operation(host.get(), &workflow_id, fencing_token, &operation_id, move reason, admission);
+			return _fail_operation(host.get(), workflow_id, fencing_token, operation_id, move reason, admission);
 		},
 		DispatchResult::Route404 => {
 			// Persistent route-404 -> advance the durable reconcile budget (within budget -> defer,
 			// exhausted -> blocked forward).
-			return _reconcile_budget_forward(host.get(), cfg, &workflow_id, fencing_token, OPERATION_SEQ, &operation_id, admission);
+			return _reconcile_budget_forward(host.get(), cfg, workflow_id, fencing_token, OPERATION_SEQ, operation_id, admission);
 		}
 	}
 
@@ -1026,9 +1026,9 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 	var final_result: String = result_json.clone();
 	// No graph/IR at all on this legacy single-op path (no NReturn is possible without a
 	// graph), and a single-op plan always settles final -> always unit (1b.0a step 3).
-	val workflow_return: Optional<String> = Optional<String>::Some(_dup(&"{}"));
-	match host.get().operation_settle(&workflow_id, fencing_token, OPERATION_SEQ, &operation_id, CHECKPOINT_SEQ,
-	                                  &result_json, &result_json, &workflow_return, &"{\"pos\":\"complete\"}", &t_settle, &"{}", true) {
+	val workflow_return: Optional<String> = Optional<String>::Some(_dup("{}"));
+	match host.get().operation_settle(workflow_id, fencing_token, OPERATION_SEQ, operation_id, CHECKPOINT_SEQ,
+	                                  result_json, result_json, workflow_return, "{\"pos\":\"complete\"}", t_settle, "{}", true) {
 		mf.OperationSettleOutcome::Settled(r) => { final_result = move r; },
 		mf.OperationSettleOutcome::AlreadySettled(r) => {
 			// Requirement 1: the stored result is AUTHORITATIVE.
@@ -1038,14 +1038,14 @@ fn _run_core(host: &arc.Arc<mf.MicroflowsHost>, cfg: &json.JsonNode, workflow_he
 			return Outcome::Aborted(reason = "settle_fence_lost", code = 3);
 		},
 		mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
-			return _defer(host.get(), &workflow_id, fencing_token, &defer_until, "settle_event_time_skew", admission);
+			return _defer(host.get(), workflow_id, fencing_token, defer_until, "settle_event_time_skew", admission);
 		},
 		default => {
 			throw RunnerError(message = "operation_settle unexpected outcome");
 		}
 	}
 
-	return Outcome::Completed(operation_id = _dup(&operation_id_hex), result = _dup(&final_result), workflow_return = _dup(&"{}"));
+	return Outcome::Completed(operation_id = _dup(operation_id_hex), result = _dup(final_result), workflow_return = _dup("{}"));
 }
 
 // Thin wrapper: load the single `--config` and drive (the original CLI mode).
@@ -1053,7 +1053,7 @@ fn _run(config_path: &String, workflow_hex: &String,
         operation_name: &String, input_json: &String,
         arguments_json: &String, has_arguments: Bool, admission: &AdmissionState) throws -> Outcome {
 	val cfg = _load_config_json(config_path);
-	return _run_cfg(&cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
+	return _run_cfg(cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, admission);
 }
 
 // ===== manifest-driven ScriptRegistry (roadmap item 3a: named, pinned, validated deployments) =====
@@ -1144,7 +1144,7 @@ fn _deployment_for(base: &json.JsonNode, name: &String, version: &String, return
 	while !done {
 		match it.next() {
 			Optional::Some(entry) => {
-				val skip = _str_eq(entry.key, &"script_name") or _str_eq(entry.key, &"plan_version") or _str_eq(entry.key, &"returns");
+				val skip = _str_eq(entry.key, "script_name") or _str_eq(entry.key, "plan_version") or _str_eq(entry.key, "returns");
 				if !skip {
 					o.set(_dup(entry.key), entry.value.clone_deep());
 				}
@@ -1163,12 +1163,12 @@ fn _deployment_for(base: &json.JsonNode, name: &String, version: &String, return
 fn _load_manifest(manifest_path: &String) throws -> ManifestSet {
 	val raw = _read_text(manifest_path);
 	var mjson = json.JsonNode::Null();
-	match json.parse_strict(&raw) {
+	match json.parse_strict(raw) {
 		core.Result::Ok(n) => { mjson = move n; },
 		core.Result::Err(_) => { throw RunnerError(message = "manifest is not valid JSON"); }
 	}
 	var deployment = json.JsonNode::Null();
-	match mjson.get(&"deployment") {
+	match mjson.get("deployment") {
 		Optional::Some(d) => { deployment = d.clone_deep(); },
 		Optional::None => { throw RunnerError(message = "manifest missing 'deployment'"); }
 	}
@@ -1177,41 +1177,41 @@ fn _load_manifest(manifest_path: &String) throws -> ManifestSet {
 	// below — never persisted on `ManifestScript` itself (that struct's existing shape/callers,
 	// e.g. `_find_script`/`_drive_manifest_request`'s dispatch-selection, are unaffected).
 	var registries: Array<ScriptRegistry> = [];
-	match mjson.get(&"scripts") {
+	match mjson.get("scripts") {
 		Optional::Some(sn) => {
 			match sn.as_array() {
 				Optional::Some(arr) => {
 					var i = 0;
 					while i < arr.len {
-						val name = _req_str(&arr[i], &"name", "script.name");
-						val version = _req_str(&arr[i], &"version", "script.version");
-						val spath = _req_str(&arr[i], &"path", "script.path");
-						_validate_semver(&version);
+						val name = _req_str(arr[i], "name", "script.name");
+						val version = _req_str(arr[i], "version", "script.version");
+						val spath = _req_str(arr[i], "path", "script.path");
+						_validate_semver(version);
 						var d = 0;
 						while d < scripts.len {
-							if _str_eq(&scripts[d].name, &name) { throw RunnerError(message = "duplicate script name in manifest: " + _dup(&name)); }
+							if _str_eq(scripts[d].name, name) { throw RunnerError(message = "duplicate script name in manifest: " + _dup(name)); }
 							d = d + 1;
 						}
 						// 1b.0: EVERY manifest script must declare its OWN full workflow contract — no
 						// shared/inherited `returns` across scripts, no fallback to `deployment.returns`.
 						// Explicit unit is `"returns": {}`; the key itself must never be omitted.
 						var returns_value = json.JsonNode::Null();
-						match arr[i].get(&"returns") {
+						match arr[i].get("returns") {
 							Optional::Some(r) => { returns_value = r.clone_deep(); },
-							Optional::None => { throw RunnerError(message = "script '" + _dup(&name) + "' is missing required 'returns' declaration (every manifest script must declare its own return contract; use \"returns\": {} for an explicit unit return)"); }
+							Optional::None => { throw RunnerError(message = "script '" + _dup(name) + "' is missing required 'returns' declaration (every manifest script must declare its own return contract; use \"returns\": {} for an explicit unit return)"); }
 						}
-						val rpath = _resolve_script_path(manifest_path, &spath);
-						val source = _read_text(&rpath);
-						val base2 = _deployment_for(&deployment, &name, &version, &returns_value);
+						val rpath = _resolve_script_path(manifest_path, spath);
+						val source = _read_text(rpath);
+						val base2 = _deployment_for(deployment, name, version, returns_value);
 						var merged = json.JsonNode::Null();
-						match parser.lower(&source, &base2) {
+						match parser.lower(source, base2) {
 							core.Result::Ok(m) => { merged = move m; },
-							core.Result::Err(e) => { throw RunnerError(message = "script '" + _dup(&name) + "' failed to lower: " + _dup(&e.message)); }
+							core.Result::Err(e) => { throw RunnerError(message = "script '" + _dup(name) + "' failed to lower: " + _dup(e.message)); }
 						}
-						_validate_registry(&merged);
-						val reg = _registry_build(&merged, true);   // 1b.0: defer call-executability to the manifest-wide pass below
-						if reg.revisions.len == 0 { throw RunnerError(message = "script '" + _dup(&name) + "' produced no revision (empty plan/graph)"); }
-						val chx = _bytes_to_hex(&reg.revisions[0].content_hash);
+						_validate_registry(merged);
+						val reg = _registry_build(merged, true);   // 1b.0: defer call-executability to the manifest-wide pass below
+						if reg.revisions.len == 0 { throw RunnerError(message = "script '" + _dup(name) + "' produced no revision (empty plan/graph)"); }
+						val chx = _bytes_to_hex(reg.revisions[0].content_hash);
 						val plen = reg.revisions[0].plan_length;
 						scripts.push(ManifestScript(name = move name, version = move version, cfg = move merged, content_hash_hex = move chx, plan_length = plen));
 						registries.push(move reg);
@@ -1226,7 +1226,7 @@ fn _load_manifest(manifest_path: &String) throws -> ManifestSet {
 	if scripts.len == 0 { throw RunnerError(message = "manifest declares no scripts"); }
 	// 1b.0: NOW that every sibling script's own contract (arg_type/return_type/graph) is known,
 	// resolve + validate every `call` across the whole manifest — see `_validate_manifest_calls`.
-	_validate_manifest_calls(&scripts, &registries);
+	_validate_manifest_calls(scripts, registries);
 	return ManifestSet(deployment = move deployment, scripts = move scripts);
 }
 
@@ -1243,16 +1243,16 @@ fn _validate_manifest_calls(scripts: &Array<ManifestScript>, registries: &Array<
 	var i = 0;
 	while i < registries.len {
 		val rev = &registries[i].revisions[0];
-		targets.push(ir.make_call_target(_dup(&rev.name), _dup(&rev.version), &rev.arg_type, &rev.return_type));
+		targets.push(ir.make_call_target(_dup(rev.name), _dup(rev.version), rev.arg_type, rev.return_type));
 		i = i + 1;
 	}
 	val call_targets_opt = Optional<Array<ir.CallTarget>>::Some(move targets);
 	i = 0;
 	while i < registries.len {
 		val rev = &registries[i].revisions[0];
-		val contracts = _op_contracts(&scripts[i].cfg);
-		match ir.type_check_graph(&rev.graph, &rev.arg_type, &contracts, &rev.return_type, &call_targets_opt) {
-			Optional::Some(m) => { throw RunnerError(message = "script '" + _dup(&scripts[i].name) + "@" + _dup(&scripts[i].version) + "': " + move m); },
+		val contracts = _op_contracts(scripts[i].cfg);
+		match ir.type_check_graph(rev.graph, rev.arg_type, contracts, rev.return_type, call_targets_opt) {
+			Optional::Some(m) => { throw RunnerError(message = "script '" + _dup(scripts[i].name) + "@" + _dup(scripts[i].version) + "': " + move m); },
 			Optional::None => {}
 		}
 		i = i + 1;
@@ -1281,13 +1281,13 @@ fn _assert_no_call_cycles(scripts: &Array<ManifestScript>, registries: &Array<Sc
 	while i < n { indeg.push(0); i = i + 1; }
 	i = 0;
 	while i < n {
-		val edges = ir.call_edges(&registries[i].revisions[0].graph);
+		val edges = ir.call_edges(registries[i].revisions[0].graph);
 		var e = 0;
 		while e < edges.len {
 			var j = -1;
 			var k = 0;
 			while k < n {
-				if _str_eq(&scripts[k].name, &edges[e].child) and _str_eq(&scripts[k].version, &edges[e].plan_version) { j = k; }
+				if _str_eq(scripts[k].name, edges[e].child) and _str_eq(scripts[k].version, edges[e].plan_version) { j = k; }
 				k = k + 1;
 			}
 			if j >= 0 {
@@ -1321,19 +1321,19 @@ fn _assert_no_call_cycles(scripts: &Array<ManifestScript>, registries: &Array<Sc
 	if visited < n {
 		var culprit = "";
 		i = 0;
-		while i < n { if indeg[i] > 0 { culprit = _dup(&scripts[i].name) + "@" + _dup(&scripts[i].version); } i = i + 1; }
+		while i < n { if indeg[i] > 0 { culprit = _dup(scripts[i].name) + "@" + _dup(scripts[i].version); } i = i + 1; }
 		throw RunnerError(message = "static call cycle detected in manifest (involves " + culprit + ")");
 	}
 }
 
 fn _find_script(scripts: &Array<ManifestScript>, name: &String) nothrow -> Int {
 	var i = 0;
-	while i < scripts.len { if _str_eq(&scripts[i].name, name) { return i; } i = i + 1; }
+	while i < scripts.len { if _str_eq(scripts[i].name, name) { return i; } i = i + 1; }
 	return -1;
 }
 fn _find_script_nv(scripts: &Array<ManifestScript>, name: &String, version: &String) nothrow -> Int {
 	var i = 0;
-	while i < scripts.len { if _str_eq(&scripts[i].name, name) and _str_eq(&scripts[i].version, version) { return i; } i = i + 1; }
+	while i < scripts.len { if _str_eq(scripts[i].name, name) and _str_eq(scripts[i].version, version) { return i; } i = i + 1; }
 	return -1;
 }
 
@@ -1348,21 +1348,21 @@ fn _drive_manifest_request(host: &arc.Arc<mf.MicroflowsHost>, ms: &ManifestSet, 
 	if has_arguments {
 		// SUBMISSION: name the script explicitly; creation pins its resolved identity.
 		if !has_script { return Outcome::Aborted(reason = "script_required_for_submission", code = 2); }
-		val sidx = _find_script(&ms.scripts, script_name);
+		val sidx = _find_script(ms.scripts, script_name);
 		if sidx < 0 { return Outcome::Aborted(reason = "unknown_script", code = 2); }
-		return _run_core(host, &ms.scripts[sidx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, &ms.scripts, admission);
+		return _run_core(host, ms.scripts[sidx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, ms.scripts, admission);
 	}
 	// RESUME: pick the script by the DURABLE pin (name, version) — never the active version.
 	val workflow_id = _hex_to_bytes(workflow_hex);
 	var pin_name = "";
 	var pin_version = "";
 	var pin_present = false;
-	match host.get().plan_get(&workflow_id) {
-		mf.PlanGetOutcome::Found(p) => { pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version); pin_present = true; },
+	match host.get().plan_get(workflow_id) {
+		mf.PlanGetOutcome::Found(p) => { pin_name = _dup(p.script_name); pin_version = _dup(p.plan_version); pin_present = true; },
 		mf.PlanGetOutcome::NotFound => {}
 	}
 	if !pin_present { return Outcome::Aborted(reason = "not_found", code = 2); }
-	val ridx = _find_script_nv(&ms.scripts, &pin_name, &pin_version);
+	val ridx = _find_script_nv(ms.scripts, pin_name, pin_version);
 	if ridx < 0 {
 		// The pinned revision is NOT in the current manifest. Do NOT short-circuit: drive the proven
 		// STORAGE-FIRST planned path with the deployment-only config (no plan/graph), so the durable
@@ -1370,9 +1370,9 @@ fn _drive_manifest_request(host: &arc.Arc<mf.MicroflowsHost>, ms: &ManifestSet, 
 		// (registry-independent), and a CLAIMABLE workflow gets a DURABLE `revision_unavailable` defer
 		// (lease cleared, admission-aware via _defer_dispatch), exactly as an absent pinned plan does on
 		// the `--config` path. Never substitute.
-		return _run_core(host, &ms.deployment, workflow_hex, operation_name, input_json, arguments_json, has_arguments, &ms.scripts, admission);
+		return _run_core(host, ms.deployment, workflow_hex, operation_name, input_json, arguments_json, has_arguments, ms.scripts, admission);
 	}
-	return _run_core(host, &ms.scripts[ridx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, &ms.scripts, admission);
+	return _run_core(host, ms.scripts[ridx].cfg, workflow_hex, operation_name, input_json, arguments_json, has_arguments, ms.scripts, admission);
 }
 
 // Manifest mode (one-shot CLI): validate the whole set, build a host, then drive the one needed script.
@@ -1389,14 +1389,14 @@ fn _run_manifest(manifest_path: &String, workflow_hex: &String, script_name: &St
 	}
 	match move ms_opt {
 		Optional::Some(ms) => {
-			val db_sub = _require_db(&ms.deployment);
-			val worker_id = _config_str(&ms.deployment, &"worker_id", "runner-1");
-			val identity = mf.identity_from_worker_name(&worker_id);
+			val db_sub = _require_db(ms.deployment);
+			val worker_id = _config_str(ms.deployment, "worker_id", "runner-1");
+			val identity = mf.identity_from_worker_name(worker_id);
 			var b = mf.new_host_builder();
-			mf.with_json(&mut b, &db_sub);
-			mf.with_identity(&mut b, move identity);
+			mf.with_json(b, db_sub);
+			mf.with_identity(b, move identity);
 			val host = _build_host(move b);
-			return _drive_manifest_request(&host, &ms, workflow_hex, script_name, has_script, operation_name, input_json, arguments_json, has_arguments, admission);
+			return _drive_manifest_request(host, ms, workflow_hex, script_name, has_script, operation_name, input_json, arguments_json, has_arguments, admission);
 		},
 		Optional::None => { return Outcome::Aborted(reason = "invalid_manifest", code = 2); }
 	}
@@ -1417,9 +1417,9 @@ fn _run_manifest(manifest_path: &String, workflow_hex: &String, script_name: &St
 fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Array<Byte>,
                 workflow_canon_hex: &String, storage_pin: &PinView,
                 is_submission: Bool, args_json: &String, call_scripts: &Array<ManifestScript>, admission: &AdmissionState) -> Outcome {
-	var pin_name: String = _dup(&storage_pin.name);
-	var pin_version: String = _dup(&storage_pin.version);
-	var pin_hash_hex: String = _dup(&storage_pin.hash_hex);
+	var pin_name: String = _dup(storage_pin.name);
+	var pin_version: String = _dup(storage_pin.version);
+	var pin_hash_hex: String = _dup(storage_pin.hash_hex);
 	var pin_len: Int = storage_pin.plan_length;
 	// The pin is AUTHORITATIVE once it comes from a submission's create_planned (set below) or
 	// a resume's storage-first read. A resume whose initial read found NO pin must RELOAD it
@@ -1464,10 +1464,10 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		reg_ready = true;
 		// Resolve the active generation by the CONFIGURED plan name (not a constant), so
 		// any configured name (e.g. checkout-v1) can create workflows.
-		val active_name = _config_str(cfg, &"script_name", _dup(&SCRIPT_NAME));
+		val active_name = _config_str(cfg, "script_name", _dup(SCRIPT_NAME));
 		var has_active = false;
 		var aidx = 0;
-		match _registry_active(&reg, &active_name) { Optional::Some(i) => { aidx = i; has_active = true; }, Optional::None => {} }
+		match _registry_active(reg, active_name) { Optional::Some(i) => { aidx = i; has_active = true; }, Optional::None => {} }
 		if !has_active {
 			return Outcome::Aborted(reason = "no_active_revision", code = 2);
 		}
@@ -1483,7 +1483,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 			// STRICT: a lenient parse keeps-last duplicate keys (so a duplicate could bypass the
 			// type's field/closed-object checks) and accepts non-standard numbers.
 			match json.parse_strict(args_json) {
-				core.Result::Ok(node) => { args_err = ir.validate(&node, &reg.revisions[aidx].arg_type); },
+				core.Result::Ok(node) => { args_err = ir.validate(node, reg.revisions[aidx].arg_type); },
 				core.Result::Err(_) => { args_err = Optional<String>::Some("arguments are not valid JSON"); }
 			}
 			match args_err {
@@ -1497,12 +1497,12 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		// The submitted instance arguments (a validated JSON object). The host canonicalizes
 		// them at the command boundary before storage/compare; their declared TYPE is already
 		// folded into content_hash (the argument contract is part of revision identity).
-		match host.create_planned(workflow_id, &reg.revisions[aidx].name, &reg.revisions[aidx].version,
-		                          &t_create, &t_create, &"{\"pos\":\"start\"}", &"{}",
-		                          &reg.revisions[aidx].content_hash, reg.revisions[aidx].plan_length,
+		match host.create_planned(workflow_id, reg.revisions[aidx].name, reg.revisions[aidx].version,
+		                          t_create, t_create, "{\"pos\":\"start\"}", "{}",
+		                          reg.revisions[aidx].content_hash, reg.revisions[aidx].plan_length,
 		                          args_json) {
-			mf.CreatePlannedOutcome::Created(p) => { pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version); pin_hash_hex = _dup(&p.content_hash); pin_len = p.plan_length; },
-			mf.CreatePlannedOutcome::Exists(p) => { pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version); pin_hash_hex = _dup(&p.content_hash); pin_len = p.plan_length; },
+			mf.CreatePlannedOutcome::Created(p) => { pin_name = _dup(p.script_name); pin_version = _dup(p.plan_version); pin_hash_hex = _dup(p.content_hash); pin_len = p.plan_length; },
+			mf.CreatePlannedOutcome::Exists(p) => { pin_name = _dup(p.script_name); pin_version = _dup(p.plan_version); pin_hash_hex = _dup(p.content_hash); pin_len = p.plan_length; },
 			mf.CreatePlannedOutcome::PlanConflict(_) => {
 				// The workflow_id exists under a CONTRADICTORY identity — a legacy non-plan
 				// workflow, OR a DIFFERENT plan name (id collision across plans). No pin to
@@ -1522,7 +1522,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 	var fencing_token: Int = 0;
 	var claimed_state: Int = 0;
 	var not_claimable = false;
-	match host.claim_workflow(workflow_id, &clock.now, &clock.deadline) {
+	match host.claim_workflow(workflow_id, clock.now, clock.deadline) {
 		mf.ClaimByIdOutcome::Claimed(wf) => { fencing_token = wf.fencing_token; claimed_state = wf.state_code; },
 		mf.ClaimByIdOutcome::NotFound => {
 			// A submission just created (or adopted) the workflow, so absence here is a real
@@ -1541,8 +1541,8 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 	if !pin_loaded {
 		match host.plan_get(workflow_id) {
 			mf.PlanGetOutcome::Found(p) => {
-				pin_name = _dup(&p.script_name); pin_version = _dup(&p.plan_version);
-				pin_hash_hex = _dup(&p.content_hash); pin_len = p.plan_length; pin_loaded = true;
+				pin_name = _dup(p.script_name); pin_version = _dup(p.plan_version);
+				pin_hash_hex = _dup(p.content_hash); pin_len = p.plan_length; pin_loaded = true;
 			},
 			mf.PlanGetOutcome::NotFound => {
 				// The workflow exists but carries no plan pin — a concurrently-created legacy /
@@ -1552,7 +1552,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// observation took no lease.)
 				if !not_claimable {
 					val rclk = host.clock_read(PENDING_RETRY_SECONDS);
-					match host.release(workflow_id, fencing_token, &rclk.now, &rclk.deadline) { default => {} }
+					match host.release(workflow_id, fencing_token, rclk.now, rclk.deadline) { default => {} }
 				}
 				return Outcome::Aborted(reason = "not_found", code = 2);
 			}
@@ -1568,10 +1568,10 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 		// when the final op was never reached/stored (leased/deferred mid-flight) — a stable placeholder.
 		var last_hex: String = "";
 		match host.operation_request_get(workflow_id, pin_len) {
-			mf.OperationRequestGetOutcome::Found(rec) => { last_hex = _bytes_to_hex(&rec.operation_id); },
-			mf.OperationRequestGetOutcome::NotFound => { last_hex = _bytes_to_hex(&_operation_id(workflow_canon_hex, pin_len)); }
+			mf.OperationRequestGetOutcome::Found(rec) => { last_hex = _bytes_to_hex(rec.operation_id); },
+			mf.OperationRequestGetOutcome::NotFound => { last_hex = _bytes_to_hex(_operation_id(workflow_canon_hex, pin_len)); }
 		}
-		return _inspect_report(host, workflow_id, &last_hex, pin_len);
+		return _inspect_report(host, workflow_id, last_hex, pin_len);
 	}
 
 	// 3. CLAIMED: NOW build + validate the registry (deferred past terminal replay). For a
@@ -1609,12 +1609,12 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 	//    guarantees.
 	var has_rev = false;
 	var ridx = 0;
-	match _registry_resolve(&reg, &pin_name, &pin_version) { Optional::Some(i) => { ridx = i; has_rev = true; }, Optional::None => {} }
+	match _registry_resolve(reg, pin_name, pin_version) { Optional::Some(i) => { ridx = i; has_rev = true; }, Optional::None => {} }
 	if !has_rev {
 		return _defer_dispatch(host, workflow_id, fencing_token, "revision_unavailable", admission);
 	}
-	val rev_hash_hex = _bytes_to_hex(&reg.revisions[ridx].content_hash);
-	if !_str_eq(&rev_hash_hex, &pin_hash_hex) or reg.revisions[ridx].plan_length != pin_len {
+	val rev_hash_hex = _bytes_to_hex(reg.revisions[ridx].content_hash);
+	if !_str_eq(rev_hash_hex, pin_hash_hex) or reg.revisions[ridx].plan_length != pin_len {
 		return _defer_dispatch(host, workflow_id, fencing_token, "revision_unavailable", admission);
 	}
 
@@ -1623,8 +1623,8 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 	if claimed_state == STATE_REVERSING {
 		return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 	}
-	val ch_hex = _bytes_to_hex(&reg.revisions[ridx].content_hash);
-	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, &reg.revisions[ridx].graph, reg.revisions[ridx].plan_length, &ch_hex, &reg.revisions[ridx].return_type, call_scripts, admission);
+	val ch_hex = _bytes_to_hex(reg.revisions[ridx].content_hash);
+	return _run_forward(host, cfg, workflow_id, workflow_canon_hex, fencing_token, reg.revisions[ridx].graph, reg.revisions[ridx].plan_length, ch_hex, reg.revisions[ridx].return_type, call_scripts, admission);
 }
 
 // ===== ScriptRegistry build + lookup (v1: one configured generation per process) =====
@@ -1639,8 +1639,8 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 // check; the actual parse/validate happens in _registry_build). Distinguishes planned workflows
 // (which take --arguments + a content-hash-pinned revision) from the legacy single-op path.
 fn _is_planned_config(cfg: &json.JsonNode) nothrow -> Bool {
-	match cfg.get(&"graph") { Optional::Some(_) => { return true; }, Optional::None => {} }
-	match cfg.get(&"plan") { Optional::Some(_) => { return true; }, Optional::None => {} }
+	match cfg.get("graph") { Optional::Some(_) => { return true; }, Optional::None => {} }
+	match cfg.get("plan") { Optional::Some(_) => { return true; }, Optional::None => {} }
 	return false;
 }
 
@@ -1652,7 +1652,7 @@ fn _registry_build(cfg: &json.JsonNode, allow_calls: Bool) -> ScriptRegistry {
 	// shapes) OR the flat "plan" lifted to a degenerate straight-line graph. Neither present ->
 	// no revision (legacy single-op path).
 	var graph_opt: Optional<ir.IrGraph> = Optional<ir.IrGraph>::None();
-	match cfg.get(&"graph") {
+	match cfg.get("graph") {
 		Optional::Some(gnode) => {
 			match ir.parse_graph(gnode) {
 				core.Result::Ok(g) => { graph_opt = Optional<ir.IrGraph>::Some(move g); },
@@ -1661,16 +1661,16 @@ fn _registry_build(cfg: &json.JsonNode, allow_calls: Bool) -> ScriptRegistry {
 		},
 		Optional::None => {
 			match _build_plan(cfg) {
-				Optional::Some(plan) => { graph_opt = Optional<ir.IrGraph>::Some(_build_graph(&plan)); },
+				Optional::Some(plan) => { graph_opt = Optional<ir.IrGraph>::Some(_build_graph(plan)); },
 				Optional::None => {}
 			}
 		}
 	}
 	match move graph_opt {
 		Optional::Some(graph) => {
-			val name = _config_str(cfg, &"script_name", _dup(&SCRIPT_NAME));
-			val version = _config_str(cfg, &"plan_version", _dup(&PLAN_VERSION_DEFAULT));
-			_validate_semver(&version);
+			val name = _config_str(cfg, "script_name", _dup(SCRIPT_NAME));
+			val version = _config_str(cfg, "plan_version", _dup(PLAN_VERSION_DEFAULT));
+			_validate_semver(version);
 			// The script's declared closed-object argument type (default the empty object).
 			// It ALWAYS participates in content_hash (the argument contract is part of the
 			// revision identity — never elided/conditional).
@@ -1681,16 +1681,16 @@ fn _registry_build(cfg: &json.JsonNode, allow_calls: Bool) -> ScriptRegistry {
 			// VALIDATE the graph. A malformed graph -> RunnerError, surfaced by the existing build
 			// catches as invalid_config (submission, pre-claim) or revision_unavailable (resume,
 			// post-claim) — never executing an ill-formed graph.
-			match ir.validate_graph(&graph) {
+			match ir.validate_graph(graph) {
 				Optional::Some(m) => { throw RunnerError(message = "invalid graph: " + move m); },
 				Optional::None => {}
 			}
 			// Reject non-executable shapes (loops; op-unbalanced branches) at build, BEFORE any
 			// claim, and derive plan_length = the uniform per-path operation count.
-			val plan_length = _assert_executable(&graph, allow_calls);
+			val plan_length = _assert_executable(graph, allow_calls);
 			// Reject non-reversible graphs: every non-final operation must be compensable (mirrors
 			// the flat-plan rule, generalized over branches), so reversal can never strand.
-			_assert_reversible(cfg, &graph, allow_calls);
+			_assert_reversible(cfg, graph, allow_calls);
 			// TYPE-check the graph against the declared argument type + operation contracts +
 			// declared return type (1b.0a: also structurally validates every explicit `return`
 			// value's SHAPE against return_type — not just terminal-reachability, which
@@ -1704,7 +1704,7 @@ fn _registry_build(cfg: &json.JsonNode, allow_calls: Bool) -> ScriptRegistry {
 			// re-invokes `ir.type_check_graph` a SECOND time per script, once every sibling's
 			// arg_type/return_type is known, with the REAL call_targets populated — see
 			// `_validate_manifest_calls`.
-			match ir.type_check_graph(&graph, &arg_type, &contracts, &return_type, &Optional<Array<ir.CallTarget>>::None()) {
+			match ir.type_check_graph(graph, arg_type, contracts, return_type, Optional<Array<ir.CallTarget>>::None()) {
 				Optional::Some(m) => { throw RunnerError(message = "graph type error: " + move m); },
 				Optional::None => {}
 			}
@@ -1712,11 +1712,11 @@ fn _registry_build(cfg: &json.JsonNode, allow_calls: Bool) -> ScriptRegistry {
 			// the standard forward-context envelope, not the forward op's input directly, so its declared
 			// input type is not cross-linked to the forward op's (types still fold into the content_hash via
 			// _content_hash). Call kept so the registry-build pipeline is unchanged.
-			_assert_compensation_types(cfg, &graph);
+			_assert_compensation_types(cfg, graph);
 			// Return-CONTRACT validation (1b.0a step 1): a non-unit return_type must be an object (checked
 			// in _return_type already) and every successful sink must be an explicit `return` — an implicit
 			// unit fall-through on any successful path is a build-time RunnerError, never a dispatch.
-			match ir.validate_return_contract(&graph, &return_type) {
+			match ir.validate_return_contract(graph, return_type) {
 				Optional::Some(m) => { throw RunnerError(message = "invalid workflow return contract: " + move m); },
 				Optional::None => {}
 			}
@@ -1727,13 +1727,13 @@ fn _registry_build(cfg: &json.JsonNode, allow_calls: Bool) -> ScriptRegistry {
 			// manual config), so the general-purpose manual-graph testing surface (ir_exec_test.drift,
 			// coordinator-singular's `graph_cfg()` helper, etc.) is completely unaffected and keeps
 			// the existing runtime `{}`-normalization compatibility behavior.
-			if _config_bool(cfg, &"mf_source", false) {
-				match ir.validate_source_unit_return(&graph, &return_type) {
+			if _config_bool(cfg, "mf_source", false) {
+				match ir.validate_source_unit_return(graph, return_type) {
 					Optional::Some(m) => { throw RunnerError(message = "invalid workflow return: " + move m); },
 					Optional::None => {}
 				}
 			}
-			val ch = _content_hash(cfg, &graph, &arg_type, &return_type);
+			val ch = _content_hash(cfg, graph, arg_type, return_type);
 			revs.push(ScriptRevision(name = move name, version = move version,
 			                         graph = move graph, arg_type = move arg_type, return_type = move return_type,
 			                         content_hash = move ch, plan_length = plan_length));
@@ -1747,7 +1747,7 @@ fn _registry_build(cfg: &json.JsonNode, allow_calls: Bool) -> ScriptRegistry {
 // encoding). Absent -> the empty closed object `{}`. A malformed declaration becomes a
 // RunnerError (so the existing build catch surfaces/defers it, never leaking a lease).
 fn _arg_type(cfg: &json.JsonNode) -> ir.IrType {
-	match cfg.get(&"argument_type") {
+	match cfg.get("argument_type") {
 		Optional::Some(n) => {
 			match ir.parse_object_type(n) {
 				core.Result::Ok(ty) => { return move ty; },
@@ -1769,14 +1769,14 @@ fn _arg_type(cfg: &json.JsonNode) -> ir.IrType {
 // declaration OR a non-object return type also becomes a RunnerError (surfaced by the existing build
 // catch as invalid_config / revision_unavailable, never a dispatch).
 fn _return_type(cfg: &json.JsonNode) -> Optional<ir.IrType> {
-	match cfg.get(&"returns") {
+	match cfg.get("returns") {
 		Optional::Some(rn) => {
 			var nkeys = 0;
 			match rn.as_object() {
 				Optional::Some(o) => { nkeys = o.len(); },
 				Optional::None => { throw RunnerError(message = "'returns' must be an object"); }
 			}
-			match rn.get(&"type") {
+			match rn.get("type") {
 				Optional::Some(tn) => {
 					if nkeys != 1 { throw RunnerError(message = "'returns' has unknown key(s) (only 'type' is allowed)"); }
 					match ir.parse_object_type(tn) {
@@ -1799,16 +1799,16 @@ fn _return_type(cfg: &json.JsonNode) -> Optional<ir.IrType> {
 // exactly as before). A malformed type declaration -> RunnerError (invalid_config / deferred).
 fn _op_contracts(cfg: &json.JsonNode) -> Array<ir.OpContract> {
 	var out: Array<ir.OpContract> = [];
-	match cfg.get(&"operations") {
+	match cfg.get("operations") {
 		Optional::Some(on) => {
 			match on.as_array() {
 				Optional::Some(items) => {
 					var i = 0;
 					while i < items.len {
-						val nm = _req_str(&items[i], &"name", "operation.name");
+						val nm = _req_str(items[i], "name", "operation.name");
 						out.push(ir.OpContract(name = move nm,
-						                       input_type = _op_type_opt(&items[i], &"input_type"),
-						                       result_type = _op_type_opt(&items[i], &"result_type")));
+						                       input_type = _op_type_opt(items[i], "input_type"),
+						                       result_type = _op_type_opt(items[i], "result_type")));
 						i = i + 1;
 					}
 				},
@@ -1839,7 +1839,7 @@ fn _op_type_opt(item: &json.JsonNode, key: &String) -> Optional<ir.IrType> {
 fn _registry_active(reg: &ScriptRegistry, name: &String) -> Optional<Int> {
 	var i = 0;
 	while i < reg.revisions.len {
-		if _str_eq(&reg.revisions[i].name, name) { return Optional<Int>::Some(i); }
+		if _str_eq(reg.revisions[i].name, name) { return Optional<Int>::Some(i); }
 		i = i + 1;
 	}
 	return Optional<Int>::None();
@@ -1851,7 +1851,7 @@ fn _registry_active(reg: &ScriptRegistry, name: &String) -> Optional<Int> {
 fn _registry_resolve(reg: &ScriptRegistry, name: &String, version: &String) -> Optional<Int> {
 	var i = 0;
 	while i < reg.revisions.len {
-		if _str_eq(&reg.revisions[i].name, name) and _str_eq(&reg.revisions[i].version, version) {
+		if _str_eq(reg.revisions[i].name, name) and _str_eq(reg.revisions[i].version, version) {
 			return Optional<Int>::Some(i);
 		}
 		i = i + 1;
@@ -1898,12 +1898,12 @@ fn _validate_semver(version: &String) -> Void {
 // canonicalized), so identity tracks graph SEMANTICS, not raw spelling.
 fn _content_hash(cfg: &json.JsonNode, graph: &ir.IrGraph, arg_type: &ir.IrType, return_type: &Optional<ir.IrType>) -> Array<Byte> {
 	val canonical = ir.graph_canonical(graph) + _graph_bindings(cfg, graph) + ir.canonical(arg_type) + _return_type_hash_suffix(return_type);
-	val msg = _str_bytes(&canonical);
-	val digest = crypto.sha256(&msg);   // 32 bytes
+	val msg = _str_bytes(canonical);
+	val digest = crypto.sha256(msg);   // 32 bytes
 	var out: Array<Byte> = [];
 	// Scheme tag 0x01 (versioned digest scheme), built via hex_decode so we never push
 	// an Int literal into Array<Byte>.
-	match codec.hex_decode(&"01") {
+	match codec.hex_decode("01") {
 		core.Result::Ok(tag) => { out.push(tag[0]); },
 		core.Result::Err(_) => { throw RunnerError(message = "content-hash scheme tag decode failed"); }
 	}
@@ -1935,31 +1935,31 @@ fn _graph_bindings(cfg: &json.JsonNode, graph: &ir.IrGraph) -> String {
 	var s: String = "";
 	var i = 0;
 	while i < ops.len {
-		val r = _resolve_operation(cfg, &ops[i], Optional<Int>::None());
+		val r = _resolve_operation(cfg, ops[i], Optional<Int>::None());
 		var comp_op: String = "";
 		var comp_sv: Int = 0;
 		var comp_part: String = "";
-		match _compensation_for(cfg, &ops[i]) {
+		match _compensation_for(cfg, ops[i]) {
 			Optional::Some(c) => {
-				comp_op = _dup(&c.op_name); comp_sv = c.schema_version;
-				comp_part = _dup(&_resolve_operation(cfg, &comp_op, Optional<Int>::None()).participant_id);
+				comp_op = _dup(c.op_name); comp_sv = c.schema_version;
+				comp_part = _dup(_resolve_operation(cfg, comp_op, Optional<Int>::None()).participant_id);
 			},
 			Optional::None => {}   // a final / single-op step may have no compensation.
 		}
 		val sv_str = fmt.format_int(r.schema_version);
 		val comp_sv_str = fmt.format_int(comp_sv);
-		s = s + _lp(&sv_str) + _lp(&r.participant_id)
-		      + _lp(&comp_op) + _lp(&comp_sv_str) + _lp(&comp_part);
+		s = s + _lp(sv_str) + _lp(r.participant_id)
+		      + _lp(comp_op) + _lp(comp_sv_str) + _lp(comp_part);
 		// Declared TYPE contract participates in identity (so a changed type -> different hash ->
 		// revision_unavailable on resume, never a silent substitution). Tagged + appended ONLY when
 		// present, so an UNTYPED operation yields the identical binding string as before (existing
 		// hashes — flat plans, untyped graphs — are unchanged). The COMPENSATION op's contract is
 		// executable workflow semantics too, so its type tags are included (lowercase) when present.
-		match _op_type_canon(cfg, &ops[i], &"input_type") { Optional::Some(c) => { s = s + "I" + _lp(&c); }, Optional::None => {} }
-		match _op_type_canon(cfg, &ops[i], &"result_type") { Optional::Some(c) => { s = s + "R" + _lp(&c); }, Optional::None => {} }
+		match _op_type_canon(cfg, ops[i], "input_type") { Optional::Some(c) => { s = s + "I" + _lp(c); }, Optional::None => {} }
+		match _op_type_canon(cfg, ops[i], "result_type") { Optional::Some(c) => { s = s + "R" + _lp(c); }, Optional::None => {} }
 		if comp_op.byte_length() > 0 {
-			match _op_type_canon(cfg, &comp_op, &"input_type") { Optional::Some(c) => { s = s + "i" + _lp(&c); }, Optional::None => {} }
-			match _op_type_canon(cfg, &comp_op, &"result_type") { Optional::Some(c) => { s = s + "r" + _lp(&c); }, Optional::None => {} }
+			match _op_type_canon(cfg, comp_op, "input_type") { Optional::Some(c) => { s = s + "i" + _lp(c); }, Optional::None => {} }
+			match _op_type_canon(cfg, comp_op, "result_type") { Optional::Some(c) => { s = s + "r" + _lp(c); }, Optional::None => {} }
 		}
 		i = i + 1;
 	}
@@ -1969,16 +1969,16 @@ fn _graph_bindings(cfg: &json.JsonNode, graph: &ir.IrGraph) -> String {
 // Canonical encoding of an operation's OPTIONAL declared type at `key`, or None if undeclared.
 // Malformed -> RunnerError (same surfacing as _op_type_opt).
 fn _op_type_canon(cfg: &json.JsonNode, opname: &String, key: &String) -> Optional<String> {
-	match cfg.get(&"operations") {
+	match cfg.get("operations") {
 		Optional::Some(on) => {
 			match on.as_array() {
 				Optional::Some(items) => {
 					var i = 0;
 					while i < items.len {
-						val nm = _req_str(&items[i], &"name", "operation.name");
-						if _str_eq(&nm, opname) {
-							match _op_type_opt(&items[i], key) {
-								Optional::Some(ty) => { return Optional<String>::Some(ir.canonical(&ty)); },
+						val nm = _req_str(items[i], "name", "operation.name");
+						if _str_eq(nm, opname) {
+							match _op_type_opt(items[i], key) {
+								Optional::Some(ty) => { return Optional<String>::Some(ir.canonical(ty)); },
 								Optional::None => { return Optional<String>::None(); }
 							}
 						}
@@ -2011,10 +2011,10 @@ fn _build_graph(plan: &Array<PlanStep>) -> ir.IrGraph {
 	var steps: Array<ir.FlatStep> = [];
 	var i = 0;
 	while i < plan.len {
-		steps.push(ir.FlatStep(operation = _dup(&plan[i].operation), input_json = _dup(&plan[i].input_json)));
+		steps.push(ir.FlatStep(operation = _dup(plan[i].operation), input_json = _dup(plan[i].input_json)));
 		i = i + 1;
 	}
-	match ir.flat_to_graph(&steps) {
+	match ir.flat_to_graph(steps) {
 		core.Result::Ok(g) => { return move g; },
 		core.Result::Err(e) => { throw RunnerError(message = "graph build failed: " + e.message); }
 	}
@@ -2049,10 +2049,10 @@ fn _assert_reversible(cfg: &json.JsonNode, graph: &ir.IrGraph, allow_calls: Bool
 		core.Result::Ok(ops) => {
 			var i = 0;
 			while i < ops.len {
-				match _compensation_for(cfg, &ops[i]) {
+				match _compensation_for(cfg, ops[i]) {
 					Optional::Some(_) => {},
 					Optional::None => {
-						throw RunnerError(message = "non-final operation '" + _dup(&ops[i])
+						throw RunnerError(message = "non-final operation '" + _dup(ops[i])
 							+ "' has no compensation binding — it must be reversible");
 					}
 				}
@@ -2068,7 +2068,7 @@ fn _assert_reversible(cfg: &json.JsonNode, graph: &ir.IrGraph, allow_calls: Bool
 fn _canonical_json(input_json: &String) -> String {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
 	match json.parse_strict(input_json) {
-		core.Result::Ok(n) => { return json.encode_compact_with_config(&n, &cfg); },
+		core.Result::Ok(n) => { return json.encode_compact_with_config(n, cfg); },
 		core.Result::Err(_) => { throw RunnerError(message = "plan step input is not valid JSON"); }
 	}
 }
@@ -2126,7 +2126,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 	var guard = 0;
 	while guard < n + 4 {
 		guard = guard + 1;
-		match ir.advance(graph, &args, &settled) {
+		match ir.advance(graph, args, settled) {
 			ir.StepOutcome::Completed(result) => {
 				// All operations settled. `result` (last-op-result, unchanged) per the existing
 				// final-op result rules; `workflow_return` (1b.0a step 3) was captured at the
@@ -2135,7 +2135,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// UPDATE sets workflow_return_json and state=4 together, so this arm can never be
 				// reached without having just gone through the live probe+settle path for the
 				// final op in this call (never a stale/default value).
-				return Outcome::Completed(operation_id = _dup(&last_op_id_hex), result = _dup(&final_result), workflow_return = _dup(&workflow_return));
+				return Outcome::Completed(operation_id = _dup(last_op_id_hex), result = _dup(final_result), workflow_return = _dup(workflow_return));
 			},
 			ir.StepOutcome::Fault(m) => {
 				// A validated graph should not Fault here. Treat defensively — never execute on a
@@ -2149,11 +2149,11 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// the op whose result reached this fail is already checkpointed, so its side effects MUST be
 				// compensated, never stranded forward (and replay stays stable).
 				var reason: String = "invalid_fail_reason";
-				match _fail_reason_string(&reason_json) {
+				match _fail_reason_string(reason_json) {
 					Optional::Some(rs) => { reason = move rs; },
 					Optional::None => {}
 				}
-				return _authored_fail_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, content_hash_hex, &node_id, move reason, admission);
+				return _authored_fail_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, content_hash_hex, node_id, move reason, admission);
 			},
 			ir.StepOutcome::NeedOperation(node_id, op, input) => {
 				// Durable seq = EXECUTION POSITION on the taken path (settled.len+1); ops settle
@@ -2172,12 +2172,12 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						// a freshly-derived node-address id (migration-safety). A settled op with no request
 						// row is a durable inconsistency -- defer, don't mint a new external id.
 						match host.operation_request_get(workflow_id, seq) {
-							mf.OperationRequestGetOutcome::Found(rec) => { last_op_id_hex = _bytes_to_hex(&rec.operation_id); },
+							mf.OperationRequestGetOutcome::Found(rec) => { last_op_id_hex = _bytes_to_hex(rec.operation_id); },
 							mf.OperationRequestGetOutcome::NotFound => {
 								return _defer_dispatch(host, workflow_id, fencing_token, "settled_op_request_missing", admission);
 							}
 						}
-						settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&r)));
+						settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(r)));
 						final_result = move r;
 						prior_done = true;
 					},
@@ -2198,19 +2198,19 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				match host.operation_request_get(workflow_id, seq) {
 					mf.OperationRequestGetOutcome::Found(rec) => {
 						recovered = true;
-						op_name = _dup(&rec.operation_name);
-						input_json = _dup(&rec.input_json);
+						op_name = _dup(rec.operation_name);
+						input_json = _dup(rec.input_json);
 						schema_version = rec.schema_version;
-						operation_id = _copy_bytes(&rec.operation_id);
-						input_hash = _dup(&rec.input_hash);
+						operation_id = _copy_bytes(rec.operation_id);
+						input_hash = _dup(rec.input_hash);
 					},
 					mf.OperationRequestGetOutcome::NotFound => {
 						op_name = _dup(op);
 						input_json = _dup(input);
-						input_hash = _input_hash(&input_json);
+						input_hash = _input_hash(input_json);
 					}
 				}
-				val operation_id_hex = _bytes_to_hex(&operation_id);
+				val operation_id_hex = _bytes_to_hex(operation_id);
 
 				// Resolve the operation; pin the durable schema_version on a resume.
 				var base_url: String = "";
@@ -2218,9 +2218,9 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				var pinned: Optional<Int> = Optional<Int>::None();
 				if recovered { pinned = Optional<Int>::Some(schema_version); }
 				try {
-					val r = _resolve_operation(cfg, &op_name, pinned);
+					val r = _resolve_operation(cfg, op_name, pinned);
 					schema_version = r.schema_version;
-					base_url = _dup(&r.base_url);
+					base_url = _dup(r.base_url);
 					ok = true;
 				} catch RunnerError(e) { console.eprintln(e.message); }
 				if !ok {
@@ -2231,9 +2231,9 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// Exists) + the suspended continuation BEFORE dispatch.
 				val cont_dispatch = "{\"pos\":\"op:" + fmt.format_int(seq) + ":dispatched\",\"operation_seq\":" + fmt.format_int(seq) + "}";
 				val t_req = _now(host);
-				match host.operation_request_checked(workflow_id, fencing_token, seq, &operation_id,
-				                                     &op_name, schema_version, &input_json, &input_hash,
-				                                     &cont_dispatch, &t_req, &"{}") {
+				match host.operation_request_checked(workflow_id, fencing_token, seq, operation_id,
+				                                     op_name, schema_version, input_json, input_hash,
+				                                     cont_dispatch, t_req, "{}") {
 					core.Result::Err(kind) => {
 						return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "operation_request", admission);
 					},
@@ -2253,7 +2253,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 								return Outcome::Aborted(reason = "request_plan_violation:" + move reason, code = 8);
 							},
 							mf.OperationRequestOutcome::EventTimeSkew(defer_until) => {
-								return _defer(host, workflow_id, fencing_token, &defer_until, "request_event_time_skew", admission);
+								return _defer(host, workflow_id, fencing_token, defer_until, "request_event_time_skew", admission);
 							},
 							default => {
 								throw RunnerError(message = "operation_request unexpected outcome");
@@ -2264,14 +2264,14 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 
 				// Dispatch through the generic dispatcher. A RECOVERED request (durable from a
 				// prior drive) reconciles GET-first; a FRESH request is PUT-first.
-				var eff_dr = _dispatch_or_reconcile(recovered, &base_url, &op_name, &operation_id_hex, &input_json);
+				var eff_dr = _dispatch_or_reconcile(recovered, base_url, op_name, operation_id_hex, input_json);
 				// A RECOVERED + CONFIRMED-pending op escalates via the durable re-dispatch timer (case [12]);
 				// the escalation may REPLACE eff_dr with the byte-identical re-PUT's classification.
 				if recovered {
 					var observed = false;
 					match &eff_dr { DispatchResult::PendingObserved => { observed = true; }, default => {} }
 					if observed {
-						match _pending_redispatch_or_defer(host, cfg, workflow_id, fencing_token, seq, &operation_id, &base_url, &op_name, &operation_id_hex, &input_json, admission) {
+						match _pending_redispatch_or_defer(host, cfg, workflow_id, fencing_token, seq, operation_id, base_url, op_name, operation_id_hex, input_json, admission) {
 							RedispatchStep::Done(r) => { eff_dr = DispatchResult::Done(move r); },
 							RedispatchStep::Reject(reason) => { eff_dr = DispatchResult::Rejected(move reason); },
 							RedispatchStep::Route404 => { eff_dr = DispatchResult::Route404(); },
@@ -2288,12 +2288,12 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						var probe: Array<ir.OpResult> = [];
 						var pj = 0;
 						while pj < settled.len {
-							probe.push(ir.OpResult(node_id = _dup(&settled[pj].node_id), result_json = _dup(&settled[pj].result_json)));
+							probe.push(ir.OpResult(node_id = _dup(settled[pj].node_id), result_json = _dup(settled[pj].result_json)));
 							pj = pj + 1;
 						}
-						probe.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&r)));
+						probe.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(r)));
 						var is_final = false;
-						match ir.advance(graph, &args, &probe) {
+						match ir.advance(graph, args, probe) {
 							// This is the ONLY place the workflow's return value can be captured in time to
 							// hand it to operation_settle below (the probe re-runs `advance` with this op's
 							// about-to-be-persisted result BEFORE the real settle call). 1b.0a step 3: NORMALIZE
@@ -2309,7 +2309,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 								is_final = true;
 								var is_unit = false;
 								match return_type { Optional::None => { is_unit = true; }, Optional::Some(_) => {} }
-								if is_unit or _str_eq(&result, &"null") { workflow_return = "{}"; } else { workflow_return = _dup(&result); }
+								if is_unit or _str_eq(result, "null") { workflow_return = "{}"; } else { workflow_return = _dup(result); }
 							},
 							default => {}
 						}
@@ -2321,22 +2321,22 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						// workflow_return_json (1b.0a step 3): Some(...) iff final (the SP requires a JSON
 						// object exactly when arg_is_final=1), None otherwise (SP requires SQL NULL).
 						var settle_return: Optional<String> = Optional<String>::None();
-						if is_final { settle_return = Optional<String>::Some(_dup(&workflow_return)); }
-						match host.operation_settle_checked(workflow_id, fencing_token, seq, &operation_id, seq,
-						                                    &r, &input_json, &settle_return, &cont_settle, &t_settle, &"{}", is_final) {
+						if is_final { settle_return = Optional<String>::Some(_dup(workflow_return)); }
+						match host.operation_settle_checked(workflow_id, fencing_token, seq, operation_id, seq,
+						                                    r, input_json, settle_return, cont_settle, t_settle, "{}", is_final) {
 							core.Result::Err(kind) => {
 								return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "operation_settle", admission);
 							},
 							core.Result::Ok(outcome) => {
 								match outcome {
 									mf.OperationSettleOutcome::Settled(res) => {
-										last_op_id_hex = _dup(&operation_id_hex);
-										settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+										last_op_id_hex = _dup(operation_id_hex);
+										settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(res)));
 										final_result = move res;
 									},
 									mf.OperationSettleOutcome::AlreadySettled(res) => {
-										last_op_id_hex = _dup(&operation_id_hex);
-										settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+										last_op_id_hex = _dup(operation_id_hex);
+										settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(res)));
 										final_result = move res;
 									},
 									mf.OperationSettleOutcome::FenceLost => {
@@ -2348,7 +2348,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 										return Outcome::Aborted(reason = "settle_plan_violation:" + move reason, code = 8);
 									},
 									mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
-										return _defer(host, workflow_id, fencing_token, &defer_until, "settle_event_time_skew", admission);
+										return _defer(host, workflow_id, fencing_token, defer_until, "settle_event_time_skew", admission);
 									},
 									default => {
 										throw RunnerError(message = "operation_settle unexpected outcome");
@@ -2358,10 +2358,10 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						}
 					},
 					DispatchResult::PendingObserved => {
-						return _defer_pending(host, workflow_id, fencing_token, &"", admission);
+						return _defer_pending(host, workflow_id, fencing_token, "", admission);
 					},
 					DispatchResult::PendingUncertain => {
-						return _defer_pending(host, workflow_id, fencing_token, &"", admission);
+						return _defer_pending(host, workflow_id, fencing_token, "", admission);
 					},
 					DispatchResult::Rejected(reason) => {
 						// A DEFINITE forward rejection ALWAYS begins reversal (the model: every
@@ -2370,10 +2370,10 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						// reaches terminal `failed` (compensated:false) immediately. Never
 						// `blocked_resolution` for a definite forward rejection — that is reserved for
 						// an UNCERTAIN forward outcome.
-						return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, move reason, admission);
+						return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, operation_id, move reason, admission);
 					},
 					DispatchResult::Route404 => {
-						return _reconcile_budget_forward(host, cfg, workflow_id, fencing_token, seq, &operation_id, admission);
+						return _reconcile_budget_forward(host, cfg, workflow_id, fencing_token, seq, operation_id, admission);
 					}
 				}
 			},
@@ -2387,12 +2387,12 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				match host.operation_result(workflow_id, seq) {
 					mf.OperationResultOutcome::Succeeded(r) => {
 						match host.operation_request_get(workflow_id, seq) {
-							mf.OperationRequestGetOutcome::Found(rec) => { last_op_id_hex = _bytes_to_hex(&rec.operation_id); },
+							mf.OperationRequestGetOutcome::Found(rec) => { last_op_id_hex = _bytes_to_hex(rec.operation_id); },
 							mf.OperationRequestGetOutcome::NotFound => {
 								return _defer_dispatch(host, workflow_id, fencing_token, "settled_call_request_missing", admission);
 							}
 						}
-						settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&r)));
+						settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(r)));
 						final_result = move r;
 						prior_done = true;
 					},
@@ -2404,15 +2404,15 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// Resolve the call target against the RESIDENT manifest sibling registry. Build-time
 				// validation (_validate_manifest_calls) already confirmed this binds; a miss here is a
 				// defensive registry-drift guard, not an expected path.
-				val sidx = _find_script_nv(call_scripts, &child, &plan_version);
+				val sidx = _find_script_nv(call_scripts, child, plan_version);
 				if sidx < 0 {
 					return _defer_dispatch(host, workflow_id, fencing_token, "call_target_unavailable", admission);
 				}
-				val child_script_name = _dup(&call_scripts[sidx].name);
-				val child_plan_version_resolved = _dup(&call_scripts[sidx].version);
-				val child_content_hash_hex = _dup(&call_scripts[sidx].content_hash_hex);
+				val child_script_name = _dup(call_scripts[sidx].name);
+				val child_plan_version_resolved = _dup(call_scripts[sidx].version);
+				val child_content_hash_hex = _dup(call_scripts[sidx].content_hash_hex);
 				var child_content_hash: Array<Byte> = [];
-				match codec.hex_decode(&child_content_hash_hex) {
+				match codec.hex_decode(child_content_hash_hex) {
 					core.Result::Ok(b) => { child_content_hash = move b; },
 					core.Result::Err(_) => {
 						return _defer_dispatch(host, workflow_id, fencing_token, "call_target_hash_invalid", admission);
@@ -2424,8 +2424,8 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// mf-op;), derived ONLY from (parent workflow, parent content_hash, this call node) — a
 				// pure function, so a resumed drive re-derives the IDENTICAL id; never a second child.
 				val child_workflow_id = _child_workflow_id_node(workflow_canon_hex, content_hash_hex, node_id);
-				val operation_id = _copy_bytes(&child_workflow_id);
-				val operation_id_hex = _bytes_to_hex(&operation_id);
+				val operation_id = _copy_bytes(child_workflow_id);
+				val operation_id_hex = _bytes_to_hex(operation_id);
 				val parent_node_id = _dup(node_id);
 				val max_call_depth = _max_call_depth(cfg);
 
@@ -2439,11 +2439,11 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 				// agreement — never a differently-recreated identity.
 				val cont_dispatch = "{\"pos\":\"call:" + fmt.format_int(seq) + ":dispatched\",\"operation_seq\":" + fmt.format_int(seq) + "}";
 				val t_submit = _now(host);
-				match host.call_submit_checked(workflow_id, fencing_token, seq, &operation_id, &input,
-				                               &cont_dispatch, &t_submit, &"{}",
-				                               &child_workflow_id, &child_script_name, &child_plan_version_resolved, &child_content_hash,
-				                               child_plan_length, &"{\"pos\":\"start\"}", &t_submit, &"{}",
-				                               &parent_node_id, max_call_depth) {
+				match host.call_submit_checked(workflow_id, fencing_token, seq, operation_id, input,
+				                               cont_dispatch, t_submit, "{}",
+				                               child_workflow_id, child_script_name, child_plan_version_resolved, child_content_hash,
+				                               child_plan_length, "{\"pos\":\"start\"}", t_submit, "{}",
+				                               parent_node_id, max_call_depth) {
 					core.Result::Err(kind) => {
 						return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "call_submit", admission);
 					},
@@ -2457,13 +2457,13 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 							mf.CallSubmitOutcome::CallRejected(reason) => {
 								// The recursion guard (call_cycle / max_call_depth_exceeded): a rejected call IS a
 								// rejected forward step, same as a definite participant rejection -> reversal.
-								return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, "call_rejected:" + move reason, admission);
+								return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, operation_id, "call_rejected:" + move reason, admission);
 							},
 							mf.CallSubmitOutcome::PlanViolation(reason, plan_length) => {
 								return Outcome::Aborted(reason = "call_plan_violation:" + move reason, code = 8);
 							},
 							mf.CallSubmitOutcome::EventTimeSkew(defer_until) => {
-								return _defer(host, workflow_id, fencing_token, &defer_until, "call_submit_event_time_skew", admission);
+								return _defer(host, workflow_id, fencing_token, defer_until, "call_submit_event_time_skew", admission);
 							},
 							mf.CallSubmitOutcome::FenceLost => {
 								return Outcome::Aborted(reason = "call_submit_fence_lost", code = 3);
@@ -2495,12 +2495,12 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 								// authoritative state always comes from call_inspect itself, never the hint.
 								match _advisory_now(host) {
 									Optional::Some(t_hint) => {
-										_log_best_effort("call_hint_refresh", &_bytes_to_hex(workflow_id), host.call_hint_refresh_best_effort(workflow_id, seq, CHILD_STATUS_BLOCKED, &t_hint));
+										_log_best_effort("call_hint_refresh", _bytes_to_hex(workflow_id), host.call_hint_refresh_best_effort(workflow_id, seq, CHILD_STATUS_BLOCKED, t_hint));
 									},
 									Optional::None => {}
 								}
 							}
-							return _defer_pending(host, workflow_id, fencing_token, &child_workflow_id, admission);
+							return _defer_pending(host, workflow_id, fencing_token, child_workflow_id, admission);
 						}
 						if state == STATE_COMPLETED {
 							var child_return: String = "{}";
@@ -2518,17 +2518,17 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 							var probe: Array<ir.OpResult> = [];
 							var pj = 0;
 							while pj < settled.len {
-								probe.push(ir.OpResult(node_id = _dup(&settled[pj].node_id), result_json = _dup(&settled[pj].result_json)));
+								probe.push(ir.OpResult(node_id = _dup(settled[pj].node_id), result_json = _dup(settled[pj].result_json)));
 								pj = pj + 1;
 							}
-							probe.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&child_return)));
+							probe.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(child_return)));
 							var is_final = false;
-							match ir.advance(graph, &args, &probe) {
+							match ir.advance(graph, args, probe) {
 								ir.StepOutcome::Completed(result) => {
 									is_final = true;
 									var is_unit = false;
 									match return_type { Optional::None => { is_unit = true; }, Optional::Some(_) => {} }
-									if is_unit or _str_eq(&result, &"null") { workflow_return = "{}"; } else { workflow_return = _dup(&result); }
+									if is_unit or _str_eq(result, "null") { workflow_return = "{}"; } else { workflow_return = _dup(result); }
 								},
 								default => {}
 							}
@@ -2536,22 +2536,22 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 							var cont_settle = "{\"pos\":\"complete\"}";
 							if !is_final { cont_settle = "{\"pos\":\"call:" + fmt.format_int(seq) + ":settled\",\"next_operation_seq\":" + fmt.format_int(seq + 1) + "}"; }
 							var settle_return: Optional<String> = Optional<String>::None();
-							if is_final { settle_return = Optional<String>::Some(_dup(&workflow_return)); }
-							match host.operation_settle_checked(workflow_id, fencing_token, seq, &operation_id, seq,
-							                                    &child_return, &input, &settle_return, &cont_settle, &t_settle, &"{}", is_final) {
+							if is_final { settle_return = Optional<String>::Some(_dup(workflow_return)); }
+							match host.operation_settle_checked(workflow_id, fencing_token, seq, operation_id, seq,
+							                                    child_return, input, settle_return, cont_settle, t_settle, "{}", is_final) {
 								core.Result::Err(kind) => {
 									return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "call_settle", admission);
 								},
 								core.Result::Ok(outcome) => {
 									match outcome {
 										mf.OperationSettleOutcome::Settled(res) => {
-											last_op_id_hex = _dup(&operation_id_hex);
-											settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+											last_op_id_hex = _dup(operation_id_hex);
+											settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(res)));
 											final_result = move res;
 										},
 										mf.OperationSettleOutcome::AlreadySettled(res) => {
-											last_op_id_hex = _dup(&operation_id_hex);
-											settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(&res)));
+											last_op_id_hex = _dup(operation_id_hex);
+											settled.push(ir.OpResult(node_id = _dup(node_id), result_json = _dup(res)));
 											final_result = move res;
 										},
 										mf.OperationSettleOutcome::FenceLost => {
@@ -2561,7 +2561,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 											return Outcome::Aborted(reason = "call_settle_plan_violation:" + move reason, code = 8);
 										},
 										mf.OperationSettleOutcome::EventTimeSkew(defer_until) => {
-											return _defer(host, workflow_id, fencing_token, &defer_until, "call_settle_event_time_skew", admission);
+											return _defer(host, workflow_id, fencing_token, defer_until, "call_settle_event_time_skew", admission);
 										},
 										default => {
 											throw RunnerError(message = "call operation_settle unexpected outcome");
@@ -2572,7 +2572,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 						} else {
 							// Child terminated WITHOUT completing (reversed / failed / resolved_exception):
 							// a call rejection, same as a definite participant rejection -> reversal.
-							return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, &operation_id, "call_child_failed:" + terminal_reason, admission);
+							return _begin_reversal_unwind(host, cfg, workflow_id, workflow_canon_hex, fencing_token, seq, operation_id, "call_child_failed:" + terminal_reason, admission);
 						}
 					},
 					mf.CallInspectOutcome::NotFound => {
@@ -2615,9 +2615,9 @@ fn _authored_fail_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow
                          workflow_canon_hex: &String, fencing_token: Int, content_hash_hex: &String,
                          fail_node_id: &String, reason: String, admission: &AdmissionState) -> Outcome {
 	val tagged = "fail:" + _dup(fail_node_id);
-	val fail_id = _operation_id_node(workflow_canon_hex, content_hash_hex, &tagged);
+	val fail_id = _operation_id_node(workflow_canon_hex, content_hash_hex, tagged);
 	val t = _now(host);
-	match host.authored_fail(workflow_id, fencing_token, &fail_id, &t, &reason) {
+	match host.authored_fail(workflow_id, fencing_token, fail_id, t, reason) {
 		mf.AuthoredFailOutcome::Reversing(_) => {
 			return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 		},
@@ -2629,10 +2629,10 @@ fn _authored_fail_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow
 				return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 			}
 			if state == STATE_REVERSED {
-				return Outcome::TerminalFailure(reason = _dup(&terminal_reason), compensated = true);
+				return Outcome::TerminalFailure(reason = _dup(terminal_reason), compensated = true);
 			}
 			if state == STATE_FAILED {
-				return Outcome::TerminalFailure(reason = _dup(&terminal_reason), compensated = false);
+				return Outcome::TerminalFailure(reason = _dup(terminal_reason), compensated = false);
 			}
 			return Outcome::Blocked(direction = "reverse", reason = "");
 		},
@@ -2643,7 +2643,7 @@ fn _authored_fail_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow
 			return Outcome::ReverseAborted(reason = "authored_fail_fence_lost", code = 7);
 		},
 		mf.AuthoredFailOutcome::EventTimeSkew(defer_until) => {
-			return _defer(host, workflow_id, fencing_token, &defer_until, "authored_fail_skew", admission);
+			return _defer(host, workflow_id, fencing_token, defer_until, "authored_fail_skew", admission);
 		},
 		mf.AuthoredFailOutcome::NotFound => {
 			return Outcome::Aborted(reason = "authored_fail_not_found", code = 8);
@@ -2655,7 +2655,7 @@ fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflo
                           workflow_canon_hex: &String, fencing_token: Int, operation_seq: Int,
                           operation_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Outcome {
 	val t = _now(host);
-	match host.begin_reversal(workflow_id, fencing_token, operation_seq, operation_id, &t, &reason) {
+	match host.begin_reversal(workflow_id, fencing_token, operation_seq, operation_id, t, reason) {
 		mf.BeginReversalOutcome::Reversing(_) => {
 			return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 		},
@@ -2669,10 +2669,10 @@ fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflo
 				return _run_reversal(host, cfg, workflow_id, workflow_canon_hex, fencing_token, admission);
 			}
 			if state == STATE_REVERSED {
-				return Outcome::TerminalFailure(reason = _dup(&terminal_reason), compensated = true);
+				return Outcome::TerminalFailure(reason = _dup(terminal_reason), compensated = true);
 			}
 			if state == STATE_FAILED {
-				return Outcome::TerminalFailure(reason = _dup(&terminal_reason), compensated = false);
+				return Outcome::TerminalFailure(reason = _dup(terminal_reason), compensated = false);
 			}
 			return Outcome::Blocked(direction = "reverse", reason = "");
 		},
@@ -2680,7 +2680,7 @@ fn _begin_reversal_unwind(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflo
 			return Outcome::ReverseAborted(reason = "begin_reversal_fence_lost", code = 7);
 		},
 		mf.BeginReversalOutcome::EventTimeSkew(defer_until) => {
-			return _defer(host, workflow_id, fencing_token, &defer_until, "begin_reversal_skew", admission);
+			return _defer(host, workflow_id, fencing_token, defer_until, "begin_reversal_skew", admission);
 		},
 		default => {
 			// trigger_mismatch / operation_not_found / operation_conflict /
@@ -2732,7 +2732,7 @@ variant ResultClass { Object(json: String), Invalid, Missing }
 fn _classify_result(envelope: &String) nothrow -> ResultClass {
 	match json.parse(envelope) {
 		core.Result::Ok(n) => {
-			match n.get(&"result") {
+			match n.get("result") {
 				Optional::Some(r) => {
 					match r.as_object() {
 						Optional::Some(_) => { return ResultClass::Object(json.encode_compact(r)); },
@@ -2762,13 +2762,13 @@ fn _dispatch_put(base: &String, operation_name: &String, operation_id_hex: &Stri
                  input_json: &String, io_timeout_ms: Int) nothrow -> PutOutcome {
 	val url = _op_url(base, operation_name, operation_id_hex);
 	var cfg = client.new_client_config();
-	client.with_io_timeout(&mut cfg, io_timeout_ms);
+	client.with_io_timeout(cfg, io_timeout_ms);
 	var session = client.new_session(move cfg);
 	var req = client.new_request("PUT", move url);
-	client.set_json_body(&mut req, _dup(input_json));
-	match client.send(&session, move req) {
+	client.set_json_body(req, _dup(input_json));
+	match client.send(session, move req) {
 		core.Result::Ok(resp) => {
-			match client.response_body_string(&resp) {
+			match client.response_body_string(resp) {
 				core.Result::Ok(body) => { return PutOutcome::Responded(resp.status, move body); },
 				// An unreadable response body is NOT a known response: the outcome
 				// is uncertain -> TransportFailed (reconcile), never Responded("").
@@ -2785,7 +2785,7 @@ fn _dispatch_put(base: &String, operation_name: &String, operation_id_hex: &Stri
 fn _classify_dispatch(base: &String, operation_name: &String, operation_id_hex: &String, input_json: &String) -> DispatchResult {
 	match _dispatch_put(base, operation_name, operation_id_hex, input_json, PUT_IO_TIMEOUT_MS) {
 		PutOutcome::Responded(status, body) => {
-			if status == 200 { return _classify_200_body(&body); }
+			if status == 200 { return _classify_200_body(body); }
 			if status == 202 { return DispatchResult::PendingObserved(); }
 			if status == 400 { return DispatchResult::Rejected("participant_invalid_request"); }
 			if status == 409 { return DispatchResult::Rejected("participant_identity_conflict"); }
@@ -2800,21 +2800,21 @@ fn _classify_dispatch(base: &String, operation_name: &String, operation_id_hex: 
 fn _get_op(base: &String, operation_name: &String, operation_id_hex: &String) nothrow -> GetOutcome {
 	val url = _op_url(base, operation_name, operation_id_hex);
 	var cfg = client.new_client_config();
-	client.with_io_timeout(&mut cfg, RECONCILE_IO_TIMEOUT_MS);
+	client.with_io_timeout(cfg, RECONCILE_IO_TIMEOUT_MS);
 	var session = client.new_session(move cfg);
 	var req = client.new_request("GET", move url);
-	match client.send(&session, move req) {
+	match client.send(session, move req) {
 		core.Result::Ok(resp) => {
 			if resp.status == 404 { return GetOutcome::Unknown(); }
 			if resp.status == 202 { return GetOutcome::Pending(); }
 			if resp.status == 400 { return GetOutcome::Rejected("participant_invalid_request"); }
 			if resp.status == 409 { return GetOutcome::Rejected("participant_identity_conflict"); }
 			if resp.status == 200 {
-				match client.response_body_string(&resp) {
+				match client.response_body_string(resp) {
 					core.Result::Ok(body) => {
 						// 200 with a missing/non-object `result` is a definite PROTOCOL failure (the participant
 						// claims success but produced no usable result), not transport uncertainty -> Rejected.
-						match _classify_result(&body) {
+						match _classify_result(body) {
 							ResultClass::Object(r) => { return GetOutcome::Terminal(move r); },
 							ResultClass::Invalid => { return GetOutcome::Rejected("participant_protocol_invalid_result"); },
 							ResultClass::Missing => { return GetOutcome::Rejected("participant_protocol_missing_result"); }
@@ -2841,7 +2841,7 @@ const PENDING_REDISPATCH_AFTER_MS_DEFAULT: Int = 60000;
 
 fn _pending_redispatch_after_ms(cfg: &json.JsonNode) nothrow -> Int {
 	var v = PENDING_REDISPATCH_AFTER_MS_DEFAULT;
-	match cfg.get(&"pending_redispatch_after_ms") {
+	match cfg.get("pending_redispatch_after_ms") {
 		Optional::Some(n) => { match n.as_int() { Optional::Some(x) => { if x >= 0 { v = x; } }, Optional::None => {} } },
 		Optional::None => {}
 	}
@@ -2857,10 +2857,10 @@ struct ReconcileBudget { max_elapsed_ms: Int, min_attempts: Int }
 fn _reconcile_budget(cfg: &json.JsonNode) nothrow -> ReconcileBudget {
 	var me = RECONCILE_MAX_ELAPSED_MS_DEFAULT;
 	var ma = RECONCILE_MIN_ATTEMPTS_DEFAULT;
-	match cfg.get(&"reconcile_budget") {
+	match cfg.get("reconcile_budget") {
 		Optional::Some(rb) => {
-			match rb.get(&"max_elapsed_ms") { Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { if v > 0 { me = v; } }, Optional::None => {} } }, Optional::None => {} }
-			match rb.get(&"min_attempts") { Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { if v >= 1 { ma = v; } }, Optional::None => {} } }, Optional::None => {} }
+			match rb.get("max_elapsed_ms") { Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { if v > 0 { me = v; } }, Optional::None => {} } }, Optional::None => {} }
+			match rb.get("min_attempts") { Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { if v >= 1 { ma = v; } }, Optional::None => {} } }, Optional::None => {} }
 		},
 		Optional::None => {}
 	}
@@ -2872,10 +2872,10 @@ fn _reconcile_budget_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, work
                              admission: &AdmissionState) -> Outcome {
 	val b = _reconcile_budget(cfg);
 	val clock = host.clock_read(DISPATCH_DEFER_SECONDS);
-	match host.reconcile_defer(workflow_id, fencing_token, operation_seq, operation_id, &clock.now, &clock.deadline, &clock.now, b.max_elapsed_ms, b.min_attempts) {
-		mf.ReconcileDeferOutcome::Deferred(_) => { return Outcome::Deferred(reason = "participant_route_404", defer_until = _dup(&clock.deadline), code = 9); },
+	match host.reconcile_defer(workflow_id, fencing_token, operation_seq, operation_id, clock.now, clock.deadline, clock.now, b.max_elapsed_ms, b.min_attempts) {
+		mf.ReconcileDeferOutcome::Deferred(_) => { return Outcome::Deferred(reason = "participant_route_404", defer_until = _dup(clock.deadline), code = 9); },
 		mf.ReconcileDeferOutcome::Blocked(direction, reason) => { return Outcome::Blocked(direction = move direction, reason = move reason); },
-		mf.ReconcileDeferOutcome::EventTimeSkew(defer_until) => { return _defer(host, workflow_id, fencing_token, &defer_until, "reconcile_skew", admission); },
+		mf.ReconcileDeferOutcome::EventTimeSkew(defer_until) => { return _defer(host, workflow_id, fencing_token, defer_until, "reconcile_skew", admission); },
 		mf.ReconcileDeferOutcome::FenceLost => { return Outcome::Aborted(reason = "reconcile_fence_lost", code = 3); },
 		mf.ReconcileDeferOutcome::OperationNotFound => { return _defer_dispatch(host, workflow_id, fencing_token, "reconcile_op_not_found", admission); },
 		mf.ReconcileDeferOutcome::OperationConflict => { return _defer_dispatch(host, workflow_id, fencing_token, "reconcile_op_conflict", admission); },
@@ -2889,11 +2889,11 @@ fn _reconcile_budget_reverse(host: &mf.MicroflowsHost, cfg: &json.JsonNode, work
                              admission: &AdmissionState) -> Outcome {
 	val b = _reconcile_budget(cfg);
 	val clock = host.clock_read(DISPATCH_DEFER_SECONDS);
-	match host.checkpoint_reconcile_defer(workflow_id, fencing_token, seq, rev_id, &clock.now, &clock.deadline, &clock.now, b.max_elapsed_ms, b.min_attempts) {
-		mf.CheckpointReconcileDeferOutcome::Deferred(_) => { return Outcome::Deferred(reason = "participant_route_404", defer_until = _dup(&clock.deadline), code = 9); },
+	match host.checkpoint_reconcile_defer(workflow_id, fencing_token, seq, rev_id, clock.now, clock.deadline, clock.now, b.max_elapsed_ms, b.min_attempts) {
+		mf.CheckpointReconcileDeferOutcome::Deferred(_) => { return Outcome::Deferred(reason = "participant_route_404", defer_until = _dup(clock.deadline), code = 9); },
 		mf.CheckpointReconcileDeferOutcome::Blocked(direction, reason) => { return Outcome::Blocked(direction = move direction, reason = move reason); },
 		mf.CheckpointReconcileDeferOutcome::AlreadyBlocked => { return Outcome::Blocked(direction = "reverse", reason = "participant_route_unknown"); },
-		mf.CheckpointReconcileDeferOutcome::EventTimeSkew(defer_until) => { return _defer(host, workflow_id, fencing_token, &defer_until, "reconcile_skew", admission); },
+		mf.CheckpointReconcileDeferOutcome::EventTimeSkew(defer_until) => { return _defer(host, workflow_id, fencing_token, defer_until, "reconcile_skew", admission); },
 		mf.CheckpointReconcileDeferOutcome::FenceLost => { return Outcome::ReverseAborted(reason = "reconcile_fence_lost", code = 7); },
 		mf.CheckpointReconcileDeferOutcome::NotFound => { return Outcome::Aborted(reason = "reconcile_workflow_not_found", code = 8); },
 		mf.CheckpointReconcileDeferOutcome::CheckpointNotFound => { return _defer_dispatch(host, workflow_id, fencing_token, "reconcile_checkpoint_not_found", admission); },
@@ -2926,17 +2926,17 @@ fn _pending_redispatch_or_defer(host: &mf.MicroflowsHost, cfg: &json.JsonNode, w
 	if !_admission_accepting(admission) { return RedispatchStep::Return(_drain_release(host, workflow_id, fencing_token, admission)); }
 	val after_ms = _pending_redispatch_after_ms(cfg);
 	val clock = host.clock_read(PENDING_RETRY_SECONDS);
-	match host.operation_pending_defer(workflow_id, fencing_token, operation_seq, operation_id, &clock.now, &clock.deadline, &clock.now, after_ms) {
+	match host.operation_pending_defer(workflow_id, fencing_token, operation_seq, operation_id, clock.now, clock.deadline, clock.now, after_ms) {
 		mf.OperationPendingDeferOutcome::Defer(_) => {
-			return RedispatchStep::Return(Outcome::Pending(reason = "operation_pending", defer_until = _dup(&clock.deadline), child_workflow_id = ""));
+			return RedispatchStep::Return(Outcome::Pending(reason = "operation_pending", defer_until = _dup(clock.deadline), child_workflow_id = ""));
 		},
 		mf.OperationPendingDeferOutcome::Redispatch(_) => {
 			match _classify_dispatch(base, operation_name, operation_id_hex, input_json) {
 				DispatchResult::Done(r) => { return RedispatchStep::Done(move r); },
 				DispatchResult::Rejected(reason) => { return RedispatchStep::Reject(move reason); },
 				DispatchResult::Route404 => { return RedispatchStep::Route404(); },
-				DispatchResult::PendingObserved => { return RedispatchStep::Return(_defer_pending(host, workflow_id, fencing_token, &"", admission)); },
-				DispatchResult::PendingUncertain => { return RedispatchStep::Return(_defer_pending(host, workflow_id, fencing_token, &"", admission)); }
+				DispatchResult::PendingObserved => { return RedispatchStep::Return(_defer_pending(host, workflow_id, fencing_token, "", admission)); },
+				DispatchResult::PendingUncertain => { return RedispatchStep::Return(_defer_pending(host, workflow_id, fencing_token, "", admission)); }
 			}
 		},
 		mf.OperationPendingDeferOutcome::FenceLost => { return RedispatchStep::Return(Outcome::Aborted(reason = "pending_fence_lost", code = 3)); },
@@ -2957,9 +2957,9 @@ fn _checkpoint_pending_redispatch_or_defer(host: &mf.MicroflowsHost, cfg: &json.
 	if !_admission_accepting(admission) { return RedispatchStep::Return(_drain_release(host, workflow_id, fencing_token, admission)); }
 	val after_ms = _pending_redispatch_after_ms(cfg);
 	val clock = host.clock_read(PENDING_RETRY_SECONDS);
-	match host.checkpoint_pending_defer(workflow_id, fencing_token, seq, rev_id, &clock.now, &clock.deadline, &clock.now, after_ms) {
+	match host.checkpoint_pending_defer(workflow_id, fencing_token, seq, rev_id, clock.now, clock.deadline, clock.now, after_ms) {
 		mf.CheckpointPendingDeferOutcome::Defer(_) => {
-			return RedispatchStep::Return(Outcome::Deferred(reason = "compensation_pending", defer_until = _dup(&clock.deadline), code = 9));
+			return RedispatchStep::Return(Outcome::Deferred(reason = "compensation_pending", defer_until = _dup(clock.deadline), code = 9));
 		},
 		mf.CheckpointPendingDeferOutcome::Redispatch(_) => {
 			match _classify_dispatch(base, comp_op, rev_id_hex, rev_input) {
@@ -2997,7 +2997,7 @@ fn _reconcile(base: &String, operation_name: &String, operation_id_hex: &String,
 			// 404-reconcile: participant has no record -> resubmit identical PUT.
 			match _dispatch_put(base, operation_name, operation_id_hex, input_json, RECONCILE_IO_TIMEOUT_MS) {
 				PutOutcome::Responded(status, body) => {
-					if status == 200 { return _classify_200_body(&body); }
+					if status == 200 { return _classify_200_body(body); }
 					if status == 202 { return DispatchResult::PendingObserved(); }
 					if status == 400 { return DispatchResult::Rejected("participant_invalid_request"); }
 					if status == 409 { return DispatchResult::Rejected("participant_identity_conflict"); }
@@ -3031,16 +3031,16 @@ fn _blocked_from_continuation(snap: &mf.WorkflowSnapshot) nothrow -> Optional<Ou
 	// Render blocked ONLY for a durable blocked_resolution(3) row. A stale/malformed `pos:blocked` on a
 	// forward/reversing/deferred row must NOT suppress normal retry — the durable state is authoritative.
 	if snap.state_code != STATE_BLOCKED { return Optional<Outcome>::None(); }
-	match json.parse_strict(&snap.continuation_json) {
+	match json.parse_strict(snap.continuation_json) {
 		core.Result::Ok(n) => {
 			var pos = "";
-			match n.get(&"pos") { Optional::Some(pp) => { match pp.as_string() { Optional::Some(v) => { pos = move v; }, Optional::None => {} } }, Optional::None => {} }
+			match n.get("pos") { Optional::Some(pp) => { match pp.as_string() { Optional::Some(v) => { pos = move v; }, Optional::None => {} } }, Optional::None => {} }
 			if pos == "blocked" {
 				var direction = "reverse";
 				if snap.execution_direction == 1 { direction = "forward"; }
-				match n.get(&"direction") { Optional::Some(dd) => { match dd.as_string() { Optional::Some(v) => { direction = move v; }, Optional::None => {} } }, Optional::None => {} }
+				match n.get("direction") { Optional::Some(dd) => { match dd.as_string() { Optional::Some(v) => { direction = move v; }, Optional::None => {} } }, Optional::None => {} }
 				var reason = "";
-				match n.get(&"reason") { Optional::Some(rr) => { match rr.as_string() { Optional::Some(v) => { reason = move v; }, Optional::None => {} } }, Optional::None => {} }
+				match n.get("reason") { Optional::Some(rr) => { match rr.as_string() { Optional::Some(v) => { reason = move v; }, Optional::None => {} } }, Optional::None => {} }
 				return Optional<Outcome>::Some(Outcome::Blocked(direction = move direction, reason = move reason));
 			}
 			return Optional<Outcome>::None();
@@ -3054,16 +3054,16 @@ fn _blocked_from_continuation(snap: &mf.WorkflowSnapshot) nothrow -> Optional<Ou
 // already persisted it; no dependency on the participant being reachable).
 fn _inspect_report(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, operation_id_hex: &String, result_seq: Int) -> Outcome {
 	val now = _now(host);
-	match host.inspect_workflow(workflow_id, &now) {
+	match host.inspect_workflow(workflow_id, now) {
 		mf.WorkflowInspectOutcome::Found(snap) => {
 			if snap.is_terminal {
-				return _report_terminal(host, workflow_id, &snap, operation_id_hex, result_seq);
+				return _report_terminal(host, workflow_id, snap, operation_id_hex, result_seq);
 			}
 			if snap.leased {
 				return Outcome::Active(reason = "leased_by_another");
 			}
 			// A blocked_resolution(3) workflow renders {workflow:blocked,direction,reason} from durable state.
-			match _blocked_from_continuation(&snap) {
+			match _blocked_from_continuation(snap) {
 				Optional::Some(o) => { return o; },
 				Optional::None => {}
 			}
@@ -3115,10 +3115,10 @@ fn _report_terminal(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>,
 		}
 	}
 	if snap.state_code == STATE_REVERSED {
-		return Outcome::TerminalFailure(reason = _dup(&snap.terminal_reason), compensated = true);
+		return Outcome::TerminalFailure(reason = _dup(snap.terminal_reason), compensated = true);
 	}
 	if snap.state_code == STATE_FAILED {
-		return Outcome::TerminalFailure(reason = _dup(&snap.terminal_reason), compensated = false);
+		return Outcome::TerminalFailure(reason = _dup(snap.terminal_reason), compensated = false);
 	}
 	if snap.state_code == STATE_RESOLVED_EXCEPTION {
 		return Outcome::ResolvedException();
@@ -3142,9 +3142,9 @@ fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 	// Schedule the next attempt PENDING_RETRY_SECONDS out (NOT the lease window):
 	// the DB clock returns this as an absolute next-attempt deadline.
 	val clock = host.clock_read(PENDING_RETRY_SECONDS);
-	match host.release(workflow_id, fencing_token, &clock.now, &clock.deadline) {
+	match host.release(workflow_id, fencing_token, clock.now, clock.deadline) {
 		mf.ReleaseOutcome::Released => {
-			return Outcome::Pending(reason = "operation_pending", defer_until = _dup(&clock.deadline), child_workflow_id = _dup(child_workflow_id_hex));
+			return Outcome::Pending(reason = "operation_pending", defer_until = _dup(clock.deadline), child_workflow_id = _dup(child_workflow_id_hex));
 		},
 		mf.ReleaseOutcome::FenceLost => {
 			return Outcome::DeferFailed(reason = "release_fence_lost", code = 7);
@@ -3166,9 +3166,9 @@ fn _defer_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 fn _defer_reverse_pending(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int, child_workflow_id_hex: &String, admission: &AdmissionState) -> Outcome {
 	if !_admission_accepting(admission) { return _drain_release(host, workflow_id, fencing_token, admission); }
 	val clock = host.clock_read(PENDING_RETRY_SECONDS);
-	match host.release(workflow_id, fencing_token, &clock.now, &clock.deadline) {
+	match host.release(workflow_id, fencing_token, clock.now, clock.deadline) {
 		mf.ReleaseOutcome::Released => {
-			return Outcome::Pending(reason = "compensation_pending", defer_until = _dup(&clock.deadline), child_workflow_id = _dup(child_workflow_id_hex));
+			return Outcome::Pending(reason = "compensation_pending", defer_until = _dup(clock.deadline), child_workflow_id = _dup(child_workflow_id_hex));
 		},
 		mf.ReleaseOutcome::FenceLost => {
 			return Outcome::DeferFailed(reason = "release_fence_lost", code = 7);
@@ -3189,7 +3189,7 @@ fn _defer(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: In
 	// Admission (slice 2): suppress new defers while draining/stopped (see _defer_pending).
 	if !_admission_accepting(admission) { return _drain_release(host, workflow_id, fencing_token, admission); }
 	val clock = host.clock_read(LEASE_SECONDS);
-	match host.release(workflow_id, fencing_token, &clock.now, defer_until) {
+	match host.release(workflow_id, fencing_token, clock.now, defer_until) {
 		mf.ReleaseOutcome::Released => {
 			return Outcome::Deferred(reason = move reason, defer_until = _dup(defer_until), code = 6);
 		},
@@ -3237,10 +3237,10 @@ fn _defer_on_backend_unavailable(host: &mf.MicroflowsHost, workflow_id: &Array<B
 	val clock = host.clock_read(DISPATCH_DEFER_SECONDS);
 	match kind {
 		mf.HostErrorKind::BackendUnavailable(detail) => {
-			return _defer(host, workflow_id, fencing_token, &clock.deadline, reason_prefix + ":backend_unavailable:" + detail, admission);
+			return _defer(host, workflow_id, fencing_token, clock.deadline, reason_prefix + ":backend_unavailable:" + detail, admission);
 		},
 		mf.HostErrorKind::BackendTimeout(detail) => {
-			return _defer(host, workflow_id, fencing_token, &clock.deadline, reason_prefix + ":backend_timeout:" + detail, admission);
+			return _defer(host, workflow_id, fencing_token, clock.deadline, reason_prefix + ":backend_timeout:" + detail, admission);
 		},
 		default => {
 			throw mf.HostException(kind = move kind);
@@ -3252,9 +3252,9 @@ fn _defer_dispatch(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_
 	// Admission (slice 2): suppress new dispatch defers while draining/stopped (see _defer_pending).
 	if !_admission_accepting(admission) { return _drain_release(host, workflow_id, fencing_token, admission); }
 	val clock = host.clock_read(DISPATCH_DEFER_SECONDS);
-	match host.defer_dispatch(workflow_id, fencing_token, &clock.now, &clock.deadline, &clock.now, &reason) {
+	match host.defer_dispatch(workflow_id, fencing_token, clock.now, clock.deadline, clock.now, reason) {
 		mf.ReleaseOutcome::Released => {
-			return Outcome::Deferred(reason = move reason, defer_until = _dup(&clock.deadline), code = 9);
+			return Outcome::Deferred(reason = move reason, defer_until = _dup(clock.deadline), code = 9);
 		},
 		mf.ReleaseOutcome::FenceLost => {
 			return Outcome::DeferFailed(reason = "defer_fence_lost", code = 7);
@@ -3275,8 +3275,8 @@ fn _fail_operation(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_
                    operation_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Outcome {
 	val t = _now(host);
 	val cont = "{\"pos\":\"op:1:failed\"}";
-	val payload = "{\"reason\":\"" + _dup(&reason) + "\",\"kind\":\"non_retryable_failure\"}";
-	match host.operation_fail(workflow_id, fencing_token, OPERATION_SEQ, operation_id, &cont, &t, &payload) {
+	val payload = "{\"reason\":\"" + _dup(reason) + "\",\"kind\":\"non_retryable_failure\"}";
+	match host.operation_fail(workflow_id, fencing_token, OPERATION_SEQ, operation_id, cont, t, payload) {
 		mf.OperationFailOutcome::Blocked => {
 			return Outcome::Failed(reason = move reason);
 		},
@@ -3297,7 +3297,7 @@ fn _fail_operation(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_
 			return Outcome::FailAborted(reason = "fail_operation_not_found", code = 8);
 		},
 		mf.OperationFailOutcome::EventTimeSkew(defer_until) => {
-			return _defer(host, workflow_id, fencing_token, &defer_until, "fail_event_time_skew", admission);
+			return _defer(host, workflow_id, fencing_token, defer_until, "fail_event_time_skew", admission);
 		}
 	}
 }
@@ -3309,9 +3309,9 @@ fn _fail_operation(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_
 fn _reverse_id(workflow_hex: &String, seq: Int) nothrow -> Array<Byte> {
 	val rev = fmt.format_int(SCRIPT_REVISION);
 	val s = fmt.format_int(seq);
-	val seed = _join3(workflow_hex, &rev, &s) + "reverse:1";
-	val u = uuid.v3_from_string(&seed);
-	return uuid.to_bytes(&u);
+	val seed = _join3(workflow_hex, rev, s) + "reverse:1";
+	val u = uuid.v3_from_string(seed);
+	return uuid.to_bytes(u);
 }
 
 // Build the standard forward-context envelope a compensation receives (E):
@@ -3332,24 +3332,24 @@ fn _comp_envelope(workflow_hex: &String, operation: &String, forward_op_id_hex: 
 	var o = json.new_object();
 	o.set("forward", fwd.to_node());
 	val node = o.to_node();
-	return json.encode_compact(&node);
+	return json.encode_compact(node);
 }
 
 // Manual-IR compensation binding for a forward operation (None if it declares no
 // compensation — then its checkpoint cannot be auto-unwound).
 fn _compensation_for(cfg: &json.JsonNode, fwd_op: &String) -> Optional<CompensationBinding> {
-	match cfg.get(&"operations") {
+	match cfg.get("operations") {
 		Optional::Some(on) => {
 			match on.as_array() {
 				Optional::Some(items) => {
 					var i = 0;
 					while i < items.len {
-						val nm = _req_str(&items[i], &"name", "operation.name");
-						if _str_eq(&nm, fwd_op) {
-							match items[i].get(&"compensation") {
+						val nm = _req_str(items[i], "name", "operation.name");
+						if _str_eq(nm, fwd_op) {
+							match items[i].get("compensation") {
 								Optional::Some(c) => {
-									val cop = _req_str(c, &"operation", "compensation.operation");
-									val csv = _req_int(c, &"schema_version", "compensation.schema_version");
+									val cop = _req_str(c, "operation", "compensation.operation");
+									val csv = _req_int(c, "schema_version", "compensation.schema_version");
 									return Optional<CompensationBinding>::Some(CompensationBinding(op_name = move cop, schema_version = csv));
 								},
 								Optional::None => { return Optional<CompensationBinding>::None(); }
@@ -3370,7 +3370,7 @@ fn _compensation_for(cfg: &json.JsonNode, fwd_op: &String) -> Optional<Compensat
 fn _reverse_block(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_token: Int,
                   seq: Int, rev_id: &Array<Byte>, reason: String, admission: &AdmissionState) -> Outcome {
 	val ts = _now(host);
-	match host.reverse_block(workflow_id, fencing_token, seq, rev_id, 2, &reason, &ts) {
+	match host.reverse_block(workflow_id, fencing_token, seq, rev_id, 2, reason, ts) {
 		mf.ReverseBlockOutcome::Blocked => {
 			return Outcome::Blocked(direction = "reverse", reason = move reason);
 		},
@@ -3383,7 +3383,7 @@ fn _reverse_block(host: &mf.MicroflowsHost, workflow_id: &Array<Byte>, fencing_t
 		mf.ReverseBlockOutcome::EventTimeSkew(defer_until) => {
 			// Time-disciplined like every transition: defer to the supplied deadline
 			// rather than reporting failure with the lease still held.
-			return _defer(host, workflow_id, fencing_token, &defer_until, "reverse_block_skew", admission);
+			return _defer(host, workflow_id, fencing_token, defer_until, "reverse_block_skew", admission);
 		},
 		default => {
 			return Outcome::ReverseAborted(reason = "reverse_block_failed", code = 8);
@@ -3428,7 +3428,7 @@ fn _compensate(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arra
 	match eff_dr {
 		DispatchResult::Done(result) => {
 			val ts = _now(host);
-			match host.reverse_settle(workflow_id, fencing_token, seq, rev_id, &result, &ts) {
+			match host.reverse_settle(workflow_id, fencing_token, seq, rev_id, result, ts) {
 				mf.ReverseSettleOutcome::Reversed(reason) => {
 					return CompStep::Terminal(Outcome::TerminalFailure(reason = move reason, compensated = true));
 				},
@@ -3438,7 +3438,7 @@ fn _compensate(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arra
 					return CompStep::Terminal(Outcome::ReverseAborted(reason = "settle_fence_lost", code = 7));
 				},
 				mf.ReverseSettleOutcome::EventTimeSkew(defer_until) => {
-					return CompStep::Terminal(_defer(host, workflow_id, fencing_token, &defer_until, "reverse_settle_skew", admission));
+					return CompStep::Terminal(_defer(host, workflow_id, fencing_token, defer_until, "reverse_settle_skew", admission));
 				},
 				default => {
 					return CompStep::Terminal(Outcome::ReverseAborted(reason = "reverse_settle_failed", code = 8));
@@ -3489,7 +3489,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 					// dispatched" flag, so re-calling it every pass is correct and cheap — a true
 					// replay writes nothing at all, on either the parent's or the child's event stream.
 					val t_reopen = _now(host);
-					match host.checkpoint_reverse_child_reopen_checked(workflow_id, fencing_token, seq, &t_reopen) {
+					match host.checkpoint_reverse_child_reopen_checked(workflow_id, fencing_token, seq, t_reopen) {
 						core.Result::Err(kind) => {
 							return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "checkpoint_reverse_child_reopen", admission);
 						},
@@ -3507,7 +3507,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_reopen_out_of_order", code = 8);
 								},
 								mf.CheckpointReverseChildReopenOutcome::EventTimeSkew(defer_until) => {
-									return _defer(host, workflow_id, fencing_token, &defer_until, "checkpoint_reverse_child_reopen_skew", admission);
+									return _defer(host, workflow_id, fencing_token, defer_until, "checkpoint_reverse_child_reopen_skew", admission);
 								},
 								mf.CheckpointReverseChildReopenOutcome::FenceLost => {
 									return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_reopen_fence_lost", code = 7);
@@ -3538,19 +3538,19 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 									// NeedCall await — never fenced, never affects this defer.
 									match _advisory_now(host) {
 										Optional::Some(t_hint) => {
-											_log_best_effort("call_hint_refresh", &_bytes_to_hex(workflow_id), host.call_hint_refresh_best_effort(workflow_id, seq, CHILD_STATUS_BLOCKED, &t_hint));
+											_log_best_effort("call_hint_refresh", _bytes_to_hex(workflow_id), host.call_hint_refresh_best_effort(workflow_id, seq, CHILD_STATUS_BLOCKED, t_hint));
 										},
 										Optional::None => {}
 									}
 								}
-								return _defer_reverse_pending(host, workflow_id, fencing_token, &child_workflow_id, admission);
+								return _defer_reverse_pending(host, workflow_id, fencing_token, child_workflow_id, admission);
 							}
 							// is_terminal: attempt settle regardless of WHICH terminal state — the settle
 							// SP's own child-state check (1c-design.md §2) is the single source of truth
 							// for whether this is a valid settle, never enumerated by this runner branch
 							// (the parent must never branch on the child's internal terminal disposition).
 							val t_settle = _now(host);
-							match host.checkpoint_reverse_child_settle_checked(workflow_id, fencing_token, seq, &t_settle) {
+							match host.checkpoint_reverse_child_settle_checked(workflow_id, fencing_token, seq, t_settle) {
 								core.Result::Err(kind) => {
 									return _defer_on_backend_unavailable(host, workflow_id, fencing_token, move kind, "checkpoint_reverse_child_settle", admission);
 								},
@@ -3565,7 +3565,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 											// Race: our own call_inspect read (above) is stale relative to the
 											// settle SP's own (later, authoritative) read, or the child regressed.
 											// Defer and re-poll — not an error.
-											return _defer_reverse_pending(host, workflow_id, fencing_token, &child_workflow_id, admission);
+											return _defer_reverse_pending(host, workflow_id, fencing_token, child_workflow_id, admission);
 										},
 										mf.CheckpointReverseChildSettleOutcome::ChildNotCompensated(_) => {
 											return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_not_compensated", code = 8);
@@ -3574,7 +3574,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 											return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_settle_out_of_order", code = 8);
 										},
 										mf.CheckpointReverseChildSettleOutcome::EventTimeSkew(defer_until) => {
-											return _defer(host, workflow_id, fencing_token, &defer_until, "checkpoint_reverse_child_settle_skew", admission);
+											return _defer(host, workflow_id, fencing_token, defer_until, "checkpoint_reverse_child_settle_skew", admission);
 										},
 										mf.CheckpointReverseChildSettleOutcome::FenceLost => {
 											return Outcome::ReverseAborted(reason = "checkpoint_reverse_child_settle_fence_lost", code = 7);
@@ -3604,11 +3604,11 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				}
 				// participant (call_kind == 1): UNCHANGED existing compensation path.
 				val rev_id = _reverse_id(workflow_canon_hex, seq);
-				val rev_id_hex = _bytes_to_hex(&rev_id);
+				val rev_id_hex = _bytes_to_hex(rev_id);
 				var comp_op: String = "";
 				var comp_sv: Int = 0;
-				match _compensation_for(cfg, &forward_operation_name) {
-					Optional::Some(c) => { comp_op = _dup(&c.op_name); comp_sv = c.schema_version; },
+				match _compensation_for(cfg, forward_operation_name) {
+					Optional::Some(c) => { comp_op = _dup(c.op_name); comp_sv = c.schema_version; },
 					Optional::None => {
 						// PRE-dispatch resolution failure: nothing was dispatched, so
 						// reverse_block (which requires a persisted reverse id) cannot
@@ -3624,7 +3624,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				var fwd_op_id_hex: String = "";
 				var fwd_sv: Int = 0;
 				match host.operation_request_get(workflow_id, seq) {
-					mf.OperationRequestGetOutcome::Found(rec) => { fwd_op_id_hex = _bytes_to_hex(&rec.operation_id); fwd_sv = rec.schema_version; },
+					mf.OperationRequestGetOutcome::Found(rec) => { fwd_op_id_hex = _bytes_to_hex(rec.operation_id); fwd_sv = rec.schema_version; },
 					mf.OperationRequestGetOutcome::NotFound => {
 						return _defer_dispatch(host, workflow_id, fencing_token, "reverse_forward_request_missing", admission);
 					}
@@ -3641,23 +3641,23 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				// Reversal context comes from DURABLE state and is never synthesized: strict-parse the stored
 				// forward input + result; a malformed value is a durable inconsistency -> defer with a distinct reason.
 				var fwd_input_node = json.JsonNode::Null();
-				match json.parse_strict(&forward_payload) {
+				match json.parse_strict(forward_payload) {
 					core.Result::Ok(n) => { fwd_input_node = move n; },
 					core.Result::Err(_) => { return _defer_dispatch(host, workflow_id, fencing_token, "reverse_forward_input_invalid", admission); }
 				}
 				var fwd_result_node = json.JsonNode::Null();
-				match json.parse_strict(&fwd_result) {
+				match json.parse_strict(fwd_result) {
 					core.Result::Ok(n) => { fwd_result_node = move n; },
 					core.Result::Err(_) => { return _defer_dispatch(host, workflow_id, fencing_token, "reverse_forward_result_invalid", admission); }
 				}
-				val rev_input = _comp_envelope(workflow_canon_hex, &forward_operation_name, &fwd_op_id_hex, fwd_sv, &fwd_input_node, &fwd_result_node);
-				val rev_hash = _input_hash(&rev_input);
+				val rev_input = _comp_envelope(workflow_canon_hex, forward_operation_name, fwd_op_id_hex, fwd_sv, fwd_input_node, fwd_result_node);
+				val rev_hash = _input_hash(rev_input);
 				// resolve the pinned reverse contract (registry, not workflow input)
 				var base: String = "";
 				var rok = false;
 				try {
-					val r = _resolve_operation(cfg, &comp_op, Optional<Int>::Some(comp_sv));
-					base = _dup(&r.base_url);
+					val r = _resolve_operation(cfg, comp_op, Optional<Int>::Some(comp_sv));
+					base = _dup(r.base_url);
 					rok = true;
 				} catch RunnerError(e) { console.eprintln(e.message); }
 				if !rok {
@@ -3666,8 +3666,8 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				// persist the binding BEFORE dispatch (crash-safe)
 				val treq = _now(host);
 				var ready = false;
-				match host.reverse_request(workflow_id, fencing_token, seq, &rev_id, &comp_op, comp_sv,
-				                           &rev_input, &rev_hash, &treq) {
+				match host.reverse_request(workflow_id, fencing_token, seq, rev_id, comp_op, comp_sv,
+				                           rev_input, rev_hash, treq) {
 					mf.ReverseRequestOutcome::Requested(_) => { ready = true; },
 					mf.ReverseRequestOutcome::AlreadyRequested(_, _, _, _, _) => { ready = true; },
 					mf.ReverseRequestOutcome::BindingConflict => {},   // persisted binding wins -> re-read head
@@ -3676,7 +3676,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 						return Outcome::ReverseAborted(reason = "reverse_request_fence_lost", code = 7);
 					},
 					mf.ReverseRequestOutcome::EventTimeSkew(defer_until) => {
-						return _defer(host, workflow_id, fencing_token, &defer_until, "reverse_request_skew", admission);
+						return _defer(host, workflow_id, fencing_token, defer_until, "reverse_request_skew", admission);
 					},
 					default => {
 						return Outcome::ReverseAborted(reason = "reverse_request_failed", code = 8);
@@ -3684,7 +3684,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				}
 				if ready {
 					// Fresh dispatch of a just-persisted binding: PUT-first.
-					match _compensate(host, cfg, workflow_id, fencing_token, seq, &comp_op, &base, &rev_id, &rev_id_hex, &rev_input, false, admission) {
+					match _compensate(host, cfg, workflow_id, fencing_token, seq, comp_op, base, rev_id, rev_id_hex, rev_input, false, admission) {
 						CompStep::Continue => {},
 						CompStep::Terminal(code) => { return code; }
 					}
@@ -3692,19 +3692,19 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 			},
 			mf.ReverseHeadOutcome::Dispatched(seq, forward_operation_name, reverse_invocation_id, reverse_operation_name, reverse_schema_version, reverse_input_json, reverse_input_hash) => {
 				val _ = forward_operation_name; val _ = reverse_input_hash;
-				val rev_op = _dup(&reverse_operation_name);
+				val rev_op = _dup(reverse_operation_name);
 				val rev_sv = reverse_schema_version;
-				val rev_input = _dup(&reverse_input_json);
+				val rev_input = _dup(reverse_input_json);
 				// USE the DURABLE persisted reverse id (decode it) for dispatch + settle,
 				// never a re-derived one — so recovery targets exactly the recorded
 				// invocation even if derivation changes or seeded state is inconsistent.
-				val rev_id = _hex_to_bytes(&reverse_invocation_id);
-				val rev_id_hex = _dup(&reverse_invocation_id);
+				val rev_id = _hex_to_bytes(reverse_invocation_id);
+				val rev_id_hex = _dup(reverse_invocation_id);
 				var base: String = "";
 				var rok = false;
 				try {
-					val r = _resolve_operation(cfg, &rev_op, Optional<Int>::Some(rev_sv));
-					base = _dup(&r.base_url);
+					val r = _resolve_operation(cfg, rev_op, Optional<Int>::Some(rev_sv));
+					base = _dup(r.base_url);
 					rok = true;
 				} catch RunnerError(e) { console.eprintln(e.message); }
 				if !rok {
@@ -3712,7 +3712,7 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				}
 				// Durable binding already dispatched (recovery): GET-first reconcile,
 				// never a blind re-PUT.
-				match _compensate(host, cfg, workflow_id, fencing_token, seq, &rev_op, &base, &rev_id, &rev_id_hex, &rev_input, true, admission) {
+				match _compensate(host, cfg, workflow_id, fencing_token, seq, rev_op, base, rev_id, rev_id_hex, rev_input, true, admission) {
 					CompStep::Continue => {},
 					CompStep::Terminal(code) => { return code; }
 				}
@@ -3759,9 +3759,9 @@ fn _operation_id(workflow_hex: &String, operation_seq: Int) nothrow -> Array<Byt
 	val rev = fmt.format_int(SCRIPT_REVISION);
 	val seq = fmt.format_int(operation_seq);
 	// invocation = 1 (first occurrence of this static call site).
-	val seed = _join3(workflow_hex, &rev, &seq) + "inv:1";
-	val u = uuid.v3_from_string(&seed);
-	return uuid.to_bytes(&u);
+	val seed = _join3(workflow_hex, rev, seq) + "inv:1";
+	val u = uuid.v3_from_string(seed);
+	return uuid.to_bytes(u);
 }
 
 // Node-address operation identity (planned path). INVARIANT: a compiled operation node executes AT MOST
@@ -3774,8 +3774,8 @@ fn _operation_id(workflow_hex: &String, operation_seq: Int) nothrow -> Array<Byt
 // reverse-id space.
 fn _operation_id_node(workflow_hex: &String, content_hash_hex: &String, node_id: &String) nothrow -> Array<Byte> {
 	val seed = "mf-op;" + _join3(workflow_hex, content_hash_hex, node_id);
-	val u = uuid.v3_from_string(&seed);
-	return uuid.to_bytes(&u);
+	val u = uuid.v3_from_string(seed);
+	return uuid.to_bytes(u);
 }
 
 // Child-workflow identity for a `call` node (1b.1). Same derivation shape as `_operation_id_node` (parent
@@ -3786,18 +3786,18 @@ fn _operation_id_node(workflow_hex: &String, content_hash_hex: &String, node_id:
 // pass's decision: operation_id = child_workflow_id).
 fn _child_workflow_id_node(workflow_hex: &String, content_hash_hex: &String, node_id: &String) nothrow -> Array<Byte> {
 	val seed = "mf-call;" + _join3(workflow_hex, content_hash_hex, node_id);
-	val u = uuid.v3_from_string(&seed);
-	return uuid.to_bytes(&u);
+	val u = uuid.v3_from_string(seed);
+	return uuid.to_bytes(u);
 }
 
 fn _input_hash(input_json: &String) -> String {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
 	match json.parse_strict(input_json) {
 		core.Result::Ok(n) => {
-			val compact = json.encode_compact_with_config(&n, &cfg);
-			val u = uuid.v3_from_string(&compact);
-			val bytes = uuid.to_bytes(&u);
-			return _bytes_to_hex(&bytes);
+			val compact = json.encode_compact_with_config(n, cfg);
+			val u = uuid.v3_from_string(compact);
+			val bytes = uuid.to_bytes(u);
+			return _bytes_to_hex(bytes);
 		},
 		core.Result::Err(_) => { throw RunnerError(message = "input is not valid JSON"); }
 	}
@@ -3815,7 +3815,7 @@ fn _input_hash(input_json: &String) -> String {
 // Validate the WHOLE registry at startup, before any execution.
 fn _validate_registry(cfg: &json.JsonNode) -> Void {
 	val ids = _validate_participants(cfg);
-	_validate_operations(cfg, &ids);
+	_validate_operations(cfg, ids);
 	_validate_reconcile_budget(cfg);
 	_validate_pending_redispatch(cfg);
 	_validate_workflow_call(cfg);
@@ -3825,7 +3825,7 @@ fn _validate_registry(cfg: &json.JsonNode) -> Void {
 // reconcile_budget: a typo must not silently become the 60s default. Absent -> default. Must be an
 // integer >= 0 (0 = escalate on the first recovered poll; the test override). (case [12])
 fn _validate_pending_redispatch(cfg: &json.JsonNode) -> Void {
-	match cfg.get(&"pending_redispatch_after_ms") {
+	match cfg.get("pending_redispatch_after_ms") {
 		Optional::Some(n) => {
 			match n.as_int() {
 				Optional::Some(v) => { if v < 0 { throw RunnerError(message = "pending_redispatch_after_ms must be an integer >= 0"); } },
@@ -3841,13 +3841,13 @@ fn _validate_pending_redispatch(cfg: &json.JsonNode) -> Void {
 // keys default. Must be an object; max_elapsed_ms (if present) an integer > 0; min_attempts (if present)
 // an integer >= 1.
 fn _validate_reconcile_budget(cfg: &json.JsonNode) -> Void {
-	match cfg.get(&"reconcile_budget") {
+	match cfg.get("reconcile_budget") {
 		Optional::Some(rb) => {
 			match rb.as_object() {
 				Optional::Some(_) => {},
 				Optional::None => { throw RunnerError(message = "reconcile_budget must be an object"); }
 			}
-			match rb.get(&"max_elapsed_ms") {
+			match rb.get("max_elapsed_ms") {
 				Optional::Some(n) => {
 					match n.as_int() {
 						Optional::Some(v) => { if v <= 0 { throw RunnerError(message = "reconcile_budget.max_elapsed_ms must be an integer > 0"); } },
@@ -3856,7 +3856,7 @@ fn _validate_reconcile_budget(cfg: &json.JsonNode) -> Void {
 				},
 				Optional::None => {}
 			}
-			match rb.get(&"min_attempts") {
+			match rb.get("min_attempts") {
 				Optional::Some(n) => {
 					match n.as_int() {
 						Optional::Some(v) => { if v < 1 { throw RunnerError(message = "reconcile_budget.min_attempts must be an integer >= 1"); } },
@@ -3876,13 +3876,13 @@ fn _validate_reconcile_budget(cfg: &json.JsonNode) -> Void {
 // falling back to _max_call_depth's runtime default. Absent -> DEFAULT_MAX_CALL_DEPTH (read at
 // dispatch time by _max_call_depth). Must be an object; max_call_depth (if present) an integer >= 1.
 fn _validate_workflow_call(cfg: &json.JsonNode) -> Void {
-	match cfg.get(&"workflow_call") {
+	match cfg.get("workflow_call") {
 		Optional::Some(wc) => {
 			match wc.as_object() {
 				Optional::Some(_) => {},
 				Optional::None => { throw RunnerError(message = "workflow_call must be an object"); }
 			}
-			match wc.get(&"max_call_depth") {
+			match wc.get("max_call_depth") {
 				Optional::Some(n) => {
 					match n.as_int() {
 						Optional::Some(v) => { if v < 1 { throw RunnerError(message = "workflow_call.max_call_depth must be an integer >= 1"); } },
@@ -3899,15 +3899,15 @@ fn _validate_workflow_call(cfg: &json.JsonNode) -> Void {
 // Validate every participant's transport; return the owned set of participant ids.
 fn _validate_participants(cfg: &json.JsonNode) -> Array<String> {
 	var ids: Array<String> = [];
-	match cfg.get(&"participants") {
+	match cfg.get("participants") {
 		Optional::Some(pn) => {
 			match pn.as_array() {
 				Optional::Some(items) => {
 					var i = 0;
 					while i < items.len {
-						val pid = _req_str(&items[i], &"id", "participant.id");
-						if _contains(&ids, &pid) { throw RunnerError(message = "duplicate participant id: " + _dup(&pid)); }
-						_validate_transport(&items[i], &pid);
+						val pid = _req_str(items[i], "id", "participant.id");
+						if _contains(ids, pid) { throw RunnerError(message = "duplicate participant id: " + _dup(pid)); }
+						_validate_transport(items[i], pid);
 						ids.push(move pid);
 						i = i + 1;
 					}
@@ -3923,19 +3923,19 @@ fn _validate_participants(cfg: &json.JsonNode) -> Array<String> {
 fn _validate_operations(cfg: &json.JsonNode, ids: &Array<String>) -> Void {
 	var names: Array<String> = [];
 	var svs: Array<Int> = [];
-	match cfg.get(&"operations") {
+	match cfg.get("operations") {
 		Optional::Some(on) => {
 			match on.as_array() {
 				Optional::Some(items) => {
 					var i = 0;
 					while i < items.len {
-						val nm = _req_str(&items[i], &"name", "operation.name");
-						if !_is_op_name_safe(&nm) { throw RunnerError(message = "operation name is empty or not a URI-safe segment: '" + _dup(&nm) + "' (allowed: A-Z a-z 0-9 . _ -)"); }
-						if _contains(&names, &nm) { throw RunnerError(message = "duplicate operation binding: " + _dup(&nm)); }
-						val pref = _req_str(&items[i], &"participant", "operation.participant");
-						if !_contains(ids, &pref) { throw RunnerError(message = "operation '" + _dup(&nm) + "' references unknown participant '" + _dup(&pref) + "'"); }
-						val sv = _req_int(&items[i], &"schema_version", "operation.schema_version");
-						if sv < 1 { throw RunnerError(message = "operation '" + _dup(&nm) + "' has invalid schema_version"); }
+						val nm = _req_str(items[i], "name", "operation.name");
+						if !_is_op_name_safe(nm) { throw RunnerError(message = "operation name is empty or not a URI-safe segment: '" + _dup(nm) + "' (allowed: A-Z a-z 0-9 . _ -)"); }
+						if _contains(names, nm) { throw RunnerError(message = "duplicate operation binding: " + _dup(nm)); }
+						val pref = _req_str(items[i], "participant", "operation.participant");
+						if !_contains(ids, pref) { throw RunnerError(message = "operation '" + _dup(nm) + "' references unknown participant '" + _dup(pref) + "'"); }
+						val sv = _req_int(items[i], "schema_version", "operation.schema_version");
+						if sv < 1 { throw RunnerError(message = "operation '" + _dup(nm) + "' has invalid schema_version"); }
 						svs.push(sv);
 						names.push(move nm);
 						i = i + 1;
@@ -3944,13 +3944,13 @@ fn _validate_operations(cfg: &json.JsonNode, ids: &Array<String>) -> Void {
 					// names are known (a compensation must reference a registered op).
 					var k = 0;
 					while k < items.len {
-						match items[k].get(&"compensation") {
+						match items[k].get("compensation") {
 							Optional::Some(c) => {
-								val cop = _req_str(c, &"operation", "compensation.operation");
-								if !_contains(&names, &cop) {
-									throw RunnerError(message = "compensation references unknown operation '" + _dup(&cop) + "'");
+								val cop = _req_str(c, "operation", "compensation.operation");
+								if !_contains(names, cop) {
+									throw RunnerError(message = "compensation references unknown operation '" + _dup(cop) + "'");
 								}
-								val csv = _req_int(c, &"schema_version", "compensation.schema_version");
+								val csv = _req_int(c, "schema_version", "compensation.schema_version");
 								if csv < 1 { throw RunnerError(message = "compensation for an operation has invalid schema_version"); }
 								// The pinned compensation version must MATCH the referenced
 								// operation's registered version — reject an inconsistent
@@ -3958,12 +3958,12 @@ fn _validate_operations(cfg: &json.JsonNode, ids: &Array<String>) -> Void {
 								var reg_sv = 0;
 								var fi = 0;
 								while fi < names.len {
-									if _str_eq(&names[fi], &cop) { reg_sv = svs[fi]; }
+									if _str_eq(names[fi], cop) { reg_sv = svs[fi]; }
 									fi = fi + 1;
 								}
 								if reg_sv != csv {
 									throw RunnerError(message = "compensation pins schema_version " + fmt.format_int(csv)
-										+ " but operation '" + _dup(&cop) + "' offers version " + fmt.format_int(reg_sv));
+										+ " but operation '" + _dup(cop) + "' offers version " + fmt.format_int(reg_sv));
 								}
 							},
 							Optional::None => {}
@@ -3982,19 +3982,19 @@ fn _validate_operations(cfg: &json.JsonNode, ids: &Array<String>) -> Void {
 // legacy single --operation path). Each step is {operation: string, input: object};
 // the input is normalized to compact JSON text for stable hashing + storage.
 fn _build_plan(cfg: &json.JsonNode) -> Optional<Array<PlanStep>> {
-	match cfg.get(&"plan") {
+	match cfg.get("plan") {
 		Optional::Some(pn) => {
 			match pn.as_array() {
 				Optional::Some(items) => {
 					var steps: Array<PlanStep> = [];
 					var i = 0;
 					while i < items.len {
-						val op = _req_str(&items[i], &"operation", "plan.operation");
+						val op = _req_str(items[i], "operation", "plan.operation");
 						// The input is the operation request body; the operation layer
 						// requires a JSON OBJECT. Reject a scalar/array at STARTUP (before
 						// any claim) so a bad plan can't fail post-claim and strand the lease.
 						var input: String = "{}";
-						match items[i].get(&"input") {
+						match items[i].get("input") {
 							Optional::Some(inode) => {
 								match inode.as_object() {
 									Optional::Some(_) => { input = json.encode_compact(inode); },
@@ -4028,14 +4028,14 @@ fn _validate_plan(cfg: &json.JsonNode) -> Void {
 			val last = plan.len - 1;
 			var i = 0;
 			while i < plan.len {
-				val _ = _resolve_operation(cfg, &plan[i].operation, Optional<Int>::None());
+				val _ = _resolve_operation(cfg, plan[i].operation, Optional<Int>::None());
 				// Steps before the last could be a "prior success" when a later step fails,
 				// so they must be compensable. The last step never needs compensation.
 				if i < last {
-					match _compensation_for(cfg, &plan[i].operation) {
+					match _compensation_for(cfg, plan[i].operation) {
 						Optional::Some(_) => {},
 						Optional::None => {
-							throw RunnerError(message = "plan operation '" + _dup(&plan[i].operation)
+							throw RunnerError(message = "plan operation '" + _dup(plan[i].operation)
 								+ "' (not the final step) has no compensation binding — it must be reversible");
 						}
 					}
@@ -4048,13 +4048,13 @@ fn _validate_plan(cfg: &json.JsonNode) -> Void {
 }
 
 fn _validate_transport(part: &json.JsonNode, pid: &String) -> Void {
-	match part.get(&"transport") {
+	match part.get("transport") {
 		Optional::Some(tr) => {
-			val kind = _req_str(tr, &"kind", "transport.kind");
+			val kind = _req_str(tr, "kind", "transport.kind");
 			if kind != "http" { throw RunnerError(message = "participant '" + _dup(pid) + "' unsupported transport kind: " + kind); }
-			val sel = _req_str(tr, &"selection", "transport.selection");
+			val sel = _req_str(tr, "selection", "transport.selection");
 			if sel != "ordered_failover" { throw RunnerError(message = "participant '" + _dup(pid) + "' unsupported selection: " + sel); }
-			match tr.get(&"endpoints") {
+			match tr.get("endpoints") {
 				Optional::Some(epn) => {
 					match epn.as_array() {
 						Optional::Some(eps) => {
@@ -4066,7 +4066,7 @@ fn _validate_transport(part: &json.JsonNode, pid: &String) -> Void {
 							var k = 0;
 							while k < eps.len {
 								match eps[k].as_string() {
-									Optional::Some(u) => { if !_is_http_url(&u) { throw RunnerError(message = "participant '" + _dup(pid) + "' invalid endpoint URL: " + u); } },
+									Optional::Some(u) => { if !_is_http_url(u) { throw RunnerError(message = "participant '" + _dup(pid) + "' invalid endpoint URL: " + u); } },
 									Optional::None => { throw RunnerError(message = "participant '" + _dup(pid) + "' endpoint is not a string"); }
 								}
 								k = k + 1;
@@ -4083,7 +4083,7 @@ fn _validate_transport(part: &json.JsonNode, pid: &String) -> Void {
 	// Only a null/absent auth_profile is supported in this slice; ANY non-null
 	// value (object, string, boolean, number, array) is an unsupported credential
 	// mechanism -> fail. Check is_null() directly so no JSON type slips through.
-	match part.get(&"auth_profile") {
+	match part.get("auth_profile") {
 		Optional::Some(ap) => {
 			if !ap.is_null() { throw RunnerError(message = "participant '" + _dup(pid) + "' has an unsupported auth_profile (only null/absent supported in this slice)"); }
 		},
@@ -4098,16 +4098,16 @@ fn _validate_transport(part: &json.JsonNode, pid: &String) -> Void {
 // a different (e.g. upgraded) binding. Throws if the operation or its participant
 // is absent. Resolution is thus by (operation_name, schema_version) on resume.
 fn _resolve_operation(cfg: &json.JsonNode, op_name: &String, pinned: Optional<Int>) -> ResolvedOperation {
-	match cfg.get(&"operations") {
+	match cfg.get("operations") {
 		Optional::Some(on) => {
 			match on.as_array() {
 				Optional::Some(items) => {
 					var i = 0;
 					while i < items.len {
-						val nm = _req_str(&items[i], &"name", "operation.name");
-						if _str_eq(&nm, op_name) {
-							val pref = _req_str(&items[i], &"participant", "operation.participant");
-							val sv = _req_int(&items[i], &"schema_version", "operation.schema_version");
+						val nm = _req_str(items[i], "name", "operation.name");
+						if _str_eq(nm, op_name) {
+							val pref = _req_str(items[i], "participant", "operation.participant");
+							val sv = _req_int(items[i], "schema_version", "operation.schema_version");
 							match pinned {
 								Optional::Some(req) => {
 									if sv != req {
@@ -4118,8 +4118,8 @@ fn _resolve_operation(cfg: &json.JsonNode, op_name: &String, pinned: Optional<In
 								},
 								Optional::None => {}
 							}
-							val base = _participant_base_url(cfg, &pref);
-							return ResolvedOperation(operation_name = _dup(op_name), schema_version = sv, participant_id = _dup(&pref), base_url = move base);
+							val base = _participant_base_url(cfg, pref);
+							return ResolvedOperation(operation_name = _dup(op_name), schema_version = sv, participant_id = _dup(pref), base_url = move base);
 						}
 						i = i + 1;
 					}
@@ -4133,15 +4133,15 @@ fn _resolve_operation(cfg: &json.JsonNode, op_name: &String, pinned: Optional<In
 }
 
 fn _participant_base_url(cfg: &json.JsonNode, pid: &String) -> String {
-	match cfg.get(&"participants") {
+	match cfg.get("participants") {
 		Optional::Some(pn) => {
 			match pn.as_array() {
 				Optional::Some(items) => {
 					var i = 0;
 					while i < items.len {
-						val id = _req_str(&items[i], &"id", "participant.id");
-						if _str_eq(&id, pid) {
-							return _first_endpoint(&items[i], pid);
+						val id = _req_str(items[i], "id", "participant.id");
+						if _str_eq(id, pid) {
+							return _first_endpoint(items[i], pid);
 						}
 						i = i + 1;
 					}
@@ -4155,9 +4155,9 @@ fn _participant_base_url(cfg: &json.JsonNode, pid: &String) -> String {
 }
 
 fn _first_endpoint(part: &json.JsonNode, pid: &String) -> String {
-	match part.get(&"transport") {
+	match part.get("transport") {
 		Optional::Some(tr) => {
-			match tr.get(&"endpoints") {
+			match tr.get("endpoints") {
 				Optional::Some(epn) => {
 					match epn.as_array() {
 						Optional::Some(eps) => {
@@ -4203,7 +4203,7 @@ fn _req_int(n: &json.JsonNode, key: &String, what: String) -> Int {
 
 fn _contains(arr: &Array<String>, s: &String) nothrow -> Bool {
 	var i = 0;
-	while i < arr.len { if _str_eq(&arr[i], s) { return true; } i = i + 1; }
+	while i < arr.len { if _str_eq(arr[i], s) { return true; } i = i + 1; }
 	return false;
 }
 
@@ -4216,8 +4216,8 @@ fn _starts_with(s: &String, prefix: &String) nothrow -> Bool {
 }
 
 fn _is_http_url(s: &String) nothrow -> Bool {
-	if _starts_with(s, &"https://") and s.byte_length() > 8 { return true; }
-	if _starts_with(s, &"http://") and s.byte_length() > 7 { return true; }
+	if _starts_with(s, "https://") and s.byte_length() > 8 { return true; }
+	if _starts_with(s, "http://") and s.byte_length() > 7 { return true; }
 	return false;
 }
 
@@ -4231,7 +4231,7 @@ fn _is_op_name_safe(s: &String) nothrow -> Bool {
 	// Reject the dot-segments "." and ".." — even though their bytes are in the
 	// allowed set, as a whole URL path segment they are normalized away / climb the
 	// path, which would change the route.
-	if _str_eq(s, &".") or _str_eq(s, &"..") { return false; }
+	if _str_eq(s, ".") or _str_eq(s, "..") { return false; }
 	var i = 0;
 	while i < n {
 		val b = _byte(s, i);
@@ -4255,7 +4255,7 @@ fn _build_host(b: mf.HostBuilder) -> arc.Arc<mf.MicroflowsHost> {
 }
 
 fn _require_db(cfg: &json.JsonNode) -> json.JsonNode {
-	match cfg.get(&"db") {
+	match cfg.get("db") {
 		Optional::Some(n) => { return n.clone_deep(); },
 		Optional::None => { throw RunnerError(message = "config: missing 'db' subtree"); }
 	}
@@ -4268,7 +4268,7 @@ fn _load_config_json(path: &String) throws -> json.JsonNode {
 			val text = _drain(move file);
 			// STRICT: reject duplicate keys + non-standard number forms (a lenient parse would
 			// keep-last duplicates and weaken canonical identity / the unknown-key guarantee).
-			match json.parse_strict(&text) {
+			match json.parse_strict(text) {
 				core.Result::Ok(n) => { return move n; },
 				core.Result::Err(_) => { throw RunnerError(message = "config: JSON parse failed"); }
 			}
@@ -4282,7 +4282,7 @@ fn _drain(var f: io.ConfiguredFile) throws -> String {
 	var buf = io.buffer(4096);
 	var done = false;
 	while !done {
-		match f.read(&mut buf) {
+		match f.read(buf) {
 			core.Result::Ok(n) => {
 				if n == 0 { done = true; }
 				else { out = out + core.string_from_utf8_bytes(io.buffer_ptr(&buf), n); }
@@ -4317,9 +4317,9 @@ fn _config_bool(cfg: &json.JsonNode, key: &String, default_val: Bool) nothrow ->
 // or malformed value silently defaults (same tolerance as `_config_str`/`_config_bool`) rather than
 // failing a dispatch over an optional tuning knob.
 fn _max_call_depth(cfg: &json.JsonNode) nothrow -> Int {
-	match cfg.get(&"workflow_call") {
+	match cfg.get("workflow_call") {
 		Optional::Some(wc) => {
-			match wc.get(&"max_call_depth") {
+			match wc.get("max_call_depth") {
 				Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { if v >= 1 { return v; } }, Optional::None => {} } },
 				Optional::None => {}
 			}
@@ -4398,7 +4398,7 @@ struct ServiceApp {
 // drive — an in-flight request keeps its snapshot even if a concurrent reload swaps the active one.
 fn _registry_snapshot(m: &conc.Mutex<arc.Arc<ManifestSet>>) nothrow -> arc.Arc<ManifestSet> {
 	var g = conc.lock(m);
-	return conc.mutex_guard_get_mut(&mut g).clone();
+	return conc.mutex_guard_get_mut(g).clone();
 }
 
 // Staged reload: load+validate a NEW manifest into a standby, atomically swap on success; on an
@@ -4412,14 +4412,14 @@ fn _service_reload(app: &ServiceApp) throws -> Bool {
 	// RunnerError -> reject the reload, keep the active registry. A truly UNEXPECTED defect is NOT a
 	// RunnerError, so it is NOT caught here and fails loudly rather than masquerading as "bad manifest"
 	// (the same discipline applied to config-build errors in _run_planned).
-	try { new_opt = Optional<ManifestSet>::Some(_load_manifest(&app.manifest_path)); ok = true; } catch RunnerError(e) { app.logger.error("manifest-reload-rejected", {"reason": "invalid_manifest", "message": e.message}); ok = false; }
+	try { new_opt = Optional<ManifestSet>::Some(_load_manifest(app.manifest_path)); ok = true; } catch RunnerError(e) { app.logger.error("manifest-reload-rejected", {"reason": "invalid_manifest", "message": e.message}); ok = false; }
 	if !ok { return false; }
 	match move new_opt {
 		Optional::Some(ms) => {
-			var g = conc.lock(&app.registry);
-			val slot = conc.mutex_guard_get_mut(&mut g);
+			var g = conc.lock(app.registry);
+			val slot = conc.mutex_guard_get_mut(g);
 			*slot = conc.arc(ms);
-			app.logger.info("manifest-reloaded", {"manifest": _dup(&app.manifest_path)});
+			app.logger.info("manifest-reloaded", {"manifest": _dup(app.manifest_path)});
 			return true;
 		},
 		Optional::None => { return false; }
@@ -4438,8 +4438,8 @@ fn _outcome_http_status(o: &Outcome) nothrow -> Int {
 		Outcome::Pending(reason, defer_until, child_workflow_id) => { return 202; },
 		Outcome::PendingRestart(r) => { return 503; },   // drain back-pressure: same 503 contract as Refused (§13)
 		Outcome::Refused(r) => { return 503; },
-		Outcome::Deferred(r, d, c) => { if _str_eq(r, &"workflow_conflict") { return 409; } return 202; },
-		Outcome::Aborted(r, c) => { if _str_eq(r, &"not_found") { return 404; } return 400; },
+		Outcome::Deferred(r, d, c) => { if _str_eq(r, "workflow_conflict") { return 409; } return 202; },
+		Outcome::Aborted(r, c) => { if _str_eq(r, "not_found") { return 404; } return 400; },
 		Outcome::Active(r) => { return 409; },
 		Outcome::Blocked(d, r) => { return 409; },
 		Outcome::Failed(r) => { return 409; },
@@ -4459,11 +4459,11 @@ implement ServiceApp {
 	fn drive(self: &ServiceApp, wf: &String, script: &String, has_script: Bool, args: &String, has_arguments: Bool) -> rest.Response {
 		if wf.byte_length() != 32 { return rest.json_response(400, "{\"workflow\":\"aborted\",\"reason\":\"bad_workflow_id\"}"); }
 		val adm = _admission_of_int(self.admission.load(conc.MemoryOrder::SeqCst()));
-		val snap = _registry_snapshot(&self.registry);
+		val snap = _registry_snapshot(self.registry);
 		var resp: rest.Response = rest.json_response(500, "{\"workflow\":\"error\",\"reason\":\"runner-fatal\"}");
 		try {
-			val outcome = _drive_manifest_request(&self.host, snap.get(), wf, script, has_script, &"", &"{}", args, has_arguments, &adm);
-			resp = _outcome_response(&outcome);
+			val outcome = _drive_manifest_request(self.host, snap.get(), wf, script, has_script, "", "{}", args, has_arguments, adm);
+			resp = _outcome_response(outcome);
 		} catch unexpected {
 			self.logger.error("workflow-handler-failed", {"reason": "runner_fatal"});
 			resp = rest.json_response(500, "{\"workflow\":\"error\",\"reason\":\"runner-fatal\"}");
@@ -4475,9 +4475,9 @@ implement ServiceApp {
 		val wf = rest.path_param(req, "id").or_throw();
 		var script = "";
 		var has_script = false;
-		match rest.query_param(req, &"script") { Optional::Some(s) => { script = move s; has_script = true; }, Optional::None => {} }
-		logging.set_workflow_fields(_dup(&wf), _dup(&script));
-		self.logger.info("workflow-submit-received", {"script": _dup(&script)});
+		match rest.query_param(req, "script") { Optional::Some(s) => { script = move s; has_script = true; }, Optional::None => {} }
+		logging.set_workflow_fields(_dup(wf), _dup(script));
+		self.logger.info("workflow-submit-received", {"script": _dup(script)});
 		// The submit body MUST be a valid JSON document (the instance arguments — `{}` if none). A
 		// malformed/empty body is a structured 400 BEFORE any drive — never silently coerced to `{}`
 		// (which could create a valid empty-argument workflow for a script that accepts no fields).
@@ -4488,16 +4488,16 @@ implement ServiceApp {
 			self.logger.error("workflow-submit-rejected", {"reason": "malformed_arguments"});
 			return rest.json_response(400, "{\"workflow\":\"aborted\",\"reason\":\"malformed_arguments\"}");
 		}
-		val resp = self.drive(&wf, &script, has_script, &args, true);
+		val resp = self.drive(wf, script, has_script, args, true);
 		self.logger.info("workflow-submit-completed", {"status": fmt.format_int(resp.status)});
 		return move resp;
 	}
 	// POST /v1/workflows/{id}/resume  — no script, no args; driven strictly by the durable pin.
 	pub fn handle_resume(self: &ServiceApp, req: &rest.Request) throws -> rest.Response {
 		val wf = rest.path_param(req, "id").or_throw();
-		logging.set_workflow_fields(_dup(&wf), "");
-		self.logger.info("workflow-resume-received", {"workflow_id": _dup(&wf)});
-		val resp = self.drive(&wf, &"", false, &"", false);
+		logging.set_workflow_fields(_dup(wf), "");
+		self.logger.info("workflow-resume-received", {"workflow_id": _dup(wf)});
+		val resp = self.drive(wf, "", false, "", false);
 		self.logger.info("workflow-resume-completed", {"status": fmt.format_int(resp.status)});
 		return move resp;
 	}
@@ -4544,7 +4544,7 @@ pub fn service_main(argv: Array<String>) nothrow -> Int {
 			return 2;
 		}
 	}
-	return try _service_run(&manifest_path, port, log_level) catch unexpected { console.eprintln("uflowsd: fatal"); 1 };
+	return try _service_run(manifest_path, port, log_level) catch unexpected { console.eprintln("uflowsd: fatal"); 1 };
 }
 
 fn _service_run(manifest_path: &String, port: Int, log_level: log.Level) throws -> Int {
@@ -4579,18 +4579,18 @@ fn _service_run(manifest_path: &String, port: Int, log_level: log.Level) throws 
 		Optional::Some(ms) => {
 			logger.info("manifest-load-completed", {"manifest": _dup(manifest_path)});
 			// ONE shared, internally-pooled host (from the manifest's deployment db) for all requests.
-			val db_sub = _require_db(&ms.deployment);
-			val worker_id = _config_str(&ms.deployment, &"worker_id", "runner-1");
-			val identity = mf.identity_from_worker_name(&worker_id);
+			val db_sub = _require_db(ms.deployment);
+			val worker_id = _config_str(ms.deployment, "worker_id", "runner-1");
+			val identity = mf.identity_from_worker_name(worker_id);
 			var hb = mf.new_host_builder();
-			mf.with_json(&mut hb, &db_sub);
-			mf.with_identity(&mut hb, move identity);
+			mf.with_json(hb, db_sub);
+			mf.with_identity(hb, move identity);
 			val host = _build_host(move hb);
 			// Initial admission from MICROFLOWS_ADMISSION (accepting unless told otherwise); SIGTERM
 			// later flips it to draining at runtime. The drive applies the SAME admission rules.
 			val adm0 = _admission_from_env();
 			val app = conc.arc(ServiceApp(host = move host, registry = conc.mutex(conc.arc(ms)),
-			                              admission = conc.atomic_int(_admission_to_int(&adm0)), manifest_path = _dup(manifest_path),
+			                              admission = conc.atomic_int(_admission_to_int(adm0)), manifest_path = _dup(manifest_path),
 				                              logger = move logger));
 
 			var ab = rest.new_app_builder();

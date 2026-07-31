@@ -37,7 +37,7 @@ test:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source "../tools/cert-env.sh"
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
 	exec "{{FLOCKER}}" --key "$DB_LOCK" -j 1 -- just _test-locked
 
@@ -59,7 +59,7 @@ stress:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source "../tools/cert-env.sh"
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
 	exec "{{FLOCKER}}" --key "$DB_LOCK" -j 1 -- just _stress-locked
 
@@ -78,7 +78,7 @@ perf *ARGS:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source "../tools/cert-env.sh"
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
 	[[ -x "{{FLOCKER}}" ]] || { echo "error: flocker not found at {{FLOCKER}} (required for DB serialization; ships with the toolchain)" >&2; exit 1; }
 	exec "{{FLOCKER}}" --key "$DB_LOCK" -j 1 -- just _perf-locked {{ARGS}}
 

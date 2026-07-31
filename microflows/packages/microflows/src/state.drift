@@ -248,7 +248,7 @@ pub fn state_direction_valid(s: &WorkflowState, d: &ExecutionDirection) nothrow 
 pub fn transition(from: &WorkflowState, dir: &ExecutionDirection, cause: &TransitionCause) nothrow -> Optional<Transition> {
 	match transition_target(from, dir, cause) {
 		Optional::Some(to) => {
-			val to_dir = _derived_direction(&to, dir);
+			val to_dir = _derived_direction(to, dir);
 			return Optional<Transition>::Some(Transition(to_state = move to, to_direction = move to_dir));
 		},
 		Optional::None => { return Optional<Transition>::None(); }

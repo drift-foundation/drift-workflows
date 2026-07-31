@@ -10,7 +10,7 @@
       "kind": "package",
       "name": "singular",
       "module_namespace": "singular",
-      "version": "0.9.1",
+      "version": "0.9.2",
       "description": "Idempotency and lease coordination over MariaDB",
       "entry_module": "singular/drift/packages/singular/src/lib.drift",
       "modules": [
@@ -32,7 +32,7 @@
       "kind": "package",
       "name": "microflows",
       "module_namespace": "microflows",
-      "version": "0.8.1",
+      "version": "0.8.2",
       "description": "Microflows \u2014 typed durable workflow coordinator (control state over MariaDB)",
       "entry_module": "microflows/packages/microflows/src/lib.drift",
       "modules": [
@@ -54,7 +54,7 @@
       "kind": "app",
       "name": "uflowsd",
       "module_namespace": "microflows.runner",
-      "version": "0.7.2",
+      "version": "0.7.3",
       "description": "Microflows coordinator daemon — manifest-driven HTTP front-door driving .mf plans + dispatching operations over MariaDB",
       "entry_module": "microflows/runner/src/runner.drift",
       "entry_point": "microflows.runner::service_main",

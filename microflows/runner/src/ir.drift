@@ -110,33 +110,33 @@ pub fn parse_type(node: &json.JsonNode) -> IrType {
 	// would otherwise be silently dropped — and dropped data would also be absent from
 	// content_hash, yielding a valid-but-unintended contract. We reject it.
 	val nkeys = _obj_len(node);
-	val kind = _req_str(node, &"type");
-	if _str_eq(&kind, &"null") { _reject_extra(nkeys, 1); return IrType::TNull(); }
-	if _str_eq(&kind, &"bool") { _reject_extra(nkeys, 1); return IrType::TBool(); }
-	if _str_eq(&kind, &"int") { _reject_extra(nkeys, 1); return IrType::TInt(); }
-	if _str_eq(&kind, &"float") { _reject_extra(nkeys, 1); return IrType::TFloat(); }
-	if _str_eq(&kind, &"string") { _reject_extra(nkeys, 1); return IrType::TString(); }
-	if _str_eq(&kind, &"array") {
-		match node.get(&"elem") {
+	val kind = _req_str(node, "type");
+	if _str_eq(kind, "null") { _reject_extra(nkeys, 1); return IrType::TNull(); }
+	if _str_eq(kind, "bool") { _reject_extra(nkeys, 1); return IrType::TBool(); }
+	if _str_eq(kind, "int") { _reject_extra(nkeys, 1); return IrType::TInt(); }
+	if _str_eq(kind, "float") { _reject_extra(nkeys, 1); return IrType::TFloat(); }
+	if _str_eq(kind, "string") { _reject_extra(nkeys, 1); return IrType::TString(); }
+	if _str_eq(kind, "array") {
+		match node.get("elem") {
 			Optional::Some(e) => { val inner = parse_type(e); _reject_extra(nkeys, 2); return IrType::TArray(elem = core.box(move inner)); },
 			Optional::None => { throw IrError(message = "array type missing 'elem'"); }
 		}
 	}
-	if _str_eq(&kind, &"optional") {
-		match node.get(&"inner") {
+	if _str_eq(kind, "optional") {
+		match node.get("inner") {
 			Optional::Some(e) => { val inner = parse_type(e); _reject_extra(nkeys, 2); return IrType::TOptional(inner = core.box(move inner)); },
 			Optional::None => { throw IrError(message = "optional type missing 'inner'"); }
 		}
 	}
-	if _str_eq(&kind, &"object") {
+	if _str_eq(kind, "object") {
 		var fields: Array<IrField> = [];
-		match node.get(&"fields") {
+		match node.get("fields") {
 			Optional::Some(fnode) => {
 				match fnode.as_array() {
 					Optional::Some(arr) => {
 						var i = 0;
 						while i < arr.len {
-							fields.push(_parse_field(&arr[i]));
+							fields.push(_parse_field(arr[i]));
 							i = i + 1;
 						}
 					},
@@ -146,18 +146,18 @@ pub fn parse_type(node: &json.JsonNode) -> IrType {
 			Optional::None => { throw IrError(message = "object type missing 'fields'"); }
 		}
 		_reject_extra(nkeys, 2);
-		_sort_fields(&mut fields);
-		_check_no_dup_fields(&fields);
+		_sort_fields(fields);
+		_check_no_dup_fields(fields);
 		return IrType::TObject(fields = move fields);
 	}
-	throw IrError(message = "unknown type kind: " + _dup(&kind));
+	throw IrError(message = "unknown type kind: " + _dup(kind));
 }
 
 // One object field: exactly {"name", "type"} — extra keys rejected.
 fn _parse_field(fnode: &json.JsonNode) -> IrField {
 	val nkeys = _obj_len(fnode);
-	val nm = _req_str(fnode, &"name");
-	match fnode.get(&"type") {
+	val nm = _req_str(fnode, "name");
+	match fnode.get("type") {
 		Optional::Some(ft) => {
 			val fty = parse_type(ft);
 			_reject_extra(nkeys, 2);
@@ -210,7 +210,7 @@ pub fn validate(value: &json.JsonNode, ty: &IrType) nothrow -> Optional<String> 
 			// int — no implicit coercion.
 			match value.as_number_raw() {
 				Optional::Some(raw) => {
-					if _is_float_shaped(&raw) { return Optional<String>::Some("expected int (got a float-shaped number)"); }
+					if _is_float_shaped(raw) { return Optional<String>::Some("expected int (got a float-shaped number)"); }
 					match value.as_int() { Optional::Some(_) => { return Optional<String>::None(); }, Optional::None => {} }
 					return Optional<String>::Some("expected int (out of range)");
 				},
@@ -223,7 +223,7 @@ pub fn validate(value: &json.JsonNode, ty: &IrType) nothrow -> Optional<String> 
 			// non-finite magnitude (e.g. 1e400) is rejected.
 			match value.as_number_raw() {
 				Optional::Some(raw) => {
-					if !_is_float_shaped(&raw) { return Optional<String>::Some("expected float (got an integer-shaped number)"); }
+					if !_is_float_shaped(raw) { return Optional<String>::Some("expected float (got an integer-shaped number)"); }
 					match value.as_float() {
 						Optional::Some(v) => {
 							if float.is_finite(v) { return Optional<String>::None(); }
@@ -245,7 +245,7 @@ pub fn validate(value: &json.JsonNode, ty: &IrType) nothrow -> Optional<String> 
 				Optional::Some(arr) => {
 					var i = 0;
 					while i < arr.len {
-						match validate(&arr[i], elem.get()) {
+						match validate(arr[i], elem.get()) {
 							Optional::Some(m) => { return Optional<String>::Some("array[" + fmt.format_int(i) + "]: " + m); },
 							Optional::None => {}
 						}
@@ -269,7 +269,7 @@ pub fn validate(value: &json.JsonNode, ty: &IrType) nothrow -> Optional<String> 
 						val nm = &fields[i].name;
 						match value.get(nm) {
 							Optional::Some(fv) => {
-								match validate(fv, &fields[i].ty) {
+								match validate(fv, fields[i].ty) {
 									Optional::Some(m) => { return Optional<String>::Some("field '" + _dup(nm) + "': " + m); },
 									Optional::None => {}
 								}
@@ -277,7 +277,7 @@ pub fn validate(value: &json.JsonNode, ty: &IrType) nothrow -> Optional<String> 
 							},
 							Optional::None => {
 								// Absent is allowed ONLY for an optional field.
-								if !_is_optional(&fields[i].ty) {
+								if !_is_optional(fields[i].ty) {
 									return Optional<String>::Some("missing field '" + _dup(nm) + "'");
 								}
 							}
@@ -313,7 +313,7 @@ pub fn canonical(ty: &IrType) nothrow -> String {
 			var s: String = "O{";
 			var i = 0;
 			while i < fields.len {
-				s = s + _lp(&fields[i].name) + canonical(&fields[i].ty) + ";";
+				s = s + _lp(fields[i].name) + canonical(fields[i].ty) + ";";
 				i = i + 1;
 			}
 			return s + "}";
@@ -434,13 +434,13 @@ pub fn flat_to_graph(steps: &Array<FlatStep>) -> core.Result<IrGraph, IrError> {
 	var i = 0;
 	while i < n {
 		var canon: String = "";
-		match canonical_json(&steps[i].input_json) {
+		match canonical_json(steps[i].input_json) {
 			core.Result::Ok(c) => { canon = move c; },
 			core.Result::Err(e) => { return core.Result<IrGraph, IrError>::Err(move e); }
 		}
 		nodes.push(IrNode::NOperation(
 			id = _nid(i),
-			operation = _dup(&steps[i].operation),
+			operation = _dup(steps[i].operation),
 			input = IrExpr::EConst(canonical_json = move canon),
 			next = _nid(i + 1)
 		));
@@ -483,14 +483,14 @@ pub fn parse_graph(node: &json.JsonNode) -> core.Result<IrGraph, IrError> {
 
 fn _parse_graph_throwing(node: &json.JsonNode) -> IrGraph {
 	_reject_extra(_obj_len(node), 2);   // exactly {entry, nodes} — unknown keys rejected
-	val entry = _req_str(node, &"entry");
+	val entry = _req_str(node, "entry");
 	var nodes: Array<IrNode> = [];
-	match node.get(&"nodes") {
+	match node.get("nodes") {
 		Optional::Some(nn) => {
 			match nn.as_array() {
 				Optional::Some(arr) => {
 					var i = 0;
-					while i < arr.len { nodes.push(_parse_node(&arr[i])); i = i + 1; }
+					while i < arr.len { nodes.push(_parse_node(arr[i])); i = i + 1; }
 				},
 				Optional::None => { throw IrError(message = "graph 'nodes' must be an array"); }
 			}
@@ -505,36 +505,36 @@ fn _parse_graph_throwing(node: &json.JsonNode) -> IrGraph {
 // content-hashed executable identity; a typo'd key must fail validation, not be silently dropped).
 fn _parse_node(n: &json.JsonNode) -> IrNode {
 	val nkeys = _obj_len(n);
-	val kind = _req_str(n, &"kind");
-	val id = _req_str(n, &"id");
-	if _str_eq(&kind, &"operation") {
-		val op = _req_str(n, &"operation");
-		val next = _req_str(n, &"next");
-		val input = _parse_expr_at(n, &"input");
+	val kind = _req_str(n, "kind");
+	val id = _req_str(n, "id");
+	if _str_eq(kind, "operation") {
+		val op = _req_str(n, "operation");
+		val next = _req_str(n, "next");
+		val input = _parse_expr_at(n, "input");
 		_reject_extra(nkeys, 5);   // kind, id, operation, input, next
 		return IrNode::NOperation(id = move id, operation = move op, input = move input, next = move next);
 	}
-	if _str_eq(&kind, &"if") {
-		val then_n = _req_str(n, &"then");
-		val else_n = _req_str(n, &"else");
-		val cond = _parse_expr_at(n, &"cond");
+	if _str_eq(kind, "if") {
+		val then_n = _req_str(n, "then");
+		val else_n = _req_str(n, "else");
+		val cond = _parse_expr_at(n, "cond");
 		_reject_extra(nkeys, 5);   // kind, id, cond, then, else
 		return IrNode::NIf(id = move id, cond = move cond, then_node = move then_n, else_node = move else_n);
 	}
-	if _str_eq(&kind, &"let") {
-		val name = _req_str(n, &"name");
-		val next = _req_str(n, &"next");
-		val value = _parse_expr_at(n, &"value");
+	if _str_eq(kind, "let") {
+		val name = _req_str(n, "name");
+		val next = _req_str(n, "next");
+		val value = _parse_expr_at(n, "value");
 		_reject_extra(nkeys, 5);   // kind, id, name, value, next
 		return IrNode::NLet(id = move id, name = move name, value = move value, next = move next);
 	}
-	if _str_eq(&kind, &"return") {
-		val value = _parse_expr_at(n, &"value");
+	if _str_eq(kind, "return") {
+		val value = _parse_expr_at(n, "value");
 		_reject_extra(nkeys, 3);   // kind, id, value
 		return IrNode::NReturn(id = move id, value = move value);
 	}
-	if _str_eq(&kind, &"fail") {
-		val reason = _parse_expr_at(n, &"reason");
+	if _str_eq(kind, "fail") {
+		val reason = _parse_expr_at(n, "reason");
 		_reject_extra(nkeys, 3);   // kind, id, reason
 		return IrNode::NFail(id = move id, reason = move reason);
 	}
@@ -542,17 +542,17 @@ fn _parse_node(n: &json.JsonNode) -> IrNode {
 	// pinned child workflow). `child`@`plan_version` is the child's plan identity; `input` is an IrExpr;
 	// the result binds to this node id (read downstream via `result`). Optional `compensation` names a
 	// comp workflow's plan — PARSED but BUILD-REJECTED until composition slice 1c (validate_graph). Slice 1a.
-	if _str_eq(&kind, &"call") {
-		val child = _req_str(n, &"child");
-		val plan_version = _req_str(n, &"plan_version");
-		val next = _req_str(n, &"next");
-		val input = _parse_expr_at(n, &"input");
+	if _str_eq(kind, "call") {
+		val child = _req_str(n, "child");
+		val plan_version = _req_str(n, "plan_version");
+		val next = _req_str(n, "next");
+		val input = _parse_expr_at(n, "input");
 		var comp: Optional<CallComp> = Optional<CallComp>::None();
 		var allowed = 6;   // kind, id, child, plan_version, input, next
-		match n.get(&"compensation") {
+		match n.get("compensation") {
 			Optional::Some(cn) => {
-				val cchild = _req_str(cn, &"child");
-				val cver = _req_str(cn, &"plan_version");
+				val cchild = _req_str(cn, "child");
+				val cver = _req_str(cn, "plan_version");
 				_reject_extra(_obj_len(cn), 2);   // child, plan_version
 				comp = Optional<CallComp>::Some(CallComp(child = move cchild, plan_version = move cver));
 				allowed = 7;   // + compensation
@@ -566,26 +566,26 @@ fn _parse_node(n: &json.JsonNode) -> IrNode {
 	// a downstream local named `as`; the body is a pure IrExpr over `elem` (+ the `as` accumulator
 	// for fold), so it can never dispatch a remote operation. map/filter carry no accumulator (the
 	// init is implicitly the unit null); fold threads `as` from `init` through the body.
-	if _str_eq(&kind, &"map") or _str_eq(&kind, &"filter") {
-		val source = _parse_expr_at(n, &"source");
-		val elem = _req_str(n, &"elem");
-		val as_name = _req_str(n, &"as");
-		val body = _parse_expr_at(n, &"body");
-		val next = _req_str(n, &"next");
+	if _str_eq(kind, "map") or _str_eq(kind, "filter") {
+		val source = _parse_expr_at(n, "source");
+		val elem = _req_str(n, "elem");
+		val as_name = _req_str(n, "as");
+		val body = _parse_expr_at(n, "body");
+		val next = _req_str(n, "next");
 		_reject_extra(nkeys, 7);   // kind, id, source, elem, as, body, next
 		var lk = LoopKind::LMap();
-		if _str_eq(&kind, &"filter") { lk = LoopKind::LFilter(); }
+		if _str_eq(kind, "filter") { lk = LoopKind::LFilter(); }
 		return IrNode::NLoop(id = move id, kind = move lk, source = move source, elem = move elem,
 		                     acc = move as_name, init = IrExpr::EConst(canonical_json = "null"),
 		                     body = move body, next = move next);
 	}
-	if _str_eq(&kind, &"fold") {
-		val source = _parse_expr_at(n, &"source");
-		val elem = _req_str(n, &"elem");
-		val as_name = _req_str(n, &"as");
-		val init = _parse_expr_at(n, &"init");
-		val body = _parse_expr_at(n, &"body");
-		val next = _req_str(n, &"next");
+	if _str_eq(kind, "fold") {
+		val source = _parse_expr_at(n, "source");
+		val elem = _req_str(n, "elem");
+		val as_name = _req_str(n, "as");
+		val init = _parse_expr_at(n, "init");
+		val body = _parse_expr_at(n, "body");
+		val next = _req_str(n, "next");
 		_reject_extra(nkeys, 8);   // kind, id, source, elem, as, init, body, next
 		return IrNode::NLoop(id = move id, kind = LoopKind::LFold(), source = move source, elem = move elem,
 		                     acc = move as_name, init = move init, body = move body, next = move next);
@@ -594,16 +594,16 @@ fn _parse_node(n: &json.JsonNode) -> IrNode {
 	// `default` (required) is taken when no arm matches. Pure control flow (no durable boundary).
 	// validate_graph enforces canonical/valid match constants and rejects duplicate arm constants;
 	// op_depth keeps every arm + default uniform.
-	if _str_eq(&kind, &"case") {
-		val scrutinee = _parse_expr_at(n, &"scrutinee");
-		val default_n = _req_str(n, &"default");
+	if _str_eq(kind, "case") {
+		val scrutinee = _parse_expr_at(n, "scrutinee");
+		val default_n = _req_str(n, "default");
 		var arms: Array<IrCaseArm> = [];
-		match n.get(&"arms") {
+		match n.get("arms") {
 			Optional::Some(an) => {
 				match an.as_array() {
 					Optional::Some(arr) => {
 						var i = 0;
-						while i < arr.len { arms.push(_parse_case_arm(&arr[i])); i = i + 1; }
+						while i < arr.len { arms.push(_parse_case_arm(arr[i])); i = i + 1; }
 					},
 					Optional::None => { throw IrError(message = "case 'arms' must be an array"); }
 				}
@@ -616,16 +616,16 @@ fn _parse_node(n: &json.JsonNode) -> IrNode {
 	// merge: a phi that rejoins branch paths, binding `name` to a value selected by which immediate
 	// predecessor (`from`) control arrived from. Pure control flow; validate_graph enforces that the
 	// sources are total + unambiguous over the incoming edges and references are in-scope.
-	if _str_eq(&kind, &"merge") {
-		val name = _req_str(n, &"name");
-		val next = _req_str(n, &"next");
+	if _str_eq(kind, "merge") {
+		val name = _req_str(n, "name");
+		val next = _req_str(n, "next");
 		var sources: Array<MergeArm> = [];
-		match n.get(&"sources") {
+		match n.get("sources") {
 			Optional::Some(sn) => {
 				match sn.as_array() {
 					Optional::Some(arr) => {
 						var i = 0;
-						while i < arr.len { sources.push(_parse_merge_source(&arr[i])); i = i + 1; }
+						while i < arr.len { sources.push(_parse_merge_source(arr[i])); i = i + 1; }
 					},
 					Optional::None => { throw IrError(message = "merge 'sources' must be an array"); }
 				}
@@ -635,16 +635,16 @@ fn _parse_node(n: &json.JsonNode) -> IrNode {
 		_reject_extra(nkeys, 5);   // kind, id, name, sources, next
 		return IrNode::NMerge(id = move id, name = move name, sources = move sources, next = move next);
 	}
-	throw IrError(message = "unknown graph node kind: " + _dup(&kind));
+	throw IrError(message = "unknown graph node kind: " + _dup(kind));
 }
 
 // Parse one case arm: exactly {match, target}. `match` is a JSON value canonicalized into the
 // match constant (so {"a":1,"b":2} and {"b":2,"a":1} collapse to one arm, caught as a duplicate);
 // `target` is the destination node id. Unknown/missing keys are rejected.
 fn _parse_case_arm(n: &json.JsonNode) -> IrCaseArm {
-	val target = _req_str(n, &"target");
+	val target = _req_str(n, "target");
 	var mc: String = "";
-	match n.get(&"match") {
+	match n.get("match") {
 		Optional::Some(m) => { mc = _canon_node(m); },
 		Optional::None => { throw IrError(message = "case arm missing 'match'"); }
 	}
@@ -655,8 +655,8 @@ fn _parse_case_arm(n: &json.JsonNode) -> IrCaseArm {
 // Parse one merge source: exactly {from, value}. `from` is the immediate predecessor node id;
 // `value` is the expression bound when control arrives from it. Unknown/missing keys are rejected.
 fn _parse_merge_source(n: &json.JsonNode) -> MergeArm {
-	val from = _req_str(n, &"from");
-	val value = _parse_expr_at(n, &"value");
+	val from = _req_str(n, "from");
+	val value = _parse_expr_at(n, "value");
 	_reject_extra(_obj_len(n), 2);   // from, value
 	return MergeArm(from = move from, value = move value);
 }
@@ -675,31 +675,31 @@ fn _parse_expr_at(n: &json.JsonNode, key: &String) -> IrExpr {
 // appear inside (only NOperation is a node, never an IrExpr arm).
 fn _parse_expr(e: &json.JsonNode) -> IrExpr {
 	_reject_extra(_obj_len(e), 1);   // at most one variant key; 0 falls through to the throw below
-	match e.get(&"const") {
+	match e.get("const") {
 		Optional::Some(c) => { return IrExpr::EConst(canonical_json = _canon_node(c)); },
 		Optional::None => {}
 	}
-	match e.get(&"arg") {
+	match e.get("arg") {
 		Optional::Some(p) => { return IrExpr::EArg(path = _parse_path(p)); },
 		Optional::None => {}
 	}
-	match e.get(&"result") {
+	match e.get("result") {
 		Optional::Some(r) => {
-			_reject_unknown_opt_path(r, &"node");   // exactly {node, path?}
-			val rnode = _req_str(r, &"node");
-			return IrExpr::EResult(node = move rnode, path = _parse_path_opt(r, &"path"));
+			_reject_unknown_opt_path(r, "node");   // exactly {node, path?}
+			val rnode = _req_str(r, "node");
+			return IrExpr::EResult(node = move rnode, path = _parse_path_opt(r, "path"));
 		},
 		Optional::None => {}
 	}
-	match e.get(&"local") {
+	match e.get("local") {
 		Optional::Some(l) => {
-			_reject_unknown_opt_path(l, &"name");   // exactly {name, path?}
-			val lname = _req_str(l, &"name");
-			return IrExpr::ELocal(name = move lname, path = _parse_path_opt(l, &"path"));
+			_reject_unknown_opt_path(l, "name");   // exactly {name, path?}
+			val lname = _req_str(l, "name");
+			return IrExpr::ELocal(name = move lname, path = _parse_path_opt(l, "path"));
 		},
 		Optional::None => {}
 	}
-	match e.get(&"object") {
+	match e.get("object") {
 		Optional::Some(o) => {
 			// {"object": { "<key>": <expr>, … }} — a JSON object mapping field name -> sub-expression.
 			match o.as_object() {
@@ -713,7 +713,7 @@ fn _parse_expr(e: &json.JsonNode) -> IrExpr {
 				match it.next() {
 					Optional::Some(entry) => {
 						val key = _dup(entry.key);
-						if _expr_field_has(&fields, &key) { throw IrError(message = "duplicate object-construction field '" + _dup(&key) + "'"); }
+						if _expr_field_has(fields, key) { throw IrError(message = "duplicate object-construction field '" + _dup(key) + "'"); }
 						fields.push(ExprField(key = move key, value = _parse_expr(entry.value)));
 					},
 					Optional::None => { done = true; }
@@ -723,14 +723,14 @@ fn _parse_expr(e: &json.JsonNode) -> IrExpr {
 		},
 		Optional::None => {}
 	}
-	match e.get(&"array") {
+	match e.get("array") {
 		Optional::Some(arr) => {
 			// {"array": [ <expr>, … ]} — element sub-expressions, in order.
 			var elems: Array<IrExpr> = [];
 			match arr.as_array() {
 				Optional::Some(a) => {
 					var i = 0;
-					while i < a.len { elems.push(_parse_expr(&a[i])); i = i + 1; }
+					while i < a.len { elems.push(_parse_expr(a[i])); i = i + 1; }
 				},
 				Optional::None => { throw IrError(message = "array construction must be a JSON array of exprs"); }
 			}
@@ -743,7 +743,7 @@ fn _parse_expr(e: &json.JsonNode) -> IrExpr {
 
 fn _expr_field_has(fields: &Array<ExprField>, key: &String) nothrow -> Bool {
 	var i = 0;
-	while i < fields.len { if _str_eq(&fields[i].key, key) { return true; } i = i + 1; }
+	while i < fields.len { if _str_eq(fields[i].key, key) { return true; } i = i + 1; }
 	return false;
 }
 
@@ -779,7 +779,7 @@ fn _parse_path_opt(n: &json.JsonNode, key: &String) -> Array<String> {
 pub fn canonical_json(text: &String) nothrow -> core.Result<String, IrError> {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
 	match json.parse_strict(text) {
-		core.Result::Ok(n) => { return core.Result<String, IrError>::Ok(json.encode_compact_with_config(&n, &cfg)); },
+		core.Result::Ok(n) => { return core.Result<String, IrError>::Ok(json.encode_compact_with_config(n, cfg)); },
 		core.Result::Err(_) => { return core.Result<String, IrError>::Err(IrError(message = "constant is not valid JSON")); }
 	}
 }
@@ -789,7 +789,7 @@ pub fn canonical_json(text: &String) nothrow -> core.Result<String, IrError> {
 fn _check_const(text: &String) nothrow -> Optional<String> {
 	match canonical_json(text) {
 		core.Result::Ok(c) => {
-			if !_str_eq(&c, text) { return Optional<String>::Some("constant is not canonical JSON: " + _dup(text)); }
+			if !_str_eq(c, text) { return Optional<String>::Some("constant is not canonical JSON: " + _dup(text)); }
 			return Optional<String>::None();
 		},
 		core.Result::Err(e) => { return Optional<String>::Some("constant is not valid JSON: " + _dup(text)); }
@@ -804,11 +804,11 @@ fn _check_const(text: &String) nothrow -> Optional<String> {
 // and compensation bindings + the declared argument type when it adopts the graph as authoritative
 // (a separate chunk). All fields are length-prefixed so distinct graphs never collide. -----
 pub fn graph_canonical(g: &IrGraph) nothrow -> String {
-	val order = _node_order_by_id(&g.nodes);
-	var s: String = "G{" + _lp(&g.entry) + "|";
+	val order = _node_order_by_id(g.nodes);
+	var s: String = "G{" + _lp(g.entry) + "|";
 	var k = 0;
 	while k < order.len {
-		s = s + _node_canonical(&g.nodes[order[k]]) + ";";
+		s = s + _node_canonical(g.nodes[order[k]]) + ";";
 		k = k + 1;
 	}
 	return s + "}";
@@ -820,7 +820,7 @@ pub fn graph_canonical(g: &IrGraph) nothrow -> String {
 // is declaration-order-independent and matches the node ordering inside `graph_canonical` — two
 // equivalent graphs with reordered node tables then hash identically.
 pub fn operation_names(g: &IrGraph) nothrow -> Array<String> {
-	val order = _node_order_by_id(&g.nodes);
+	val order = _node_order_by_id(g.nodes);
 	var out: Array<String> = [];
 	var k = 0;
 	while k < order.len {
@@ -837,7 +837,7 @@ pub fn operation_names(g: &IrGraph) nothrow -> Array<String> {
 // stable graph node ids; operation/let/merge names + case match-consts are .mf identifiers/codes (safe
 // inside Mermaid labels). Pure + nothrow — a faithful structural view of the compiled plan.
 pub fn emit_mermaid(g: &IrGraph) nothrow -> String {
-	val order = _node_order_by_id(&g.nodes);
+	val order = _node_order_by_id(g.nodes);
 	var out: String = "flowchart TD\n";
 	var k = 0;
 	while k < order.len {
@@ -860,7 +860,7 @@ pub fn emit_mermaid(g: &IrGraph) nothrow -> String {
 				out = out + "  " + _dup(id) + "{\"case\"}\n";
 				var a = 0;
 				while a < arms.len {
-					out = out + "  " + _dup(id) + " -->|" + _dup(&arms[a].match_const) + "| " + _dup(&arms[a].target) + "\n";
+					out = out + "  " + _dup(id) + " -->|" + _dup(arms[a].match_const) + "| " + _dup(arms[a].target) + "\n";
 					a = a + 1;
 				}
 				out = out + "  " + _dup(id) + " -->|default| " + _dup(default_node) + "\n";
@@ -893,7 +893,7 @@ fn _node_canonical(n: &IrNode) nothrow -> String {
 		IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => {
 			var s = "W" + _lp(id) + _lp(child) + _lp(plan_version) + _expr_canonical(input) + _lp(next);
 			match comp {
-				Optional::Some(cc) => { s = s + "K" + _lp(&cc.child) + _lp(&cc.plan_version); },
+				Optional::Some(cc) => { s = s + "K" + _lp(cc.child) + _lp(cc.plan_version); },
 				Optional::None => {}
 			}
 			return s;
@@ -929,7 +929,7 @@ fn _merge_sources_canonical(sources: &Array<MergeArm>) nothrow -> String {
 	var s: String = "[";
 	var k = 0;
 	while k < order.len {
-		s = s + _lp(&sources[order[k]].from) + _expr_canonical(&sources[order[k]].value);
+		s = s + _lp(sources[order[k]].from) + _expr_canonical(sources[order[k]].value);
 		k = k + 1;
 	}
 	return s + "]";
@@ -942,7 +942,7 @@ fn _merge_order(sources: &Array<MergeArm>) nothrow -> Array<Int> {
 	var a = 1;
 	while a < idx.len {
 		var b = a;
-		while b > 0 and _str_lt(&sources[idx[b]].from, &sources[idx[b - 1]].from) {
+		while b > 0 and _str_lt(sources[idx[b]].from, sources[idx[b - 1]].from) {
 			idx.swap(b, b - 1);
 			b = b - 1;
 		}
@@ -966,15 +966,15 @@ fn _expr_canonical(e: &IrExpr) nothrow -> String {
 			var a = 1;
 			while a < idx.len {
 				var b = a;
-				while b > 0 and _str_lt(&fields[idx[b]].key, &fields[idx[b - 1]].key) { idx.swap(b, b - 1); b = b - 1; }
+				while b > 0 and _str_lt(fields[idx[b]].key, fields[idx[b - 1]].key) { idx.swap(b, b - 1); b = b - 1; }
 				a = a + 1;
 			}
 			var s: String = "o" + fmt.format_int(fields.len) + ";";
 			var k = 0;
 			while k < idx.len {
-				val kc = _lp(&fields[idx[k]].key);
-				val vc = _expr_canonical(&fields[idx[k]].value);
-				val vlp = _lp(&vc);
+				val kc = _lp(fields[idx[k]].key);
+				val vc = _expr_canonical(fields[idx[k]].value);
+				val vlp = _lp(vc);
 				s = s + kc + vlp;
 				k = k + 1;
 			}
@@ -985,8 +985,8 @@ fn _expr_canonical(e: &IrExpr) nothrow -> String {
 			var s: String = "y" + fmt.format_int(elems.len) + ";";
 			var k = 0;
 			while k < elems.len {
-				val ec = _expr_canonical(&elems[k]);
-				val elp = _lp(&ec);
+				val ec = _expr_canonical(elems[k]);
+				val elp = _lp(ec);
 				s = s + elp;
 				k = k + 1;
 			}
@@ -998,7 +998,7 @@ fn _expr_canonical(e: &IrExpr) nothrow -> String {
 fn _path_canonical(p: &Array<String>) nothrow -> String {
 	var s: String = "[";
 	var i = 0;
-	while i < p.len { s = s + _lp(&p[i]); i = i + 1; }
+	while i < p.len { s = s + _lp(p[i]); i = i + 1; }
 	return s + "]";
 }
 
@@ -1016,7 +1016,7 @@ fn _arms_canonical(arms: &Array<IrCaseArm>) nothrow -> String {
 	var s: String = "[";
 	var k = 0;
 	while k < order.len {
-		s = s + _lp(&arms[order[k]].match_const) + _lp(&arms[order[k]].target);
+		s = s + _lp(arms[order[k]].match_const) + _lp(arms[order[k]].target);
 		k = k + 1;
 	}
 	return s + "]";
@@ -1029,7 +1029,7 @@ fn _arm_order(arms: &Array<IrCaseArm>) nothrow -> Array<Int> {
 	var a = 1;
 	while a < idx.len {
 		var b = a;
-		while b > 0 and _str_lt(&arms[idx[b]].match_const, &arms[idx[b - 1]].match_const) {
+		while b > 0 and _str_lt(arms[idx[b]].match_const, arms[idx[b - 1]].match_const) {
 			idx.swap(b, b - 1);
 			b = b - 1;
 		}
@@ -1048,9 +1048,9 @@ fn _node_order_by_id(nodes: &Array<IrNode>) nothrow -> Array<Int> {
 		var b = a;
 		var cont = true;
 		while cont and b > 0 {
-			val ia = _node_id(&nodes[idx[b]]);
-			val ib = _node_id(&nodes[idx[b - 1]]);
-			if _str_lt(&ia, &ib) { idx.swap(b, b - 1); b = b - 1; }
+			val ia = _node_id(nodes[idx[b]]);
+			val ib = _node_id(nodes[idx[b - 1]]);
+			if _str_lt(ia, ib) { idx.swap(b, b - 1); b = b - 1; }
 			else { cont = false; }
 		}
 		a = a + 1;
@@ -1118,27 +1118,27 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 	var local_names: Array<String> = [];
 	var local_vals: Array<json.JsonNode> = [];
 
-	var cur = _dup(&g.entry);
+	var cur = _dup(g.entry);
 	var prev: String = "";   // id of the node we arrived FROM (for NMerge source selection); "" at entry
 	var steps = 0;
 	val budget = g.nodes.len + 4;
 	while steps < budget {
 		steps = steps + 1;
-		val idx = _find_node(g, &cur);
-		if idx < 0 { return StepOutcome::Fault(message = "node not found during replay: " + _dup(&cur)); }
-		val here = _dup(&cur);   // the node being processed now; becomes `prev` for the next step
+		val idx = _find_node(g, cur);
+		if idx < 0 { return StepOutcome::Fault(message = "node not found during replay: " + _dup(cur)); }
+		val here = _dup(cur);   // the node being processed now; becomes `prev` for the next step
 		match &g.nodes[idx] {
 			IrNode::NReturn(id, value) => {
-				match _eval(g, value, &args_node, settled, &local_names, &local_vals) {
-					core.Result::Ok(n) => { return StepOutcome::Completed(result_json = _canon_node(&n)); },
+				match _eval(g, value, args_node, settled, local_names, local_vals) {
+					core.Result::Ok(n) => { return StepOutcome::Completed(result_json = _canon_node(n)); },
 					core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
 				}
 			},
 			IrNode::NFail(id, reason) => {
 				// Authored fail: evaluate the reason (a String code) and stop here. The drive validates
 				// the value (string, <=190) then enters reversal via its OWN durable transition.
-				match _eval(g, reason, &args_node, settled, &local_names, &local_vals) {
-					core.Result::Ok(n) => { return StepOutcome::Fail(node_id = _dup(id), reason_json = _canon_node(&n)); },
+				match _eval(g, reason, args_node, settled, local_names, local_vals) {
+					core.Result::Ok(n) => { return StepOutcome::Fail(node_id = _dup(id), reason_json = _canon_node(n)); },
 					core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
 				}
 			},
@@ -1146,8 +1146,8 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 				match _find_settled(settled, id) {
 					Optional::Some(_) => { cur = _dup(next); },   // settled: continue past it
 					Optional::None => {
-						match _eval(g, input, &args_node, settled, &local_names, &local_vals) {
-							core.Result::Ok(n) => { return StepOutcome::NeedOperation(node_id = _dup(id), operation = _dup(operation), input_json = _canon_node(&n)); },
+						match _eval(g, input, args_node, settled, local_names, local_vals) {
+							core.Result::Ok(n) => { return StepOutcome::NeedOperation(node_id = _dup(id), operation = _dup(operation), input_json = _canon_node(n)); },
 							core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
 						}
 					}
@@ -1159,21 +1159,21 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 				match _find_settled(settled, id) {
 					Optional::Some(_) => { cur = _dup(next); },   // settled: continue past it
 					Optional::None => {
-						match _eval(g, input, &args_node, settled, &local_names, &local_vals) {
-							core.Result::Ok(n) => { return StepOutcome::NeedCall(node_id = _dup(id), child = _dup(child), plan_version = _dup(plan_version), input_json = _canon_node(&n)); },
+						match _eval(g, input, args_node, settled, local_names, local_vals) {
+							core.Result::Ok(n) => { return StepOutcome::NeedCall(node_id = _dup(id), child = _dup(child), plan_version = _dup(plan_version), input_json = _canon_node(n)); },
 							core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
 						}
 					}
 				}
 			},
 			IrNode::NLet(id, name, value, next) => {
-				match _eval(g, value, &args_node, settled, &local_names, &local_vals) {
+				match _eval(g, value, args_node, settled, local_names, local_vals) {
 					core.Result::Ok(n) => { local_names.push(_dup(name)); local_vals.push(move n); cur = _dup(next); },
 					core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
 				}
 			},
 			IrNode::NIf(id, cond, then_node, else_node) => {
-				match _eval(g, cond, &args_node, settled, &local_names, &local_vals) {
+				match _eval(g, cond, args_node, settled, local_names, local_vals) {
 					core.Result::Ok(n) => {
 						match n.as_bool() {
 							Optional::Some(b) => { if b { cur = _dup(then_node); } else { cur = _dup(else_node); } },
@@ -1184,14 +1184,14 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 				}
 			},
 			IrNode::NCase(id, scrutinee, arms, default_node) => {
-				match _eval(g, scrutinee, &args_node, settled, &local_names, &local_vals) {
+				match _eval(g, scrutinee, args_node, settled, local_names, local_vals) {
 					core.Result::Ok(n) => {
-						val v = _canon_node(&n);
+						val v = _canon_node(n);
 						var tgt = _dup(default_node);
 						var matched = false;
 						var a = 0;
 						while a < arms.len {
-							if !matched and _str_eq(&arms[a].match_const, &v) { tgt = _dup(&arms[a].target); matched = true; }
+							if !matched and _str_eq(arms[a].match_const, v) { tgt = _dup(arms[a].target); matched = true; }
 							a = a + 1;
 						}
 						cur = move tgt;
@@ -1204,11 +1204,11 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 				// pure body per element (map/filter/fold), and bind the result to local `acc` — just
 				// like an NLet. NO operation seq, NO durable write: a loop is recomputed on replay
 				// from the same durable args/results/locals, so it is deterministic.
-				match _eval(g, source, &args_node, settled, &local_names, &local_vals) {
+				match _eval(g, source, args_node, settled, local_names, local_vals) {
 					core.Result::Ok(sn) => {
 						match sn.as_array() {
 							Optional::Some(arr) => {
-								match _eval_loop(g, kind, arr, elem, acc, init, body, &args_node, settled, &local_names, &local_vals) {
+								match _eval_loop(g, kind, arr, elem, acc, init, body, args_node, settled, local_names, local_vals) {
 									core.Result::Ok(rn) => {
 										local_names.push(_dup(acc));
 										local_vals.push(move rn);
@@ -1231,15 +1231,15 @@ pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothr
 				var picked = false;
 				var ms = 0;
 				while ms < sources.len {
-					if !picked and _str_eq(&sources[ms].from, &prev) {
-						match _eval(g, &sources[ms].value, &args_node, settled, &local_names, &local_vals) {
+					if !picked and _str_eq(sources[ms].from, prev) {
+						match _eval(g, sources[ms].value, args_node, settled, local_names, local_vals) {
 							core.Result::Ok(n) => { local_names.push(_dup(name)); local_vals.push(move n); picked = true; },
 							core.Result::Err(e) => { return StepOutcome::Fault(message = e.message); }
 						}
 					}
 					ms = ms + 1;
 				}
-				if !picked { return StepOutcome::Fault(message = "merge has no source for predecessor '" + _dup(&prev) + "': " + _dup(id)); }
+				if !picked { return StepOutcome::Fault(message = "merge has no source for predecessor '" + _dup(prev) + "': " + _dup(id)); }
 				cur = _dup(next);
 			}
 		}
@@ -1255,13 +1255,13 @@ fn _eval(g: &IrGraph, e: &IrExpr, args: &json.JsonNode, settled: &Array<OpResult
 		IrExpr::EConst(canonical_json) => {
 			match json.parse_strict(canonical_json) {
 				core.Result::Ok(n) => { return core.Result<json.JsonNode, IrError>::Ok(move n); },
-				core.Result::Err(_) => { return _ev_err(&"EConst is not valid JSON"); }
+				core.Result::Err(_) => { return _ev_err("EConst is not valid JSON"); }
 			}
 		},
 		IrExpr::EArg(path) => {
 			match _project(args, path) {
 				Optional::Some(n) => { return core.Result<json.JsonNode, IrError>::Ok(move n); },
-				Optional::None => { return _ev_err(&"EArg path not found"); }
+				Optional::None => { return _ev_err("EArg path not found"); }
 			}
 		},
 		IrExpr::EResult(node, path) => {
@@ -1269,37 +1269,37 @@ fn _eval(g: &IrGraph, e: &IrExpr, args: &json.JsonNode, settled: &Array<OpResult
 				Optional::Some(rj) => {
 					match json.parse_strict(rj) {
 						core.Result::Ok(rn) => {
-							match _project(&rn, path) {
+							match _project(rn, path) {
 								Optional::Some(n) => { return core.Result<json.JsonNode, IrError>::Ok(move n); },
-								Optional::None => { return _ev_err(&"EResult path not found"); }
+								Optional::None => { return _ev_err("EResult path not found"); }
 							}
 						},
-						core.Result::Err(_) => { return _ev_err(&"settled result is not valid JSON"); }
+						core.Result::Err(_) => { return _ev_err("settled result is not valid JSON"); }
 					}
 				},
-				Optional::None => { return _ev_err(&"EResult references an unsettled operation"); }
+				Optional::None => { return _ev_err("EResult references an unsettled operation"); }
 			}
 		},
 		IrExpr::ELocal(name, path) => {
 			var k = 0;
 			while k < lnames.len {
-				if _str_eq(&lnames[k], name) {
-					match _project(&lvals[k], path) {
+				if _str_eq(lnames[k], name) {
+					match _project(lvals[k], path) {
 						Optional::Some(n) => { return core.Result<json.JsonNode, IrError>::Ok(move n); },
-						Optional::None => { return _ev_err(&"ELocal path not found"); }
+						Optional::None => { return _ev_err("ELocal path not found"); }
 					}
 				}
 				k = k + 1;
 			}
-			return _ev_err(&"ELocal references an unbound local");
+			return _ev_err("ELocal references an unbound local");
 		},
 		IrExpr::EObject(fields) => {
 			// Pure construction: evaluate each field's sub-expression; a child Fault propagates.
 			var o = json.new_object();
 			var i = 0;
 			while i < fields.len {
-				match _eval(g, &fields[i].value, args, settled, lnames, lvals) {
-					core.Result::Ok(v) => { o.set(_dup(&fields[i].key), move v); },
+				match _eval(g, fields[i].value, args, settled, lnames, lvals) {
+					core.Result::Ok(v) => { o.set(_dup(fields[i].key), move v); },
 					core.Result::Err(er) => { return core.Result<json.JsonNode, IrError>::Err(er); }
 				}
 				i = i + 1;
@@ -1310,7 +1310,7 @@ fn _eval(g: &IrGraph, e: &IrExpr, args: &json.JsonNode, settled: &Array<OpResult
 			var arr = json.new_array();
 			var i = 0;
 			while i < elems.len {
-				match _eval(g, &elems[i], args, settled, lnames, lvals) {
+				match _eval(g, elems[i], args, settled, lnames, lvals) {
 					core.Result::Ok(v) => { arr.push(move v); },
 					core.Result::Err(er) => { return core.Result<json.JsonNode, IrError>::Err(er); }
 				}
@@ -1356,11 +1356,11 @@ fn _eval_loop(g: &IrGraph, kind: &LoopKind, arr: &Array<json.JsonNode>, elem: &S
 		var bnames: Array<String> = [];
 		var bvals: Array<json.JsonNode> = [];
 		var k = 0;
-		while k < outer_names.len { bnames.push(_dup(&outer_names[k])); bvals.push(outer_vals[k].clone_deep()); k = k + 1; }
+		while k < outer_names.len { bnames.push(_dup(outer_names[k])); bvals.push(outer_vals[k].clone_deep()); k = k + 1; }
 		bnames.push(_dup(elem));
 		bvals.push(arr[e].clone_deep());
 		if is_fold { bnames.push(_dup(acc)); bvals.push(fold_acc.clone_deep()); }
-		match _eval(g, body, args, settled, &bnames, &bvals) {
+		match _eval(g, body, args, settled, bnames, bvals) {
 			core.Result::Ok(rv) => {
 				if is_fold {
 					fold_acc = move rv;
@@ -1368,7 +1368,7 @@ fn _eval_loop(g: &IrGraph, kind: &LoopKind, arr: &Array<json.JsonNode>, elem: &S
 					if is_filter {
 						match rv.as_bool() {
 							Optional::Some(keep) => { if keep { out.push(arr[e].clone_deep()); } },
-							Optional::None => { return _ev_err(&"filter body did not evaluate to a bool"); }
+							Optional::None => { return _ev_err("filter body did not evaluate to a bool"); }
 						}
 					} else {
 						out.push(move rv);   // map
@@ -1395,7 +1395,7 @@ fn _project(node: &json.JsonNode, path: &Array<String>) nothrow -> Optional<json
 fn _find_settled(settled: &Array<OpResult>, id: &String) nothrow -> Optional<&String> {
 	var i = 0;
 	while i < settled.len {
-		if _str_eq(&settled[i].node_id, id) { return Optional<&String>::Some(&settled[i].result_json); }
+		if _str_eq(settled[i].node_id, id) { return Optional<&String>::Some(&settled[i].result_json); }
 		i = i + 1;
 	}
 	return Optional<&String>::None();
@@ -1403,7 +1403,7 @@ fn _find_settled(settled: &Array<OpResult>, id: &String) nothrow -> Optional<&St
 
 fn _canon_node(n: &json.JsonNode) nothrow -> String {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
-	return json.encode_compact_with_config(n, &cfg);
+	return json.encode_compact_with_config(n, cfg);
 }
 
 // ===== structural validation (Step 1b(ii) chunk 2: the graph is authoritative) =====
@@ -1433,27 +1433,27 @@ pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
 	var i = 0;
 	while i < nn {
 		var j = i + 1;
-		val idi = _node_id(&g.nodes[i]);
+		val idi = _node_id(g.nodes[i]);
 		while j < nn {
-			val idj = _node_id(&g.nodes[j]);
-			if _str_eq(&idi, &idj) { return Optional<String>::Some("duplicate node id: " + _dup(&idi)); }
+			val idj = _node_id(g.nodes[j]);
+			if _str_eq(idi, idj) { return Optional<String>::Some("duplicate node id: " + _dup(idi)); }
 			j = j + 1;
 		}
 		i = i + 1;
 	}
 
 	// entry exists
-	if _find_node(g, &g.entry) < 0 { return Optional<String>::Some("entry node not found: " + _dup(&g.entry)); }
+	if _find_node(g, g.entry) < 0 { return Optional<String>::Some("entry node not found: " + _dup(g.entry)); }
 
 	// every edge targets an existing node
 	i = 0;
 	while i < nn {
 		var succs: Array<String> = [];
-		_succs(&g.nodes[i], &mut succs);
+		_succs(g.nodes[i], succs);
 		var s = 0;
 		while s < succs.len {
-			if _find_node(g, &succs[s]) < 0 {
-				return Optional<String>::Some("edge target not found: " + _dup(&succs[s]));
+			if _find_node(g, succs[s]) < 0 {
+				return Optional<String>::Some("edge target not found: " + _dup(succs[s]));
 			}
 			s = s + 1;
 		}
@@ -1463,8 +1463,8 @@ pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
 	// acyclic control flow (DFS back-edge detection over reachable nodes)
 	var color: Array<Int> = [];   // 0=white 1=gray 2=black
 	i = 0; while i < nn { color.push(0); i = i + 1; }
-	val entry_idx = _find_node(g, &g.entry);
-	if _has_cycle(g, entry_idx, &mut color) {
+	val entry_idx = _find_node(g, g.entry);
+	if _has_cycle(g, entry_idx, color) {
 		return Optional<String>::Some("control-flow cycle (loops must be finite array expressions, not back-edges)");
 	}
 
@@ -1474,7 +1474,7 @@ pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
 	val reach = _reachable_without(g, -1);
 	i = 0;
 	while i < nn {
-		if !reach[i] { return Optional<String>::Some("unreachable node: " + _dup(&_node_id(&g.nodes[i]))); }
+		if !reach[i] { return Optional<String>::Some("unreachable node: " + _dup(_node_id(g.nodes[i]))); }
 		i = i + 1;
 	}
 
@@ -1482,9 +1482,9 @@ pub fn validate_graph(g: &IrGraph) nothrow -> Optional<String> {
 	i = 0;
 	while i < nn {
 		var succs: Array<String> = [];
-		_succs(&g.nodes[i], &mut succs);
-		if succs.len == 0 and !_is_return(&g.nodes[i]) and !_is_fail(&g.nodes[i]) {
-			return Optional<String>::Some("non-terminal node has no successor: " + _dup(&_node_id(&g.nodes[i])));
+		_succs(g.nodes[i], succs);
+		if succs.len == 0 and !_is_return(g.nodes[i]) and !_is_fail(g.nodes[i]) {
+			return Optional<String>::Some("non-terminal node has no successor: " + _dup(_node_id(g.nodes[i])));
 		}
 		i = i + 1;
 	}
@@ -1532,9 +1532,9 @@ fn _dup_let_name(g: &IrGraph) nothrow -> Optional<String> {
 	var names: Array<String> = [];
 	var i = 0;
 	while i < g.nodes.len {
-		match _binder_name_of(&g.nodes[i]) {
+		match _binder_name_of(g.nodes[i]) {
 			Optional::Some(bn) => {
-				if _contains_str(&names, &bn) { return Optional<String>::Some(move bn); }
+				if _contains_str(names, bn) { return Optional<String>::Some(move bn); }
 				names.push(move bn);
 			},
 			Optional::None => {}
@@ -1550,7 +1550,7 @@ fn _dup_case_const(arms: &Array<IrCaseArm>) nothrow -> Optional<String> {
 	while i < arms.len {
 		var j = i + 1;
 		while j < arms.len {
-			if _str_eq(&arms[i].match_const, &arms[j].match_const) { return Optional<String>::Some(_dup(&arms[i].match_const)); }
+			if _str_eq(arms[i].match_const, arms[j].match_const) { return Optional<String>::Some(_dup(arms[i].match_const)); }
 			j = j + 1;
 		}
 		i = i + 1;
@@ -1562,8 +1562,8 @@ fn _dup_case_const(arms: &Array<IrCaseArm>) nothrow -> Optional<String> {
 fn _find_node(g: &IrGraph, id: &String) nothrow -> Int {
 	var i = 0;
 	while i < g.nodes.len {
-		val nid = _node_id(&g.nodes[i]);
-		if _str_eq(&nid, id) { return i; }
+		val nid = _node_id(g.nodes[i]);
+		if _str_eq(nid, id) { return i; }
 		i = i + 1;
 	}
 	return -1;
@@ -1578,7 +1578,7 @@ fn _succs(n: &IrNode, out: &mut Array<String>) nothrow -> Void {
 		IrNode::NIf(id, cond, then_node, else_node) => { out.push(_dup(then_node)); out.push(_dup(else_node)); },
 		IrNode::NCase(id, scrutinee, arms, default_node) => {
 			var a = 0;
-			while a < arms.len { out.push(_dup(&arms[a].target)); a = a + 1; }
+			while a < arms.len { out.push(_dup(arms[a].target)); a = a + 1; }
 			out.push(_dup(default_node));
 		},
 		IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => { out.push(_dup(next)); },
@@ -1630,7 +1630,7 @@ pub fn validate_return_contract(g: &IrGraph, return_type: &Optional<IrType>) not
 			var i = 0;
 			while i < g.nodes.len {
 				var succs: Array<String> = [];
-				_succs(&g.nodes[i], &mut succs);
+				_succs(g.nodes[i], succs);
 				if succs.len == 0 {
 					match &g.nodes[i] {
 						IrNode::NReturn(id, value) => {
@@ -1657,7 +1657,7 @@ fn _is_object_type(t: &IrType) nothrow -> Bool {
 // unit so `return null` can never become an app-facing non-unit result.
 fn _is_unit_return_value(e: &IrExpr) nothrow -> Bool {
 	match e {
-		IrExpr::EConst(canonical_json) => { return _str_eq(canonical_json, &"null"); },
+		IrExpr::EConst(canonical_json) => { return _str_eq(canonical_json, "null"); },
 		default => { return false; }
 	}
 }
@@ -1682,7 +1682,7 @@ pub fn validate_source_unit_return(g: &IrGraph, return_type: &Optional<IrType>) 
 	var i = 0;
 	while i < g.nodes.len {
 		var succs: Array<String> = [];
-		_succs(&g.nodes[i], &mut succs);
+		_succs(g.nodes[i], succs);
 		if succs.len == 0 {
 			match &g.nodes[i] {
 				IrNode::NReturn(id, value) => {
@@ -1717,16 +1717,16 @@ fn _reaches_fail(g: &IrGraph, start: Int) nothrow -> Bool {
 	var k = 0;
 	while k < g.nodes.len { seen.push(false); k = k + 1; }
 	var frontier: Array<String> = [];
-	_succs(&g.nodes[start], &mut frontier);
+	_succs(g.nodes[start], frontier);
 	var qi = 0;
 	while qi < frontier.len {
-		val ni = _find_node(g, &frontier[qi]);
+		val ni = _find_node(g, frontier[qi]);
 		qi = qi + 1;
 		if ni < 0 { continue; }
 		if seen[ni] { continue; }
 		seen[ni] = true;
-		if _is_fail(&g.nodes[ni]) { return true; }
-		_succs(&g.nodes[ni], &mut frontier);
+		if _is_fail(g.nodes[ni]) { return true; }
+		_succs(g.nodes[ni], frontier);
 	}
 	return false;
 }
@@ -1742,11 +1742,11 @@ fn _plan_length_from_depths(g: &IrGraph, depth: &Array<Int>) nothrow -> core.Res
 	var i = 0;
 	while i < g.nodes.len {
 		if depth[i] >= 0 {
-			if _is_return(&g.nodes[i]) {
+			if _is_return(g.nodes[i]) {
 				if ret_pl < 0 { ret_pl = depth[i]; }
 				else { if ret_pl != depth[i] { return core.Result<Int, IrError>::Err(IrError(message = "op-unbalanced branch (terminal paths have differing operation counts)")); } }
 			}
-			if _is_fail(&g.nodes[i]) { if depth[i] > max_fail { max_fail = depth[i]; } }
+			if _is_fail(g.nodes[i]) { if depth[i] > max_fail { max_fail = depth[i]; } }
 		}
 		i = i + 1;
 	}
@@ -1765,10 +1765,10 @@ fn _is_operation(n: &IrNode) nothrow -> Bool {
 fn _has_cycle(g: &IrGraph, idx: Int, color: &mut Array<Int>) nothrow -> Bool {
 	color[idx] = 1;   // gray
 	var succs: Array<String> = [];
-	_succs(&g.nodes[idx], &mut succs);
+	_succs(g.nodes[idx], succs);
 	var s = 0;
 	while s < succs.len {
-		val t = _find_node(g, &succs[s]);
+		val t = _find_node(g, succs[s]);
 		if t >= 0 {
 			if color[t] == 1 { return true; }              // back-edge into a gray node
 			if color[t] == 0 and _has_cycle(g, t, color) { return true; }
@@ -1784,7 +1784,7 @@ fn _has_cycle(g: &IrGraph, idx: Int, color: &mut Array<Int>) nothrow -> Bool {
 fn _reachable_without(g: &IrGraph, removed: Int) nothrow -> Array<Bool> {
 	var reach: Array<Bool> = [];
 	var i = 0; while i < g.nodes.len { reach.push(false); i = i + 1; }
-	val entry_idx = _find_node(g, &g.entry);
+	val entry_idx = _find_node(g, g.entry);
 	if entry_idx < 0 or entry_idx == removed { return move reach; }
 	var work: Array<Int> = [];
 	work.push(entry_idx);
@@ -1794,10 +1794,10 @@ fn _reachable_without(g: &IrGraph, removed: Int) nothrow -> Array<Bool> {
 		val cur = work[h];
 		h = h + 1;
 		var succs: Array<String> = [];
-		_succs(&g.nodes[cur], &mut succs);
+		_succs(g.nodes[cur], succs);
 		var s = 0;
 		while s < succs.len {
-			val t = _find_node(g, &succs[s]);
+			val t = _find_node(g, succs[s]);
 			if t >= 0 and t != removed and !reach[t] { reach[t] = true; work.push(t); }
 			s = s + 1;
 		}
@@ -1831,8 +1831,8 @@ fn _binder_name_of(n: &IrNode) nothrow -> Optional<String> {
 fn _has_dominating_binder(g: &IrGraph, name: &String, y: Int) nothrow -> Bool {
 	var i = 0;
 	while i < g.nodes.len {
-		match _binder_name_of(&g.nodes[i]) {
-			Optional::Some(bn) => { if _str_eq(&bn, name) and _dominates(g, i, y) { return true; } },
+		match _binder_name_of(g.nodes[i]) {
+			Optional::Some(bn) => { if _str_eq(bn, name) and _dominates(g, i, y) { return true; } },
 			Optional::None => {}
 		}
 		i = i + 1;
@@ -1846,8 +1846,8 @@ fn _has_dominating_binder(g: &IrGraph, name: &String, y: Int) nothrow -> Bool {
 fn _is_binder_name(g: &IrGraph, name: &String) nothrow -> Bool {
 	var i = 0;
 	while i < g.nodes.len {
-		match _binder_name_of(&g.nodes[i]) {
-			Optional::Some(bn) => { if _str_eq(&bn, name) { return true; } },
+		match _binder_name_of(g.nodes[i]) {
+			Optional::Some(bn) => { if _str_eq(bn, name) { return true; } },
 			Optional::None => {}
 		}
 		i = i + 1;
@@ -1867,8 +1867,8 @@ fn _available_after(g: &IrGraph, y: Int, x: Int) nothrow -> Bool {
 fn _binder_available_after(g: &IrGraph, name: &String, x: Int) nothrow -> Bool {
 	var i = 0;
 	while i < g.nodes.len {
-		match _binder_name_of(&g.nodes[i]) {
-			Optional::Some(bn) => { if _str_eq(&bn, name) and _available_after(g, i, x) { return true; } },
+		match _binder_name_of(g.nodes[i]) {
+			Optional::Some(bn) => { if _str_eq(bn, name) and _available_after(g, i, x) { return true; } },
 			Optional::None => {}
 		}
 		i = i + 1;
@@ -1900,16 +1900,16 @@ fn _check_fail_reason_const(reason: &IrExpr) nothrow -> Optional<String> {
 fn _check_node(g: &IrGraph, idx: Int) nothrow -> Optional<String> {
 	var no_locals: Array<String> = [];
 	match &g.nodes[idx] {
-		IrNode::NOperation(id, operation, input, next) => { return _check_expr(g, input, idx, &no_locals); },
-		IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => { return _check_expr(g, input, idx, &no_locals); },
-		IrNode::NLet(id, name, value, next) => { return _check_expr(g, value, idx, &no_locals); },
-		IrNode::NIf(id, cond, then_node, else_node) => { return _check_expr(g, cond, idx, &no_locals); },
+		IrNode::NOperation(id, operation, input, next) => { return _check_expr(g, input, idx, no_locals); },
+		IrNode::NCallWorkflow(id, child, plan_version, input, next, comp) => { return _check_expr(g, input, idx, no_locals); },
+		IrNode::NLet(id, name, value, next) => { return _check_expr(g, value, idx, no_locals); },
+		IrNode::NIf(id, cond, then_node, else_node) => { return _check_expr(g, cond, idx, no_locals); },
 		IrNode::NCase(id, scrutinee, arms, default_node) => {
 			// Each arm constant must be valid + canonical (checked FIRST, so the duplicate check
 			// below compares canonical forms rather than raw spelling).
 			var a = 0;
 			while a < arms.len {
-				match _check_const(&arms[a].match_const) {
+				match _check_const(arms[a].match_const) {
 					Optional::Some(m) => { return Optional<String>::Some(move m); },
 					Optional::None => {}
 				}
@@ -1921,11 +1921,11 @@ fn _check_node(g: &IrGraph, idx: Int) nothrow -> Optional<String> {
 				Optional::Some(c) => { return Optional<String>::Some("duplicate NCase match_const: " + move c); },
 				Optional::None => {}
 			}
-			return _check_expr(g, scrutinee, idx, &no_locals);
+			return _check_expr(g, scrutinee, idx, no_locals);
 		},
-		IrNode::NReturn(id, value) => { return _check_expr(g, value, idx, &no_locals); },
+		IrNode::NReturn(id, value) => { return _check_expr(g, value, idx, no_locals); },
 		IrNode::NFail(id, reason) => {
-			match _check_expr(g, reason, idx, &no_locals) {
+			match _check_expr(g, reason, idx, no_locals) {
 				Optional::Some(m) => { return Optional<String>::Some(move m); },
 				Optional::None => {}
 			}
@@ -1954,13 +1954,13 @@ fn _check_node(g: &IrGraph, idx: Int) nothrow -> Optional<String> {
 			if !is_fold {
 				if !_is_const_null(init) { return Optional<String>::Some("map/filter loop init must be null: " + _dup(id)); }
 			}
-			match _check_expr(g, source, idx, &no_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
-			match _check_expr(g, init, idx, &no_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+			match _check_expr(g, source, idx, no_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+			match _check_expr(g, init, idx, no_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
 			// body locals: the element, plus the accumulator for fold.
 			var locals: Array<String> = [];
 			locals.push(_dup(elem));
 			if is_fold { locals.push(_dup(acc)); }
-			return _check_expr(g, body, idx, &locals);
+			return _check_expr(g, body, idx, locals);
 		},
 		IrNode::NMerge(id, name, sources, next) => { return _check_merge(g, idx, id, name, sources); }
 	}
@@ -1981,9 +1981,9 @@ fn _check_merge(g: &IrGraph, idx: Int, id: &String, name: &String, sources: &Arr
 	while i < g.nodes.len {
 		if i != idx {
 			var succs: Array<String> = [];
-			_succs(&g.nodes[i], &mut succs);
+			_succs(g.nodes[i], succs);
 			var s = 0;
-			while s < succs.len { if _str_eq(&succs[s], &merge_id) { preds.push(i); } s = s + 1; }
+			while s < succs.len { if _str_eq(succs[s], merge_id) { preds.push(i); } s = s + 1; }
 		}
 		i = i + 1;
 	}
@@ -1991,15 +1991,15 @@ fn _check_merge(g: &IrGraph, idx: Int, id: &String, name: &String, sources: &Arr
 	// Each source: a DISTINCT predecessor `from`, with a value valid in that predecessor's scope.
 	var a = 0;
 	while a < sources.len {
-		val fidx = _find_node(g, &sources[a].from);
-		if fidx < 0 { return Optional<String>::Some("merge source 'from' not found: " + _dup(&sources[a].from)); }
-		if !_contains_int(&preds, fidx) { return Optional<String>::Some("merge source 'from' is not a predecessor: " + _dup(&sources[a].from)); }
+		val fidx = _find_node(g, sources[a].from);
+		if fidx < 0 { return Optional<String>::Some("merge source 'from' not found: " + _dup(sources[a].from)); }
+		if !_contains_int(preds, fidx) { return Optional<String>::Some("merge source 'from' is not a predecessor: " + _dup(sources[a].from)); }
 		var b = 0;
 		while b < a {
-			if _str_eq(&sources[a].from, &sources[b].from) { return Optional<String>::Some("merge has duplicate source 'from': " + _dup(&sources[a].from)); }
+			if _str_eq(sources[a].from, sources[b].from) { return Optional<String>::Some("merge has duplicate source 'from': " + _dup(sources[a].from)); }
 			b = b + 1;
 		}
-		match _check_merge_source(g, &sources[a].value, fidx) {
+		match _check_merge_source(g, sources[a].value, fidx) {
 			Optional::Some(m) => { return Optional<String>::Some(move m); },
 			Optional::None => {}
 		}
@@ -2008,11 +2008,11 @@ fn _check_merge(g: &IrGraph, idx: Int, id: &String, name: &String, sources: &Arr
 	// Totality: every predecessor must have a source (else the merge is ambiguous on that path).
 	var p = 0;
 	while p < preds.len {
-		val pid = _node_id(&g.nodes[preds[p]]);
+		val pid = _node_id(g.nodes[preds[p]]);
 		var found = false;
 		var c = 0;
-		while c < sources.len { if _str_eq(&sources[c].from, &pid) { found = true; } c = c + 1; }
-		if !found { return Optional<String>::Some("merge missing source for predecessor: " + _dup(&pid)); }
+		while c < sources.len { if _str_eq(sources[c].from, pid) { found = true; } c = c + 1; }
+		if !found { return Optional<String>::Some("merge missing source for predecessor: " + _dup(pid)); }
 		p = p + 1;
 	}
 	return Optional<String>::None();
@@ -2027,7 +2027,7 @@ fn _check_merge_source(g: &IrGraph, e: &IrExpr, fidx: Int) nothrow -> Optional<S
 		IrExpr::EResult(node, path) => {
 			val t = _find_node(g, node);
 			if t < 0 { return Optional<String>::Some("merge source EResult references missing node: " + _dup(node)); }
-			if !_is_result_binding_node(&g.nodes[t]) { return Optional<String>::Some("merge source EResult must reference an NOperation or a workflow call: " + _dup(node)); }
+			if !_is_result_binding_node(g.nodes[t]) { return Optional<String>::Some("merge source EResult must reference an NOperation or a workflow call: " + _dup(node)); }
 			if !_available_after(g, t, fidx) { return Optional<String>::Some("merge source EResult is not available at its predecessor: " + _dup(node)); }
 			return Optional<String>::None();
 		},
@@ -2038,7 +2038,7 @@ fn _check_merge_source(g: &IrGraph, e: &IrExpr, fidx: Int) nothrow -> Optional<S
 		IrExpr::EObject(fields) => {
 			var i = 0;
 			while i < fields.len {
-				match _check_merge_source(g, &fields[i].value, fidx) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+				match _check_merge_source(g, fields[i].value, fidx) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
 				i = i + 1;
 			}
 			return Optional<String>::None();
@@ -2046,7 +2046,7 @@ fn _check_merge_source(g: &IrGraph, e: &IrExpr, fidx: Int) nothrow -> Optional<S
 		IrExpr::EArray(elems) => {
 			var i = 0;
 			while i < elems.len {
-				match _check_merge_source(g, &elems[i], fidx) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+				match _check_merge_source(g, elems[i], fidx) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
 				i = i + 1;
 			}
 			return Optional<String>::None();
@@ -2097,7 +2097,7 @@ fn _resolve_call_target(call_targets: &Optional<Array<CallTarget>>, name: &Strin
 		Optional::Some(targets) => {
 			var i = 0;
 			while i < targets.len {
-				if _str_eq(&targets[i].name, name) and _str_eq(&targets[i].version, version) {
+				if _str_eq(targets[i].name, name) and _str_eq(targets[i].version, version) {
 					return Optional<&CallTarget>::Some(&targets[i]);
 				}
 				i = i + 1;
@@ -2119,7 +2119,7 @@ pub struct CallEdge {
 }
 
 pub fn call_edges(g: &IrGraph) nothrow -> Array<CallEdge> {
-	val order = _node_order_by_id(&g.nodes);
+	val order = _node_order_by_id(g.nodes);
 	var out: Array<CallEdge> = [];
 	var k = 0;
 	while k < order.len {
@@ -2180,7 +2180,7 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 			IrNode::NOperation(id, operation, input, next) => {
 				match _op_input_type(contracts, operation) {
 					Optional::Some(it) => {
-						match _check_value_is(g, input, it, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+						match _check_value_is(g, input, it, arg_type, contracts, lt_names, lt_types, call_targets) {
 							Optional::Some(m) => { return Optional<String>::Some("operation '" + _dup(operation) + "' input: " + move m); },
 							Optional::None => {}
 						}
@@ -2202,8 +2202,8 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 					Optional::Some(_) => {
 						match _resolve_call_target(call_targets, child, plan_version) {
 							Optional::Some(target) => {
-								val cat = _clone_type(&target.arg_type);
-								match _check_value_is(g, input, &cat, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+								val cat = _clone_type(target.arg_type);
+								match _check_value_is(g, input, cat, arg_type, contracts, lt_names, lt_types, call_targets) {
 									Optional::Some(m) => { return Optional<String>::Some("call '" + _dup(id) + "' (" + _dup(child) + "@" + _dup(plan_version) + ") input: " + m); },
 									Optional::None => {}
 								}
@@ -2214,7 +2214,7 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 						}
 					},
 					Optional::None => {
-						match _infer_expr_type(g, input, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+						match _infer_expr_type(g, input, arg_type, contracts, lt_names, lt_types, call_targets) {
 							core.Result::Ok(_) => {},
 							core.Result::Err(e) => { return Optional<String>::Some(e.message); }
 						}
@@ -2222,10 +2222,10 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 				}
 			},
 			IrNode::NIf(id, cond, then_node, else_node) => {
-				match _infer_expr_type(g, cond, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+				match _infer_expr_type(g, cond, arg_type, contracts, lt_names, lt_types, call_targets) {
 					core.Result::Ok(it) => {
 						match &it {
-							InferType::Known(t) => { if !_str_eq(&canonical(t), &"b") { return Optional<String>::Some("NIf condition must be Bool (got " + canonical(t) + "): " + _dup(id)); } },
+							InferType::Known(t) => { if !_str_eq(canonical(t), "b") { return Optional<String>::Some("NIf condition must be Bool (got " + canonical(t) + "): " + _dup(id)); } },
 							InferType::Imprecise() => { return Optional<String>::Some("NIf condition must be Bool (got an imprecise literal): " + _dup(id)); },
 							InferType::Unknown() => {}
 						}
@@ -2234,10 +2234,10 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 				}
 			},
 			IrNode::NFail(id, reason) => {
-				match _infer_expr_type(g, reason, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+				match _infer_expr_type(g, reason, arg_type, contracts, lt_names, lt_types, call_targets) {
 					core.Result::Ok(it) => {
 						match &it {
-							InferType::Known(t) => { if !_str_eq(&canonical(t), &"s") { return Optional<String>::Some("fail reason must be String (got " + canonical(t) + "): " + _dup(id)); } },
+							InferType::Known(t) => { if !_str_eq(canonical(t), "s") { return Optional<String>::Some("fail reason must be String (got " + canonical(t) + "): " + _dup(id)); } },
 							InferType::Imprecise() => {},
 							InferType::Unknown() => {}
 						}
@@ -2246,15 +2246,15 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 				}
 			},
 			IrNode::NCase(id, scrutinee, arms, default_node) => {
-				match _infer_expr_type(g, scrutinee, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+				match _infer_expr_type(g, scrutinee, arg_type, contracts, lt_names, lt_types, call_targets) {
 					core.Result::Ok(it) => {
 						match &it {
 							InferType::Known(st) => {
 								var a = 0;
 								while a < arms.len {
-									match json.parse_strict(&arms[a].match_const) {
+									match json.parse_strict(arms[a].match_const) {
 										core.Result::Ok(mn) => {
-											match validate(&mn, st) {
+											match validate(mn, st) {
 												Optional::Some(m) => { return Optional<String>::Some("NCase arm constant incompatible with scrutinee type: " + move m); },
 												Optional::None => {}
 											}
@@ -2271,19 +2271,19 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 				}
 			},
 			IrNode::NLet(id, name, value, next) => {
-				match _infer_expr_type(g, value, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+				match _infer_expr_type(g, value, arg_type, contracts, lt_names, lt_types, call_targets) {
 					core.Result::Ok(opt) => { lt_names.push(_dup(name)); lt_types.push(move opt); },
 					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
 				}
 			},
 			IrNode::NLoop(id, kind, source, elem, acc, init, body, next) => {
-				match _tc_loop(g, id, kind, source, elem, acc, init, body, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+				match _tc_loop(g, id, kind, source, elem, acc, init, body, arg_type, contracts, lt_names, lt_types, call_targets) {
 					core.Result::Ok(rt) => { lt_names.push(_dup(acc)); lt_types.push(move rt); },
 					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
 				}
 			},
 			IrNode::NMerge(id, name, sources, next) => {
-				match _tc_merge(g, id, sources, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+				match _tc_merge(g, id, sources, arg_type, contracts, lt_names, lt_types, call_targets) {
 					core.Result::Ok(mt) => { lt_names.push(_dup(name)); lt_types.push(move mt); },
 					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
 				}
@@ -2291,7 +2291,7 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 			IrNode::NReturn(id, value) => {
 				// Always infer, even with no declared return type, to catch a structurally-bad
 				// projection.
-				match _infer_expr_type(g, value, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+				match _infer_expr_type(g, value, arg_type, contracts, lt_names, lt_types, call_targets) {
 					core.Result::Ok(_) => {},
 					core.Result::Err(e) => { return Optional<String>::Some(e.message); }
 				}
@@ -2324,7 +2324,7 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 						// scalar or a wrong-shaped object is rejected here, not silently persisted as
 						// `workflow_return_json` and only discovered later at the host/SP boundary.
 						Optional::Some(rt) => {
-							match _check_value_is(g, value, rt, arg_type, contracts, &lt_names, &lt_types, call_targets) {
+							match _check_value_is(g, value, rt, arg_type, contracts, lt_names, lt_types, call_targets) {
 								Optional::Some(m) => { return Optional<String>::Some("return value does not match the declared return type (" + m + "): " + _dup(id)); },
 								Optional::None => {}
 							}
@@ -2348,7 +2348,7 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 fn _check_value_is(g: &IrGraph, e: &IrExpr, expected: &IrType, arg_type: &IrType, contracts: &Array<OpContract>,
                    lt_names: &Array<String>, lt_types: &Array<InferType>, call_targets: &Optional<Array<CallTarget>>) nothrow -> Optional<String> {
 	match _const_value_of(g, e) {
-		Optional::Some(v) => { return validate(&v, expected); },
+		Optional::Some(v) => { return validate(v, expected); },
 		Optional::None => {}
 	}
 	match _infer_expr_type(g, e, arg_type, contracts, lt_names, lt_types, call_targets) {
@@ -2387,7 +2387,7 @@ fn _const_value_of(g: &IrGraph, e: &IrExpr) nothrow -> Optional<json.JsonNode> {
 			match _find_let_value(g, name) {
 				Optional::Some(v) => {
 					match _const_value_of(g, v) {
-						Optional::Some(base) => { return _project(&base, path); },
+						Optional::Some(base) => { return _project(base, path); },
 						Optional::None => { return Optional<json.JsonNode>::None(); }
 					}
 				},
@@ -2417,7 +2417,7 @@ fn _find_let_value(g: &IrGraph, name: &String) nothrow -> Optional<&IrExpr> {
 // or both are objects and every field is assignable (an expected OPTIONAL field may be absent;
 // closed otherwise). Used for INFERRED (non-const) types; const values are checked by `validate`.
 fn _type_assignable(actual: &IrType, expected: &IrType) nothrow -> Bool {
-	if _str_eq(&canonical(actual), &canonical(expected)) { return true; }
+	if _str_eq(canonical(actual), canonical(expected)) { return true; }
 	match expected {
 		IrType::TOptional(inner) => {
 			match actual { IrType::TNull() => { return true; }, default => {} }
@@ -2432,11 +2432,11 @@ fn _type_assignable(actual: &IrType, expected: &IrType) nothrow -> Bool {
 						var ok = false;
 						var j = 0;
 						while j < afields.len {
-							if _str_eq(&afields[j].name, &efields[i].name) { found = true; ok = _type_assignable(&afields[j].ty, &efields[i].ty); }
+							if _str_eq(afields[j].name, efields[i].name) { found = true; ok = _type_assignable(afields[j].ty, efields[i].ty); }
 							j = j + 1;
 						}
 						if found { if !ok { return false; } }
-						else { if !_is_optional(&efields[i].ty) { return false; } }
+						else { if !_is_optional(efields[i].ty) { return false; } }
 						i = i + 1;
 					}
 					// closed: every actual field must be declared on `expected`.
@@ -2444,7 +2444,7 @@ fn _type_assignable(actual: &IrType, expected: &IrType) nothrow -> Bool {
 					while k < afields.len {
 						var in_exp = false;
 						var m = 0;
-						while m < efields.len { if _str_eq(&efields[m].name, &afields[k].name) { in_exp = true; } m = m + 1; }
+						while m < efields.len { if _str_eq(efields[m].name, afields[k].name) { in_exp = true; } m = m + 1; }
 						if !in_exp { return false; }
 						k = k + 1;
 					}
@@ -2504,11 +2504,11 @@ fn _tc_loop(g: &IrGraph, id: &String, kind: &LoopKind, source: &IrExpr, elem: &S
 	var bn: Array<String> = [];
 	var bt: Array<InferType> = [];
 	var j = 0;
-	while j < lt_names.len { bn.push(_dup(&lt_names[j])); bt.push(_clone_infer(&lt_types[j])); j = j + 1; }
-	bn.push(_dup(elem)); bt.push(_clone_infer(&elem_it));
-	if is_fold { bn.push(_dup(acc)); bt.push(_clone_infer(&acc_it)); }
+	while j < lt_names.len { bn.push(_dup(lt_names[j])); bt.push(_clone_infer(lt_types[j])); j = j + 1; }
+	bn.push(_dup(elem)); bt.push(_clone_infer(elem_it));
+	if is_fold { bn.push(_dup(acc)); bt.push(_clone_infer(acc_it)); }
 	var body_it: InferType = InferType::Unknown();
-	match _infer_expr_type(g, body, arg_type, contracts, &bn, &bt, call_targets) {
+	match _infer_expr_type(g, body, arg_type, contracts, bn, bt, call_targets) {
 		core.Result::Ok(it) => { body_it = move it; },
 		core.Result::Err(e) => { return core.Result<InferType, IrError>::Err(e); }
 	}
@@ -2517,12 +2517,12 @@ fn _tc_loop(g: &IrGraph, id: &String, kind: &LoopKind, source: &IrExpr, elem: &S
 		// accumulator each step): the result is the body type. A concretely-typed init requires the
 		// body to PRODUCE that same type (a true reduction).
 		var init_is_null = false;
-		match &acc_it { InferType::Known(a) => { if _str_eq(&canonical(a), &"n") { init_is_null = true; } }, default => {} }
+		match &acc_it { InferType::Known(a) => { if _str_eq(canonical(a), "n") { init_is_null = true; } }, default => {} }
 		if init_is_null { return core.Result<InferType, IrError>::Ok(move body_it); }
 		match &acc_it {
 			InferType::Known(a) => {
 				match &body_it {
-					InferType::Known(b) => { if !_str_eq(&canonical(b), &canonical(a)) { return core.Result<InferType, IrError>::Err(IrError(message = "fold body type must match the accumulator type: " + _dup(id))); } },
+					InferType::Known(b) => { if !_str_eq(canonical(b), canonical(a)) { return core.Result<InferType, IrError>::Err(IrError(message = "fold body type must match the accumulator type: " + _dup(id))); } },
 					InferType::Imprecise() => { return core.Result<InferType, IrError>::Err(IrError(message = "fold body (an imprecise literal) cannot match the accumulator type: " + _dup(id))); },
 					InferType::Unknown() => {}
 				}
@@ -2533,7 +2533,7 @@ fn _tc_loop(g: &IrGraph, id: &String, kind: &LoopKind, source: &IrExpr, elem: &S
 	}
 	if _is_filter(kind) {
 		match &body_it {
-			InferType::Known(b) => { if !_str_eq(&canonical(b), &"b") { return core.Result<InferType, IrError>::Err(IrError(message = "filter body must be Bool (got " + canonical(b) + "): " + _dup(id))); } },
+			InferType::Known(b) => { if !_str_eq(canonical(b), "b") { return core.Result<InferType, IrError>::Err(IrError(message = "filter body must be Bool (got " + canonical(b) + "): " + _dup(id))); } },
 			InferType::Imprecise() => { return core.Result<InferType, IrError>::Err(IrError(message = "filter body must be Bool (got an imprecise literal): " + _dup(id))); },
 			InferType::Unknown() => {}
 		}
@@ -2557,15 +2557,15 @@ fn _tc_merge(g: &IrGraph, id: &String, sources: &Array<MergeArm>, arg_type: &IrT
 	var merged_known: Optional<IrType> = Optional<IrType>::None();
 	var s = 0;
 	while s < sources.len {
-		match _infer_expr_type(g, &sources[s].value, arg_type, contracts, lt_names, lt_types, call_targets) {
+		match _infer_expr_type(g, sources[s].value, arg_type, contracts, lt_names, lt_types, call_targets) {
 			core.Result::Ok(it) => {
 				match &it {
 					InferType::Known(t) => {
 						val tc = canonical(t);
-						if !have_known { have_known = true; first_canon = _dup(&tc); merged_known = Optional<IrType>::Some(_clone_type(t)); }
+						if !have_known { have_known = true; first_canon = _dup(tc); merged_known = Optional<IrType>::Some(_clone_type(t)); }
 						else {
-							if !_str_eq(&tc, &first_canon) {
-								return core.Result<InferType, IrError>::Err(IrError(message = "merge sources disagree on type (" + _dup(&first_canon) + " vs " + _dup(&tc) + "): " + _dup(id)));
+							if !_str_eq(tc, first_canon) {
+								return core.Result<InferType, IrError>::Err(IrError(message = "merge sources disagree on type (" + _dup(first_canon) + " vs " + _dup(tc) + "): " + _dup(id)));
 							}
 						}
 					},
@@ -2591,7 +2591,7 @@ fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Arra
 	match e {
 		IrExpr::EConst(canonical_json) => {
 			match json.parse_strict(canonical_json) {
-				core.Result::Ok(n) => { return core.Result<InferType, IrError>::Ok(_infer_const_type(&n)); },
+				core.Result::Ok(n) => { return core.Result<InferType, IrError>::Ok(_infer_const_type(n)); },
 				core.Result::Err(_) => { return core.Result<InferType, IrError>::Ok(InferType::Imprecise()); }
 			}
 		},
@@ -2620,7 +2620,7 @@ fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Arra
 						var child_name: String = "";
 						var child_ver: String = "";
 						match &g.nodes[t] { IrNode::NCallWorkflow(cid, child, plan_version, cinput, cnext, ccomp) => { child_name = _dup(child); child_ver = _dup(plan_version); }, default => {} }
-						match _resolve_call_target(call_targets, &child_name, &child_ver) {
+						match _resolve_call_target(call_targets, child_name, child_ver) {
 							Optional::Some(target) => {
 								match &target.return_type {
 									Optional::Some(rt) => {
@@ -2630,7 +2630,7 @@ fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Arra
 										}
 									},
 									Optional::None => {
-										return core.Result<InferType, IrError>::Err(IrError(message = "EResult(" + _dup(node) + "): child workflow " + _dup(&child_name) + "@" + _dup(&child_ver) + " declares a unit return — result access is not allowed"));
+										return core.Result<InferType, IrError>::Err(IrError(message = "EResult(" + _dup(node) + "): child workflow " + _dup(child_name) + "@" + _dup(child_ver) + " declares a unit return — result access is not allowed"));
 									}
 								}
 							},
@@ -2655,7 +2655,7 @@ fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Arra
 		IrExpr::ELocal(name, path) => {
 			var i = 0;
 			while i < lt_names.len {
-				if _str_eq(&lt_names[i], name) {
+				if _str_eq(lt_names[i], name) {
 					match &lt_types[i] {
 						InferType::Known(t) => {
 							match _project_type(t, path, 0) {
@@ -2679,21 +2679,21 @@ fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Arra
 			var ftypes: Array<IrField> = [];
 			var i = 0;
 			while i < fields.len {
-				match _infer_expr_type(g, &fields[i].value, arg_type, contracts, lt_names, lt_types, call_targets) {
+				match _infer_expr_type(g, fields[i].value, arg_type, contracts, lt_names, lt_types, call_targets) {
 					core.Result::Ok(it) => {
 						match it {
-							InferType::Known(t) => { ftypes.push(IrField(name = _dup(&fields[i].key), ty = move t)); },
+							InferType::Known(t) => { ftypes.push(IrField(name = _dup(fields[i].key), ty = move t)); },
 							InferType::Imprecise() => { any_imprecise = true; },
 							InferType::Unknown() => { any_unknown = true; }
 						}
 					},
-					core.Result::Err(er) => { return core.Result<InferType, IrError>::Err(IrError(message = "EObject field '" + _dup(&fields[i].key) + "': " + er.message)); }
+					core.Result::Err(er) => { return core.Result<InferType, IrError>::Err(IrError(message = "EObject field '" + _dup(fields[i].key) + "': " + er.message)); }
 				}
 				i = i + 1;
 			}
 			if any_imprecise { return core.Result<InferType, IrError>::Ok(InferType::Imprecise()); }
 			if any_unknown { return core.Result<InferType, IrError>::Ok(InferType::Unknown()); }
-			_sort_fields(&mut ftypes);
+			_sort_fields(ftypes);
 			return core.Result<InferType, IrError>::Ok(InferType::Known(ty = IrType::TObject(fields = move ftypes)));
 		},
 		IrExpr::EArray(elems) => {
@@ -2707,13 +2707,13 @@ fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Arra
 			var elem_known: Optional<IrType> = Optional<IrType>::None();
 			var i = 0;
 			while i < elems.len {
-				match _infer_expr_type(g, &elems[i], arg_type, contracts, lt_names, lt_types, call_targets) {
+				match _infer_expr_type(g, elems[i], arg_type, contracts, lt_names, lt_types, call_targets) {
 					core.Result::Ok(it) => {
 						match &it {
 							InferType::Known(t) => {
 								val tc = canonical(t);
-								if !have_known { have_known = true; first_canon = _dup(&tc); elem_known = Optional<IrType>::Some(_clone_type(t)); }
-								else { if !_str_eq(&tc, &first_canon) { any_imprecise = true; } }
+								if !have_known { have_known = true; first_canon = _dup(tc); elem_known = Optional<IrType>::Some(_clone_type(t)); }
+								else { if !_str_eq(tc, first_canon) { any_imprecise = true; } }
 							},
 							InferType::Imprecise() => { any_imprecise = true; },
 							InferType::Unknown() => { any_unknown = true; }
@@ -2742,13 +2742,13 @@ fn _project_type(ty: &IrType, path: &Array<String>, from: Int) nothrow -> core.R
 		IrType::TObject(fields) => {
 			var i = 0;
 			while i < fields.len {
-				if _str_eq(&fields[i].name, &path[from]) { return _project_type(&fields[i].ty, path, from + 1); }
+				if _str_eq(fields[i].name, path[from]) { return _project_type(fields[i].ty, path, from + 1); }
 				i = i + 1;
 			}
-			return core.Result<IrType, IrError>::Err(IrError(message = "type has no field '" + _dup(&path[from]) + "'"));
+			return core.Result<IrType, IrError>::Err(IrError(message = "type has no field '" + _dup(path[from]) + "'"));
 		},
 		IrType::TOptional(inner) => { return _project_type(inner.get(), path, from); },
-		default => { return core.Result<IrType, IrError>::Err(IrError(message = "cannot project '" + _dup(&path[from]) + "' into a non-object type")); }
+		default => { return core.Result<IrType, IrError>::Err(IrError(message = "cannot project '" + _dup(path[from]) + "' into a non-object type")); }
 	}
 }
 
@@ -2762,7 +2762,7 @@ fn _infer_const_type(node: &json.JsonNode) nothrow -> InferType {
 	match node.as_bool() { Optional::Some(_) => { return InferType::Known(ty = IrType::TBool()); }, Optional::None => {} }
 	match node.as_number_raw() {
 		Optional::Some(raw) => {
-			if _is_float_shaped(&raw) { return InferType::Known(ty = IrType::TFloat()); }
+			if _is_float_shaped(raw) { return InferType::Known(ty = IrType::TFloat()); }
 			return InferType::Known(ty = IrType::TInt());
 		},
 		Optional::None => {}
@@ -2771,18 +2771,18 @@ fn _infer_const_type(node: &json.JsonNode) nothrow -> InferType {
 	match node.as_array() {
 		Optional::Some(arr) => {
 			if arr.len == 0 { return InferType::Imprecise(); }
-			match _infer_const_type(&arr[0]) {
+			match _infer_const_type(arr[0]) {
 				InferType::Known(e0) => {
-					val c0 = canonical(&e0);
+					val c0 = canonical(e0);
 					var i = 1;
 					while i < arr.len {
-						match _infer_const_type(&arr[i]) {
-							InferType::Known(ei) => { if !_str_eq(&canonical(&ei), &c0) { return InferType::Imprecise(); } },
+						match _infer_const_type(arr[i]) {
+							InferType::Known(ei) => { if !_str_eq(canonical(ei), c0) { return InferType::Imprecise(); } },
 							default => { return InferType::Imprecise(); }
 						}
 						i = i + 1;
 					}
-					return InferType::Known(ty = IrType::TArray(elem = core.box(_clone_type(&e0))));
+					return InferType::Known(ty = IrType::TArray(elem = core.box(_clone_type(e0))));
 				},
 				default => { return InferType::Imprecise(); }
 			}
@@ -2798,14 +2798,14 @@ fn _infer_const_type(node: &json.JsonNode) nothrow -> InferType {
 				match it.next() {
 					Optional::Some(entry) => {
 						match _infer_const_type(entry.value) {
-							InferType::Known(ft) => { fields.push(IrField(name = _dup(entry.key), ty = _clone_type(&ft))); },
+							InferType::Known(ft) => { fields.push(IrField(name = _dup(entry.key), ty = _clone_type(ft))); },
 							default => { return InferType::Imprecise(); }   // an imprecise field -> whole object imprecise
 						}
 					},
 					Optional::None => { done = true; }
 				}
 			}
-			_sort_fields(&mut fields);   // canonical needs sorted-by-name fields
+			_sort_fields(fields);   // canonical needs sorted-by-name fields
 			return InferType::Known(ty = IrType::TObject(fields = move fields));
 		},
 		Optional::None => {}
@@ -2825,7 +2825,7 @@ fn _clone_type(ty: &IrType) nothrow -> IrType {
 		IrType::TObject(fields) => {
 			var fs: Array<IrField> = [];
 			var i = 0;
-			while i < fields.len { fs.push(IrField(name = _dup(&fields[i].name), ty = _clone_type(&fields[i].ty))); i = i + 1; }
+			while i < fields.len { fs.push(IrField(name = _dup(fields[i].name), ty = _clone_type(fields[i].ty))); i = i + 1; }
 			return IrType::TObject(fields = move fs);
 		}
 	}
@@ -2834,7 +2834,7 @@ fn _clone_type(ty: &IrType) nothrow -> IrType {
 fn _op_input_type(contracts: &Array<OpContract>, opname: &String) nothrow -> Optional<&IrType> {
 	var i = 0;
 	while i < contracts.len {
-		if _str_eq(&contracts[i].name, opname) {
+		if _str_eq(contracts[i].name, opname) {
 			match &contracts[i].input_type { Optional::Some(it) => { return Optional<&IrType>::Some(it); }, Optional::None => { return Optional<&IrType>::None(); } }
 		}
 		i = i + 1;
@@ -2849,7 +2849,7 @@ fn _op_result_type(g: &IrGraph, contracts: &Array<OpContract>, node_id: &String)
 		IrNode::NOperation(id, operation, input, next) => {
 			var i = 0;
 			while i < contracts.len {
-				if _str_eq(&contracts[i].name, operation) {
+				if _str_eq(contracts[i].name, operation) {
 					match &contracts[i].result_type { Optional::Some(rt) => { return Optional<&IrType>::Some(rt); }, Optional::None => { return Optional<&IrType>::None(); } }
 				}
 				i = i + 1;
@@ -2869,9 +2869,9 @@ fn _topo_order(g: &IrGraph) nothrow -> core.Result<Array<Int>, IrError> {
 	i = 0;
 	while i < nn {
 		var succs: Array<String> = [];
-		_succs(&g.nodes[i], &mut succs);
+		_succs(g.nodes[i], succs);
 		var s = 0;
-		while s < succs.len { val t = _find_node(g, &succs[s]); if t >= 0 { indeg[t] = indeg[t] + 1; } s = s + 1; }
+		while s < succs.len { val t = _find_node(g, succs[s]); if t >= 0 { indeg[t] = indeg[t] + 1; } s = s + 1; }
 		i = i + 1;
 	}
 	var q: Array<Int> = [];
@@ -2884,10 +2884,10 @@ fn _topo_order(g: &IrGraph) nothrow -> core.Result<Array<Int>, IrError> {
 		h = h + 1;
 		order.push(cur);
 		var succs: Array<String> = [];
-		_succs(&g.nodes[cur], &mut succs);
+		_succs(g.nodes[cur], succs);
 		var s = 0;
 		while s < succs.len {
-			val t = _find_node(g, &succs[s]);
+			val t = _find_node(g, succs[s]);
 			if t >= 0 { indeg[t] = indeg[t] - 1; if indeg[t] == 0 { q.push(t); } }
 			s = s + 1;
 		}
@@ -2901,7 +2901,7 @@ fn _is_fold(k: &LoopKind) nothrow -> Bool {
 }
 
 fn _is_const_null(e: &IrExpr) nothrow -> Bool {
-	match e { IrExpr::EConst(canonical_json) => { return _str_eq(canonical_json, &"null"); }, default => { return false; } }
+	match e { IrExpr::EConst(canonical_json) => { return _str_eq(canonical_json, "null"); }, default => { return false; } }
 }
 
 // Validate every EResult/ELocal reference inside `e` against node `idx`'s scope. `extra_locals`
@@ -2915,7 +2915,7 @@ fn _check_expr(g: &IrGraph, e: &IrExpr, idx: Int, extra_locals: &Array<String>) 
 			if t < 0 { return Optional<String>::Some("EResult references missing node: " + _dup(node)); }
 			// A `result <name>` ref resolves to a result-binding node: a participant operation OR a child
 			// workflow call (composition slice 1a) — both settle a result keyed by their node id.
-			if !_is_result_binding_node(&g.nodes[t]) { return Optional<String>::Some("EResult must reference an NOperation or a workflow call: " + _dup(node)); }
+			if !_is_result_binding_node(g.nodes[t]) { return Optional<String>::Some("EResult must reference an NOperation or a workflow call: " + _dup(node)); }
 			if t == idx { return Optional<String>::Some("EResult references its own node: " + _dup(node)); }
 			if !_dominates(g, t, idx) { return Optional<String>::Some("EResult references a non-prior operation: " + _dup(node)); }
 			return Optional<String>::None();
@@ -2928,7 +2928,7 @@ fn _check_expr(g: &IrGraph, e: &IrExpr, idx: Int, extra_locals: &Array<String>) 
 		IrExpr::EObject(fields) => {
 			var i = 0;
 			while i < fields.len {
-				match _check_expr(g, &fields[i].value, idx, extra_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+				match _check_expr(g, fields[i].value, idx, extra_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
 				i = i + 1;
 			}
 			return Optional<String>::None();
@@ -2936,7 +2936,7 @@ fn _check_expr(g: &IrGraph, e: &IrExpr, idx: Int, extra_locals: &Array<String>) 
 		IrExpr::EArray(elems) => {
 			var i = 0;
 			while i < elems.len {
-				match _check_expr(g, &elems[i], idx, extra_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
+				match _check_expr(g, elems[i], idx, extra_locals) { Optional::Some(m) => { return Optional<String>::Some(move m); }, Optional::None => {} }
 				i = i + 1;
 			}
 			return Optional<String>::None();
@@ -2946,7 +2946,7 @@ fn _check_expr(g: &IrGraph, e: &IrExpr, idx: Int, extra_locals: &Array<String>) 
 
 fn _contains_str(xs: &Array<String>, x: &String) nothrow -> Bool {
 	var i = 0;
-	while i < xs.len { if _str_eq(&xs[i], x) { return true; } i = i + 1; }
+	while i < xs.len { if _str_eq(xs[i], x) { return true; } i = i + 1; }
 	return false;
 }
 
@@ -2973,17 +2973,17 @@ fn _node_depths(g: &IrGraph, allow_calls: Bool) nothrow -> core.Result<Array<Int
 	i = 0;
 	while i < nn {
 		var succs: Array<String> = [];
-		_succs(&g.nodes[i], &mut succs);
+		_succs(g.nodes[i], succs);
 		var s = 0;
 		while s < succs.len {
-			val t = _find_node(g, &succs[s]);
+			val t = _find_node(g, succs[s]);
 			if t >= 0 { indeg[t] = indeg[t] + 1; }
 			s = s + 1;
 		}
 		i = i + 1;
 	}
 
-	val entry_idx = _find_node(g, &g.entry);
+	val entry_idx = _find_node(g, g.entry);
 	if entry_idx < 0 { return core.Result<Array<Int>, IrError>::Err(IrError(message = "entry not found")); }
 
 	var queue: Array<Int> = [];
@@ -3006,7 +3006,7 @@ fn _node_depths(g: &IrGraph, allow_calls: Bool) nothrow -> core.Result<Array<Int
 		// dispatch, `ir_exec_test.drift`, `--parse-check`) passes `false`, preserving this exact
 		// rejection unchanged — the manifest-wide pass makes the FINAL "not implemented until 1b.1"
 		// call once precise validation has run (see `_validate_manifest_calls`).
-		if !allow_calls and _is_call(&g.nodes[u]) {
+		if !allow_calls and _is_call(g.nodes[u]) {
 			return core.Result<Array<Int>, IrError>::Err(IrError(message = "workflow call is not runnable until composition slice 1b (frontend-only in slice 1a)"));
 		}
 		// A call counts as an executable step ONLY once `allow_calls` has let it through — DESIGN.md's
@@ -3016,14 +3016,14 @@ fn _node_depths(g: &IrGraph, allow_calls: Bool) nothrow -> core.Result<Array<Int
 		// this is unreachable (the graph was already rejected above), so it never changes behavior
 		// for any pre-existing single-script caller.
 		var inc = 0;
-		if _is_operation(&g.nodes[u]) { inc = 1; }
-		else if allow_calls and _is_call(&g.nodes[u]) { inc = 1; }
+		if _is_operation(g.nodes[u]) { inc = 1; }
+		else if allow_calls and _is_call(g.nodes[u]) { inc = 1; }
 		val ud = depth[u] + inc;
 		var succs: Array<String> = [];
-		_succs(&g.nodes[u], &mut succs);
+		_succs(g.nodes[u], succs);
 		var s = 0;
 		while s < succs.len {
-			val v = _find_node(g, &succs[s]);
+			val v = _find_node(g, succs[s]);
 			if v >= 0 {
 				if depth[v] < 0 { depth[v] = ud; }
 				else { if depth[v] != ud { return core.Result<Array<Int>, IrError>::Err(IrError(message = "op-unbalanced branch (paths reach a node with differing operation counts)")); } }
@@ -3043,7 +3043,7 @@ pub fn op_depth(g: &IrGraph, allow_calls: Bool) nothrow -> core.Result<Int, IrEr
 		core.Result::Ok(d) => { depth = move d; },
 		core.Result::Err(e) => { return core.Result<Int, IrError>::Err(IrError(message = e.message)); }
 	}
-	match _plan_length_from_depths(g, &depth) {
+	match _plan_length_from_depths(g, depth) {
 		core.Result::Ok(pl) => {
 			// A workflow must execute at least one operation. plan_length 0 is a fail-only or empty
 			// `steps {}` graph (no remote call) — nothing to complete or compensate, and the durable
@@ -3066,7 +3066,7 @@ pub fn nonfinal_operations(g: &IrGraph, allow_calls: Bool) nothrow -> core.Resul
 		core.Result::Err(e) => { return core.Result<Array<String>, IrError>::Err(IrError(message = e.message)); }
 	}
 	var pl = -1;
-	match _plan_length_from_depths(g, &depth) {
+	match _plan_length_from_depths(g, depth) {
 		core.Result::Ok(p) => { pl = p; },
 		core.Result::Err(e) => { return core.Result<Array<String>, IrError>::Err(IrError(message = e.message)); }
 	}
@@ -3107,7 +3107,7 @@ fn _reject_extra(actual: Int, allowed: Int) -> Void {
 fn _reject_unknown_opt_path(n: &json.JsonNode, required: &String) -> Void {
 	_reject_extra(_obj_len(n), 2);
 	if _obj_len(n) == 2 {
-		match n.get(&"path") {
+		match n.get("path") {
 			Optional::Some(_) => {},
 			Optional::None => { throw IrError(message = "unknown key in expression (only '" + _dup(required) + "' and 'path' allowed)"); }
 		}
@@ -3167,7 +3167,7 @@ fn _sort_fields(fields: &mut Array<IrField>) nothrow -> Void {
 	var i = 1;
 	while i < fields.len {
 		var j = i;
-		while j > 0 and _str_lt(&fields[j].name, &fields[j - 1].name) {
+		while j > 0 and _str_lt(fields[j].name, fields[j - 1].name) {
 			fields.swap(j, j - 1);
 			j = j - 1;
 		}
@@ -3178,8 +3178,8 @@ fn _sort_fields(fields: &mut Array<IrField>) nothrow -> Void {
 fn _check_no_dup_fields(fields: &Array<IrField>) -> Void {
 	var i = 1;
 	while i < fields.len {
-		if _str_eq(&fields[i].name, &fields[i - 1].name) {
-			throw IrError(message = "duplicate object field '" + _dup(&fields[i].name) + "'");
+		if _str_eq(fields[i].name, fields[i - 1].name) {
+			throw IrError(message = "duplicate object field '" + _dup(fields[i].name) + "'");
 		}
 		i = i + 1;
 	}

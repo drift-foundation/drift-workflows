@@ -63,15 +63,15 @@ fn _config_json() -> json.JsonNode {
 	val user = _db_user();
 	val pwd = _db_pwd();
 	val text: String = "{\"backend\":\"mariadb\",\"host\":\"" + host + "\",\"port\":" + port + ",\"user\":\"" + user + "\",\"password\":\"" + pwd + "\",\"database\":\"singular\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
-	return json.parse(&text).or_throw();
+	return json.parse(text).or_throw();
 }
 
 fn _build_gw() -> arc.Arc<gw.SingularGateway> {
 	val cfg = _config_json();
-	val identity = gw.identity_from_worker_name("singular-perf", &"driver");
+	val identity = gw.identity_from_worker_name("singular-perf", "driver");
 	var b = gw.new_gateway_builder();
-	gw.with_json(&mut b, &cfg);
-	gw.with_identity(&mut b, move identity);
+	gw.with_json(b, cfg);
+	gw.with_identity(b, move identity);
 	return gw.build_gateway(move b).or_throw();
 }
 
@@ -79,16 +79,16 @@ fn _build_gw() -> arc.Arc<gw.SingularGateway> {
 fn _cycle(g: arc.Arc<gw.SingularGateway>, seed: Int) nothrow -> Bool {
 	var ok = false;
 	try {
-		val key = uuid.uuid_v3_from_string(&("singular-perf-" + fmt.format_int(seed)));
+		val key = uuid.uuid_v3_from_string(("singular-perf-" + fmt.format_int(seed)));
 		val tok = gw.new_lease_token();
 		val claim_time = time.now_utc();
-		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(&claim_time) + TIMEOUT_S * 1000000);
-		match g.get().start(&key, &"{\"t\":\"perf\"}", &"{}", &claim_time, &lease_expires, &tok) {
+		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(claim_time) + TIMEOUT_S * 1000000);
+		match g.get().start(key, "{\"t\":\"perf\"}", "{}", claim_time, lease_expires, tok) {
 			gw.StartOutcome::Granted(lease) => {
 				val settle_time = time.now_utc();
-				match g.get().complete(&lease, &settle_time, &"{\"r\":\"ok\"}") {
+				match g.get().complete(lease, settle_time, "{\"r\":\"ok\"}") {
 					gw.SettleOutcome::Settled(_) => {
-						match g.get().inspect(&key) {
+						match g.get().inspect(key) {
 							gw.InspectOutcome::Terminal(_, _) => { ok = true; },
 							default => {}
 						}
@@ -114,8 +114,8 @@ pub fn main(argv: Array<String>) nothrow -> Int {
 			var ok = 0;
 			var i = 0;
 			while i < CYCLES { if _cycle(g.clone(), i) { ok = ok + 1; } i = i + 1; }
-			val ms = time.elapsed_ms(&t0);
-			val us_per = time.elapsed_micros(&t0) / CYCLES;
+			val ms = time.elapsed_ms(t0);
+			val us_per = time.elapsed_micros(t0) / CYCLES;
 			con.println("{\"scenario\":\"lease_cycle\",\"cycles\":" + fmt.format_int(ok)
 				+ ",\"elapsed_ms\":" + fmt.format_int(ms)
 				+ ",\"per_cycle_us\":" + fmt.format_int(us_per) + "}");

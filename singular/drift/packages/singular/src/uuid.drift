@@ -31,7 +31,7 @@ pub struct UuidError {
 
 implement core.Diagnostic for UuidError {
 	pub fn to_json_text(self: &UuidError) nothrow -> String {
-		return core.diagnostic_json_string(&self.tag);
+		return core.diagnostic_json_string(self.tag);
 	}
 }
 
@@ -89,7 +89,7 @@ pub fn bytes_to_uuid(bytes: &Array<Byte>) nothrow -> core.Result<String, UuidErr
 			io.buffer_write(&mut buf, bi, cast<Byte>(45));
 			bi = bi + 1;
 		}
-		io.buffer_write(&mut buf, bi, _byte(&hex, hi));
+		io.buffer_write(&mut buf, bi, _byte(hex, hi));
 		hi = hi + 1;
 		bi = bi + 1;
 	}
@@ -111,7 +111,7 @@ pub fn uuid_v3_from_bytes(input: &Array<Byte>) nothrow -> Array<Byte> {
 // Convenience: UUID v3 from a UTF-8 string.
 pub fn uuid_v3_from_string(s: &String) nothrow -> Array<Byte> {
 	val bytes = _string_to_bytes(s);
-	return uuid_v3_from_bytes(&bytes);
+	return uuid_v3_from_bytes(bytes);
 }
 
 // --- Helpers ---

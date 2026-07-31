@@ -35,7 +35,7 @@ test:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source tools/cert-env.sh
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
 	# Gate RESTORES ENTRY STATE exactly: bring up our private DB, then on exit (success OR failure) put it
 	# back as found — created->removed, was-stopped->stopped, was-running->left. Sub-gates see it RUNNING.
 	_dbstate="$("$DB_INSTANCE_SH" up)"
@@ -80,7 +80,7 @@ _test-combined:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source tools/cert-env.sh
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
 	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
@@ -130,7 +130,7 @@ test-resilience:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source tools/cert-env.sh
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.17}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
 	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 	PROXY_BIN="${MARIADB_FAILPOINT_PROXY_BIN:-../drift-mariadb-client/build/local-app/mariadb-failpoint-proxy}"
 	[[ -x "$PROXY_BIN" ]] || { echo "error: mariadb-failpoint-proxy not found at $PROXY_BIN (set MARIADB_FAILPOINT_PROXY_BIN, or build it: cd ../drift-mariadb-client && just build-app mariadb-failpoint-proxy)" >&2; exit 1; }

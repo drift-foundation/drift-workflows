@@ -36,7 +36,7 @@ fn _config_json() -> json.JsonNode {
 	val user = _env_or("DB_USER", "root");
 	val pwd = _env_or("MDB_ROOT_PWD", "rootpw");
 	val text: String = "{\"backend\":\"mariadb\",\"host\":\"" + db_host + "\",\"port\":" + port + ",\"user\":\"" + user + "\",\"password\":\"" + pwd + "\",\"database\":\"microflows\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
-	return json.parse(&text).or_throw();
+	return json.parse(text).or_throw();
 }
 
 fn _ns() nothrow -> String {
@@ -55,16 +55,16 @@ fn _build_host(worker_name: &String) -> arc.Arc<host.MicroflowsHost> {
 	val cfg = _config_json();
 	val identity = host.identity_from_worker_name(worker_name);
 	var b = host.new_host_builder();
-	host.with_json(&mut b, &cfg);
-	host.with_identity(&mut b, move identity);
+	host.with_json(b, cfg);
+	host.with_identity(b, move identity);
 	return host.build_host(move b).or_throw();
 }
 
 fn _wf_id(seed: &String) nothrow -> Array<Byte> {
 	val ns = _ns();
-	val combined = _concat(&ns, seed);
-	val u: uuid.Uuid = uuid.v3_from_string(&combined);
-	return uuid.to_bytes(&u);
+	val combined = _concat(ns, seed);
+	val u: uuid.Uuid = uuid.v3_from_string(combined);
+	return uuid.to_bytes(u);
 }
 
 fn _expect_int(node: &json.JsonNode, key: &String, want: Int) nothrow -> Bool {
@@ -77,61 +77,61 @@ fn _expect_int(node: &json.JsonNode, key: &String, want: Int) nothrow -> Bool {
 }
 
 fn scenario_args() -> Int {
-	val h = _build_host(&"pd-args-w1");
+	val h = _build_host("pd-args-w1");
 	val script = _ns();
-	val wf = _wf_id(&"-args-wf1");
-	val absent = _wf_id(&"-args-never");
+	val wf = _wf_id("-args-wf1");
+	val absent = _wf_id("-args-never");
 
 	// 33-byte content_hash (1 scheme byte + 32-byte digest); value is arbitrary for this test.
-	val ch = codec.hex_decode(&"010101010101010101010101010101010101010101010101010101010101010101").or_throw();
+	val ch = codec.hex_decode("010101010101010101010101010101010101010101010101010101010101010101").or_throw();
 
 	// create_planned with instance arguments -> Created.
-	match h.get().create_planned(&wf, &script, &"1.0.0",
-		&"2026-01-01 10:00:00.000000", &"2026-01-01 10:00:00.000000",
-		&"{\"pos\":\"start\"}", &"{}", &ch, 2, &"{\"b\":2,\"a\":1}") {
+	match h.get().create_planned(wf, script, "1.0.0",
+		"2026-01-01 10:00:00.000000", "2026-01-01 10:00:00.000000",
+		"{\"pos\":\"start\"}", "{}", ch, 2, "{\"b\":2,\"a\":1}") {
 		host.CreatePlannedOutcome::Created(_) => {},
 		default => { return 301; }
 	}
 
 	// Idempotent re-create with the SAME content in a DIFFERENT key order -> Exists (the host
 	// canonicalizes at the boundary, so reordering is not a conflict).
-	match h.get().create_planned(&wf, &script, &"1.0.0",
-		&"2026-01-01 10:00:00.000000", &"2026-01-01 10:00:00.000000",
-		&"{\"pos\":\"start\"}", &"{}", &ch, 2, &"{\"a\":1,\"b\":2}") {
+	match h.get().create_planned(wf, script, "1.0.0",
+		"2026-01-01 10:00:00.000000", "2026-01-01 10:00:00.000000",
+		"{\"pos\":\"start\"}", "{}", ch, 2, "{\"a\":1,\"b\":2}") {
 		host.CreatePlannedOutcome::Exists(_) => {},
 		default => { return 302; }
 	}
 
 	// args_get: Found, round-tripping the canonical object {"a":1,"b":2}.
-	match h.get().args_get(&wf) {
+	match h.get().args_get(wf) {
 		host.ArgsGetOutcome::Found(args_json) => {
-			val node = json.parse(&args_json).or_throw();
-			if !_expect_int(&node, &"a", 1) { return 303; }
-			if !_expect_int(&node, &"b", 2) { return 304; }
+			val node = json.parse(args_json).or_throw();
+			if !_expect_int(node, "a", 1) { return 303; }
+			if !_expect_int(node, "b", 2) { return 304; }
 		},
 		host.ArgsGetOutcome::NotFound => { return 305; }
 	}
 
 	// args_get on a never-created id: NotFound.
-	match h.get().args_get(&absent) {
+	match h.get().args_get(absent) {
 		host.ArgsGetOutcome::NotFound => {},
 		host.ArgsGetOutcome::Found(_) => { return 306; }
 	}
 
 	// plan_get: Found (pinned identity) + NotFound — also previously untested live.
-	match h.get().plan_get(&wf) {
+	match h.get().plan_get(wf) {
 		host.PlanGetOutcome::Found(p) => { if p.plan_version != "1.0.0" { return 307; } },
 		host.PlanGetOutcome::NotFound => { return 308; }
 	}
-	match h.get().plan_get(&absent) {
+	match h.get().plan_get(absent) {
 		host.PlanGetOutcome::NotFound => {},
 		host.PlanGetOutcome::Found(_) => { return 309; }
 	}
 
 	// Same plan name, DIFFERENT instance arguments -> WorkflowConflict (byte-compared).
-	match h.get().create_planned(&wf, &script, &"1.0.0",
-		&"2026-01-01 10:00:00.000000", &"2026-01-01 10:00:00.000000",
-		&"{\"pos\":\"start\"}", &"{}", &ch, 2, &"{\"a\":1,\"b\":9}") {
+	match h.get().create_planned(wf, script, "1.0.0",
+		"2026-01-01 10:00:00.000000", "2026-01-01 10:00:00.000000",
+		"{\"pos\":\"start\"}", "{}", ch, 2, "{\"a\":1,\"b\":9}") {
 		host.CreatePlannedOutcome::WorkflowConflict(_) => {},
 		default => { return 310; }
 	}

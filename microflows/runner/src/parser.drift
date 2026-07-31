@@ -202,9 +202,9 @@ pub fn parse_source(source: &String) -> core.Result<ParsedWorkflow, ParseError> 
 	val uc_msg: String = "unterminated block comment ('/*' without a closing '*/')";
 	val empty: String = "";
 	try {
-		val pw = _parse(&mut c);
+		val pw = _parse(c);
 		if c.open_comment_at >= 0 {
-			return core.Result<ParsedWorkflow, ParseError>::Err(_finalize(source, &uc_code, c.open_comment_at, &empty, &empty, &uc_msg));
+			return core.Result<ParsedWorkflow, ParseError>::Err(_finalize(source, uc_code, c.open_comment_at, empty, empty, uc_msg));
 		}
 		return core.Result<ParsedWorkflow, ParseError>::Ok(move pw);
 	} catch ParseError(e) {
@@ -212,9 +212,9 @@ pub fn parse_source(source: &String) -> core.Result<ParsedWorkflow, ParseError> 
 		// precise comment diagnostic when one was recorded. Otherwise fill line/column from the byte
 		// offset ONCE here (the source is in scope) and return a movable error value.
 		if c.open_comment_at >= 0 {
-			return core.Result<ParsedWorkflow, ParseError>::Err(_finalize(source, &uc_code, c.open_comment_at, &empty, &empty, &uc_msg));
+			return core.Result<ParsedWorkflow, ParseError>::Err(_finalize(source, uc_code, c.open_comment_at, empty, empty, uc_msg));
 		}
-		return core.Result<ParsedWorkflow, ParseError>::Err(_finalize(source, &e.code, e.byte_offset, &e.expected, &e.found, &e.message));
+		return core.Result<ParsedWorkflow, ParseError>::Err(_finalize(source, e.code, e.byte_offset, e.expected, e.found, e.message));
 	}
 }
 
@@ -232,17 +232,17 @@ pub fn lower(source: &String, base: &json.JsonNode) -> core.Result<json.JsonNode
 	val uc_msg: String = "unterminated block comment ('/*' without a closing '*/')";
 	val empty: String = "";
 	try {
-		val pw = _parse(&mut c);
+		val pw = _parse(c);
 		if c.open_comment_at >= 0 {
-			return core.Result<json.JsonNode, ParseError>::Err(_finalize(source, &uc_code, c.open_comment_at, &empty, &empty, &uc_msg));
+			return core.Result<json.JsonNode, ParseError>::Err(_finalize(source, uc_code, c.open_comment_at, empty, empty, uc_msg));
 		}
-		val merged = _merge(base, &pw);
+		val merged = _merge(base, pw);
 		return core.Result<json.JsonNode, ParseError>::Ok(move merged);
 	} catch ParseError(e) {
 		if c.open_comment_at >= 0 {
-			return core.Result<json.JsonNode, ParseError>::Err(_finalize(source, &uc_code, c.open_comment_at, &empty, &empty, &uc_msg));
+			return core.Result<json.JsonNode, ParseError>::Err(_finalize(source, uc_code, c.open_comment_at, empty, empty, uc_msg));
 		}
-		return core.Result<json.JsonNode, ParseError>::Err(_finalize(source, &e.code, e.byte_offset, &e.expected, &e.found, &e.message));
+		return core.Result<json.JsonNode, ParseError>::Err(_finalize(source, e.code, e.byte_offset, e.expected, e.found, e.message));
 	}
 }
 
@@ -279,21 +279,21 @@ fn _byte(s: &String, i: Int) nothrow -> Byte {
 fn _skip_ws(c: &mut Cursor) nothrow -> Void {
 	val n = c.src.byte_length();
 	while !_eof(c) {
-		val b = _byte(&c.src, c.pos);
+		val b = _byte(c.src, c.pos);
 		if text.is_space(b) {
 			c.pos = c.pos + 1;
 		} else if cast<Int>(b) == 47 {   // '/': maybe a `//` line or `/*` block comment
-			if c.pos + 1 < n and cast<Int>(_byte(&c.src, c.pos + 1)) == 47 {
+			if c.pos + 1 < n and cast<Int>(_byte(c.src, c.pos + 1)) == 47 {
 				// `//` line comment -> skip to end of line
 				c.pos = c.pos + 2;
-				while !_eof(c) and cast<Int>(_byte(&c.src, c.pos)) != 10 { c.pos = c.pos + 1; }
-			} else if c.pos + 1 < n and cast<Int>(_byte(&c.src, c.pos + 1)) == 42 {
+				while !_eof(c) and cast<Int>(_byte(c.src, c.pos)) != 10 { c.pos = c.pos + 1; }
+			} else if c.pos + 1 < n and cast<Int>(_byte(c.src, c.pos + 1)) == 42 {
 				// `/* … */` block comment (non-nesting)
 				val start = c.pos;
 				c.pos = c.pos + 2;
 				var closed = false;
 				while !_eof(c) {
-					if cast<Int>(_byte(&c.src, c.pos)) == 42 and c.pos + 1 < n and cast<Int>(_byte(&c.src, c.pos + 1)) == 47 {
+					if cast<Int>(_byte(c.src, c.pos)) == 42 and c.pos + 1 < n and cast<Int>(_byte(c.src, c.pos + 1)) == 47 {
 						c.pos = c.pos + 2;
 						closed = true;
 						break;
@@ -324,18 +324,18 @@ fn _is_ident_char(b: Byte) nothrow -> Bool {
 // Read an identifier ([A-Za-z_][A-Za-z0-9_-]*) after skipping leading whitespace.
 fn _read_ident(c: &mut Cursor) -> String {
 	_skip_ws(c);
-	if _eof(c) or !_is_ident_start(_byte(&c.src, c.pos)) {
+	if _eof(c) or !_is_ident_start(_byte(c.src, c.pos)) {
 		throw ParseError(code = "expected-identifier", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an identifier");
 	}
 	val start = c.pos;
-	while !_eof(c) and _is_ident_char(_byte(&c.src, c.pos)) { c.pos = c.pos + 1; }
+	while !_eof(c) and _is_ident_char(_byte(c.src, c.pos)) { c.pos = c.pos + 1; }
 	return _slice(c, start, c.pos - start);
 }
 
 // Require the next non-whitespace byte to equal `code` (a single-char token); consume it.
 fn _expect(c: &mut Cursor, code: Int, what: &String) -> Void {
 	_skip_ws(c);
-	if _eof(c) or cast<Int>(_byte(&c.src, c.pos)) != code {
+	if _eof(c) or cast<Int>(_byte(c.src, c.pos)) != code {
 		throw ParseError(code = "expected-token", byte_offset = c.pos, line = 0, column = 0, expected = _dup(what), found = "", message = "expected " + _dup(what));
 	}
 	c.pos = c.pos + 1;
@@ -344,12 +344,12 @@ fn _expect(c: &mut Cursor, code: Int, what: &String) -> Void {
 // Consume the next non-whitespace byte iff it equals `code`; report whether it did.
 fn _accept(c: &mut Cursor, code: Int) nothrow -> Bool {
 	_skip_ws(c);
-	if !_eof(c) and cast<Int>(_byte(&c.src, c.pos)) == code { c.pos = c.pos + 1; return true; }
+	if !_eof(c) and cast<Int>(_byte(c.src, c.pos)) == code { c.pos = c.pos + 1; return true; }
 	return false;
 }
 
 fn _slice(c: &Cursor, start: Int, len: Int) -> String {
-	match text.substring(&c.src, start, len) {
+	match text.substring(c.src, start, len) {
 		core.Result::Ok(s) => { return move s; },
 		core.Result::Err(_) => { throw ParseError(code = "internal", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "internal: bad source slice"); }
 	}
@@ -371,29 +371,29 @@ fn _parse(c: &mut Cursor) -> ParsedWorkflow {
 	while !_eof(c) {
 		val kw_start = c.pos;
 		val kw = _read_ident(c);
-		if _str_eq(&kw, &"args") {
+		if _str_eq(kw, "args") {
 			if seen_args { throw ParseError(code = "duplicate-block", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'args' block"); }
 			seen_args = true;
 			arg_type = Optional<json.JsonNode>::Some(_parse_object_type(c));
-		} else if _str_eq(&kw, &"op") {
-			val cd = _parse_op_decl(c, &contracts);
+		} else if _str_eq(kw, "op") {
+			val cd = _parse_op_decl(c, contracts);
 			contracts.push(move cd);
-		} else if _str_eq(&kw, &"steps") {
+		} else if _str_eq(kw, "steps") {
 			if seen_steps { throw ParseError(code = "duplicate-block", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'steps' block"); }
 			seen_steps = true;
 			val stmts = _parse_steps(c);
 			// A purely straight-line workflow lowers to a flat "plan" (slice-1 output unchanged);
 			// any `if`/`case` makes it a control-flow "graph". Both produce config the manual IR
 			// already executes + hashes, so identity/parity is preserved either way.
-			if _all_plain_ops(&stmts) {
-				body = _build_plan_body(&stmts);
+			if _all_plain_ops(stmts) {
+				body = _build_plan_body(stmts);
 				is_graph = false;
 			} else {
-				body = _build_graph_body(&stmts, c.node_count);
+				body = _build_graph_body(stmts, c.node_count);
 				is_graph = true;
 			}
 		} else {
-			throw ParseError(code = "unknown-keyword", byte_offset = kw_start, line = 0, column = 0, expected = "args/op/steps", found = _dup(&kw), message = "unknown top-level keyword '" + _dup(&kw) + "'");
+			throw ParseError(code = "unknown-keyword", byte_offset = kw_start, line = 0, column = 0, expected = "args/op/steps", found = _dup(kw), message = "unknown top-level keyword '" + _dup(kw) + "'");
 		}
 		_skip_ws(c);
 	}
@@ -417,12 +417,12 @@ fn _parse_type(c: &mut Cursor) -> json.JsonNode {
 fn _parse_base_type(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
 	if _eof(c) { throw ParseError(code = "expected-type", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a type"); }
-	val b = _byte(&c.src, c.pos);
+	val b = _byte(c.src, c.pos);
 	if cast<Int>(b) == 123 { return _parse_object_type(c); }   // '{'
 	if cast<Int>(b) == 91 {                                     // '[' array
 		c.pos = c.pos + 1;
 		val elem = _parse_type(c);
-		_expect(c, 93, &"']'");
+		_expect(c, 93, "']'");
 		var o = json.new_object();
 		o.set("type", _jstr("array"));
 		o.set("elem", move elem);
@@ -430,25 +430,25 @@ fn _parse_base_type(c: &mut Cursor) -> json.JsonNode {
 	}
 	val kw_start = c.pos;
 	var kw = _read_ident(c);
-	if _str_eq(&kw, &"int") or _str_eq(&kw, &"float") or _str_eq(&kw, &"bool")
-	   or _str_eq(&kw, &"string") or _str_eq(&kw, &"null") {
+	if _str_eq(kw, "int") or _str_eq(kw, "float") or _str_eq(kw, "bool")
+	   or _str_eq(kw, "string") or _str_eq(kw, "null") {
 		var o = json.new_object();
 		o.set("type", _jstr(move kw));
 		return o.to_node();
 	}
-	throw ParseError(code = "unknown-type", byte_offset = kw_start, line = 0, column = 0, expected = "int/float/bool/string/null/{…}/[…]", found = _dup(&kw), message = "unknown type '" + _dup(&kw) + "'");
+	throw ParseError(code = "unknown-type", byte_offset = kw_start, line = 0, column = 0, expected = "int/float/bool/string/null/{…}/[…]", found = _dup(kw), message = "unknown type '" + _dup(kw) + "'");
 }
 
 // object-type := '{' (ident ':' type (','? ident ':' type)* ','?)? '}' — lowered to the config
 // `{"type":"object","fields":[{"name","type"}...]}` encoding (parse_type later sorts fields, so
 // declaration order is irrelevant to identity).
 fn _parse_object_type(c: &mut Cursor) -> json.JsonNode {
-	_expect(c, 123, &"'{'");
+	_expect(c, 123, "'{'");
 	var fields = json.new_array();
 	while !_accept(c, 125) {   // until '}'
 		if _eof(c) { throw ParseError(code = "unterminated-type", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated object type"); }
 		var name = _read_ident(c);
-		_expect(c, 58, &"':'");
+		_expect(c, 58, "':'");
 		val fty = _parse_type(c);
 		var fo = json.new_object();
 		fo.set("name", _jstr(move name));
@@ -469,29 +469,29 @@ fn _parse_op_decl(c: &mut Cursor, existing: &Array<ContractDecl>) -> ContractDec
 	var name = _read_ident(c);
 	var i = 0;
 	while i < existing.len {
-		if _str_eq(&existing[i].name, &name) { throw ParseError(code = "duplicate-op", byte_offset = name_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'op' declaration for '" + _dup(&name) + "'"); }
+		if _str_eq(existing[i].name, name) { throw ParseError(code = "duplicate-op", byte_offset = name_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'op' declaration for '" + _dup(name) + "'"); }
 		i = i + 1;
 	}
-	_expect(c, 123, &"'{'");
+	_expect(c, 123, "'{'");
 	var input_t: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
 	var result_t: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
 	var has_input = false;
 	var has_result = false;
 	while !_accept(c, 125) {   // until '}'
-		if _eof(c) { throw ParseError(code = "unterminated-op", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated 'op' block for '" + _dup(&name) + "'"); }
+		if _eof(c) { throw ParseError(code = "unterminated-op", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated 'op' block for '" + _dup(name) + "'"); }
 		val clause_start = c.pos;
 		val clause = _read_ident(c);
-		_expect(c, 58, &"':'");
-		if _str_eq(&clause, &"input") {
-			if has_input { throw ParseError(code = "duplicate-clause", byte_offset = clause_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'input' in op '" + _dup(&name) + "'"); }
+		_expect(c, 58, "':'");
+		if _str_eq(clause, "input") {
+			if has_input { throw ParseError(code = "duplicate-clause", byte_offset = clause_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'input' in op '" + _dup(name) + "'"); }
 			has_input = true;
 			input_t = Optional<json.JsonNode>::Some(_parse_type(c));
-		} else if _str_eq(&clause, &"result") {
-			if has_result { throw ParseError(code = "duplicate-clause", byte_offset = clause_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'result' in op '" + _dup(&name) + "'"); }
+		} else if _str_eq(clause, "result") {
+			if has_result { throw ParseError(code = "duplicate-clause", byte_offset = clause_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'result' in op '" + _dup(name) + "'"); }
 			has_result = true;
 			result_t = Optional<json.JsonNode>::Some(_parse_type(c));
 		} else {
-			throw ParseError(code = "unknown-op-clause", byte_offset = clause_start, line = 0, column = 0, expected = "", found = "", message = "unknown op clause '" + _dup(&clause) + "' (expected input/result)");
+			throw ParseError(code = "unknown-op-clause", byte_offset = clause_start, line = 0, column = 0, expected = "", found = "", message = "unknown op clause '" + _dup(clause) + "' (expected input/result)");
 		}
 		val _ = _accept(c, 44);   // optional ','
 	}
@@ -504,7 +504,7 @@ fn _parse_op_decl(c: &mut Cursor, existing: &Array<ContractDecl>) -> ContractDec
 // emitted plan input is byte-identical in meaning to a hand-authored flat-plan step.
 // steps := 'steps' '{' stmt+ '}'. The leading 'steps' is already consumed. At least one statement.
 fn _parse_steps(c: &mut Cursor) -> Array<Stmt> {
-	_expect(c, 123, &"'{'");
+	_expect(c, 123, "'{'");
 	var stmts: Array<Stmt> = [];
 	while !_accept(c, 125) {   // until '}'
 		if _eof(c) { throw ParseError(code = "unterminated-block", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated 'steps' block"); }
@@ -518,7 +518,7 @@ fn _parse_steps(c: &mut Cursor) -> Array<Stmt> {
 // block := '{' stmt* '}' (a body for an if/else/case-arm/default — may be empty: control flows
 // straight to the join continuation).
 fn _parse_block(c: &mut Cursor) -> Array<Stmt> {
-	_expect(c, 123, &"'{'");
+	_expect(c, 123, "'{'");
 	var stmts: Array<Stmt> = [];
 	while !_accept(c, 125) {
 		if _eof(c) { throw ParseError(code = "unterminated-block", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated block"); }
@@ -533,13 +533,13 @@ fn _parse_block(c: &mut Cursor) -> Array<Stmt> {
 fn _parse_stmt(c: &mut Cursor) -> Stmt {
 	val kw = _read_ident(c);
 	var id = _alloc_id(c);
-	if _str_eq(&kw, &"if") { return _parse_if(c, move id); }
-	if _str_eq(&kw, &"case") { return _parse_case(c, move id); }
-	if _str_eq(&kw, &"let") { return _parse_let(c, move id); }
-	if _str_eq(&kw, &"fail") { return _parse_fail(c, move id); }
-	if _str_eq(&kw, &"call") { return _parse_call(c, move id, Optional<String>::None()); }
-	if _str_eq(&kw, &"return") { return _parse_return(c, move id); }
-	if _str_eq(&kw, &"fan") { throw ParseError(code = "unsupported-in-release", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "fan", message = "`fan` (fan-out) is not in this release (composition slice 3)"); }
+	if _str_eq(kw, "if") { return _parse_if(c, move id); }
+	if _str_eq(kw, "case") { return _parse_case(c, move id); }
+	if _str_eq(kw, "let") { return _parse_let(c, move id); }
+	if _str_eq(kw, "fail") { return _parse_fail(c, move id); }
+	if _str_eq(kw, "call") { return _parse_call(c, move id, Optional<String>::None()); }
+	if _str_eq(kw, "return") { return _parse_return(c, move id); }
+	if _str_eq(kw, "fan") { throw ParseError(code = "unsupported-in-release", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "fan", message = "`fan` (fan-out) is not in this release (composition slice 3)"); }
 	// op_step: `kw` is the operation name, followed by an INPUT EXPRESSION (a `{…}` const object,
 	// or `const`/`arg`/`local` — slice 2b-i). The runtime requires the op input to be an object;
 	// a non-object expression is caught by the build-time type check, not here.
@@ -586,7 +586,7 @@ fn _parse_fail_reason(c: &mut Cursor) -> json.JsonNode {
 	if _eof(c) {
 		throw ParseError(code = "expected-fail-reason", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a fail reason (string literal or result/local path)");
 	}
-	val b = cast<Int>(_byte(&c.src, c.pos));
+	val b = cast<Int>(_byte(c.src, c.pos));
 	if b == 34 {   // '"' — a JSON string literal, lowered as a const expression
 		val v = _parse_json_value(c);
 		var o = json.new_object();
@@ -599,29 +599,29 @@ fn _parse_fail_reason(c: &mut Cursor) -> json.JsonNode {
 
 fn _parse_let(c: &mut Cursor, var id: String) -> Stmt {
 	val bind = _read_ident(c);
-	_expect(c, 61, &"'='");   // '='
+	_expect(c, 61, "'='");   // '='
 	_skip_ws(c);
 	var is_expr = false;
-	if !_eof(c) and cast<Int>(_byte(&c.src, c.pos)) == 123 { is_expr = true; }   // '{'
+	if !_eof(c) and cast<Int>(_byte(c.src, c.pos)) == 123 { is_expr = true; }   // '{'
 	else {
 		val w = _peek_ident(c);
-		if _is_expr_keyword(&w) { is_expr = true; }
+		if _is_expr_keyword(w) { is_expr = true; }
 	}
 	if is_expr {
 		val value = _parse_value_expr(c);
 		return Stmt(id = move id, kind = StmtKind::KLet(name = move bind, value = move value));
 	}
 	val w2 = _peek_ident(c);
-	if _is_loop_keyword(&w2) { return _parse_loop(c, move id, move bind); }
+	if _is_loop_keyword(w2) { return _parse_loop(c, move id, move bind); }
 	// workflow call: `let <bind> = call <child>@<ver> { … }` — <bind> aliases the child's RESULT (slice 1a)
-	if _str_eq(&w2, &"call") {
+	if _str_eq(w2, "call") {
 		val _ = _read_ident(c);   // consume 'call'
 		return _parse_call(c, move id, Optional<String>::Some(move bind));
 	}
 	// named operation: `let <bind> = <op-name> <input-expr>`
 	val op = _read_ident(c);
 	val input = _parse_value_expr(c);
-	_res_bind(c, &bind, &id);   // record <bind> -> this op's node id (rejects a duplicate result name)
+	_res_bind(c, bind, id);   // record <bind> -> this op's node id (rejects a duplicate result name)
 	return Stmt(id = move id, kind = StmtKind::KNamedOp(bind = move bind, op = move op, input = move input));
 }
 
@@ -633,27 +633,27 @@ fn _parse_let(c: &mut Cursor, var id: String) -> Stmt {
 // rejected here with a clear "not in this release".
 fn _parse_call(c: &mut Cursor, var id: String, var bind: Optional<String>) -> Stmt {
 	val child = _read_ident(c);
-	_expect(c, 64, &"'@'");   // '@'
+	_expect(c, 64, "'@'");   // '@'
 	val ver = _parse_plan_version(c);
 	_skip_ws(c);
-	if _eof(c) or cast<Int>(_byte(&c.src, c.pos)) != 123 {   // '{'
+	if _eof(c) or cast<Int>(_byte(c.src, c.pos)) != 123 {   // '{'
 		throw ParseError(code = "expected-call-input", byte_offset = c.pos, line = 0, column = 0, expected = "{", found = "", message = "`call` requires an input object `{ … }`");
 	}
 	val input = _parse_value_expr(c);
 	var comp: Optional<CompRef> = Optional<CompRef>::None();
-	if _accept_keyword(c, &"compensation") {
+	if _accept_keyword(c, "compensation") {
 		val cwf = _read_ident(c);
-		_expect(c, 64, &"'@'");
+		_expect(c, 64, "'@'");
 		val cver = _parse_plan_version(c);
 		comp = Optional<CompRef>::Some(CompRef(child = move cwf, plan_version = move cver));
 	}
 	// `on failed { … }` is a slice-3 form — reject clearly rather than silently leaving it for the next stmt.
 	val nxt = _peek_ident(c);
-	if _str_eq(&nxt, &"on") {
+	if _str_eq(nxt, "on") {
 		throw ParseError(code = "unsupported-in-release", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "on", message = "`on failed` is not in this release (composition slice 3)");
 	}
 	match &bind {
-		Optional::Some(b) => { _res_bind(c, b, &id); },
+		Optional::Some(b) => { _res_bind(c, b, id); },
 		Optional::None => {}
 	}
 	return Stmt(id = move id, kind = StmtKind::KCall(bind = move bind, child = move child, plan_version = move ver, input = move input, comp = move comp));
@@ -663,31 +663,31 @@ fn _parse_call(c: &mut Cursor, var id: String, var bind: Optional<String>) -> St
 // whitespace tolerated; each segment is one or more ASCII digits. (Composition slice 1a.)
 fn _parse_plan_version(c: &mut Cursor) -> String {
 	val maj = _read_uint_str(c);
-	_expect(c, 46, &"'.'");   // '.'
+	_expect(c, 46, "'.'");   // '.'
 	val min = _read_uint_str(c);
-	_expect(c, 46, &"'.'");   // '.'
+	_expect(c, 46, "'.'");   // '.'
 	val pat = _read_uint_str(c);
 	return maj + "." + min + "." + pat;
 }
 
 fn _read_uint_str(c: &mut Cursor) -> String {
 	_skip_ws(c);
-	if _eof(c) or !_is_digit_b(_byte(&c.src, c.pos)) {
+	if _eof(c) or !_is_digit_b(_byte(c.src, c.pos)) {
 		throw ParseError(code = "expected-plan-version", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a semantic plan version (major.minor.patch)");
 	}
 	val start = c.pos;
-	while !_eof(c) and _is_digit_b(_byte(&c.src, c.pos)) { c.pos = c.pos + 1; }
+	while !_eof(c) and _is_digit_b(_byte(c.src, c.pos)) { c.pos = c.pos + 1; }
 	return _slice(c, start, c.pos - start);
 }
 
 fn _is_digit_b(b: Byte) nothrow -> Bool { val v = cast<Int>(b); return v >= 48 and v <= 57; }
 
 fn _is_expr_keyword(w: &String) nothrow -> Bool {
-	return _str_eq(w, &"const") or _str_eq(w, &"arg") or _str_eq(w, &"local") or _str_eq(w, &"result");
+	return _str_eq(w, "const") or _str_eq(w, "arg") or _str_eq(w, "local") or _str_eq(w, "result");
 }
 
 fn _is_loop_keyword(w: &String) nothrow -> Bool {
-	return _str_eq(w, &"map") or _str_eq(w, &"filter") or _str_eq(w, &"fold");
+	return _str_eq(w, "map") or _str_eq(w, "filter") or _str_eq(w, "fold");
 }
 
 // loop := ('map'|'filter') <source-expr> 'each' <elem> <body-expr>
@@ -699,11 +699,11 @@ fn _parse_loop(c: &mut Cursor, var id: String, var as_name: String) -> Stmt {
 	val kind = _read_ident(c);   // map / filter / fold
 	val source = _parse_value_expr(c);
 	var init: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
-	if _str_eq(&kind, &"fold") {
-		if !_accept_keyword(c, &"from") { throw ParseError(code = "expected-from", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "`fold` requires `from <init>`"); }
+	if _str_eq(kind, "fold") {
+		if !_accept_keyword(c, "from") { throw ParseError(code = "expected-from", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "`fold` requires `from <init>`"); }
 		init = Optional<json.JsonNode>::Some(_parse_value_expr(c));
 	}
-	if !_accept_keyword(c, &"each") { throw ParseError(code = "expected-each", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "loop requires `each <elem> <body>`"); }
+	if !_accept_keyword(c, "each") { throw ParseError(code = "expected-each", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "loop requires `each <elem> <body>`"); }
 	val elem = _read_ident(c);
 	val body = _parse_value_expr(c);
 	return Stmt(id = move id, kind = StmtKind::KLoop(as_name = move as_name, kind = move kind, source = move source, elem = move elem, init = move init, body = move body));
@@ -714,14 +714,14 @@ fn _parse_loop(c: &mut Cursor, var id: String, var as_name: String) -> Stmt {
 fn _peek_merge_clause(c: &mut Cursor) nothrow -> Bool {
 	val save = c.pos;
 	val w1 = _peek_ident(c);
-	if !_str_eq(&w1, &"merge") { c.pos = save; return false; }
+	if !_str_eq(w1, "merge") { c.pos = save; return false; }
 	// advance past 'merge' (c.pos is at the ident start after _peek_ident's skip_ws)
-	while !_eof(c) and _is_ident_char(_byte(&c.src, c.pos)) { c.pos = c.pos + 1; }
+	while !_eof(c) and _is_ident_char(_byte(c.src, c.pos)) { c.pos = c.pos + 1; }
 	val w2 = _peek_ident(c);
 	if w2.byte_length() == 0 { c.pos = save; return false; }
-	while !_eof(c) and _is_ident_char(_byte(&c.src, c.pos)) { c.pos = c.pos + 1; }
+	while !_eof(c) and _is_ident_char(_byte(c.src, c.pos)) { c.pos = c.pos + 1; }
 	_skip_ws(c);
-	val ok = !_eof(c) and cast<Int>(_byte(&c.src, c.pos)) == 61;   // '='
+	val ok = !_eof(c) and cast<Int>(_byte(c.src, c.pos)) == 61;   // '='
 	c.pos = save;
 	return ok;
 }
@@ -730,12 +730,12 @@ fn _peek_merge_clause(c: &mut Cursor) nothrow -> Bool {
 // the next token is not an identifier.
 fn _peek_ident(c: &mut Cursor) nothrow -> String {
 	_skip_ws(c);
-	if _eof(c) or !_is_ident_start(_byte(&c.src, c.pos)) { return ""; }
+	if _eof(c) or !_is_ident_start(_byte(c.src, c.pos)) { return ""; }
 	val start = c.pos;
 	var i = c.pos;
 	val n = c.src.byte_length();
-	while i < n and _is_ident_char(_byte(&c.src, i)) { i = i + 1; }
-	match text.substring(&c.src, start, i - start) {
+	while i < n and _is_ident_char(_byte(c.src, i)) { i = i + 1; }
+	match text.substring(c.src, start, i - start) {
 		core.Result::Ok(s) => { return move s; },
 		core.Result::Err(_) => { return ""; }
 	}
@@ -746,7 +746,7 @@ fn _peek_ident(c: &mut Cursor) nothrow -> String {
 fn _res_bind(c: &mut Cursor, name: &String, id: &String) -> Void {
 	var i = 0;
 	while i < c.res_names.len {
-		if _str_eq(&c.res_names[i], name) { throw ParseError(code = "duplicate-result-name", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "duplicate result name '" + _dup(name) + "'"); }
+		if _str_eq(c.res_names[i], name) { throw ParseError(code = "duplicate-result-name", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "duplicate result name '" + _dup(name) + "'"); }
 		i = i + 1;
 	}
 	c.res_names.push(_dup(name));
@@ -756,7 +756,7 @@ fn _res_bind(c: &mut Cursor, name: &String, id: &String) -> Void {
 fn _res_lookup(c: &Cursor, name: &String) nothrow -> Optional<String> {
 	var i = 0;
 	while i < c.res_names.len {
-		if _str_eq(&c.res_names[i], name) { return Optional<String>::Some(_dup(&c.res_ids[i])); }
+		if _str_eq(c.res_names[i], name) { return Optional<String>::Some(_dup(c.res_ids[i])); }
 		i = i + 1;
 	}
 	return Optional<String>::None();
@@ -776,41 +776,41 @@ fn _res_lookup(c: &Cursor, name: &String) nothrow -> Optional<String> {
 fn _parse_value_expr(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
 	if _eof(c) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an expression"); }
-	val b0 = cast<Int>(_byte(&c.src, c.pos));
+	val b0 = cast<Int>(_byte(c.src, c.pos));
 	if b0 == 123 { return _parse_object_construction(c); }   // '{'
 	if b0 == 91 { return _parse_array_construction(c); }     // '['
-	if !_is_ident_start(_byte(&c.src, c.pos)) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an expression"); }
+	if !_is_ident_start(_byte(c.src, c.pos)) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an expression"); }
 	val kw_start = c.pos;
 	val kw = _read_ident(c);
-	if _str_eq(&kw, &"const") {
+	if _str_eq(kw, "const") {
 		val v = _parse_json_value(c);
 		var o = json.new_object();
 		o.set("const", move v);
 		return o.to_node();
 	}
-	if _str_eq(&kw, &"arg") {
+	if _str_eq(kw, "arg") {
 		val path = _parse_arg_path(c);
-		return _arg_expr(&path);
+		return _arg_expr(path);
 	}
-	if _str_eq(&kw, &"local") {
+	if _str_eq(kw, "local") {
 		val segs = _parse_arg_path(c);   // segs[0] = binding name; segs[1..] = projection path
-		return _local_expr(&segs);
+		return _local_expr(segs);
 	}
-	if _str_eq(&kw, &"result") {
+	if _str_eq(kw, "result") {
 		val segs = _parse_arg_path(c);   // segs[0] = result name; segs[1..] = projection path
-		match _res_lookup(c, &segs[0]) {
-			Optional::Some(rid) => { return _result_expr(&rid, &segs); },
-			Optional::None => { throw ParseError(code = "unknown-result-name", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "unknown result name '" + _dup(&segs[0]) + "' (declare it with `let <name> = <op> …` before referencing)"); }
+		match _res_lookup(c, segs[0]) {
+			Optional::Some(rid) => { return _result_expr(rid, segs); },
+			Optional::None => { throw ParseError(code = "unknown-result-name", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "unknown result name '" + _dup(segs[0]) + "' (declare it with `let <name> = <op> …` before referencing)"); }
 		}
 	}
-	throw ParseError(code = "expected-expression", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "expected an expression (const / arg / local / result / a {…} object / a […] array), got '" + _dup(&kw) + "'");
+	throw ParseError(code = "expected-expression", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "expected an expression (const / arg / local / result / a {…} object / a […] array), got '" + _dup(kw) + "'");
 }
 
 // `{ (key ':' value-expr (',' …)*)? }`. Keys are a JSON string ("k") or a bare identifier (k). Each
 // value is a CONSTRUCTION VALUE (nested {…}/[…], an expression keyword, or a bare JSON literal). If
 // every field value is constant, folds to {const: {…}} (hash-stable); else emits {object: {…}}.
 fn _parse_object_construction(c: &mut Cursor) -> json.JsonNode {
-	_expect(c, 123, &"'{'");   // '{'
+	_expect(c, 123, "'{'");   // '{'
 	var keys: Array<String> = [];
 	var vals: Array<json.JsonNode> = [];
 	_skip_ws(c);
@@ -819,30 +819,30 @@ fn _parse_object_construction(c: &mut Cursor) -> json.JsonNode {
 		while more {
 			val key = _parse_field_key(c);
 			var d = 0;
-			while d < keys.len { if _str_eq(&keys[d], &key) { throw ParseError(code = "duplicate-field", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "duplicate object field '" + _dup(&key) + "'"); } d = d + 1; }
-			_expect(c, 58, &"':'");   // ':'
+			while d < keys.len { if _str_eq(keys[d], key) { throw ParseError(code = "duplicate-field", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "duplicate object field '" + _dup(key) + "'"); } d = d + 1; }
+			_expect(c, 58, "':'");   // ':'
 			val v = _parse_constr_value(c);
 			keys.push(move key);
 			vals.push(move v);
 			_skip_ws(c);
 			if _accept(c, 44) { more = true; }       // ','
-			else { _expect(c, 125, &"'}'"); more = false; }   // '}'
+			else { _expect(c, 125, "'}'"); more = false; }   // '}'
 		}
 	}
 	var all_const = true;
 	var i = 0;
-	while i < vals.len { if !_is_const_expr(&vals[i]) { all_const = false; } i = i + 1; }
+	while i < vals.len { if !_is_const_expr(vals[i]) { all_const = false; } i = i + 1; }
 	if all_const {
 		var obj = json.new_object();
 		var j = 0;
-		while j < vals.len { obj.set(_dup(&keys[j]), _const_inner(&vals[j])); j = j + 1; }
+		while j < vals.len { obj.set(_dup(keys[j]), _const_inner(vals[j])); j = j + 1; }
 		var o = json.new_object();
 		o.set("const", obj.to_node());
 		return o.to_node();
 	}
 	var inner = json.new_object();
 	var k = 0;
-	while k < vals.len { inner.set(_dup(&keys[k]), vals[k].clone_deep()); k = k + 1; }
+	while k < vals.len { inner.set(_dup(keys[k]), vals[k].clone_deep()); k = k + 1; }
 	var oo = json.new_object();
 	oo.set("object", inner.to_node());
 	return oo.to_node();
@@ -850,7 +850,7 @@ fn _parse_object_construction(c: &mut Cursor) -> json.JsonNode {
 
 // `[ (value-expr (',' …)*)? ]`. Folds to {const: [...]} when every element is constant; else {array: [...]}.
 fn _parse_array_construction(c: &mut Cursor) -> json.JsonNode {
-	_expect(c, 91, &"'['");   // '['
+	_expect(c, 91, "'['");   // '['
 	var vals: Array<json.JsonNode> = [];
 	_skip_ws(c);
 	if !_accept(c, 93) {   // not immediately ']'
@@ -860,16 +860,16 @@ fn _parse_array_construction(c: &mut Cursor) -> json.JsonNode {
 			vals.push(move v);
 			_skip_ws(c);
 			if _accept(c, 44) { more = true; }       // ','
-			else { _expect(c, 93, &"']'"); more = false; }   // ']'
+			else { _expect(c, 93, "']'"); more = false; }   // ']'
 		}
 	}
 	var all_const = true;
 	var i = 0;
-	while i < vals.len { if !_is_const_expr(&vals[i]) { all_const = false; } i = i + 1; }
+	while i < vals.len { if !_is_const_expr(vals[i]) { all_const = false; } i = i + 1; }
 	if all_const {
 		var arr = json.new_array();
 		var j = 0;
-		while j < vals.len { arr.push(_const_inner(&vals[j])); j = j + 1; }
+		while j < vals.len { arr.push(_const_inner(vals[j])); j = j + 1; }
 		var o = json.new_object();
 		o.set("const", arr.to_node());
 		return o.to_node();
@@ -887,29 +887,29 @@ fn _parse_array_construction(c: &mut Cursor) -> json.JsonNode {
 fn _parse_constr_value(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
 	if _eof(c) { throw ParseError(code = "expected-expression", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a value"); }
-	val b = cast<Int>(_byte(&c.src, c.pos));
+	val b = cast<Int>(_byte(c.src, c.pos));
 	if b == 123 { return _parse_object_construction(c); }   // '{'
 	if b == 91 { return _parse_array_construction(c); }     // '['
-	if _is_ident_start(_byte(&c.src, c.pos)) {
+	if _is_ident_start(_byte(c.src, c.pos)) {
 		val kw_start = c.pos;
 		val kw = _read_ident(c);
-		if _str_eq(&kw, &"const") { val v = _parse_json_value(c); var o = json.new_object(); o.set("const", move v); return o.to_node(); }
-		if _str_eq(&kw, &"arg") { val path = _parse_arg_path(c); return _arg_expr(&path); }
-		if _str_eq(&kw, &"local") { val segs = _parse_arg_path(c); return _local_expr(&segs); }
-		if _str_eq(&kw, &"result") {
+		if _str_eq(kw, "const") { val v = _parse_json_value(c); var o = json.new_object(); o.set("const", move v); return o.to_node(); }
+		if _str_eq(kw, "arg") { val path = _parse_arg_path(c); return _arg_expr(path); }
+		if _str_eq(kw, "local") { val segs = _parse_arg_path(c); return _local_expr(segs); }
+		if _str_eq(kw, "result") {
 			val segs = _parse_arg_path(c);
-			match _res_lookup(c, &segs[0]) {
-				Optional::Some(rid) => { return _result_expr(&rid, &segs); },
-				Optional::None => { throw ParseError(code = "unknown-result-name", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "unknown result name '" + _dup(&segs[0]) + "'"); }
+			match _res_lookup(c, segs[0]) {
+				Optional::Some(rid) => { return _result_expr(rid, segs); },
+				Optional::None => { throw ParseError(code = "unknown-result-name", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "unknown result name '" + _dup(segs[0]) + "'"); }
 			}
 		}
-		if _str_eq(&kw, &"true") or _str_eq(&kw, &"false") or _str_eq(&kw, &"null") {
-			match json.parse_strict(&kw) {
+		if _str_eq(kw, "true") or _str_eq(kw, "false") or _str_eq(kw, "null") {
+			match json.parse_strict(kw) {
 				core.Result::Ok(n) => { var o = json.new_object(); o.set("const", move n); return o.to_node(); },
 				core.Result::Err(_) => { throw ParseError(code = "invalid-json", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "invalid JSON literal"); }
 			}
 		}
-		throw ParseError(code = "expected-expression", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "expected a value (const / arg / local / result / {…} / […] / JSON literal), got '" + _dup(&kw) + "'");
+		throw ParseError(code = "expected-expression", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "expected a value (const / arg / local / result / {…} / […] / JSON literal), got '" + _dup(kw) + "'");
 	}
 	// a bare JSON scalar (string / number)
 	val v = _parse_json_value(c);
@@ -922,25 +922,25 @@ fn _parse_constr_value(c: &mut Cursor) -> json.JsonNode {
 fn _parse_field_key(c: &mut Cursor) -> String {
 	_skip_ws(c);
 	if _eof(c) { throw ParseError(code = "expected-field-key", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an object field name"); }
-	if cast<Int>(_byte(&c.src, c.pos)) == 34 {   // '"' quoted key
+	if cast<Int>(_byte(c.src, c.pos)) == 34 {   // '"' quoted key
 		val v = _parse_json_value(c);
 		match v.as_string() {
 			Optional::Some(s) => { return move s; },
 			Optional::None => { throw ParseError(code = "expected-field-key", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "object field key must be a string"); }
 		}
 	}
-	if _is_ident_start(_byte(&c.src, c.pos)) { return _read_ident(c); }
+	if _is_ident_start(_byte(c.src, c.pos)) { return _read_ident(c); }
 	throw ParseError(code = "expected-field-key", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected an object field name (identifier or \"string\")");
 }
 
 // Is `n` a {const: …} expression node?
 fn _is_const_expr(n: &json.JsonNode) nothrow -> Bool {
-	match n.get(&"const") { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
+	match n.get("const") { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
 }
 
 // The inner value of a {const: V} node (deep-cloned). Only called when `_is_const_expr` is true.
 fn _const_inner(n: &json.JsonNode) -> json.JsonNode {
-	match n.get(&"const") {
+	match n.get("const") {
 		Optional::Some(v) => { return v.clone_deep(); },
 		Optional::None => { throw ParseError(code = "internal", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "const-fold of a non-const expression"); }
 	}
@@ -953,7 +953,7 @@ fn _result_expr(id: &String, segs: &Array<String>) -> json.JsonNode {
 	if segs.len > 1 {
 		var pa = json.new_array();
 		var i = 1;
-		while i < segs.len { pa.push(_jstr(_dup(&segs[i]))); i = i + 1; }
+		while i < segs.len { pa.push(_jstr(_dup(segs[i]))); i = i + 1; }
 		ro.set("path", pa.to_node());
 	}
 	var o = json.new_object();
@@ -964,11 +964,11 @@ fn _result_expr(id: &String, segs: &Array<String>) -> json.JsonNode {
 // {"local": {"name": <segs[0]>, "path"?: [segs[1..]]}}
 fn _local_expr(segs: &Array<String>) -> json.JsonNode {
 	var lo = json.new_object();
-	lo.set("name", _jstr(_dup(&segs[0])));
+	lo.set("name", _jstr(_dup(segs[0])));
 	if segs.len > 1 {
 		var pa = json.new_array();
 		var i = 1;
-		while i < segs.len { pa.push(_jstr(_dup(&segs[i]))); i = i + 1; }
+		while i < segs.len { pa.push(_jstr(_dup(segs[i]))); i = i + 1; }
 		lo.set("path", pa.to_node());
 	}
 	var o = json.new_object();
@@ -989,7 +989,7 @@ fn _local_expr(segs: &Array<String>) -> json.JsonNode {
 // _check_expr (dominance) then rejects a branch-local result/local that no merge carries.
 fn _parse_selector(c: &mut Cursor) -> json.JsonNode {
 	_skip_ws(c);
-	if _eof(c) or !_is_ident_start(_byte(&c.src, c.pos)) {
+	if _eof(c) or !_is_ident_start(_byte(c.src, c.pos)) {
 		throw ParseError(code = "expected-selector", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "expected a branch selector (arg/result/local path)");
 	}
 	val save = c.pos;
@@ -999,20 +999,20 @@ fn _parse_selector(c: &mut Cursor) -> json.JsonNode {
 	// it is a durable-arg FIELD literally named result/local/arg — fall back to a bare arg-path. This
 	// keeps pre-Step-5 scripts using such field names parsing as before.
 	if _selector_path_follows(c) {
-		if _str_eq(&kw, &"result") {
+		if _str_eq(kw, "result") {
 			val segs = _parse_arg_path(c);
-			match _res_lookup(c, &segs[0]) {
-				Optional::Some(rid) => { return _result_expr(&rid, &segs); },
-				Optional::None => { throw ParseError(code = "unknown-result-name", byte_offset = save, line = 0, column = 0, expected = "", found = "", message = "unknown result name '" + _dup(&segs[0]) + "' (declare it with `let <name> = <op> …` before referencing)"); }
+			match _res_lookup(c, segs[0]) {
+				Optional::Some(rid) => { return _result_expr(rid, segs); },
+				Optional::None => { throw ParseError(code = "unknown-result-name", byte_offset = save, line = 0, column = 0, expected = "", found = "", message = "unknown result name '" + _dup(segs[0]) + "' (declare it with `let <name> = <op> …` before referencing)"); }
 			}
 		}
-		if _str_eq(&kw, &"local") { val segs = _parse_arg_path(c); return _local_expr(&segs); }
-		if _str_eq(&kw, &"arg") { val path = _parse_arg_path(c); return _arg_expr(&path); }
+		if _str_eq(kw, "local") { val segs = _parse_arg_path(c); return _local_expr(segs); }
+		if _str_eq(kw, "arg") { val path = _parse_arg_path(c); return _arg_expr(path); }
 	}
 	// bare arg-path (back-compat): rewind and parse the whole dotted path as a durable-arg ref.
 	c.pos = save;
 	val path = _parse_arg_path(c);
-	return _arg_expr(&path);
+	return _arg_expr(path);
 }
 
 // After a selector keyword, does a path identifier follow (so the keyword is a selector head, not an
@@ -1021,7 +1021,7 @@ fn _selector_path_follows(c: &mut Cursor) nothrow -> Bool {
 	val save = c.pos;
 	_skip_ws(c);
 	var r = false;
-	if !_eof(c) and _is_ident_start(_byte(&c.src, c.pos)) { r = true; }
+	if !_eof(c) and _is_ident_start(_byte(c.src, c.pos)) { r = true; }
 	c.pos = save;
 	return r;
 }
@@ -1031,20 +1031,20 @@ fn _parse_if(c: &mut Cursor, var id: String) -> Stmt {
 	val then_body = _parse_block(c);
 	var else_body: Array<Stmt> = [];
 	var has_else = false;
-	if _accept_keyword(c, &"else") { else_body = _parse_block(c); has_else = true; }
+	if _accept_keyword(c, "else") { else_body = _parse_block(c); has_else = true; }
 	var merge: Optional<MergeSpec> = Optional<MergeSpec>::None();
 	// `merge` is a CONTEXTUAL keyword: it opens a merge clause ONLY when shaped `merge <ident> =`.
 	// An operation literally named `merge` after an if/else (`merge { … }`, `merge arg x`, …) is NOT
 	// that shape (an op input expression never starts with `<ident> =`), so it parses as an op step.
 	if _peek_merge_clause(c) {
-		val _ = _accept_keyword(c, &"merge");
+		val _ = _accept_keyword(c, "merge");
 		if !has_else { throw ParseError(code = "merge-requires-else", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "`merge` requires an `else` branch"); }
-		_require_merge_branch(c, &then_body, &"then");
-		_require_merge_branch(c, &else_body, &"else");
+		_require_merge_branch(c, then_body, "then");
+		_require_merge_branch(c, else_body, "else");
 		val mname = _read_ident(c);
-		_expect(c, 61, &"'='");   // '='
+		_expect(c, 61, "'='");   // '='
 		val then_val = _parse_value_expr(c);
-		_expect(c, 124, &"'|'");  // '|'
+		_expect(c, 124, "'|'");  // '|'
 		val else_val = _parse_value_expr(c);
 		val mid = _alloc_id(c);   // merge node id — allocated AFTER both branches (pre-order)
 		merge = Optional<MergeSpec>::Some(MergeSpec(merge_id = move mid, name = move mname, then_value = move then_val, else_value = move else_val));
@@ -1073,14 +1073,14 @@ fn _require_merge_branch(c: &Cursor, body: &Array<Stmt>, which: &String) -> Void
 // value; 'default' (required) is taken when no arm matches.
 fn _parse_case(c: &mut Cursor, var id: String) -> Stmt {
 	val scrut = _parse_selector(c);
-	_expect(c, 123, &"'{'");
+	_expect(c, 123, "'{'");
 	var arms: Array<SCaseArm> = [];
 	var default_body: Array<Stmt> = [];
 	var has_default = false;
 	while !_accept(c, 125) {
 		if _eof(c) { throw ParseError(code = "unterminated-block", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "unterminated 'case' block"); }
 		val arm_start = c.pos;
-		if _accept_keyword(c, &"default") {
+		if _accept_keyword(c, "default") {
 			if has_default { throw ParseError(code = "duplicate-default", byte_offset = arm_start, line = 0, column = 0, expected = "", found = "", message = "duplicate 'default' arm in case"); }
 			has_default = true;
 			default_body = _parse_block(c);
@@ -1102,12 +1102,12 @@ fn _parse_case(c: &mut Cursor, var id: String) -> Stmt {
 	// source apiece), and the value list must be exactly one-per-arm + the default (LAST).
 	var merge: Optional<CaseMergeSpec> = Optional<CaseMergeSpec>::None();
 	if _peek_merge_clause(c) {
-		val _ = _accept_keyword(c, &"merge");
+		val _ = _accept_keyword(c, "merge");
 		var k = 0;
-		while k < arms.len { _require_merge_branch(c, &arms[k].body, &"case-arm"); k = k + 1; }
-		_require_merge_branch(c, &default_body, &"default");
+		while k < arms.len { _require_merge_branch(c, arms[k].body, "case-arm"); k = k + 1; }
+		_require_merge_branch(c, default_body, "default");
 		val mname = _read_ident(c);
-		_expect(c, 61, &"'='");   // '='
+		_expect(c, 61, "'='");   // '='
 		var values: Array<json.JsonNode> = [];
 		values.push(_parse_value_expr(c));
 		while _accept(c, 124) { values.push(_parse_value_expr(c)); }   // '|'-separated
@@ -1139,12 +1139,12 @@ fn _parse_arg_path(c: &mut Cursor) -> Array<String> {
 fn _accept_keyword(c: &mut Cursor, kw: &String) nothrow -> Bool {
 	val save = c.pos;
 	_skip_ws(c);
-	if _eof(c) or !_is_ident_start(_byte(&c.src, c.pos)) { c.pos = save; return false; }
+	if _eof(c) or !_is_ident_start(_byte(c.src, c.pos)) { c.pos = save; return false; }
 	val start = c.pos;
-	while !_eof(c) and _is_ident_char(_byte(&c.src, c.pos)) { c.pos = c.pos + 1; }
+	while !_eof(c) and _is_ident_char(_byte(c.src, c.pos)) { c.pos = c.pos + 1; }
 	var matched = false;
-	match text.substring(&c.src, start, c.pos - start) {
-		core.Result::Ok(s) => { if _str_eq(&s, kw) { matched = true; } },
+	match text.substring(c.src, start, c.pos - start) {
+		core.Result::Ok(s) => { if _str_eq(s, kw) { matched = true; } },
 		core.Result::Err(_) => {}
 	}
 	if !matched { c.pos = save; }
@@ -1165,7 +1165,7 @@ fn _parse_json_value(c: &mut Cursor) -> json.JsonNode {
 	val start = c.pos;
 	val end = _scan_json_value(c);
 	val raw = _slice(c, start, end - start);
-	match json.parse_strict(&raw) {
+	match json.parse_strict(raw) {
 		core.Result::Ok(n) => { return move n; },
 		core.Result::Err(_) => { throw ParseError(code = "invalid-json", byte_offset = start, line = 0, column = 0, expected = "", found = "", message = "invalid JSON value in case arm 'match'"); }
 	}
@@ -1174,14 +1174,14 @@ fn _parse_json_value(c: &mut Cursor) -> json.JsonNode {
 // Scan a single JSON value span from c.pos: a balanced object/array, a string, or a bare token
 // (number/true/false/null up to whitespace or a structural byte). Advances the cursor past it.
 fn _scan_json_value(c: &mut Cursor) -> Int {
-	val b = cast<Int>(_byte(&c.src, c.pos));
+	val b = cast<Int>(_byte(c.src, c.pos));
 	if b == 123 or b == 91 { return _scan_balanced(c); }   // '{' or '['
 	if b == 34 { return _scan_string(c); }                 // '"'
 	val n = c.src.byte_length();
 	var i = c.pos;
 	while i < n {
-		val ch = cast<Int>(_byte(&c.src, i));
-		if text.is_space(_byte(&c.src, i)) or ch == 123 or ch == 125 or ch == 44 or ch == 93 or ch == 91 { break; }
+		val ch = cast<Int>(_byte(c.src, i));
+		if text.is_space(_byte(c.src, i)) or ch == 123 or ch == 125 or ch == 44 or ch == 93 or ch == 91 { break; }
 		i = i + 1;
 	}
 	if i == c.pos { throw ParseError(code = "empty-json-value", byte_offset = c.pos, line = 0, column = 0, expected = "", found = "", message = "empty JSON value"); }
@@ -1197,7 +1197,7 @@ fn _scan_balanced(c: &mut Cursor) -> Int {
 	var in_str = false;
 	var esc = false;
 	while i < n {
-		val ch = cast<Int>(_byte(&c.src, i));
+		val ch = cast<Int>(_byte(c.src, i));
 		if in_str {
 			if esc { esc = false; }
 			else if ch == 92 { esc = true; }
@@ -1221,7 +1221,7 @@ fn _scan_string(c: &mut Cursor) -> Int {
 	var i = c.pos + 1;
 	var esc = false;
 	while i < n {
-		val ch = cast<Int>(_byte(&c.src, i));
+		val ch = cast<Int>(_byte(c.src, i));
 		if esc { esc = false; }
 		else if ch == 92 { esc = true; }
 		else if ch == 34 { c.pos = i + 1; return i + 1; }
@@ -1252,7 +1252,7 @@ fn _all_plain_ops(stmts: &Array<Stmt>) nothrow -> Bool {
 // An expression is a const-object iff it is `{const: <object>}` (the bare-`{…}` op-input shorthand).
 // `arg`/`local`/`const <non-object>` are not — they force the "graph" lowering.
 fn _is_const_object_expr(expr: &json.JsonNode) nothrow -> Bool {
-	match expr.get(&"const") {
+	match expr.get("const") {
 		Optional::Some(c) => {
 			match c.as_object() { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
 		},
@@ -1270,7 +1270,7 @@ fn _build_plan_body(stmts: &Array<Stmt>) -> json.JsonNode {
 			StmtKind::KOp(name, input) => {
 				var step = json.new_object();
 				step.set("operation", _jstr(_dup(name)));
-				match input.get(&"const") {
+				match input.get("const") {
 					Optional::Some(obj) => { step.set("input", obj.clone_deep()); },
 					Optional::None => { throw ParseError(code = "internal", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "internal: plan op input is not a const object"); }
 				}
@@ -1290,7 +1290,7 @@ fn _build_plan_body(stmts: &Array<Stmt>) -> json.JsonNode {
 // would be unreachable, which validate_graph rejects, so we omit it.
 fn _stmts_fall_through(stmts: &Array<Stmt>) nothrow -> Bool {
 	if stmts.len == 0 { return true; }
-	return _stmt_falls_through(&stmts[stmts.len - 1]);
+	return _stmt_falls_through(stmts[stmts.len - 1]);
 }
 
 fn _stmt_falls_through(s: &Stmt) nothrow -> Bool {
@@ -1306,7 +1306,7 @@ fn _stmt_falls_through(s: &Stmt) nothrow -> Bool {
 			match merge { Optional::Some(cms) => { return true; }, Optional::None => {} }
 			if _stmts_fall_through(default_body) { return true; }
 			var i = 0;
-			while i < arms.len { if _stmts_fall_through(&arms[i].body) { return true; } i = i + 1; }
+			while i < arms.len { if _stmts_fall_through(arms[i].body) { return true; } i = i + 1; }
 			return false;
 		},
 		default => { return true; }   // op / named-op / let / loop fall through
@@ -1318,10 +1318,10 @@ fn _build_graph_body(stmts: &Array<Stmt>, node_count: Int) -> json.JsonNode {
 	var nodes = json.new_array();
 	// Only emit the implicit return when some path can reach it; an all-terminal body (ends in fail)
 	// leaves it unreachable.
-	if _stmts_fall_through(stmts) { nodes.push(_return_node(&return_id)); }
-	_lower_stmts(stmts, &return_id, &mut nodes);
-	var entry: String = _dup(&return_id);
-	if stmts.len > 0 { entry = _dup(&stmts[0].id); }
+	if _stmts_fall_through(stmts) { nodes.push(_return_node(return_id)); }
+	_lower_stmts(stmts, return_id, nodes);
+	var entry: String = _dup(return_id);
+	if stmts.len > 0 { entry = _dup(stmts[0].id); }
 	var g = json.new_object();
 	g.set("entry", _jstr(move entry));
 	g.set("nodes", nodes.to_node());
@@ -1334,8 +1334,8 @@ fn _lower_stmts(stmts: &Array<Stmt>, exit_succ: &String, out: &mut json.JsonArra
 	var i = 0;
 	while i < stmts.len {
 		var next_id: String = _dup(exit_succ);
-		if i + 1 < stmts.len { next_id = _dup(&stmts[i + 1].id); }
-		_lower_one(&stmts[i], &next_id, out);
+		if i + 1 < stmts.len { next_id = _dup(stmts[i + 1].id); }
+		_lower_one(stmts[i], next_id, out);
 		i = i + 1;
 	}
 }
@@ -1344,52 +1344,52 @@ fn _lower_stmts(stmts: &Array<Stmt>, exit_succ: &String, out: &mut json.JsonArra
 fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 	match &stmt.kind {
 		StmtKind::KOp(name, input) => {
-			out.push(_op_node(&stmt.id, name, input, succ));
+			out.push(_op_node(stmt.id, name, input, succ));
 		},
 		StmtKind::KNamedOp(bind, op, input) => {
 			// A named op lowers to a plain NOperation; `bind` was only the parse-time result alias.
-			out.push(_op_node(&stmt.id, op, input, succ));
+			out.push(_op_node(stmt.id, op, input, succ));
 		},
 		StmtKind::KLet(name, value) => {
-			out.push(_let_node(&stmt.id, name, value, succ));
+			out.push(_let_node(stmt.id, name, value, succ));
 		},
 		StmtKind::KFail(reason) => {
 			// Terminal: NFail has no successor (`succ` ignored). Any statement after `fail` in the same
 			// block is unreachable; the graph reachability check surfaces it.
-			out.push(_fail_node(&stmt.id, reason));
+			out.push(_fail_node(stmt.id, reason));
 		},
 		StmtKind::KReturn(value) => {
 			// Terminal: an explicit `return <expr>` is an NReturn carrying the exported value (`succ`
 			// ignored). Same node kind as the implicit unit terminal, just a non-unit value. Composition 1b.0a.
-			out.push(_return_value_node(&stmt.id, value));
+			out.push(_return_value_node(stmt.id, value));
 		},
 		StmtKind::KCall(bind, child, plan_version, input, comp) => {
 			// A workflow call is one forward step (like a named op); the binder was only the parse-time
 			// result alias, so it is not carried into the node. Composition slice 1a.
 			val _ = bind;
-			out.push(_call_node(&stmt.id, child, plan_version, input, comp, succ));
+			out.push(_call_node(stmt.id, child, plan_version, input, comp, succ));
 		},
 		StmtKind::KLoop(as_name, kind, source, elem, init, body) => {
-			out.push(_loop_node(&stmt.id, kind, source, elem, as_name, init, body, succ));
+			out.push(_loop_node(stmt.id, kind, source, elem, as_name, init, body, succ));
 		},
 		StmtKind::KIf(cond, then_body, else_body, merge) => {
 			match merge {
 				Optional::Some(ms) => {
 					// The MERGE node is the if's join: each branch flows INTO it, and it then flows to
 					// `succ`. Source `from` = each branch's last node (its single immediate predecessor).
-					val then_entry = _entry_of(then_body, &ms.merge_id);
-					val else_entry = _entry_of(else_body, &ms.merge_id);
-					out.push(_if_node(&stmt.id, cond, &then_entry, &else_entry));
-					_lower_stmts(then_body, &ms.merge_id, out);
-					_lower_stmts(else_body, &ms.merge_id, out);
+					val then_entry = _entry_of(then_body, ms.merge_id);
+					val else_entry = _entry_of(else_body, ms.merge_id);
+					out.push(_if_node(stmt.id, cond, then_entry, else_entry));
+					_lower_stmts(then_body, ms.merge_id, out);
+					_lower_stmts(else_body, ms.merge_id, out);
 					val then_pred = _exit_of(then_body);
 					val else_pred = _exit_of(else_body);
-					out.push(_merge_node(&ms.merge_id, &ms.name, &then_pred, &ms.then_value, &else_pred, &ms.else_value, succ));
+					out.push(_merge_node(ms.merge_id, ms.name, then_pred, ms.then_value, else_pred, ms.else_value, succ));
 				},
 				Optional::None => {
 					val then_entry = _entry_of(then_body, succ);
 					val else_entry = _entry_of(else_body, succ);
-					out.push(_if_node(&stmt.id, cond, &then_entry, &else_entry));
+					out.push(_if_node(stmt.id, cond, then_entry, else_entry));
 					_lower_stmts(then_body, succ, out);
 					_lower_stmts(else_body, succ, out);
 				}
@@ -1404,40 +1404,40 @@ fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 					var arms_arr = json.new_array();
 					var a = 0;
 					while a < arms.len {
-						val tgt = _entry_of(&arms[a].body, &cms.merge_id);
+						val tgt = _entry_of(arms[a].body, cms.merge_id);
 						var arm_o = json.new_object();
 						arm_o.set("match", arms[a].match_json.clone_deep());
-						arm_o.set("target", _jstr(_dup(&tgt)));
+						arm_o.set("target", _jstr(_dup(tgt)));
 						arms_arr.push(arm_o.to_node());
 						a = a + 1;
 					}
-					val default_entry = _entry_of(default_body, &cms.merge_id);
-					out.push(_case_node(&stmt.id, scrut, arms_arr.to_node(), &default_entry));
+					val default_entry = _entry_of(default_body, cms.merge_id);
+					out.push(_case_node(stmt.id, scrut, arms_arr.to_node(), default_entry));
 					var a2 = 0;
-					while a2 < arms.len { _lower_stmts(&arms[a2].body, &cms.merge_id, out); a2 = a2 + 1; }
-					_lower_stmts(default_body, &cms.merge_id, out);
+					while a2 < arms.len { _lower_stmts(arms[a2].body, cms.merge_id, out); a2 = a2 + 1; }
+					_lower_stmts(default_body, cms.merge_id, out);
 					// Predecessors parallel to cms.values: arm exits in order, then the default exit.
 					var preds: Array<String> = [];
 					var a3 = 0;
-					while a3 < arms.len { preds.push(_exit_of(&arms[a3].body)); a3 = a3 + 1; }
+					while a3 < arms.len { preds.push(_exit_of(arms[a3].body)); a3 = a3 + 1; }
 					preds.push(_exit_of(default_body));
-					out.push(_merge_node_multi(&cms.merge_id, &cms.name, &preds, &cms.values, succ));
+					out.push(_merge_node_multi(cms.merge_id, cms.name, preds, cms.values, succ));
 				},
 				Optional::None => {
 					var arms_arr = json.new_array();
 					var a = 0;
 					while a < arms.len {
-						val tgt = _entry_of(&arms[a].body, succ);
+						val tgt = _entry_of(arms[a].body, succ);
 						var arm_o = json.new_object();
 						arm_o.set("match", arms[a].match_json.clone_deep());
-						arm_o.set("target", _jstr(_dup(&tgt)));
+						arm_o.set("target", _jstr(_dup(tgt)));
 						arms_arr.push(arm_o.to_node());
 						a = a + 1;
 					}
 					val default_entry = _entry_of(default_body, succ);
-					out.push(_case_node(&stmt.id, scrut, arms_arr.to_node(), &default_entry));
+					out.push(_case_node(stmt.id, scrut, arms_arr.to_node(), default_entry));
 					var a2 = 0;
-					while a2 < arms.len { _lower_stmts(&arms[a2].body, succ, out); a2 = a2 + 1; }
+					while a2 < arms.len { _lower_stmts(arms[a2].body, succ, out); a2 = a2 + 1; }
 					_lower_stmts(default_body, succ, out);
 				}
 			}
@@ -1447,14 +1447,14 @@ fn _lower_one(stmt: &Stmt, succ: &String, out: &mut json.JsonArray) -> Void {
 
 // The entry id of a body: its first statement's id, or `succ` when the body is empty.
 fn _entry_of(body: &Array<Stmt>, succ: &String) nothrow -> String {
-	if body.len > 0 { return _dup(&body[0].id); }
+	if body.len > 0 { return _dup(body[0].id); }
 	return _dup(succ);
 }
 
 // The exit id of a NON-EMPTY merge branch: its last statement's node id (the single immediate
 // predecessor of the merge). `_require_merge_branch` guarantees non-empty + single-exit.
 fn _exit_of(body: &Array<Stmt>) nothrow -> String {
-	return _dup(&body[body.len - 1].id);
+	return _dup(body[body.len - 1].id);
 }
 
 // {"kind":"merge","id","name","sources":[{from,value}×2],"next"} — a phi binding `name` to the value
@@ -1487,7 +1487,7 @@ fn _merge_node_multi(id: &String, name: &String, preds: &Array<String>, values: 
 	var i = 0;
 	while i < preds.len {
 		var s = json.new_object();
-		s.set("from", _jstr(_dup(&preds[i])));
+		s.set("from", _jstr(_dup(preds[i])));
 		s.set("value", values[i].clone_deep());
 		sources.push(s.to_node());
 		i = i + 1;
@@ -1572,8 +1572,8 @@ fn _call_node(id: &String, child: &String, plan_version: &String, input: &json.J
 	match comp {
 		Optional::Some(cr) => {
 			var co = json.new_object();
-			co.set("child", _jstr(_dup(&cr.child)));
-			co.set("plan_version", _jstr(_dup(&cr.plan_version)));
+			co.set("child", _jstr(_dup(cr.child)));
+			co.set("plan_version", _jstr(_dup(cr.plan_version)));
 			o.set("compensation", co.to_node());
 		},
 		Optional::None => {}
@@ -1616,7 +1616,7 @@ fn _return_value_node(id: &String, value: &json.JsonNode) -> json.JsonNode {
 fn _arg_expr(path: &Array<String>) -> json.JsonNode {
 	var arr = json.new_array();
 	var i = 0;
-	while i < path.len { arr.push(_jstr(_dup(&path[i]))); i = i + 1; }
+	while i < path.len { arr.push(_jstr(_dup(path[i]))); i = i + 1; }
 	var o = json.new_object();
 	o.set("arg", arr.to_node());
 	return o.to_node();
@@ -1635,8 +1635,8 @@ fn _merge(base: &json.JsonNode, pw: &ParsedWorkflow) -> json.JsonNode {
 				val k = entry.key;
 				// We author plan + argument_type ourselves; drop any base "plan"/"graph"/
 				// "argument_type" so the lowered config is unambiguously the parsed workflow.
-				if _str_eq(k, &"plan") or _str_eq(k, &"graph") or _str_eq(k, &"argument_type") {
-				} else if _str_eq(k, &"operations") {
+				if _str_eq(k, "plan") or _str_eq(k, "graph") or _str_eq(k, "argument_type") {
+				} else if _str_eq(k, "operations") {
 					has_ops = true;
 					out.set(_dup(k), _overlay_operations(entry.value, pw));
 				} else {
@@ -1684,13 +1684,13 @@ fn _overlay_operations(opsnode: &json.JsonNode, pw: &ParsedWorkflow) -> json.Jso
 			var arr = json.new_array();
 			var i = 0;
 			while i < items.len {
-				val nm = _op_name(&items[i]);
+				val nm = _op_name(items[i]);
 				// SOURCE is the sole authority on contracts: strip any input_type/result_type the
 				// base routing config might carry, then re-add ONLY the source-declared ones. Without
 				// this, a base contract would leak into the emitted config + content_hash, making
 				// source identity depend on non-source data (a `op x {}` could inherit a stale type).
-				var o = _op_strip_contracts(&items[i]);
-				val ix = _find_contract(pw, &nm);
+				var o = _op_strip_contracts(items[i]);
+				val ix = _find_contract(pw, nm);
 				if ix >= 0 {
 					matched[ix] = true;
 					match &pw.contracts[ix].input_type { Optional::Some(t) => { o.set("input_type", t.clone_deep()); }, Optional::None => {} }
@@ -1701,7 +1701,7 @@ fn _overlay_operations(opsnode: &json.JsonNode, pw: &ParsedWorkflow) -> json.Jso
 			}
 			var k = 0;
 			while k < pw.contracts.len {
-				if !matched[k] { throw ParseError(code = "unknown-operation", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "op '" + _dup(&pw.contracts[k].name) + "' declared in source but absent from the operations registry"); }
+				if !matched[k] { throw ParseError(code = "unknown-operation", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "op '" + _dup(pw.contracts[k].name) + "' declared in source but absent from the operations registry"); }
 				k = k + 1;
 			}
 			return arr.to_node();
@@ -1711,7 +1711,7 @@ fn _overlay_operations(opsnode: &json.JsonNode, pw: &ParsedWorkflow) -> json.Jso
 }
 
 fn _op_name(item: &json.JsonNode) -> String {
-	match item.get(&"name") {
+	match item.get("name") {
 		Optional::Some(n) => {
 			match n.as_string() { Optional::Some(s) => { return move s; }, Optional::None => { throw ParseError(code = "operation-name-not-string", byte_offset = -1, line = 0, column = 0, expected = "", found = "", message = "operation 'name' must be a string"); } }
 		},
@@ -1722,7 +1722,7 @@ fn _op_name(item: &json.JsonNode) -> String {
 fn _find_contract(pw: &ParsedWorkflow, name: &String) nothrow -> Int {
 	var i = 0;
 	while i < pw.contracts.len {
-		if _str_eq(&pw.contracts[i].name, name) { return i; }
+		if _str_eq(pw.contracts[i].name, name) { return i; }
 		i = i + 1;
 	}
 	return -1;
@@ -1738,7 +1738,7 @@ fn _op_strip_contracts(item: &json.JsonNode) -> json.JsonObject {
 		match it.next() {
 			Optional::Some(entry) => {
 				val k = entry.key;
-				if _str_eq(k, &"input_type") or _str_eq(k, &"result_type") {
+				if _str_eq(k, "input_type") or _str_eq(k, "result_type") {
 					// drop: a base contract is not source identity
 				} else {
 					o.set(_dup(k), entry.value.clone_deep());
@@ -1808,8 +1808,8 @@ pub fn render_diagnostic(source: &String, e: &ParseError) nothrow -> String {
 	// A NO-POSITION diagnostic (byte_offset < 0 — a config/lowering error, not a `.mf` text location):
 	// render just the header, no source excerpt or caret (clamping to byte 0 would be misleading).
 	if e.byte_offset < 0 {
-		var h = "parse error [" + _dup(&e.code) + "]: " + _dup(&e.message);
-		if e.expected.byte_length() > 0 { h = h + " — expected " + _dup(&e.expected); }
+		var h = "parse error [" + _dup(e.code) + "]: " + _dup(e.message);
+		if e.expected.byte_length() > 0 { h = h + " — expected " + _dup(e.expected); }
 		return move h;
 	}
 	val n = source.byte_length();
@@ -1828,10 +1828,10 @@ pub fn render_diagnostic(source: &String, e: &ParseError) nothrow -> String {
 		core.Result::Ok(s) => { excerpt = move s; },
 		core.Result::Err(_) => {}
 	}
-	var head = "parse error [" + _dup(&e.code) + "]: " + _dup(&e.message)
+	var head = "parse error [" + _dup(e.code) + "]: " + _dup(e.message)
 		+ " at line " + fmt.format_int(e.line) + ", column " + fmt.format_int(e.column)
 		+ " (byte " + fmt.format_int(e.byte_offset) + ")";
-	if e.expected.byte_length() > 0 { head = head + " — expected " + _dup(&e.expected); }
+	if e.expected.byte_length() > 0 { head = head + " — expected " + _dup(e.expected); }
 	return head + "\n  " + excerpt + "\n  " + _spaces(e.column - 1) + "^";
 }
 

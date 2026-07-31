@@ -39,11 +39,11 @@ fn _gw() -> arc.Arc<gw.SingularGateway> {
     val user = _env_or("DB_USER", "root");
     val pwd = _env_or("MDB_ROOT_PWD", "rootpw");
     val text: String = "{\"backend\":\"mariadb\",\"host\":\"" + host + "\",\"port\":" + port + ",\"user\":\"" + user + "\",\"password\":\"" + pwd + "\",\"database\":\"singular_malformed\",\"connect_timeout_ms\":3000,\"io_timeout_ms\":3000,\"pool\":{\"keepalive_interval_ms\":100}}";
-    val cfg = json.parse(&text).or_throw();
+    val cfg = json.parse(text).or_throw();
     var b = gw.new_gateway_builder();
-    gw.with_json(&mut b, &cfg);
-    val id = gw.identity_from_worker_name("singular-malformed-fixture", &"mfx-worker");
-    gw.with_identity(&mut b, move id);
+    gw.with_json(b, cfg);
+    val id = gw.identity_from_worker_name("singular-malformed-fixture", "mfx-worker");
+    gw.with_identity(b, move id);
     return gw.build_gateway(move b).or_throw();
 }
 
@@ -53,7 +53,7 @@ fn _key(b: Int) nothrow -> Array<Byte> { var k: Array<Byte> = []; k.push(cast<By
 fn _expect_reject(g: &arc.Arc<gw.SingularGateway>, b: Int) nothrow -> Bool {
     var threw = false;
     try {
-        val _ = g.get().inspect(&_key(b));
+        val _ = g.get().inspect(_key(b));
     } catch gw:SingularException(_) {
         threw = true;
     } catch unexpected {
@@ -67,15 +67,15 @@ fn scenario_object_contract() -> Int {
     val g = _gw();
 
     // ACCEPT: valid documents parse cleanly to the expected outcome.
-    match g.get().inspect(&_key(1)) {        // terminal Done, valid object payload
+    match g.get().inspect(_key(1)) {        // terminal Done, valid object payload
         gw.InspectOutcome::Terminal(_, _) => {},
         default => { return 11; }
     }
-    match g.get().inspect(&_key(10)) {       // 0x0A working, valid owner + {} checkpoint
+    match g.get().inspect(_key(10)) {       // 0x0A working, valid owner + {} checkpoint
         gw.InspectOutcome::Working(owner, _, _) => { if owner.len != 16 { return 12; } },
         default => { return 13; }
     }
-    match g.get().inspect(&_key(11)) {       // 0x0B terminal Done, payload object with a NESTED array
+    match g.get().inspect(_key(11)) {       // 0x0B terminal Done, payload object with a NESTED array
         gw.InspectOutcome::Terminal(tr, _) => {
             match tr { gw.TerminalResult::Done(p) => { if p != "{\"items\":[1,2]}" { return 15; } }, default => { return 14; } }
         },
@@ -83,21 +83,21 @@ fn scenario_object_contract() -> Int {
     }
 
     // REJECT: nested terminal payload is not a JSON object.
-    if !_expect_reject(&g, 2) { return 21; }   // non-JSON string
-    if !_expect_reject(&g, 3) { return 22; }   // JSON null
-    if !_expect_reject(&g, 4) { return 23; }   // JSON array
-    if !_expect_reject(&g, 5) { return 24; }   // scalar "5" (parses, not an object)
+    if !_expect_reject(g, 2) { return 21; }   // non-JSON string
+    if !_expect_reject(g, 3) { return 22; }   // JSON null
+    if !_expect_reject(g, 4) { return 23; }   // JSON array
+    if !_expect_reject(g, 5) { return 24; }   // scalar "5" (parses, not an object)
 
     // REJECT: the result envelope itself is not a JSON object.
-    if !_expect_reject(&g, 6) { return 31; }   // array envelope
-    if !_expect_reject(&g, 7) { return 32; }   // SQL NULL envelope
-    if !_expect_reject(&g, 8) { return 33; }   // malformed JSON envelope
-    if !_expect_reject(&g, 9) { return 34; }   // scalar envelope
+    if !_expect_reject(g, 6) { return 31; }   // array envelope
+    if !_expect_reject(g, 7) { return 32; }   // SQL NULL envelope
+    if !_expect_reject(g, 8) { return 33; }   // malformed JSON envelope
+    if !_expect_reject(g, 9) { return 34; }   // scalar envelope
 
     // REJECT: working snapshot fields.
-    if !_expect_reject(&g, 12) { return 41; }  // 0x0C checkpoint not an object
-    if !_expect_reject(&g, 13) { return 42; }  // 0x0D owner not hex
-    if !_expect_reject(&g, 14) { return 43; }  // 0x0E owner hex != 16 bytes
+    if !_expect_reject(g, 12) { return 41; }  // 0x0C checkpoint not an object
+    if !_expect_reject(g, 13) { return 42; }  // 0x0D owner not hex
+    if !_expect_reject(g, 14) { return 43; }  // 0x0E owner hex != 16 bytes
     return 0;
 }
 
@@ -106,12 +106,12 @@ fn scenario_object_contract() -> Int {
 fn scenario_history_event_status() -> Int {
     val g = _gw();
     // ACCEPT: matched control (claimed/status=1) -> one entry, no throw.
-    val ok = g.get().history(&_key(1));
+    val ok = g.get().history(_key(1));
     if ok.len != 1 { return 51; }
     // REJECT: completed event carrying status=WORKING -> throw.
     var threw = false;
     try {
-        val _ = g.get().history(&_key(2));
+        val _ = g.get().history(_key(2));
     } catch gw:SingularException(_) {
         threw = true;
     } catch unexpected {

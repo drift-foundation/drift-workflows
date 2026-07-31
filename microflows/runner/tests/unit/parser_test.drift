@@ -53,9 +53,9 @@ fn _plan_to_steps(plan: &json.JsonNode) nothrow -> Array<ir.FlatStep> {
 			var i = 0;
 			while i < items.len {
 				var op: String = "";
-				match items[i].get(&"operation") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { op = move s; }, Optional::None => {} } }, Optional::None => {} }
+				match items[i].get("operation") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { op = move s; }, Optional::None => {} } }, Optional::None => {} }
 				var inp: String = "{}";
-				match items[i].get(&"input") { Optional::Some(n) => { inp = json.encode_compact(n); }, Optional::None => {} }
+				match items[i].get("input") { Optional::Some(n) => { inp = json.encode_compact(n); }, Optional::None => {} }
 				out.push(ir.FlatStep(operation = move op, input_json = move inp));
 				i = i + 1;
 			}
@@ -67,7 +67,7 @@ fn _plan_to_steps(plan: &json.JsonNode) nothrow -> Array<ir.FlatStep> {
 
 fn _graph_canon_of(steps: &Array<ir.FlatStep>) -> String {
 	match ir.flat_to_graph(steps) {
-		core.Result::Ok(g) => { return ir.graph_canonical(&g); },
+		core.Result::Ok(g) => { return ir.graph_canonical(g); },
 		core.Result::Err(_) => { return "<err>"; }
 	}
 }
@@ -75,7 +75,7 @@ fn _graph_canon_of(steps: &Array<ir.FlatStep>) -> String {
 // Canonical form of an object-type encoding node (None/invalid -> a distinct sentinel).
 fn _objtype_canon(node: &json.JsonNode) -> String {
 	match ir.parse_object_type(node) {
-		core.Result::Ok(ty) => { return ir.canonical(&ty); },
+		core.Result::Ok(ty) => { return ir.canonical(ty); },
 		core.Result::Err(_) => { return "<bad>"; }
 	}
 }
@@ -84,7 +84,7 @@ fn scenario() -> Int {
 	val src = _src();
 	// ---- 1. parse the valid source ----
 	var pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
-	match parser.parse_source(&src) {
+	match parser.parse_source(src) {
 		core.Result::Ok(p) => { pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); },
 		core.Result::Err(_) => { return 1; }
 	}
@@ -95,55 +95,55 @@ fn scenario() -> Int {
 
 	// ---- 2. plan parity via graph_canonical (degenerate-graph identity) ----
 	if pw.is_graph { return 28; }   // a straight-line source stays a flat "plan"
-	val parsed_steps = _plan_to_steps(&pw.body);
+	val parsed_steps = _plan_to_steps(pw.body);
 	if parsed_steps.len != 2 { return 3; }
 	var hand: Array<ir.FlatStep> = [];
 	hand.push(ir.FlatStep(operation = "reserve", input_json = "{\"reservation\":\"p1\"}"));
 	hand.push(ir.FlatStep(operation = "reserve", input_json = "{\"reservation\":\"p2\"}"));
-	val pc = _graph_canon_of(&parsed_steps);
-	val hc = _graph_canon_of(&hand);
-	if !_str_eq(&pc, &hc) { return 4; }
+	val pc = _graph_canon_of(parsed_steps);
+	val hc = _graph_canon_of(hand);
+	if !_str_eq(pc, hc) { return 4; }
 
 	// ---- 3. argument_type parity (canonical, order-independent) ----
 	var at = json.new_object().to_node();
 	match &pw.arg_type { Optional::Some(n) => { at = n.clone_deep(); }, Optional::None => { return 5; } }
-	val hand_at_node = _pj(&"{\"type\":\"object\",\"fields\":[{\"name\":\"currency\",\"type\":{\"type\":\"string\"}},{\"name\":\"amount\",\"type\":{\"type\":\"int\"}}]}");
-	val hand_at = _objtype_canon(&hand_at_node);
-	if _str_eq(&hand_at, &"<bad>") { return 6; }
-	val at_canon = _objtype_canon(&at);
-	if !_str_eq(&at_canon, &hand_at) { return 7; }
+	val hand_at_node = _pj("{\"type\":\"object\",\"fields\":[{\"name\":\"currency\",\"type\":{\"type\":\"string\"}},{\"name\":\"amount\",\"type\":{\"type\":\"int\"}}]}");
+	val hand_at = _objtype_canon(hand_at_node);
+	if _str_eq(hand_at, "<bad>") { return 6; }
+	val at_canon = _objtype_canon(at);
+	if !_str_eq(at_canon, hand_at) { return 7; }
 
 	// ---- 4. contracts: reserve has input + result, release input only ----
 	if pw.contracts.len != 2 { return 8; }
-	val ri = _find(&pw.contracts, &"reserve");
-	val li = _find(&pw.contracts, &"release");
+	val ri = _find(pw.contracts, "reserve");
+	val li = _find(pw.contracts, "release");
 	if ri < 0 or li < 0 { return 9; }
 	// reserve.input_type canonical == {reservation:string}
 	var r_in = json.new_object().to_node();
 	match &pw.contracts[ri].input_type { Optional::Some(n) => { r_in = n.clone_deep(); }, Optional::None => { return 10; } }
-	val r_in_canon = _objtype_canon(&r_in);
-	val r_in_exp_node = _pj(&"{\"type\":\"object\",\"fields\":[{\"name\":\"reservation\",\"type\":{\"type\":\"string\"}}]}");
-	val r_in_exp = _objtype_canon(&r_in_exp_node);
-	if !_str_eq(&r_in_canon, &r_in_exp) { return 11; }
+	val r_in_canon = _objtype_canon(r_in);
+	val r_in_exp_node = _pj("{\"type\":\"object\",\"fields\":[{\"name\":\"reservation\",\"type\":{\"type\":\"string\"}}]}");
+	val r_in_exp = _objtype_canon(r_in_exp_node);
+	if !_str_eq(r_in_canon, r_in_exp) { return 11; }
 	// reserve has a result; release has none.
 	match &pw.contracts[ri].result_type { Optional::Some(_) => {}, Optional::None => { return 12; } }
 	match &pw.contracts[li].result_type { Optional::Some(_) => { return 13; }, Optional::None => {} }
 
 	// ---- 5. lower() overlays contracts onto a base operations registry ----
-	val base = _pj(&"{\"worker_id\":\"w\",\"operations\":[{\"name\":\"reserve\",\"participant\":\"ref\",\"schema_version\":1},{\"name\":\"release\",\"participant\":\"ref\",\"schema_version\":1}]}");
+	val base = _pj("{\"worker_id\":\"w\",\"operations\":[{\"name\":\"reserve\",\"participant\":\"ref\",\"schema_version\":1},{\"name\":\"release\",\"participant\":\"ref\",\"schema_version\":1}]}");
 	var merged = json.new_object().to_node();
-	match parser.lower(&src, &base) {
+	match parser.lower(src, base) {
 		core.Result::Ok(m) => { merged = move m; },
 		core.Result::Err(_) => { return 14; }
 	}
 	// merged has a plan (2 steps) and an argument_type, and reserve carries input_type/result_type.
-	match merged.get(&"plan") { Optional::Some(_) => {}, Optional::None => { return 15; } }
-	match merged.get(&"argument_type") { Optional::Some(_) => {}, Optional::None => { return 16; } }
-	val mops = _op_by_name(&merged, &"reserve");
+	match merged.get("plan") { Optional::Some(_) => {}, Optional::None => { return 15; } }
+	match merged.get("argument_type") { Optional::Some(_) => {}, Optional::None => { return 16; } }
+	val mops = _op_by_name(merged, "reserve");
 	val none_sentinel: String = "<none>";
-	if _str_eq(&mops, &none_sentinel) { return 17; }
+	if _str_eq(mops, none_sentinel) { return 17; }
 	// the overlaid reserve op declares both input_type and result_type.
-	match merged.get(&"operations") {
+	match merged.get("operations") {
 		Optional::Some(on) => {
 			match on.as_array() {
 				Optional::Some(items) => {
@@ -151,10 +151,10 @@ fn scenario() -> Int {
 					var i = 0;
 					while i < items.len {
 						var nm: String = "";
-						match items[i].get(&"name") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { nm = move s; }, Optional::None => {} } }, Optional::None => {} }
-						if _str_eq(&nm, &"reserve") {
-							match items[i].get(&"input_type") { Optional::Some(_) => {}, Optional::None => { return 18; } }
-							match items[i].get(&"result_type") { Optional::Some(_) => {}, Optional::None => { return 19; } }
+						match items[i].get("name") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { nm = move s; }, Optional::None => {} } }, Optional::None => {} }
+						if _str_eq(nm, "reserve") {
+							match items[i].get("input_type") { Optional::Some(_) => {}, Optional::None => { return 18; } }
+							match items[i].get("result_type") { Optional::Some(_) => {}, Optional::None => { return 19; } }
 							found_typed = true;
 						}
 						i = i + 1;
@@ -171,24 +171,24 @@ fn scenario() -> Int {
 	// A base routing config carrying a STALE input_type/result_type on reserve, with a source that
 	// declares `op reserve {}` (NO contract), must emit a reserve with NO input_type/result_type
 	// (else source identity / content_hash would depend on non-source data).
-	val base_stale = _pj(&"{\"worker_id\":\"w\",\"operations\":[{\"name\":\"reserve\",\"participant\":\"ref\",\"schema_version\":1,\"input_type\":{\"type\":\"object\",\"fields\":[{\"name\":\"STALE\",\"type\":{\"type\":\"int\"}}]},\"result_type\":{\"type\":\"string\"}},{\"name\":\"release\",\"participant\":\"ref\",\"schema_version\":1}]}");
+	val base_stale = _pj("{\"worker_id\":\"w\",\"operations\":[{\"name\":\"reserve\",\"participant\":\"ref\",\"schema_version\":1,\"input_type\":{\"type\":\"object\",\"fields\":[{\"name\":\"STALE\",\"type\":{\"type\":\"int\"}}]},\"result_type\":{\"type\":\"string\"}},{\"name\":\"release\",\"participant\":\"ref\",\"schema_version\":1}]}");
 	val src_nc = "op reserve {}\nsteps { reserve { \"reservation\": \"p1\" } }\n";
 	var merged_nc = json.new_object().to_node();
-	match parser.lower(&src_nc, &base_stale) {
+	match parser.lower(src_nc, base_stale) {
 		core.Result::Ok(m) => { merged_nc = move m; },
 		core.Result::Err(_) => { return 23; }
 	}
-	match merged_nc.get(&"operations") {
+	match merged_nc.get("operations") {
 		Optional::Some(on) => {
 			match on.as_array() {
 				Optional::Some(items) => {
 					var i = 0;
 					while i < items.len {
 						var nm: String = "";
-						match items[i].get(&"name") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { nm = move s; }, Optional::None => {} } }, Optional::None => {} }
-						if _str_eq(&nm, &"reserve") {
-							match items[i].get(&"input_type") { Optional::Some(_) => { return 24; }, Optional::None => {} }
-							match items[i].get(&"result_type") { Optional::Some(_) => { return 25; }, Optional::None => {} }
+						match items[i].get("name") { Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { nm = move s; }, Optional::None => {} } }, Optional::None => {} }
+						if _str_eq(nm, "reserve") {
+							match items[i].get("input_type") { Optional::Some(_) => { return 24; }, Optional::None => {} }
+							match items[i].get("result_type") { Optional::Some(_) => { return 25; }, Optional::None => {} }
 						}
 						i = i + 1;
 					}
@@ -200,25 +200,25 @@ fn scenario() -> Int {
 	}
 
 	// ---- 6. malformed sources are rejected (Err), each before any dispatch ----
-	if !_parse_err(&"args { amount: int }\n") { return 30; }                       // missing steps
-	if !_parse_err(&"frobnicate { }\nsteps { reserve {} }\n") { return 31; }       // unknown keyword
-	if !_parse_err(&"op x { input: blob }\nsteps { x {} }\n") { return 32; }       // unknown type
-	if !_parse_err(&"args { a: int \nsteps { x {} }\n") { return 33; }             // unterminated object type
-	if !_parse_err(&"steps { reserve { \"a\": 1 \n") { return 34; }                // unterminated JSON object
-	if !_parse_err(&"steps {\n") { return 35; }                                    // unterminated steps block
-	if !_parse_ok(&"steps { reserve [1,2] }\n") { return 36; }                     // array op input is now VALID (construction)
-	if !_parse_err(&"steps { reserve 5 }\n") { return 37; }                        // a bare scalar is still not an expression
-	if !_parse_err(&"args { a: int }\nargs { b: int }\nsteps { x {} }\n") { return 38; }  // duplicate args
-	if !_parse_err(&"op x {}\nop x {}\nsteps { x {} }\n") { return 39; }           // duplicate op
-	if !_parse_err(&"steps { }\n") { return 40; }                                  // empty steps
-	if !_parse_err(&"op x { bogus: int }\nsteps { x {} }\n") { return 41; }        // unknown op clause
+	if !_parse_err("args { amount: int }\n") { return 30; }                       // missing steps
+	if !_parse_err("frobnicate { }\nsteps { reserve {} }\n") { return 31; }       // unknown keyword
+	if !_parse_err("op x { input: blob }\nsteps { x {} }\n") { return 32; }       // unknown type
+	if !_parse_err("args { a: int \nsteps { x {} }\n") { return 33; }             // unterminated object type
+	if !_parse_err("steps { reserve { \"a\": 1 \n") { return 34; }                // unterminated JSON object
+	if !_parse_err("steps {\n") { return 35; }                                    // unterminated steps block
+	if !_parse_ok("steps { reserve [1,2] }\n") { return 36; }                     // array op input is now VALID (construction)
+	if !_parse_err("steps { reserve 5 }\n") { return 37; }                        // a bare scalar is still not an expression
+	if !_parse_err("args { a: int }\nargs { b: int }\nsteps { x {} }\n") { return 38; }  // duplicate args
+	if !_parse_err("op x {}\nop x {}\nsteps { x {} }\n") { return 39; }           // duplicate op
+	if !_parse_err("steps { }\n") { return 40; }                                  // empty steps
+	if !_parse_err("op x { bogus: int }\nsteps { x {} }\n") { return 41; }        // unknown op clause
 
 	// the empty-input single step parses (constant {}), and an object-less args is fine when absent.
-	if !_parse_ok(&"steps { ping {} }\n") { return 42; }
-	if !_parse_ok(&"args {}\nsteps { ping {} }\n") { return 43; }  // empty arg object
+	if !_parse_ok("steps { ping {} }\n") { return 42; }
+	if !_parse_ok("args {}\nsteps { ping {} }\n") { return 43; }  // empty arg object
 
 	// ---- 7. lower() rejects a contract for an operation absent from the registry ----
-	match parser.lower(&"op ghost { input: { x: int } }\nsteps { reserve { \"reservation\": \"p1\" } }\n", &base) {
+	match parser.lower("op ghost { input: { x: int } }\nsteps { reserve { \"reservation\": \"p1\" } }\n", base) {
 		core.Result::Ok(_) => { return 44; },
 		core.Result::Err(_) => {}
 	}
@@ -228,123 +228,123 @@ fn scenario() -> Int {
 	val if_src = "args { flag: bool }\nop reserve { input: { reservation: string } }\n"
 		+ "steps { if flag { reserve { \"reservation\": \"A\" } } else { reserve { \"reservation\": \"B\" } } reserve { \"reservation\": \"fin\" } }\n";
 	var if_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
-	match parser.parse_source(&if_src) { core.Result::Ok(p) => { if_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 45; } }
+	match parser.parse_source(if_src) { core.Result::Ok(p) => { if_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 45; } }
 	var ec2: Array<parser.ContractDecl> = [];
 	var eb2 = json.new_array().to_node();
 	var if_pw = parser.ParsedWorkflow(body = move eb2, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec2);
 	match move if_pw_opt { Optional::Some(p) => { if_pw = move p; }, Optional::None => { return 46; } }
 	if !if_pw.is_graph { return 47; }   // an if source lowers to a graph, not a plan
-	val if_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"fin\"}},\"next\":\"n4\"},{\"kind\":\"return\",\"id\":\"n4\",\"value\":{\"const\":null}}]}");
-	val if_l = _graph_canon_of_node(&if_pw.body);
-	val if_h = _graph_canon_of_node(&if_hand);
-	if _str_eq(&if_h, &"<bad-graph>") { return 48; }
-	if !_str_eq(&if_l, &if_h) { return 49; }
+	val if_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"fin\"}},\"next\":\"n4\"},{\"kind\":\"return\",\"id\":\"n4\",\"value\":{\"const\":null}}]}");
+	val if_l = _graph_canon_of_node(if_pw.body);
+	val if_h = _graph_canon_of_node(if_hand);
+	if _str_eq(if_h, "<bad-graph>") { return 48; }
+	if !_str_eq(if_l, if_h) { return 49; }
 
 	// A `case` source lowers to a graph whose IR identity matches the hand-authored equivalent.
 	val case_src = "args { mode: string }\nop reserve { input: { reservation: string } }\n"
 		+ "steps { case mode { \"a\" { reserve { \"reservation\": \"A\" } } \"b\" { reserve { \"reservation\": \"B\" } } default { reserve { \"reservation\": \"D\" } } } reserve { \"reservation\": \"fin\" } }\n";
 	var case_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
-	match parser.parse_source(&case_src) { core.Result::Ok(p) => { case_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 50; } }
+	match parser.parse_source(case_src) { core.Result::Ok(p) => { case_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 50; } }
 	var ec3: Array<parser.ContractDecl> = [];
 	var eb3 = json.new_array().to_node();
 	var case_pw = parser.ParsedWorkflow(body = move eb3, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec3);
 	match move case_pw_opt { Optional::Some(p) => { case_pw = move p; }, Optional::None => { return 51; } }
 	if !case_pw.is_graph { return 52; }
-	val case_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"mode\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"},{\"match\":\"b\",\"target\":\"n2\"}],\"default\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"D\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n4\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"fin\"}},\"next\":\"n5\"},{\"kind\":\"return\",\"id\":\"n5\",\"value\":{\"const\":null}}]}");
-	val case_l = _graph_canon_of_node(&case_pw.body);
-	val case_h = _graph_canon_of_node(&case_hand);
-	if _str_eq(&case_h, &"<bad-graph>") { return 53; }
-	if !_str_eq(&case_l, &case_h) { return 54; }
+	val case_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"mode\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"},{\"match\":\"b\",\"target\":\"n2\"}],\"default\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"D\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n4\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"fin\"}},\"next\":\"n5\"},{\"kind\":\"return\",\"id\":\"n5\",\"value\":{\"const\":null}}]}");
+	val case_l = _graph_canon_of_node(case_pw.body);
+	val case_h = _graph_canon_of_node(case_hand);
+	if _str_eq(case_h, "<bad-graph>") { return 53; }
+	if !_str_eq(case_l, case_h) { return 54; }
 
 	// ---- 8c. NESTED control flow (an `if` inside a `case` arm) lowers to the expected graph
 	// identity — backing the "statements nest" claim at the canonical/validation level. ----
 	val nest_src = "args { mode: string, flag: bool }\nop reserve { input: { reservation: string } }\n"
 		+ "steps { case mode { \"a\" { if flag { reserve { \"reservation\": \"A\" } } else { reserve { \"reservation\": \"B\" } } } default { reserve { \"reservation\": \"D\" } } } reserve { \"reservation\": \"fin\" } }\n";
 	var nest_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
-	match parser.parse_source(&nest_src) { core.Result::Ok(p) => { nest_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 61; } }
+	match parser.parse_source(nest_src) { core.Result::Ok(p) => { nest_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 61; } }
 	var ec4: Array<parser.ContractDecl> = [];
 	var eb4 = json.new_array().to_node();
 	var nest_pw = parser.ParsedWorkflow(body = move eb4, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec4);
 	match move nest_pw_opt { Optional::Some(p) => { nest_pw = move p; }, Optional::None => { return 62; } }
 	if !nest_pw.is_graph { return 63; }
-	val nest_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"mode\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"}],\"default\":\"n4\"},{\"kind\":\"if\",\"id\":\"n1\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n2\",\"else\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n4\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"D\"}},\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n5\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"fin\"}},\"next\":\"n6\"},{\"kind\":\"return\",\"id\":\"n6\",\"value\":{\"const\":null}}]}");
-	val nest_l = _graph_canon_of_node(&nest_pw.body);
-	val nest_h = _graph_canon_of_node(&nest_hand);
-	if _str_eq(&nest_h, &"<bad-graph>") { return 64; }
-	if !_str_eq(&nest_l, &nest_h) { return 65; }
+	val nest_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"mode\"]},\"arms\":[{\"match\":\"a\",\"target\":\"n1\"}],\"default\":\"n4\"},{\"kind\":\"if\",\"id\":\"n1\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n2\",\"else\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n4\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"D\"}},\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n5\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"fin\"}},\"next\":\"n6\"},{\"kind\":\"return\",\"id\":\"n6\",\"value\":{\"const\":null}}]}");
+	val nest_l = _graph_canon_of_node(nest_pw.body);
+	val nest_h = _graph_canon_of_node(nest_hand);
+	if _str_eq(nest_h, "<bad-graph>") { return 64; }
+	if !_str_eq(nest_l, nest_h) { return 65; }
 
 	// ---- 9. (slice 2a) malformed control-flow sources are rejected at parse ----
-	if !_parse_err(&"args { m: string }\nsteps { case m { \"a\" { ping {} } } }\n") { return 55; }   // case w/o default
-	if !_parse_err(&"args { m: string }\nsteps { case m { default { ping {} } } }\n") { return 56; } // case w/o any arm
-	if !_parse_err(&"args { f: bool }\nsteps { if f { ping {} } else { ping {} \n") { return 57; }   // unterminated else block
-	if !_parse_err(&"steps { if }\n") { return 58; }                                                 // if missing cond/body
-	if !_parse_err(&"args { m: string }\nsteps { case m { \"a\" { ping {} } default { ping {} } default { ping {} } } }\n") { return 59; }  // duplicate default
+	if !_parse_err("args { m: string }\nsteps { case m { \"a\" { ping {} } } }\n") { return 55; }   // case w/o default
+	if !_parse_err("args { m: string }\nsteps { case m { default { ping {} } } }\n") { return 56; } // case w/o any arm
+	if !_parse_err("args { f: bool }\nsteps { if f { ping {} } else { ping {} \n") { return 57; }   // unterminated else block
+	if !_parse_err("steps { if }\n") { return 58; }                                                 // if missing cond/body
+	if !_parse_err("args { m: string }\nsteps { case m { \"a\" { ping {} } default { ping {} } default { ping {} } } }\n") { return 59; }  // duplicate default
 	// an arm AFTER default is rejected (grammar: default must be the last arm).
-	if !_parse_err(&"args { m: string }\nsteps { case m { default { ping {} } \"a\" { ping {} } } }\n") { return 66; }
+	if !_parse_err("args { m: string }\nsteps { case m { default { ping {} } \"a\" { ping {} } } }\n") { return 66; }
 	// well-formed nested control flow parses (if inside a case arm).
-	if !_parse_ok(&"args { m: string, f: bool }\nsteps { case m { \"a\" { if f { ping {} } else { ping {} } } default { ping {} } } }\n") { return 60; }
+	if !_parse_ok("args { m: string, f: bool }\nsteps { case m { \"a\" { if f { ping {} } else { ping {} } } default { ping {} } } }\n") { return 60; }
 
 	// ---- 10. (slice 2b-i) let + arg/local exprs lower to a graph; identity via graph_canonical ----
 	val let_src = "args { req: { reservation: string } }\nop reserve { input: { reservation: string } }\n"
 		+ "steps { let p = arg req\n reserve local p }\n";
 	var let_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
-	match parser.parse_source(&let_src) { core.Result::Ok(p) => { let_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 67; } }
+	match parser.parse_source(let_src) { core.Result::Ok(p) => { let_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 67; } }
 	var ec5: Array<parser.ContractDecl> = [];
 	var eb5 = json.new_array().to_node();
 	var let_pw = parser.ParsedWorkflow(body = move eb5, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec5);
 	match move let_pw_opt { Optional::Some(p) => { let_pw = move p; }, Optional::None => { return 68; } }
 	if !let_pw.is_graph { return 69; }   // a let makes the workflow a graph
-	val let_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"let\",\"id\":\"n0\",\"name\":\"p\",\"value\":{\"arg\":[\"req\"]},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"p\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
-	val let_l = _graph_canon_of_node(&let_pw.body);
-	val let_h = _graph_canon_of_node(&let_hand);
-	if _str_eq(&let_h, &"<bad-graph>") { return 70; }
-	if !_str_eq(&let_l, &let_h) { return 71; }
+	val let_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"let\",\"id\":\"n0\",\"name\":\"p\",\"value\":{\"arg\":[\"req\"]},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"p\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val let_l = _graph_canon_of_node(let_pw.body);
+	val let_h = _graph_canon_of_node(let_hand);
+	if _str_eq(let_h, "<bad-graph>") { return 70; }
+	if !_str_eq(let_l, let_h) { return 71; }
 
 	// A PROJECTED arg path in a let value lowers to {arg:[req,reservation]}.
 	val proj2 = "args { req: { reservation: string } }\nop reserve { input: { reservation: string } }\n"
 		+ "steps { let r = arg req.reservation\n reserve { \"reservation\": \"x\" } }\n";
 	var proj_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
-	match parser.parse_source(&proj2) { core.Result::Ok(p) => { proj_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 73; } }
+	match parser.parse_source(proj2) { core.Result::Ok(p) => { proj_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 73; } }
 	var ec6: Array<parser.ContractDecl> = [];
 	var eb6 = json.new_array().to_node();
 	var proj_pw = parser.ParsedWorkflow(body = move eb6, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec6);
 	match move proj_pw_opt { Optional::Some(p) => { proj_pw = move p; }, Optional::None => { return 74; } }
-	val proj_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"let\",\"id\":\"n0\",\"name\":\"r\",\"value\":{\"arg\":[\"req\",\"reservation\"]},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"x\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
-	val proj_l = _graph_canon_of_node(&proj_pw.body);
-	val proj_h = _graph_canon_of_node(&proj_hand);
-	if !_str_eq(&proj_l, &proj_h) { return 75; }
+	val proj_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"let\",\"id\":\"n0\",\"name\":\"r\",\"value\":{\"arg\":[\"req\",\"reservation\"]},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"x\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val proj_l = _graph_canon_of_node(proj_pw.body);
+	val proj_h = _graph_canon_of_node(proj_hand);
+	if !_str_eq(proj_l, proj_h) { return 75; }
 
 	// A PROJECTED LOCAL lowers to {local:{name, path:[…]}}: `let p = arg req; reserve local p.reservation`.
 	val locp_src = "args { req: { reservation: string } }\nsteps { let p = arg req\n reserve local p.reservation }\n";
 	var locp_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
-	match parser.parse_source(&locp_src) { core.Result::Ok(p) => { locp_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 83; } }
+	match parser.parse_source(locp_src) { core.Result::Ok(p) => { locp_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 83; } }
 	var ec8: Array<parser.ContractDecl> = [];
 	var eb8 = json.new_array().to_node();
 	var locp_pw = parser.ParsedWorkflow(body = move eb8, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec8);
 	match move locp_pw_opt { Optional::Some(p) => { locp_pw = move p; }, Optional::None => { return 84; } }
-	val locp_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"let\",\"id\":\"n0\",\"name\":\"p\",\"value\":{\"arg\":[\"req\"]},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"p\",\"path\":[\"reservation\"]}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
-	val locp_l = _graph_canon_of_node(&locp_pw.body);
-	val locp_h = _graph_canon_of_node(&locp_hand);
-	if _str_eq(&locp_h, &"<bad-graph>") { return 85; }
-	if !_str_eq(&locp_l, &locp_h) { return 86; }
+	val locp_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"let\",\"id\":\"n0\",\"name\":\"p\",\"value\":{\"arg\":[\"req\"]},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"p\",\"path\":[\"reservation\"]}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val locp_l = _graph_canon_of_node(locp_pw.body);
+	val locp_h = _graph_canon_of_node(locp_hand);
+	if _str_eq(locp_h, "<bad-graph>") { return 85; }
+	if !_str_eq(locp_l, locp_h) { return 86; }
 
 	// The parser does NOT track scope; an undefined local PARSES but `validate_graph` rejects it (so
 	// malformed binder scope fails at the build gate, before any dispatch).
 	val undef_src = "op reserve { input: { reservation: string } }\nsteps { reserve local nope }\n";
 	var undef_pw_opt: Optional<parser.ParsedWorkflow> = Optional<parser.ParsedWorkflow>::None();
-	match parser.parse_source(&undef_src) { core.Result::Ok(p) => { undef_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 76; } }
+	match parser.parse_source(undef_src) { core.Result::Ok(p) => { undef_pw_opt = Optional<parser.ParsedWorkflow>::Some(move p); }, core.Result::Err(_) => { return 76; } }
 	var ec7: Array<parser.ContractDecl> = [];
 	var eb7 = json.new_array().to_node();
 	var undef_pw = parser.ParsedWorkflow(body = move eb7, is_graph = false, arg_type = Optional<json.JsonNode>::None(), contracts = move ec7);
 	match move undef_pw_opt { Optional::Some(p) => { undef_pw = move p; }, Optional::None => { return 77; } }
-	if !_graph_rejects(&undef_pw.body) { return 78; }
+	if !_graph_rejects(undef_pw.body) { return 78; }
 
 	// malformed: let without '=', a bad expression keyword, a missing expr after '='.
-	if !_parse_err(&"steps { let x arg req\n reserve {} }\n") { return 79; }
-	if !_parse_err(&"steps { reserve bogus }\n") { return 80; }
-	if !_parse_err(&"steps { let x = }\n") { return 81; }
+	if !_parse_err("steps { let x arg req\n reserve {} }\n") { return 79; }
+	if !_parse_err("steps { reserve bogus }\n") { return 80; }
+	if !_parse_err("steps { let x = }\n") { return 81; }
 	// well-formed: a `const` scalar value binds; a const-object op input still works.
-	if !_parse_ok(&"steps { let y = const 5\n reserve { \"reservation\": \"z\" } }\n") { return 82; }
+	if !_parse_ok("steps { let y = const 5\n reserve { \"reservation\": \"z\" } }\n") { return 82; }
 
 	// ---- 11. (slice 2b-ii-a) named op (`let r = <op> …`) + result refs (`result r`) ----
 	// `let r = reserve {…}; confirm result r` lowers to a graph whose IR identity equals the
@@ -352,12 +352,12 @@ fn scenario() -> Int {
 	val res_src = "op reserve { input: { reservation: string } result: { reserved: string } }\n"
 		+ "op confirm { input: { reserved: string } }\n"
 		+ "steps { let r = reserve { \"reservation\": \"A\" }\n confirm result r }\n";
-	val res_body = _parse_body(&res_src);
-	val res_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"confirm\",\"input\":{\"result\":{\"node\":\"n0\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
-	val res_l = _graph_canon_of_node(&res_body);
-	val res_h = _graph_canon_of_node(&res_hand);
-	if _str_eq(&res_h, &"<bad-graph>") { return 87; }
-	if !_str_eq(&res_l, &res_h) { return 88; }
+	val res_body = _parse_body(res_src);
+	val res_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"confirm\",\"input\":{\"result\":{\"node\":\"n0\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val res_l = _graph_canon_of_node(res_body);
+	val res_h = _graph_canon_of_node(res_hand);
+	if _str_eq(res_h, "<bad-graph>") { return 87; }
+	if !_str_eq(res_l, res_h) { return 88; }
 
 	// RESULT REFS ARE STABLE under source formatting AND the result-var name: reformatting + renaming
 	// `r` -> `myRes` yields the IDENTICAL graph identity (the result name is a parser alias, never in
@@ -365,13 +365,13 @@ fn scenario() -> Int {
 	val res2 = "// reformatted\nop reserve { input: { reservation: string }  result: { reserved: string } }\n"
 		+ "op confirm { input: { reserved: string } }\n"
 		+ "steps {\n  let   myRes  =  reserve  {  \"reservation\":  \"A\"  }\n  confirm   result   myRes\n}\n";
-	val res2_body = _parse_body(&res2);
-	val res2_l = _graph_canon_of_node(&res2_body);
-	if !_str_eq(&res2_l, &res_l) { return 89; }
+	val res2_body = _parse_body(res2);
+	val res2_l = _graph_canon_of_node(res2_body);
+	if !_str_eq(res2_l, res_l) { return 89; }
 
 	// unknown result name / duplicate result name -> parse error.
-	if !_parse_err(&"op confirm { input: { reserved: string } }\nsteps { confirm result ghost }\n") { return 90; }
-	if !_parse_err(&"op reserve { input: { reservation: string } }\nop confirm { input: { reserved: string } }\nsteps { let r = reserve { \"reservation\": \"A\" }\n let r = reserve { \"reservation\": \"B\" }\n confirm result r }\n") { return 92; }
+	if !_parse_err("op confirm { input: { reserved: string } }\nsteps { confirm result ghost }\n") { return 90; }
+	if !_parse_err("op reserve { input: { reservation: string } }\nop confirm { input: { reserved: string } }\nsteps { let r = reserve { \"reservation\": \"A\" }\n let r = reserve { \"reservation\": \"B\" }\n confirm result r }\n") { return 92; }
 
 	// CROSS-BRANCH result ref WITHOUT merge: `r` is defined only in the then-branch but referenced
 	// after the join — it PARSES (the parser doesn't track dominance) but `validate_graph` REJECTS it
@@ -379,11 +379,11 @@ fn scenario() -> Int {
 	val xbr_src = "args { flag: bool }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
 		+ "op confirm { input: { reserved: string } }\n"
 		+ "steps { if flag { let r = reserve { \"reservation\": \"A\" } } else { reserve { \"reservation\": \"B\" } } confirm result r }\n";
-	val xbr_body = _parse_body(&xbr_src);
-	if !_graph_rejects(&xbr_body) { return 93; }
+	val xbr_body = _parse_body(xbr_src);
+	if !_graph_rejects(xbr_body) { return 93; }
 
 	// a `let x = result r` (an NLet binding a result expression) parses + lowers fine.
-	if !_parse_ok(&"op reserve { input: { reservation: string } result: { reserved: string } }\nop confirm { input: { reserved: string } }\nsteps { let r = reserve { \"reservation\": \"A\" }\n let x = result r\n confirm local x }\n") { return 94; }
+	if !_parse_ok("op reserve { input: { reservation: string } result: { reserved: string } }\nop confirm { input: { reserved: string } }\nsteps { let r = reserve { \"reservation\": \"A\" }\n let x = result r\n confirm local x }\n") { return 94; }
 
 	// ---- 12. (slice 2b-ii-b) merge clause -> NMerge ----
 	// `if … else … merge picked = result a | result b; confirm local picked` lowers to the exact
@@ -391,28 +391,28 @@ fn scenario() -> Int {
 	val merge_src = "args { flag: bool }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
 		+ "op confirm { input: { reserved: string } }\n"
 		+ "steps { if flag { let a = reserve { \"reservation\": \"mgA\" } } else { let b = reserve { \"reservation\": \"mgB\" } } merge picked = result a | result b\n confirm local picked }\n";
-	val merge_body = _parse_body(&merge_src);
-	val merge_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"mgA\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"mgB\"}},\"next\":\"n3\"},{\"kind\":\"merge\",\"id\":\"n3\",\"name\":\"picked\",\"sources\":[{\"from\":\"n1\",\"value\":{\"result\":{\"node\":\"n1\"}}},{\"from\":\"n2\",\"value\":{\"result\":{\"node\":\"n2\"}}}],\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n4\",\"operation\":\"confirm\",\"input\":{\"local\":{\"name\":\"picked\"}},\"next\":\"n5\"},{\"kind\":\"return\",\"id\":\"n5\",\"value\":{\"const\":null}}]}");
-	val merge_l = _graph_canon_of_node(&merge_body);
-	val merge_h = _graph_canon_of_node(&merge_hand);
-	if _str_eq(&merge_h, &"<bad-graph>") { return 95; }
-	if !_str_eq(&merge_l, &merge_h) { return 96; }
+	val merge_body = _parse_body(merge_src);
+	val merge_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"mgA\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"mgB\"}},\"next\":\"n3\"},{\"kind\":\"merge\",\"id\":\"n3\",\"name\":\"picked\",\"sources\":[{\"from\":\"n1\",\"value\":{\"result\":{\"node\":\"n1\"}}},{\"from\":\"n2\",\"value\":{\"result\":{\"node\":\"n2\"}}}],\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n4\",\"operation\":\"confirm\",\"input\":{\"local\":{\"name\":\"picked\"}},\"next\":\"n5\"},{\"kind\":\"return\",\"id\":\"n5\",\"value\":{\"const\":null}}]}");
+	val merge_l = _graph_canon_of_node(merge_body);
+	val merge_h = _graph_canon_of_node(merge_hand);
+	if _str_eq(merge_h, "<bad-graph>") { return 95; }
+	if !_str_eq(merge_l, merge_h) { return 96; }
 
 	// malformed merge SYNTAX is rejected at parse: no else / no '|' / empty branch / nested-cf branch
 	// (multi-exit) / unknown result alias in an arm value.
-	if !_parse_err(&"args { flag: bool }\nop reserve { input: { reservation: string } }\nsteps { if flag { let a = reserve { \"reservation\": \"A\" } } merge p = result a | result a\n reserve local p }\n") { return 97; }
-	if !_parse_err(&"args { flag: bool }\nop reserve { input: { reservation: string } }\nsteps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = reserve { \"reservation\": \"B\" } } merge p = result a result b\n reserve local p }\n") { return 98; }
-	if !_parse_err(&"args { flag: bool }\nsteps { if flag { } else { } merge p = const 1 | const 2\n ping local p }\n") { return 99; }
-	if !_parse_err(&"args { flag: bool, g: bool }\nsteps { if flag { if g { ping {} } else { ping {} } } else { ping {} } merge p = const 1 | const 2\n ping local p }\n") { return 100; }
-	if !_parse_err(&"args { flag: bool }\nop reserve { input: { reservation: string } }\nsteps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = reserve { \"reservation\": \"B\" } } merge p = result ghost | result b\n reserve local p }\n") { return 101; }
+	if !_parse_err("args { flag: bool }\nop reserve { input: { reservation: string } }\nsteps { if flag { let a = reserve { \"reservation\": \"A\" } } merge p = result a | result a\n reserve local p }\n") { return 97; }
+	if !_parse_err("args { flag: bool }\nop reserve { input: { reservation: string } }\nsteps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = reserve { \"reservation\": \"B\" } } merge p = result a result b\n reserve local p }\n") { return 98; }
+	if !_parse_err("args { flag: bool }\nsteps { if flag { } else { } merge p = const 1 | const 2\n ping local p }\n") { return 99; }
+	if !_parse_err("args { flag: bool, g: bool }\nsteps { if flag { if g { ping {} } else { ping {} } } else { ping {} } merge p = const 1 | const 2\n ping local p }\n") { return 100; }
+	if !_parse_err("args { flag: bool }\nop reserve { input: { reservation: string } }\nsteps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = reserve { \"reservation\": \"B\" } } merge p = result ghost | result b\n reserve local p }\n") { return 101; }
 
 	// SWAPPED arm values (then-value = the else branch's result) PARSE but `validate_graph` rejects:
 	// a merge source's value must be available at its predecessor (the EResult must be in scope there).
 	val swap_src = "args { flag: bool }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
 		+ "op confirm { input: { reserved: string } }\n"
 		+ "steps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = reserve { \"reservation\": \"B\" } } merge p = result b | result a\n confirm local p }\n";
-	val swap_body = _parse_body(&swap_src);
-	if !_graph_rejects(&swap_body) { return 102; }
+	val swap_body = _parse_body(swap_src);
+	if !_graph_rejects(swap_body) { return 102; }
 
 	// TYPE MISMATCH across merge arms: branch A returns {reserved:string}, branch B returns {sum:int}.
 	// The parser-lowered graph + the declared contracts reaches `type_check_graph`, which REJECTS the
@@ -420,115 +420,115 @@ fn scenario() -> Int {
 	val tmm_src = "args { flag: bool }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
 		+ "op confirm { input: { reserved: string } result: { sum: int } }\n"
 		+ "steps { if flag { let a = reserve { \"reservation\": \"A\" } } else { let b = confirm { \"reserved\": \"B\" } } merge picked = result a | result b\n confirm local picked }\n";
-	val tmm_body = _parse_body(&tmm_src);
+	val tmm_body = _parse_body(tmm_src);
 	var tmc: Array<ir.OpContract> = [];
-	tmc.push(_oc("reserve", &"{\"type\":\"object\",\"fields\":[{\"name\":\"reservation\",\"type\":{\"type\":\"string\"}}]}", &"{\"type\":\"object\",\"fields\":[{\"name\":\"reserved\",\"type\":{\"type\":\"string\"}}]}"));
-	tmc.push(_oc("confirm", &"{\"type\":\"object\",\"fields\":[{\"name\":\"reserved\",\"type\":{\"type\":\"string\"}}]}", &"{\"type\":\"object\",\"fields\":[{\"name\":\"sum\",\"type\":{\"type\":\"int\"}}]}"));
-	val tat_node = _pj(&"{\"type\":\"object\",\"fields\":[{\"name\":\"flag\",\"type\":{\"type\":\"bool\"}}]}");
+	tmc.push(_oc("reserve", "{\"type\":\"object\",\"fields\":[{\"name\":\"reservation\",\"type\":{\"type\":\"string\"}}]}", "{\"type\":\"object\",\"fields\":[{\"name\":\"reserved\",\"type\":{\"type\":\"string\"}}]}"));
+	tmc.push(_oc("confirm", "{\"type\":\"object\",\"fields\":[{\"name\":\"reserved\",\"type\":{\"type\":\"string\"}}]}", "{\"type\":\"object\",\"fields\":[{\"name\":\"sum\",\"type\":{\"type\":\"int\"}}]}"));
+	val tat_node = _pj("{\"type\":\"object\",\"fields\":[{\"name\":\"flag\",\"type\":{\"type\":\"bool\"}}]}");
 	var tat = ir.empty_object_type();
-	match ir.parse_object_type(&tat_node) { core.Result::Ok(t) => { tat = move t; }, core.Result::Err(_) => { return 103; } }
-	match ir.parse_graph(&tmm_body) {
+	match ir.parse_object_type(tat_node) { core.Result::Ok(t) => { tat = move t; }, core.Result::Err(_) => { return 103; } }
+	match ir.parse_graph(tmm_body) {
 		core.Result::Ok(g) => {
-			match ir.validate_graph(&g) { Optional::Some(_) => { return 104; }, Optional::None => {} }   // structurally valid
-			match ir.type_check_graph(&g, &tat, &tmc, &Optional<ir.IrType>::None(), &Optional<Array<ir.CallTarget>>::None()) { Optional::Some(_) => {}, Optional::None => { return 105; } }   // type-rejected
+			match ir.validate_graph(g) { Optional::Some(_) => { return 104; }, Optional::None => {} }   // structurally valid
+			match ir.type_check_graph(g, tat, tmc, Optional<ir.IrType>::None(), Optional<Array<ir.CallTarget>>::None()) { Optional::Some(_) => {}, Optional::None => { return 105; } }   // type-rejected
 		},
 		core.Result::Err(_) => { return 106; }
 	}
 
 	// `merge` is a CONTEXTUAL keyword: an operation literally named `merge` after an if/else (`merge
 	// { … }` — not `merge <ident> =`) parses as an op step, NOT a merge clause.
-	if !_parse_ok(&"args { flag: bool }\nsteps { if flag { ping {} } else { ping {} } merge { \"x\": 1 } }\n") { return 107; }
+	if !_parse_ok("args { flag: bool }\nsteps { if flag { ping {} } else { ping {} } merge { \"x\": 1 } }\n") { return 107; }
 
 	// ---- 13. (slice 2b-iii) map/filter/fold -> NLoop ----
 	// Each loop form lowers to the hand-authored NLoop graph identity (map/filter omit `init`; fold
 	// carries it). Bodies are pure expressions over `local <elem>` (+ `local <as>` for fold).
-	val map_body = _parse_body(&"args { cands: [ { reservation: string } ] }\nsteps { let xs = map arg cands each c local c\n reserve local xs }\n");
-	val map_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"cands\"]},\"elem\":\"c\",\"as\":\"xs\",\"body\":{\"local\":{\"name\":\"c\"}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"xs\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
-	val map_l = _graph_canon_of_node(&map_body);
-	val map_h = _graph_canon_of_node(&map_hand);
-	if _str_eq(&map_h, &"<bad-graph>") { return 108; }
-	if !_str_eq(&map_l, &map_h) { return 109; }
+	val map_body = _parse_body("args { cands: [ { reservation: string } ] }\nsteps { let xs = map arg cands each c local c\n reserve local xs }\n");
+	val map_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"map\",\"id\":\"n0\",\"source\":{\"arg\":[\"cands\"]},\"elem\":\"c\",\"as\":\"xs\",\"body\":{\"local\":{\"name\":\"c\"}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"xs\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val map_l = _graph_canon_of_node(map_body);
+	val map_h = _graph_canon_of_node(map_hand);
+	if _str_eq(map_h, "<bad-graph>") { return 108; }
+	if !_str_eq(map_l, map_h) { return 109; }
 
-	val flt_body = _parse_body(&"args { cands: [ { keep: bool } ] }\nsteps { let ys = filter arg cands each c local c.keep\n reserve local ys }\n");
-	val flt_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"filter\",\"id\":\"n0\",\"source\":{\"arg\":[\"cands\"]},\"elem\":\"c\",\"as\":\"ys\",\"body\":{\"local\":{\"name\":\"c\",\"path\":[\"keep\"]}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"ys\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
-	val flt_l = _graph_canon_of_node(&flt_body);
-	val flt_h = _graph_canon_of_node(&flt_hand);
-	if !_str_eq(&flt_l, &flt_h) { return 110; }
+	val flt_body = _parse_body("args { cands: [ { keep: bool } ] }\nsteps { let ys = filter arg cands each c local c.keep\n reserve local ys }\n");
+	val flt_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"filter\",\"id\":\"n0\",\"source\":{\"arg\":[\"cands\"]},\"elem\":\"c\",\"as\":\"ys\",\"body\":{\"local\":{\"name\":\"c\",\"path\":[\"keep\"]}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"ys\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val flt_l = _graph_canon_of_node(flt_body);
+	val flt_h = _graph_canon_of_node(flt_hand);
+	if !_str_eq(flt_l, flt_h) { return 110; }
 
-	val fold_body = _parse_body(&"args { cands: [ { reservation: string } ] }\nsteps { let last = fold arg cands from const null each c local c\n reserve local last }\n");
-	val fold_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"fold\",\"id\":\"n0\",\"source\":{\"arg\":[\"cands\"]},\"elem\":\"c\",\"as\":\"last\",\"init\":{\"const\":null},\"body\":{\"local\":{\"name\":\"c\"}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"last\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
-	val fold_l = _graph_canon_of_node(&fold_body);
-	val fold_h = _graph_canon_of_node(&fold_hand);
-	if !_str_eq(&fold_l, &fold_h) { return 111; }
+	val fold_body = _parse_body("args { cands: [ { reservation: string } ] }\nsteps { let last = fold arg cands from const null each c local c\n reserve local last }\n");
+	val fold_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"fold\",\"id\":\"n0\",\"source\":{\"arg\":[\"cands\"]},\"elem\":\"c\",\"as\":\"last\",\"init\":{\"const\":null},\"body\":{\"local\":{\"name\":\"c\"}},\"next\":\"n1\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"local\":{\"name\":\"last\"}},\"next\":\"n2\"},{\"kind\":\"return\",\"id\":\"n2\",\"value\":{\"const\":null}}]}");
+	val fold_l = _graph_canon_of_node(fold_body);
+	val fold_h = _graph_canon_of_node(fold_hand);
+	if !_str_eq(fold_l, fold_h) { return 111; }
 
 	// elem == as collision PARSES but `validate_graph` rejects (the loop element and result names must
 	// differ). Malformed loop SYNTAX (missing `each`, fold missing `from`) is a parse error.
-	val coll_body = _parse_body(&"args { cands: [ { reservation: string } ] }\nsteps { let e = map arg cands each e local e\n reserve local e }\n");
-	if !_graph_rejects(&coll_body) { return 112; }
-	if !_parse_err(&"args { cands: [ { reservation: string } ] }\nsteps { let ys = map arg cands local e\n reserve local ys }\n") { return 113; }
-	if !_parse_err(&"args { cands: [ { reservation: string } ] }\nsteps { let ys = fold arg cands each c local c\n reserve local ys }\n") { return 114; }
+	val coll_body = _parse_body("args { cands: [ { reservation: string } ] }\nsteps { let e = map arg cands each e local e\n reserve local e }\n");
+	if !_graph_rejects(coll_body) { return 112; }
+	if !_parse_err("args { cands: [ { reservation: string } ] }\nsteps { let ys = map arg cands local e\n reserve local ys }\n") { return 113; }
+	if !_parse_err("args { cands: [ { reservation: string } ] }\nsteps { let ys = fold arg cands each c local c\n reserve local ys }\n") { return 114; }
 	// a map/filter/fold whose source is a plain identifier (`map cands …`) is a parse error — the
 	// source must be an expression (`arg`/`local`/`result`/`const`/`{…}`), not a bare name.
-	if !_parse_err(&"args { cands: [ { reservation: string } ] }\nsteps { let ys = map cands each c local c\n reserve local ys }\n") { return 115; }
+	if !_parse_err("args { cands: [ { reservation: string } ] }\nsteps { let ys = map cands each c local c\n reserve local ys }\n") { return 115; }
 
 	// ---- 14. (diagnostics) parse errors are STRUCTURED events: stable `code` + byte_offset/line/column
 	// (+ expected/found). Tests pin the CODE and POSITION fields (not the human prose). ----
 	// A. bad top-level keyword: `frob` at line 1, column 1, byte 0; found = "frob".
-	val eA = _err_of(&"frob {}\nsteps { ping {} }\n");
-	if !_str_eq(&eA.code, &"unknown-keyword") { return 116; }
+	val eA = _err_of("frob {}\nsteps { ping {} }\n");
+	if !_str_eq(eA.code, "unknown-keyword") { return 116; }
 	if eA.byte_offset != 0 or eA.line != 1 or eA.column != 1 { return 117; }
-	if !_str_eq(&eA.found, &"frob") { return 118; }
+	if !_str_eq(eA.found, "frob") { return 118; }
 	// B. bad type: `blob` at line 1, column 11, byte 10; found = "blob".
-	val eB = _err_of(&"args { x: blob }\nsteps { ping {} }\n");
-	if !_str_eq(&eB.code, &"unknown-type") { return 119; }
+	val eB = _err_of("args { x: blob }\nsteps { ping {} }\n");
+	if !_str_eq(eB.code, "unknown-type") { return 119; }
 	if eB.byte_offset != 10 or eB.line != 1 or eB.column != 11 { return 120; }
-	if !_str_eq(&eB.found, &"blob") { return 121; }
+	if !_str_eq(eB.found, "blob") { return 121; }
 	// C. bad expression keyword: `bogus` at line 1, column 17, byte 16.
-	val eC = _err_of(&"steps { reserve bogus }\n");
-	if !_str_eq(&eC.code, &"expected-expression") { return 122; }
+	val eC = _err_of("steps { reserve bogus }\n");
+	if !_str_eq(eC.code, "expected-expression") { return 122; }
 	if eC.byte_offset != 16 or eC.line != 1 or eC.column != 17 { return 123; }
 	// D. unterminated block: at EOF (line 1, column 8, byte 7).
-	val eD = _err_of(&"steps {");
-	if !_str_eq(&eD.code, &"unterminated-block") { return 124; }
+	val eD = _err_of("steps {");
+	if !_str_eq(eD.code, "unterminated-block") { return 124; }
 	if eD.byte_offset != 7 or eD.line != 1 or eD.column != 8 { return 125; }
 	// E. case default ordering (code + line 2; an arm after `default`).
-	val eE = _err_of(&"args { m: string }\nsteps { case m { default { ping {} } \"a\" { ping {} } } }\n");
-	if !_str_eq(&eE.code, &"case-arm-after-default") { return 126; }
+	val eE = _err_of("args { m: string }\nsteps { case m { default { ping {} } \"a\" { ping {} } } }\n");
+	if !_str_eq(eE.code, "case-arm-after-default") { return 126; }
 	if eE.line != 2 { return 127; }
 	// F. malformed loop syntax (code + line 2; `map` without `each`).
-	val eF = _err_of(&"args { xs: [int] }\nsteps { let ys = map arg xs local e\n reserve {} }\n");
-	if !_str_eq(&eF.code, &"expected-each") { return 128; }
+	val eF = _err_of("args { xs: [int] }\nsteps { let ys = map arg xs local e\n reserve {} }\n");
+	if !_str_eq(eF.code, "expected-each") { return 128; }
 	if eF.line != 2 { return 129; }
 	// G. an expected-token error carries the `expected` field ('{' here).
-	val eG = _err_of(&"steps ping {}\n");   // 'steps' must be followed by '{'
-	if !_str_eq(&eG.code, &"expected-token") { return 130; }
-	if !_str_eq(&eG.expected, &"'{'") { return 131; }
+	val eG = _err_of("steps ping {}\n");   // 'steps' must be followed by '{'
+	if !_str_eq(eG.code, "expected-token") { return 130; }
+	if !_str_eq(eG.expected, "'{'") { return 131; }
 
 	// SMOKE: the human render includes the code, line/column, and a caret.
-	val rendered = parser.render_diagnostic(&"frob {}\nsteps { ping {} }\n", &eA);
-	if !_contains(&rendered, &"unknown-keyword") { return 132; }
-	if !_contains(&rendered, &"line 1, column 1") { return 133; }
-	if !_contains(&rendered, &"^") { return 134; }
+	val rendered = parser.render_diagnostic("frob {}\nsteps { ping {} }\n", eA);
+	if !_contains(rendered, "unknown-keyword") { return 132; }
+	if !_contains(rendered, "line 1, column 1") { return 133; }
+	if !_contains(rendered, "^") { return 134; }
 
 	// MULTIBYTE: `byte_offset` counts BYTES, `column` counts SCALARS. A 2-byte `é` before the error
 	// (the missing input of `bad`, at the final `}`) means byte_offset (34) and column (34) are EQUAL —
 	// i.e. column is one LESS than the byte-based column (35) would be. Pins the scalar-column contract.
-	val eM = _err_of(&"steps { ping { \"m\": \"café\" } bad }\n");
-	if !_str_eq(&eM.code, &"expected-expression") { return 135; }
+	val eM = _err_of("steps { ping { \"m\": \"café\" } bad }\n");
+	if !_str_eq(eM.code, "expected-expression") { return 135; }
 	if eM.line != 1 { return 136; }
 	if eM.byte_offset != 34 { return 137; }
 	if eM.column != 34 { return 138; }
 
 	// NO-POSITION diagnostic (a config/lowering error, byte_offset = -1) renders WITHOUT a source
 	// excerpt/caret — clamping to byte 0 / line 0 would be misleading.
-	match parser.lower(&"op ghost { input: { x: int } }\nsteps { reserve { \"reservation\": \"p\" } }\n", &base) {
+	match parser.lower("op ghost { input: { x: int } }\nsteps { reserve { \"reservation\": \"p\" } }\n", base) {
 		core.Result::Ok(_) => { return 139; },
 		core.Result::Err(eN) => {
 			if eN.byte_offset != -1 { return 140; }
-			val rN = parser.render_diagnostic(&"some unrelated source\ntext\n", &eN);
-			if !_contains(&rN, &"unknown-operation") { return 141; }
-			if _contains(&rN, &"^") { return 142; }        // no caret for a no-position error
-			if _contains(&rN, &"line 0") { return 143; }   // no bogus "line 0"
+			val rN = parser.render_diagnostic("some unrelated source\ntext\n", eN);
+			if !_contains(rN, "unknown-operation") { return 141; }
+			if _contains(rN, "^") { return 142; }        // no caret for a no-position error
+			if _contains(rN, "line 0") { return 143; }   // no bogus "line 0"
 		}
 	}
 
@@ -539,64 +539,64 @@ fn scenario() -> Int {
 	val cm_src = "args { kind: int }\nop reserve { input: { reservation: string } result: { reserved: string } }\n"
 		+ "op confirm { input: { reserved: string } }\n"
 		+ "steps { case kind { 1 { let a = reserve { \"reservation\": \"A\" } } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b | result d\n confirm local picked }\n";
-	val cm_body = _parse_body(&cm_src);
-	val cm_hand = _pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"kind\"]},\"arms\":[{\"match\":1,\"target\":\"n1\"},{\"match\":2,\"target\":\"n2\"}],\"default\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"D\"}},\"next\":\"n4\"},{\"kind\":\"merge\",\"id\":\"n4\",\"name\":\"picked\",\"sources\":[{\"from\":\"n1\",\"value\":{\"result\":{\"node\":\"n1\"}}},{\"from\":\"n2\",\"value\":{\"result\":{\"node\":\"n2\"}}},{\"from\":\"n3\",\"value\":{\"result\":{\"node\":\"n3\"}}}],\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n5\",\"operation\":\"confirm\",\"input\":{\"local\":{\"name\":\"picked\"}},\"next\":\"n6\"},{\"kind\":\"return\",\"id\":\"n6\",\"value\":{\"const\":null}}]}");
-	val cm_l = _graph_canon_of_node(&cm_body);
-	val cm_h = _graph_canon_of_node(&cm_hand);
-	if _str_eq(&cm_h, &"<bad-graph>") { return 144; }
-	if !_str_eq(&cm_l, &cm_h) { return 145; }
+	val cm_body = _parse_body(cm_src);
+	val cm_hand = _pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"case\",\"id\":\"n0\",\"scrutinee\":{\"arg\":[\"kind\"]},\"arms\":[{\"match\":1,\"target\":\"n1\"},{\"match\":2,\"target\":\"n2\"}],\"default\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n4\"},{\"kind\":\"operation\",\"id\":\"n3\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"D\"}},\"next\":\"n4\"},{\"kind\":\"merge\",\"id\":\"n4\",\"name\":\"picked\",\"sources\":[{\"from\":\"n1\",\"value\":{\"result\":{\"node\":\"n1\"}}},{\"from\":\"n2\",\"value\":{\"result\":{\"node\":\"n2\"}}},{\"from\":\"n3\",\"value\":{\"result\":{\"node\":\"n3\"}}}],\"next\":\"n5\"},{\"kind\":\"operation\",\"id\":\"n5\",\"operation\":\"confirm\",\"input\":{\"local\":{\"name\":\"picked\"}},\"next\":\"n6\"},{\"kind\":\"return\",\"id\":\"n6\",\"value\":{\"const\":null}}]}");
+	val cm_l = _graph_canon_of_node(cm_body);
+	val cm_h = _graph_canon_of_node(cm_hand);
+	if _str_eq(cm_h, "<bad-graph>") { return 144; }
+	if !_str_eq(cm_l, cm_h) { return 145; }
 
 	// arity mismatch: 2 values for 2 arms + default (needs 3) is a parse error.
-	if !_parse_err(&"args { kind: int }\nop reserve { input: { reservation: string } }\nsteps { case kind { 1 { let a = reserve { \"reservation\": \"A\" } } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b\n reserve local picked }\n") { return 146; }
+	if !_parse_err("args { kind: int }\nop reserve { input: { reservation: string } }\nsteps { case kind { 1 { let a = reserve { \"reservation\": \"A\" } } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b\n reserve local picked }\n") { return 146; }
 	// a non-single-exit arm (ends in a nested if) is a parse error (it would create >1 predecessor).
-	if !_parse_err(&"args { kind: int, g: bool }\nop reserve { input: { reservation: string } }\nsteps { case kind { 1 { if g { reserve {} } else { reserve {} } } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b | result d\n reserve local picked }\n") { return 147; }
+	if !_parse_err("args { kind: int, g: bool }\nop reserve { input: { reservation: string } }\nsteps { case kind { 1 { if g { reserve {} } else { reserve {} } } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b | result d\n reserve local picked }\n") { return 147; }
 	// an EMPTY arm body with a merge is a parse error (no source for that predecessor).
-	if !_parse_err(&"args { kind: int }\nop reserve { input: { reservation: string } }\nsteps { case kind { 1 { } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b | result d\n reserve local picked }\n") { return 148; }
+	if !_parse_err("args { kind: int }\nop reserve { input: { reservation: string } }\nsteps { case kind { 1 { } 2 { let b = reserve { \"reservation\": \"B\" } } default { let d = reserve { \"reservation\": \"D\" } } } merge picked = result a | result b | result d\n reserve local picked }\n") { return 148; }
 
 	// ---- 16. expression object/array construction ----
 	// An ALL-CONSTANT object literal FOLDS to a const (stays a flat "plan", byte-identical to before);
 	// a literal with ANY dynamic field becomes a "graph" (EObject construction).
-	if _lowers_to_graph(&"args { x: string }\nop reserve { input: { reservation: string } }\nsteps { reserve { reservation: \"A\" } }\n") { return 170; }   // all-const folds -> plan
-	if !_lowers_to_graph(&"args { x: string }\nop reserve { input: { reservation: string } }\nsteps { reserve { reservation: arg x } }\n") { return 171; }   // dynamic -> graph
+	if _lowers_to_graph("args { x: string }\nop reserve { input: { reservation: string } }\nsteps { reserve { reservation: \"A\" } }\n") { return 170; }   // all-const folds -> plan
+	if !_lowers_to_graph("args { x: string }\nop reserve { input: { reservation: string } }\nsteps { reserve { reservation: arg x } }\n") { return 171; }   // dynamic -> graph
 
 	// A dynamic object construction lowers to {object:{...}} matching the hand-authored EObject graph.
 	val co_src = "args { req: string }\nop reserve { input: { reservation: string } }\nsteps { reserve { reservation: arg req } }\n";
-	val co_l = _graph_canon_of_node(&_parse_body(&co_src));
-	val co_h = _graph_canon_of_node(&_pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"object\":{\"reservation\":{\"arg\":[\"req\"]}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
-	if _str_eq(&co_h, &"<bad-graph>") { return 172; }
-	if !_str_eq(&co_l, &co_h) { return 173; }
+	val co_l = _graph_canon_of_node(_parse_body(co_src));
+	val co_h = _graph_canon_of_node(_pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"reserve\",\"input\":{\"object\":{\"reservation\":{\"arg\":[\"req\"]}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
+	if _str_eq(co_h, "<bad-graph>") { return 172; }
+	if !_str_eq(co_l, co_h) { return 173; }
 
 	// A MIXED object (one const + one dynamic field) does NOT fold; the const field stays {const}.
 	val cm_src2 = "args { y: int }\nop op1 { input: { } }\nsteps { op1 { a: \"x\", b: arg y } }\n";
-	val cm_l2 = _graph_canon_of_node(&_parse_body(&cm_src2));
-	val cm_h2 = _graph_canon_of_node(&_pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"op1\",\"input\":{\"object\":{\"a\":{\"const\":\"x\"},\"b\":{\"arg\":[\"y\"]}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
-	if _str_eq(&cm_h2, &"<bad-graph>") { return 174; }
-	if !_str_eq(&cm_l2, &cm_h2) { return 175; }
+	val cm_l2 = _graph_canon_of_node(_parse_body(cm_src2));
+	val cm_h2 = _graph_canon_of_node(_pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"op1\",\"input\":{\"object\":{\"a\":{\"const\":\"x\"},\"b\":{\"arg\":[\"y\"]}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
+	if _str_eq(cm_h2, "<bad-graph>") { return 174; }
+	if !_str_eq(cm_l2, cm_h2) { return 175; }
 
 	// A top-level array construction with a dynamic element lowers to {array:[...]} (order preserved).
 	val ca_src = "args { a: int }\nop pack { }\nsteps { pack [ arg a, const 1 ] }\n";
-	val ca_l = _graph_canon_of_node(&_parse_body(&ca_src));
-	val ca_h = _graph_canon_of_node(&_pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"pack\",\"input\":{\"array\":[{\"arg\":[\"a\"]},{\"const\":1}]},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
-	if _str_eq(&ca_h, &"<bad-graph>") { return 176; }
-	if !_str_eq(&ca_l, &ca_h) { return 177; }
+	val ca_l = _graph_canon_of_node(_parse_body(ca_src));
+	val ca_h = _graph_canon_of_node(_pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"pack\",\"input\":{\"array\":[{\"arg\":[\"a\"]},{\"const\":1}]},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
+	if _str_eq(ca_h, "<bad-graph>") { return 176; }
+	if !_str_eq(ca_l, ca_h) { return 177; }
 
 	// FOLD inside a graph: all-const constructions in if-branches lower IDENTICALLY to {const} inputs
 	// (so an existing const-input workflow's content_hash is unchanged when written with `{…}` syntax).
 	val cf_src = "args { flag: bool }\nop reserve { input: { reservation: string } }\nsteps { if flag { reserve { reservation: \"A\" } } else { reserve { reservation: \"B\" } } }\n";
-	val cf_l = _graph_canon_of_node(&_parse_body(&cf_src));
-	val cf_h = _graph_canon_of_node(&_pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n3\"},{\"kind\":\"return\",\"id\":\"n3\",\"value\":{\"const\":null}}]}"));
-	if _str_eq(&cf_h, &"<bad-graph>") { return 178; }
-	if !_str_eq(&cf_l, &cf_h) { return 179; }
+	val cf_l = _graph_canon_of_node(_parse_body(cf_src));
+	val cf_h = _graph_canon_of_node(_pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"if\",\"id\":\"n0\",\"cond\":{\"arg\":[\"flag\"]},\"then\":\"n1\",\"else\":\"n2\"},{\"kind\":\"operation\",\"id\":\"n1\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"A\"}},\"next\":\"n3\"},{\"kind\":\"operation\",\"id\":\"n2\",\"operation\":\"reserve\",\"input\":{\"const\":{\"reservation\":\"B\"}},\"next\":\"n3\"},{\"kind\":\"return\",\"id\":\"n3\",\"value\":{\"const\":null}}]}"));
+	if _str_eq(cf_h, "<bad-graph>") { return 178; }
+	if !_str_eq(cf_l, cf_h) { return 179; }
 
 	// Malformed construction: a DUPLICATE field key, and a bad value keyword, are parse errors.
-	if !_parse_err(&"args { y: int }\nop op1 { }\nsteps { op1 { a: arg y, a: const 1 } }\n") { return 180; }
-	if !_parse_err(&"args { y: int }\nop op1 { }\nsteps { op1 { a: frob y } }\n") { return 181; }
+	if !_parse_err("args { y: int }\nop op1 { }\nsteps { op1 { a: arg y, a: const 1 } }\n") { return 180; }
+	if !_parse_err("args { y: int }\nop op1 { }\nsteps { op1 { a: frob y } }\n") { return 181; }
 	// A nested construction (object inside object) lowers through recursively.
 	val cn_src = "args { z: string }\nop op1 { }\nsteps { op1 { outer: { inner: arg z } } }\n";
-	val cn_l = _graph_canon_of_node(&_parse_body(&cn_src));
-	val cn_h = _graph_canon_of_node(&_pj(&"{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"op1\",\"input\":{\"object\":{\"outer\":{\"object\":{\"inner\":{\"arg\":[\"z\"]}}}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
-	if _str_eq(&cn_h, &"<bad-graph>") { return 182; }
-	if !_str_eq(&cn_l, &cn_h) { return 183; }
+	val cn_l = _graph_canon_of_node(_parse_body(cn_src));
+	val cn_h = _graph_canon_of_node(_pj("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"operation\",\"id\":\"n0\",\"operation\":\"op1\",\"input\":{\"object\":{\"outer\":{\"object\":{\"inner\":{\"arg\":[\"z\"]}}}}},\"next\":\"n1\"},{\"kind\":\"return\",\"id\":\"n1\",\"value\":{\"const\":null}}]}"));
+	if _str_eq(cn_h, "<bad-graph>") { return 182; }
+	if !_str_eq(cn_l, cn_h) { return 183; }
 
 	return 0;
 }
@@ -618,8 +618,8 @@ fn _oc(name: String, in_str: &String, out_str: &String) -> ir.OpContract {
 	val in_node = _pj(in_str);
 	val out_node = _pj(out_str);
 	return ir.OpContract(name = move name,
-		input_type = Optional<ir.IrType>::Some(ir.parse_type(&in_node)),
-		result_type = Optional<ir.IrType>::Some(ir.parse_type(&out_node)));
+		input_type = Optional<ir.IrType>::Some(ir.parse_type(in_node)),
+		result_type = Optional<ir.IrType>::Some(ir.parse_type(out_node)));
 }
 
 // Parse a source and return its lowered body graph/plan node (aborts the scenario on a parse error).
@@ -642,7 +642,7 @@ fn _lowers_to_graph(src: &String) -> Bool {
 // Parse a graph node ({entry,nodes}) and return its canonical IR identity (or a sentinel).
 fn _graph_canon_of_node(node: &json.JsonNode) -> String {
 	match ir.parse_graph(node) {
-		core.Result::Ok(g) => { return ir.graph_canonical(&g); },
+		core.Result::Ok(g) => { return ir.graph_canonical(g); },
 		core.Result::Err(_) => { return "<bad-graph>"; }
 	}
 }
@@ -651,7 +651,7 @@ fn _graph_canon_of_node(node: &json.JsonNode) -> String {
 fn _graph_rejects(node: &json.JsonNode) -> Bool {
 	match ir.parse_graph(node) {
 		core.Result::Ok(g) => {
-			match ir.validate_graph(&g) { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
+			match ir.validate_graph(g) { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
 		},
 		core.Result::Err(_) => { return true; }
 	}
@@ -659,20 +659,20 @@ fn _graph_rejects(node: &json.JsonNode) -> Bool {
 
 fn _find(cs: &Array<parser.ContractDecl>, name: &String) nothrow -> Int {
 	var i = 0;
-	while i < cs.len { if _str_eq(&cs[i].name, name) { return i; } i = i + 1; }
+	while i < cs.len { if _str_eq(cs[i].name, name) { return i; } i = i + 1; }
 	return -1;
 }
 
 // Returns the operation's name if present in merged.operations, else a sentinel.
 fn _op_by_name(merged: &json.JsonNode, name: &String) nothrow -> String {
-	match merged.get(&"operations") {
+	match merged.get("operations") {
 		Optional::Some(on) => {
 			match on.as_array() {
 				Optional::Some(items) => {
 					var i = 0;
 					while i < items.len {
-						match items[i].get(&"name") {
-							Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { if _str_eq(&s, name) { return move s; } }, Optional::None => {} } },
+						match items[i].get("name") {
+							Optional::Some(n) => { match n.as_string() { Optional::Some(s) => { if _str_eq(s, name) { return move s; } }, Optional::None => {} } },
 							Optional::None => {}
 						}
 						i = i + 1;

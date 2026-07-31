@@ -196,7 +196,7 @@ pub struct SingularIdentity {
 // SingularIdentity directly if they have a lease_owner from elsewhere.
 pub fn identity_from_worker_name(service_group: String, worker_name: &String) nothrow -> SingularIdentity {
     val u: uuid.Uuid = uuid.v3_from_string(worker_name);
-    val bytes: Array<Byte> = uuid.to_bytes(&u);
+    val bytes: Array<Byte> = uuid.to_bytes(u);
     return SingularIdentity(service_group = move service_group, lease_owner = move bytes);
 }
 
@@ -414,7 +414,7 @@ pub fn build_gateway(var b: SingularGatewayBuilder) nothrow
 
     // Extract the validated identity into a local.
     var identity_local: Optional<SingularIdentity> = Optional<SingularIdentity>::None();
-    mem.swap(&mut b.identity, &mut identity_local);
+    mem.swap(b.identity, identity_local);
     var taken_identity: SingularIdentity = match move identity_local {
         Optional::Some(v) => { move v },
         Optional::None => { _dummy_identity() }
@@ -422,7 +422,7 @@ pub fn build_gateway(var b: SingularGatewayBuilder) nothrow
 
     // Extract the validated JsonNode into a local.
     var json_local: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
-    mem.swap(&mut b.json_config, &mut json_local);
+    mem.swap(b.json_config, json_local);
     val cfg_node: json.JsonNode = match move json_local {
         Optional::Some(n) => { move n },
         Optional::None => { json.new_object().to_node() }
@@ -430,7 +430,7 @@ pub fn build_gateway(var b: SingularGatewayBuilder) nothrow
 
     // Extract the optional sink (move ownership — Callback1 is not cloneable).
     var sink_local: Optional<core.Callback1<SingularEvent, Void> > = Optional<core.Callback1<SingularEvent, Void> >::None();
-    mem.swap(&mut b.event_sink, &mut sink_local);
+    mem.swap(b.event_sink, sink_local);
 
     // Config parsing is errors-as-values: the parsers RETURN Result<_, ConfigError> so the
     // structured error stays a movable native value and never round-trips through throw/catch.
@@ -442,12 +442,12 @@ pub fn build_gateway(var b: SingularGatewayBuilder) nothrow
     // Statement-form matches: the Err arm returns the (movable) native ConfigError value; the
     // Ok arm carries the parsed config forward. No expression-form `val = match` here — an
     // early-`return` is only legal inside a statement-form arm.
-    match _build_rpc_config_from_json(&cfg_node) {
+    match _build_rpc_config_from_json(cfg_node) {
         core.Result::Err(cfg_err) => {
             return core.Result<arc.Arc<SingularGateway>, ConfigError>::Err(move cfg_err);
         },
         core.Result::Ok(rpc_cfg) => {
-            match _build_pool_config_from_json(&cfg_node, move sink_local) {
+            match _build_pool_config_from_json(cfg_node, move sink_local) {
                 core.Result::Err(cfg_err) => {
                     return core.Result<arc.Arc<SingularGateway>, ConfigError>::Err(move cfg_err);
                 },
@@ -461,7 +461,7 @@ pub fn build_gateway(var b: SingularGatewayBuilder) nothrow
                         core.Result::Err(open_err) => {
                             return core.Result<arc.Arc<SingularGateway>, ConfigError>::Err(
                                 ConfigError(
-                                    kind = ConfigErrorKind::PoolOpenFailed(upstream_tag = _dup(&open_err.tag)),
+                                    kind = ConfigErrorKind::PoolOpenFailed(upstream_tag = _dup(open_err.tag)),
                                     path = ""
                                 )
                             );
@@ -493,7 +493,7 @@ fn _build_rpc_config_from_json(node: &json.JsonNode)
     // (A statement-form match may `return` from an arm; the expression-form `val x = match …`
     // may not — its arms must each end in a value.)
     var backend: String = "";
-    match _read_required_string(node, &"backend") {
+    match _read_required_string(node, "backend") {
         core.Result::Ok(s) => { backend = move s; },
         core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, ConfigError>::Err(move e); }
     }
@@ -503,12 +503,12 @@ fn _build_rpc_config_from_json(node: &json.JsonNode)
         );
     }
     var host: String = "";
-    match _read_required_string(node, &"host") {
+    match _read_required_string(node, "host") {
         core.Result::Ok(s) => { host = move s; },
         core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, ConfigError>::Err(move e); }
     }
     var port: Int = 0;
-    match _read_required_int(node, &"port") {
+    match _read_required_int(node, "port") {
         core.Result::Ok(v) => { port = v; },
         core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, ConfigError>::Err(move e); }
     }
@@ -518,22 +518,22 @@ fn _build_rpc_config_from_json(node: &json.JsonNode)
         );
     }
     var user: String = "";
-    match _read_required_string(node, &"user") {
+    match _read_required_string(node, "user") {
         core.Result::Ok(s) => { user = move s; },
         core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, ConfigError>::Err(move e); }
     }
     var password: String = "";
-    match _read_required_string(node, &"password") {
+    match _read_required_string(node, "password") {
         core.Result::Ok(s) => { password = move s; },
         core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, ConfigError>::Err(move e); }
     }
     var database: String = "";
-    match _read_required_string(node, &"database") {
+    match _read_required_string(node, "database") {
         core.Result::Ok(s) => { database = move s; },
         core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, ConfigError>::Err(move e); }
     }
-    val connect_timeout_ms: Int = _read_optional_positive_int(node, &"connect_timeout_ms", 5000);
-    val io_timeout_ms: Int = _read_optional_positive_int(node, &"io_timeout_ms", 30000);
+    val connect_timeout_ms: Int = _read_optional_positive_int(node, "connect_timeout_ms", 5000);
+    val io_timeout_ms: Int = _read_optional_positive_int(node, "io_timeout_ms", 30000);
 
     var builder = rpc.new_connection_config_builder();
     builder.with_host(move host);
@@ -564,31 +564,31 @@ fn _build_pool_config_from_json(node: &json.JsonNode,
 {
     var pc: pool.PoolConfig = pool.default_pool_config();
 
-    val pool_opt: Optional<&json.JsonNode> = node.get(&"pool");
+    val pool_opt: Optional<&json.JsonNode> = node.get("pool");
     match pool_opt {
         Optional::Some(psub) => {
-            match psub.get_int_at_path(&"min_idle") {
+            match psub.get_int_at_path("min_idle") {
                 Optional::Some(v) => {
                     if v < 0 { return core.Result<pool.PoolConfig, ConfigError>::Err(ConfigError(kind = ConfigErrorKind::JsonPoolSizingInvalid(key = "min_idle", value = v), path = "pool.min_idle")); }
                     pc.min_idle = v;
                 },
                 Optional::None => {}
             }
-            match psub.get_int_at_path(&"max_conns") {
+            match psub.get_int_at_path("max_conns") {
                 Optional::Some(v) => {
                     if v < 1 { return core.Result<pool.PoolConfig, ConfigError>::Err(ConfigError(kind = ConfigErrorKind::JsonPoolSizingInvalid(key = "max_conns", value = v), path = "pool.max_conns")); }
                     pc.max_conns = v;
                 },
                 Optional::None => {}
             }
-            match psub.get_int_at_path(&"idle_timeout_ms") {
+            match psub.get_int_at_path("idle_timeout_ms") {
                 Optional::Some(v) => {
                     if v <= 0 { return core.Result<pool.PoolConfig, ConfigError>::Err(ConfigError(kind = ConfigErrorKind::JsonTimeoutNonPositive(key = "idle_timeout_ms", value = v), path = "pool.idle_timeout_ms")); }
                     pc.idle_timeout_ms = v;
                 },
                 Optional::None => {}
             }
-            match psub.get_int_at_path(&"keepalive_interval_ms") {
+            match psub.get_int_at_path("keepalive_interval_ms") {
                 Optional::Some(v) => {
                     if v < 0 { return core.Result<pool.PoolConfig, ConfigError>::Err(ConfigError(kind = ConfigErrorKind::JsonTimeoutNonPositive(key = "keepalive_interval_ms", value = v), path = "pool.keepalive_interval_ms")); }
                     pc.keepalive_interval_ms = v;
@@ -624,7 +624,7 @@ fn _build_pool_config_from_json(node: &json.JsonNode,
         };
         val translator: core.Callback1<pool.PoolEvent, Void> = core.callback1(
             |ev: pool.PoolEvent| captures(move sink_owned) => {
-                match _translate_pool_event(&ev) {
+                match _translate_pool_event(ev) {
                     Optional::Some(sev) => { sink_owned.call(sev); },
                     Optional::None => {}
                 }
@@ -646,9 +646,9 @@ fn _dummy_singular_sink() nothrow -> core.Callback1<SingularEvent, Void> {
 // block-forever is expressed at the API as the named Forever, which Singular
 // never uses).
 fn _read_acquire_timeout_ms(node: &json.JsonNode) nothrow -> core.Result<Int, ConfigError> {
-    match node.get(&"pool") {
+    match node.get("pool") {
         Optional::Some(psub) => {
-            match psub.get_int_at_path(&"acquire_timeout_ms") {
+            match psub.get_int_at_path("acquire_timeout_ms") {
                 Optional::Some(v) => {
                     if v <= 0 { return core.Result<Int, ConfigError>::Err(ConfigError(kind = ConfigErrorKind::JsonTimeoutNonPositive(key = "acquire_timeout_ms", value = v), path = "pool.acquire_timeout_ms")); }
                     return core.Result<Int, ConfigError>::Ok(v);
@@ -743,7 +743,7 @@ fn _byte(s: &String, i: Int) nothrow -> Byte {
     }
 }
 
-fn _managed_err_tag(e: &managed.ManagedError) nothrow -> String { return _dup(&e.tag); }
+fn _managed_err_tag(e: &managed.ManagedError) nothrow -> String { return _dup(e.tag); }
 
 // 0.5: format a caller UtcTimestamp as a MySQL DATETIME(6) literal 'YYYY-MM-DD HH:MM:SS.ffffff' for
 // the SP datetime(6) arg. ISO-8601 from std.time is the fixed shape 'YYYY-MM-DDTHH:MM:SS.ffffffZ':
@@ -760,10 +760,10 @@ fn _utc_to_db(ts: &time.UtcTimestamp) nothrow -> String {
     var buf = io.buffer(n - 1);   // 'T'->' ' is length-neutral; dropping 'Z' is -1
     var k = 0;
     var i = 0;
-    while i < 10 { io.buffer_write(&mut buf, k, _byte(&iso, i)); k = k + 1; i = i + 1; }   // YYYY-MM-DD
+    while i < 10 { io.buffer_write(&mut buf, k, _byte(iso, i)); k = k + 1; i = i + 1; }   // YYYY-MM-DD
     io.buffer_write(&mut buf, k, cast<Byte>(32)); k = k + 1;                                // ' ' (was 'T')
     i = 11;
-    while i < n - 1 { io.buffer_write(&mut buf, k, _byte(&iso, i)); k = k + 1; i = i + 1; } // HH:MM:SS.ffffff (drop 'Z')
+    while i < n - 1 { io.buffer_write(&mut buf, k, _byte(iso, i)); k = k + 1; i = i + 1; } // HH:MM:SS.ffffff (drop 'Z')
     return core.string_from_utf8_bytes(io.buffer_ptr(&buf), k);
 }
 
@@ -782,10 +782,10 @@ fn _translate_pool_event(ev: &pool.PoolEvent) nothrow -> Optional<SingularEvent>
         pool.PoolEvent::IdleConnRecycled(recycled_now) => { Optional<SingularEvent>::None() },   // mariadb-rpc 0.7: idle conn recycled by the poll fiber — internal mechanics, no domain event
 
         pool.PoolEvent::KeepalivePingOk => { Optional<SingularEvent>::None() },
-        pool.PoolEvent::KeepalivePingFailed(ping_failed_tag) => { Optional<SingularEvent>::Some(SingularEvent::BackendDegraded(detail = _dup(&ping_failed_tag))) },
+        pool.PoolEvent::KeepalivePingFailed(ping_failed_tag) => { Optional<SingularEvent>::Some(SingularEvent::BackendDegraded(detail = _dup(ping_failed_tag))) },
         pool.PoolEvent::ReconnectAttempt(attempt_attempt) => { Optional<SingularEvent>::Some(SingularEvent::BackendDegraded(detail = "reconnect-attempt")) },
         pool.PoolEvent::ReconnectSucceeded(succeeded_attempt) => { Optional<SingularEvent>::Some(SingularEvent::BackendRecovered()) },
-        pool.PoolEvent::ReconnectFailed(failed_attempt, failed_tag) => { Optional<SingularEvent>::Some(SingularEvent::BackendDegraded(detail = _dup(&failed_tag))) },
+        pool.PoolEvent::ReconnectFailed(failed_attempt, failed_tag) => { Optional<SingularEvent>::Some(SingularEvent::BackendDegraded(detail = _dup(failed_tag))) },
         pool.PoolEvent::AcquireWaiting(waiting_now) => { Optional<SingularEvent>::Some(SingularEvent::BackendSaturated(waiters = waiting_now)) },
         pool.PoolEvent::AcquireUnblocked => { Optional<SingularEvent>::Some(SingularEvent::BackendSaturationCleared()) }
     };
@@ -860,23 +860,23 @@ implement SingularGateway for SingularImpl {
             var lease = _acquire_lease(self);
             val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
             var args = rpc.new_args();
-            args.push(rpc.arg_string(_dup(&self.identity.service_group)));
+            args.push(rpc.arg_string(_dup(self.identity.service_group)));
             args.push(rpc.arg_bytes(_dup_bytes(key)));
             val sp: String = "sp_singular_inspect";
-            val doc = _call_sp_doc(conn, &sp, move args);
-            val outcome = _doc_outcome(&doc);
+            val doc = _call_sp_doc(conn, sp, move args);
+            val outcome = _doc_outcome(doc);
             if outcome == "working" {
                 // Validate every (throwing) field FIRST, then allocate the owner bytes LAST, then
                 // construct with only nothrow moves — a throw after a moved constructor argument
                 // would strand it (drift does not unwind a partially-evaluated constructor).
-                val owner_hex = _doc_str_req(&doc, &"lease_owner", "inspect-no-owner");
-                val expires = _doc_str_req(&doc, &"lease_expires_at", "inspect-no-expiry");
-                val checkpoint = _doc_object_text_req(&doc, &"checkpoint");
-                val owner = _hex16("inspect-owner-hex", &owner_hex);
+                val owner_hex = _doc_str_req(doc, "lease_owner", "inspect-no-owner");
+                val expires = _doc_str_req(doc, "lease_expires_at", "inspect-no-expiry");
+                val checkpoint = _doc_object_text_req(doc, "checkpoint");
+                val owner = _hex16("inspect-owner-hex", owner_hex);
                 return InspectOutcome::Working(move owner, move expires, move checkpoint);
             } else if outcome == "terminal" {
-                val checkpoint = _doc_object_text_req(&doc, &"checkpoint");
-                val tr = _terminal_from_doc(&doc);
+                val checkpoint = _doc_object_text_req(doc, "checkpoint");
+                val tr = _terminal_from_doc(doc);
                 return InspectOutcome::Terminal(move tr, move checkpoint);
             } else if outcome == "not_found" {
                 return InspectOutcome::NotFound();
@@ -891,27 +891,27 @@ implement SingularGateway for SingularImpl {
 
     pub fn extend_lease(self: &SingularImpl, lease: &WorkLease, event_time: &time.UtcTimestamp,
                         lease_expires_at: &time.UtcTimestamp) -> ExtendLeaseOutcome {
-        _validate_key(&lease.key);
-        _validate_lease_token(&lease.lease_token);
+        _validate_key(lease.key);
+        _validate_lease_token(lease.lease_token);
         _validate_lease_expiry(event_time, lease_expires_at);
         try {
             var leased = _acquire_lease(self);
             val conn: &mut rpc.RpcConnection = leased.conn().or_throw();
             var args = rpc.new_args();
-            args.push(rpc.arg_string(_dup(&self.identity.service_group)));
-            args.push(rpc.arg_bytes(_dup_bytes(&lease.key)));
-            args.push(rpc.arg_bytes(_dup_bytes(&self.identity.lease_owner)));
-            args.push(rpc.arg_bytes(_dup_bytes(&lease.lease_token)));
+            args.push(rpc.arg_string(_dup(self.identity.service_group)));
+            args.push(rpc.arg_bytes(_dup_bytes(lease.key)));
+            args.push(rpc.arg_bytes(_dup_bytes(self.identity.lease_owner)));
+            args.push(rpc.arg_bytes(_dup_bytes(lease.lease_token)));
             args.push(rpc.arg_string(_utc_to_db(event_time)));
             args.push(rpc.arg_string(_utc_to_db(lease_expires_at)));
             val sp: String = "sp_singular_extend_lease";
-            val doc = _call_sp_doc(conn, &sp, move args);
-            val outcome = _doc_outcome(&doc);
+            val doc = _call_sp_doc(conn, sp, move args);
+            val outcome = _doc_outcome(doc);
             if outcome == "extended" {
                 // 0.5: thread an updated WorkLease carrying the new caller-approved absolute expiry.
                 return ExtendLeaseOutcome::Extended(WorkLease(
-                    key = _dup_bytes(&lease.key),
-                    lease_token = _dup_bytes(&lease.lease_token),
+                    key = _dup_bytes(lease.key),
+                    lease_token = _dup_bytes(lease.lease_token),
                     lease_expires_at = _utc_copy(lease_expires_at)
                 ));
             } else if outcome == "token_stale" {
@@ -919,7 +919,7 @@ implement SingularGateway for SingularImpl {
             } else if outcome == "not_found" {
                 return ExtendLeaseOutcome::NotFound();
             } else if outcome == "terminal" {
-                return ExtendLeaseOutcome::Terminal(_terminal_from_doc(&doc));
+                return ExtendLeaseOutcome::Terminal(_terminal_from_doc(doc));
             } else {
                 throw SingularException(
                     kind = RuntimeErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:extend_lease")
@@ -937,14 +937,14 @@ implement SingularGateway for SingularImpl {
             var lease = _acquire_lease(self);
             val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
             var args = rpc.new_args();
-            args.push(rpc.arg_string(_dup(&self.identity.service_group)));
+            args.push(rpc.arg_string(_dup(self.identity.service_group)));
             args.push(rpc.arg_bytes(_dup_bytes(key)));
             val sp: String = "sp_singular_history";
-            var stmt = _exec_with_conn(conn, &sp, move args);
+            var stmt = _exec_with_conn(conn, sp, move args);
             var entries: Array<HistoryEntry> = [];
             var done = false;
             while !done {
-                val event = _next(&mut stmt);
+                val event = _next(stmt);
                 match event {
                     rpc.RpcEvent::Row(row) => {
                         // Each row is one audit DOCUMENT (object) keyed by `event`. Decode the object
@@ -953,19 +953,19 @@ implement SingularGateway for SingularImpl {
                         // so a throw never strands an already-moved constructor argument. payload/meta/
                         // checkpoint are nested objects (re-encoded compact); lease_owner is hex16;
                         // lease_expires_at is absent ("") on non-lease events.
-                        val text = _str_req(&row, 0);
-                        val doc = _parse_object_doc(&text);
-                        val h_event_ts = _doc_str_req(&doc, &"event_ts", "history-no-event-ts");
-                        val h_item_meta = _doc_object_text_req(&doc, &"item_meta");
-                        val h_owner_hex = _doc_str_req(&doc, &"lease_owner", "history-no-owner");
-                        val h_owner = _hex16("history-owner-hex", &h_owner_hex);
-                        val h_lease_meta = _doc_object_text_req(&doc, &"lease_meta");
-                        val h_expires = _doc_str_opt(&doc, &"lease_expires_at");
-                        val h_event = _work_event_from_name(_doc_str_req(&doc, &"event", "history-no-event"));
+                        val text = _str_req(row, 0);
+                        val doc = _parse_object_doc(text);
+                        val h_event_ts = _doc_str_req(doc, "event_ts", "history-no-event-ts");
+                        val h_item_meta = _doc_object_text_req(doc, "item_meta");
+                        val h_owner_hex = _doc_str_req(doc, "lease_owner", "history-no-owner");
+                        val h_owner = _hex16("history-owner-hex", h_owner_hex);
+                        val h_lease_meta = _doc_object_text_req(doc, "lease_meta");
+                        val h_expires = _doc_str_opt(doc, "lease_expires_at");
+                        val h_event = _work_event_from_name(_doc_str_req(doc, "event", "history-no-event"));
                         // cross-check the (event, status) pair (schema CHECK + decode protection)
-                        _check_event_status(&h_event, _doc_int_req(&doc, &"status", "history-no-status"));
-                        val h_payload = _doc_object_text_req(&doc, &"event_payload");
-                        val h_checkpoint = _doc_object_text_req(&doc, &"checkpoint");
+                        _check_event_status(h_event, _doc_int_req(doc, "status", "history-no-status"));
+                        val h_payload = _doc_object_text_req(doc, "event_payload");
+                        val h_checkpoint = _doc_object_text_req(doc, "checkpoint");
                         entries.push(HistoryEntry(
                             event_ts = move h_event_ts,
                             item_meta = move h_item_meta,
@@ -990,7 +990,7 @@ implement SingularGateway for SingularImpl {
                     }
                 }
             }
-            _finish_stmt_and_commit(&mut stmt, conn);
+            _finish_stmt_and_commit(stmt, conn);
             return move entries;
         } catch managed:ManagedError(e) {
             val tag_owned: String = e.tag;
@@ -1178,8 +1178,8 @@ fn _read_result_doc(stmt: &mut rpc.RpcStatement) -> json.JsonNode {
     val event = _next(stmt);
     match event {
         rpc.RpcEvent::Row(row) => {
-            val text = _str_req(&row, 0);   // required, non-null (SQL NULL -> BackendResponseInvalid)
-            return _parse_object_doc(&text);
+            val text = _str_req(row, 0);   // required, non-null (SQL NULL -> BackendResponseInvalid)
+            return _parse_object_doc(text);
         },
         rpc.RpcEvent::ServerErr(err) => {
             val errcode_owned: Uint = err.error_code; val msg_owned: String = err.message;
@@ -1195,8 +1195,8 @@ fn _call_sp_doc(conn: &mut rpc.RpcConnection, sp_name: &String, args: Array<rpc.
     -> json.JsonNode
 {
     var stmt = _exec_with_conn(conn, sp_name, move args);
-    val doc = _read_result_doc(&mut stmt);
-    _finish_stmt_and_commit(&mut stmt, conn);
+    val doc = _read_result_doc(stmt);
+    _finish_stmt_and_commit(stmt, conn);
     return move doc;
 }
 
@@ -1227,7 +1227,7 @@ fn _acquire_lease_checked(impl_: &SingularImpl) nothrow -> core.Result<managed.L
 fn _exec_with_conn_checked(conn: &mut rpc.RpcConnection, sp_name: &String, args: Array<rpc.RpcArg>)
     nothrow -> core.Result<rpc.RpcStatement, RuntimeErrorKind>
 {
-    match conn.call(sp_name, &args) {
+    match conn.call(sp_name, args) {
         core.Result::Err(e) => {
             val tag_owned: String = e.tag;
             return core.Result<rpc.RpcStatement, RuntimeErrorKind>::Err(RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));
@@ -1277,8 +1277,8 @@ fn _read_result_doc_checked(stmt: &mut rpc.RpcStatement) -> core.Result<json.Jso
         core.Result::Ok(event) => {
             match event {
                 rpc.RpcEvent::Row(row) => {
-                    val text = _str_req(&row, 0);
-                    return core.Result<json.JsonNode, RuntimeErrorKind>::Ok(_parse_object_doc(&text));
+                    val text = _str_req(row, 0);
+                    return core.Result<json.JsonNode, RuntimeErrorKind>::Ok(_parse_object_doc(text));
                 },
                 rpc.RpcEvent::ServerErr(err) => {
                     val errcode_owned: Uint = err.error_code; val msg_owned: String = err.message;
@@ -1299,10 +1299,10 @@ fn _call_sp_doc_checked(conn: &mut rpc.RpcConnection, sp_name: &String, args: Ar
         core.Result::Err(kind) => { return core.Result<json.JsonNode, RuntimeErrorKind>::Err(move kind); },
         core.Result::Ok(stmt) => {
             var stmt_mut = move stmt;
-            match _read_result_doc_checked(&mut stmt_mut) {
+            match _read_result_doc_checked(stmt_mut) {
                 core.Result::Err(kind) => { return core.Result<json.JsonNode, RuntimeErrorKind>::Err(move kind); },
                 core.Result::Ok(doc) => {
-                    match _finish_stmt_and_commit_checked(&mut stmt_mut, conn) {
+                    match _finish_stmt_and_commit_checked(stmt_mut, conn) {
                         core.Result::Err(kind) => { return core.Result<json.JsonNode, RuntimeErrorKind>::Err(move kind); },
                         core.Result::Ok(_) => { return core.Result<json.JsonNode, RuntimeErrorKind>::Ok(move doc); }
                     }
@@ -1330,19 +1330,19 @@ fn _start_core(impl_: &SingularImpl, key: &Array<Byte>, item_meta: &String, leas
             try {
                 val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
                 var args = rpc.new_args();
-                args.push(rpc.arg_string(_dup(&impl_.identity.service_group)));
+                args.push(rpc.arg_string(_dup(impl_.identity.service_group)));
                 args.push(rpc.arg_bytes(_dup_bytes(key)));
                 args.push(_meta_object_arg("item_meta", item_meta));
-                args.push(rpc.arg_bytes(_dup_bytes(&impl_.identity.lease_owner)));
+                args.push(rpc.arg_bytes(_dup_bytes(impl_.identity.lease_owner)));
                 args.push(_meta_object_arg("lease_meta", lease_meta));
                 args.push(rpc.arg_string(_utc_to_db(event_time)));
                 args.push(rpc.arg_string(_utc_to_db(lease_expires_at)));
                 args.push(rpc.arg_bytes(_dup_bytes(lease_token)));
                 val sp: String = "sp_singular_start";
-                match _call_sp_doc_checked(conn, &sp, move args) {
+                match _call_sp_doc_checked(conn, sp, move args) {
                     core.Result::Err(kind) => { return core.Result<StartOutcome, RuntimeErrorKind>::Err(move kind); },
                     core.Result::Ok(doc) => {
-                        val outcome = _doc_outcome(&doc);
+                        val outcome = _doc_outcome(doc);
                         if outcome == "granted" {
                             return core.Result<StartOutcome, RuntimeErrorKind>::Ok(StartOutcome::Granted(WorkLease(
                                 key = _dup_bytes(key),
@@ -1368,8 +1368,8 @@ fn _resume_core(impl_: &SingularImpl, key: &Array<Byte>, recovery: &Optional<Rec
     _validate_key(key);
     match recovery {
         Optional::Some(r) => {
-            _validate_lease_token(&r.lease_token);
-            _validate_lease_expiry(&r.event_time, &r.lease_expires_at);
+            _validate_lease_token(r.lease_token);
+            _validate_lease_expiry(r.event_time, r.lease_expires_at);
         },
         Optional::None => {}
     }
@@ -1380,15 +1380,15 @@ fn _resume_core(impl_: &SingularImpl, key: &Array<Byte>, recovery: &Optional<Rec
             try {
                 val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
                 var args = rpc.new_args();
-                args.push(rpc.arg_string(_dup(&impl_.identity.service_group)));
+                args.push(rpc.arg_string(_dup(impl_.identity.service_group)));
                 args.push(rpc.arg_bytes(_dup_bytes(key)));
                 match recovery {
                     Optional::Some(r) => {
-                        args.push(rpc.arg_bytes(_dup_bytes(&impl_.identity.lease_owner)));
-                        args.push(_meta_object_arg("lease_meta", &r.lease_meta_json));
-                        args.push(rpc.arg_string(_utc_to_db(&r.event_time)));
-                        args.push(rpc.arg_string(_utc_to_db(&r.lease_expires_at)));
-                        args.push(rpc.arg_bytes(_dup_bytes(&r.lease_token)));
+                        args.push(rpc.arg_bytes(_dup_bytes(impl_.identity.lease_owner)));
+                        args.push(_meta_object_arg("lease_meta", r.lease_meta_json));
+                        args.push(rpc.arg_string(_utc_to_db(r.event_time)));
+                        args.push(rpc.arg_string(_utc_to_db(r.lease_expires_at)));
+                        args.push(rpc.arg_bytes(_dup_bytes(r.lease_token)));
                     },
                     Optional::None => {
                         args.push(rpc.arg_null());
@@ -1399,14 +1399,14 @@ fn _resume_core(impl_: &SingularImpl, key: &Array<Byte>, recovery: &Optional<Rec
                     }
                 }
                 val sp: String = "sp_singular_resume";
-                match _call_sp_doc_checked(conn, &sp, move args) {
+                match _call_sp_doc_checked(conn, sp, move args) {
                     core.Result::Err(kind) => { return core.Result<ResumeOutcome, RuntimeErrorKind>::Err(move kind); },
                     core.Result::Ok(doc) => {
-                        val outcome = _doc_outcome(&doc);
+                        val outcome = _doc_outcome(doc);
                         if outcome == "active" {
-                            return core.Result<ResumeOutcome, RuntimeErrorKind>::Ok(ResumeOutcome::Active(_doc_str_req(&doc, &"lease_expires_at", "resume-no-expiry")));
+                            return core.Result<ResumeOutcome, RuntimeErrorKind>::Ok(ResumeOutcome::Active(_doc_str_req(doc, "lease_expires_at", "resume-no-expiry")));
                         } else if outcome == "terminal" {
-                            return core.Result<ResumeOutcome, RuntimeErrorKind>::Ok(ResumeOutcome::Terminal(_terminal_from_doc(&doc)));
+                            return core.Result<ResumeOutcome, RuntimeErrorKind>::Ok(ResumeOutcome::Terminal(_terminal_from_doc(doc)));
                         } else if outcome == "not_found" {
                             return core.Result<ResumeOutcome, RuntimeErrorKind>::Ok(ResumeOutcome::NotFound());
                         } else if outcome == "granted" {
@@ -1415,11 +1415,11 @@ fn _resume_core(impl_: &SingularImpl, key: &Array<Byte>, recovery: &Optional<Rec
                                     return core.Result<ResumeOutcome, RuntimeErrorKind>::Ok(ResumeOutcome::Granted(
                                         WorkLease(
                                             key = _dup_bytes(key),
-                                            lease_token = _dup_bytes(&r.lease_token),
-                                            lease_expires_at = _utc_copy(&r.lease_expires_at)
+                                            lease_token = _dup_bytes(r.lease_token),
+                                            lease_expires_at = _utc_copy(r.lease_expires_at)
                                         ),
-                                        _doc_int_req(&doc, &"recovery_attempt", "resume-no-recovery-attempt"),
-                                        _doc_object_text_req(&doc, &"checkpoint")
+                                        _doc_int_req(doc, "recovery_attempt", "resume-no-recovery-attempt"),
+                                        _doc_object_text_req(doc, "checkpoint")
                                     ));
                                 },
                                 Optional::None => {
@@ -1440,8 +1440,8 @@ fn _resume_core(impl_: &SingularImpl, key: &Array<Byte>, recovery: &Optional<Rec
 }
 
 fn _complete_core(impl_: &SingularImpl, lease: &WorkLease, event_time: &time.UtcTimestamp, response_json: &String) -> core.Result<SettleOutcome, RuntimeErrorKind> {
-    _validate_key(&lease.key);
-    _validate_lease_token(&lease.lease_token);
+    _validate_key(lease.key);
+    _validate_lease_token(lease.lease_token);
     match _acquire_lease_checked(impl_) {
         core.Result::Err(kind) => { return core.Result<SettleOutcome, RuntimeErrorKind>::Err(move kind); },
         core.Result::Ok(leased0) => {
@@ -1449,18 +1449,18 @@ fn _complete_core(impl_: &SingularImpl, lease: &WorkLease, event_time: &time.Utc
             try {
                 val conn: &mut rpc.RpcConnection = leased.conn().or_throw();
                 var args = rpc.new_args();
-                args.push(rpc.arg_string(_dup(&impl_.identity.service_group)));
-                args.push(rpc.arg_bytes(_dup_bytes(&lease.key)));
-                args.push(rpc.arg_bytes(_dup_bytes(&impl_.identity.lease_owner)));
-                args.push(rpc.arg_bytes(_dup_bytes(&lease.lease_token)));
+                args.push(rpc.arg_string(_dup(impl_.identity.service_group)));
+                args.push(rpc.arg_bytes(_dup_bytes(lease.key)));
+                args.push(rpc.arg_bytes(_dup_bytes(impl_.identity.lease_owner)));
+                args.push(rpc.arg_bytes(_dup_bytes(lease.lease_token)));
                 args.push(rpc.arg_string(_utc_to_db(event_time)));
                 args.push(_json_object_arg("response", response_json));
                 val sp: String = "sp_singular_complete";
-                match _call_sp_doc_checked(conn, &sp, move args) {
+                match _call_sp_doc_checked(conn, sp, move args) {
                     core.Result::Err(kind) => { return core.Result<SettleOutcome, RuntimeErrorKind>::Err(move kind); },
                     core.Result::Ok(doc) => {
-                        val outcome = _doc_outcome(&doc);
-                        if outcome == "settled" { return core.Result<SettleOutcome, RuntimeErrorKind>::Ok(SettleOutcome::Settled(_terminal_from_doc(&doc))); }
+                        val outcome = _doc_outcome(doc);
+                        if outcome == "settled" { return core.Result<SettleOutcome, RuntimeErrorKind>::Ok(SettleOutcome::Settled(_terminal_from_doc(doc))); }
                         else if outcome == "token_stale" { return core.Result<SettleOutcome, RuntimeErrorKind>::Ok(SettleOutcome::TokenStale()); }
                         else if outcome == "not_found" { return core.Result<SettleOutcome, RuntimeErrorKind>::Ok(SettleOutcome::NotFound()); }
                         else {
@@ -1477,8 +1477,8 @@ fn _complete_core(impl_: &SingularImpl, lease: &WorkLease, event_time: &time.Utc
 }
 
 fn _fail_core(impl_: &SingularImpl, lease: &WorkLease, event_time: &time.UtcTimestamp, error_json: &String) -> core.Result<SettleOutcome, RuntimeErrorKind> {
-    _validate_key(&lease.key);
-    _validate_lease_token(&lease.lease_token);
+    _validate_key(lease.key);
+    _validate_lease_token(lease.lease_token);
     match _acquire_lease_checked(impl_) {
         core.Result::Err(kind) => { return core.Result<SettleOutcome, RuntimeErrorKind>::Err(move kind); },
         core.Result::Ok(leased0) => {
@@ -1486,18 +1486,18 @@ fn _fail_core(impl_: &SingularImpl, lease: &WorkLease, event_time: &time.UtcTime
             try {
                 val conn: &mut rpc.RpcConnection = leased.conn().or_throw();
                 var args = rpc.new_args();
-                args.push(rpc.arg_string(_dup(&impl_.identity.service_group)));
-                args.push(rpc.arg_bytes(_dup_bytes(&lease.key)));
-                args.push(rpc.arg_bytes(_dup_bytes(&impl_.identity.lease_owner)));
-                args.push(rpc.arg_bytes(_dup_bytes(&lease.lease_token)));
+                args.push(rpc.arg_string(_dup(impl_.identity.service_group)));
+                args.push(rpc.arg_bytes(_dup_bytes(lease.key)));
+                args.push(rpc.arg_bytes(_dup_bytes(impl_.identity.lease_owner)));
+                args.push(rpc.arg_bytes(_dup_bytes(lease.lease_token)));
                 args.push(rpc.arg_string(_utc_to_db(event_time)));
                 args.push(_json_object_arg("error", error_json));
                 val sp: String = "sp_singular_fail";
-                match _call_sp_doc_checked(conn, &sp, move args) {
+                match _call_sp_doc_checked(conn, sp, move args) {
                     core.Result::Err(kind) => { return core.Result<SettleOutcome, RuntimeErrorKind>::Err(move kind); },
                     core.Result::Ok(doc) => {
-                        val outcome = _doc_outcome(&doc);
-                        if outcome == "settled" { return core.Result<SettleOutcome, RuntimeErrorKind>::Ok(SettleOutcome::Settled(_terminal_from_doc(&doc))); }
+                        val outcome = _doc_outcome(doc);
+                        if outcome == "settled" { return core.Result<SettleOutcome, RuntimeErrorKind>::Ok(SettleOutcome::Settled(_terminal_from_doc(doc))); }
                         else if outcome == "token_stale" { return core.Result<SettleOutcome, RuntimeErrorKind>::Ok(SettleOutcome::TokenStale()); }
                         else if outcome == "not_found" { return core.Result<SettleOutcome, RuntimeErrorKind>::Ok(SettleOutcome::NotFound()); }
                         else {
@@ -1515,7 +1515,7 @@ fn _fail_core(impl_: &SingularImpl, lease: &WorkLease, event_time: &time.UtcTime
 
 // The discriminant. Every result document carries a String `outcome`.
 fn _doc_outcome(doc: &json.JsonNode) -> String {
-    return _doc_str_req(doc, &"outcome", "result-no-outcome");
+    return _doc_str_req(doc, "outcome", "result-no-outcome");
 }
 
 // A required String property. Missing key or non-String value -> BackendResponseInvalid(detail).
@@ -1553,13 +1553,13 @@ fn _doc_object_text_req(doc: &json.JsonNode, key: &String) -> String {
 // payload is extracted only inside the matched state branch and returned immediately, so no owned
 // local is ever live across a throw.
 fn _terminal_from_doc(doc: &json.JsonNode) -> TerminalResult {
-    val state = _doc_str_req(doc, &"state", "terminal-no-state");
+    val state = _doc_str_req(doc, "state", "terminal-no-state");
     if state == "done" {
-        val payload = _doc_object_text_req(doc, &"payload");
+        val payload = _doc_object_text_req(doc, "payload");
         return TerminalResult::Done(move payload);
     }
     if state == "failed" {
-        val payload = _doc_object_text_req(doc, &"payload");
+        val payload = _doc_object_text_req(doc, "payload");
         return TerminalResult::Failed(move payload);
     }
     throw SingularException(kind = RuntimeErrorKind::BackendResponseInvalid(detail = "terminal-unknown-state"));
@@ -1717,7 +1717,7 @@ fn _classify_acquire_tag(tag: String) nothrow -> RuntimeErrorKind {
 fn _exec_with_conn(conn: &mut rpc.RpcConnection, sp_name: &String, args: Array<rpc.RpcArg>)
     -> rpc.RpcStatement
 {
-    match conn.call(sp_name, &args) {
+    match conn.call(sp_name, args) {
         core.Result::Err(e) => {
             val tag_owned: String = e.tag;
             throw SingularException(kind = RuntimeErrorKind::BackendUnavailable(detail = move tag_owned));

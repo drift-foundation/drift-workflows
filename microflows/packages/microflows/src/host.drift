@@ -88,7 +88,7 @@ pub struct ExecutorIdentity {
 // Derive a stable 16-byte executor identity from a worker name (UUID v3).
 pub fn identity_from_worker_name(worker_name: &String) nothrow -> ExecutorIdentity {
 	val u: uuid.Uuid = uuid.v3_from_string(worker_name);
-	val bytes: Array<Byte> = uuid.to_bytes(&u);
+	val bytes: Array<Byte> = uuid.to_bytes(u);
 	return ExecutorIdentity(executor_id = move bytes);
 }
 
@@ -892,14 +892,14 @@ pub fn build_host(var b: HostBuilder) nothrow -> core.Result<arc.Arc<MicroflowsH
 	}
 
 	var identity_local: Optional<ExecutorIdentity> = Optional<ExecutorIdentity>::None();
-	mem.swap(&mut b.identity, &mut identity_local);
+	mem.swap(b.identity, identity_local);
 	var taken_identity: ExecutorIdentity = match move identity_local {
 		Optional::Some(v) => { move v },
 		Optional::None => { _dummy_identity() }
 	};
 
 	var json_local: Optional<json.JsonNode> = Optional<json.JsonNode>::None();
-	mem.swap(&mut b.json_config, &mut json_local);
+	mem.swap(b.json_config, json_local);
 	val cfg_node: json.JsonNode = match move json_local {
 		Optional::Some(n) => { move n },
 		Optional::None => { json.new_object().to_node() }
@@ -912,12 +912,12 @@ pub fn build_host(var b: HostBuilder) nothrow -> core.Result<arc.Arc<MicroflowsH
 	// toolchain limitation, 2026-06-15.) Statement-form matches: the Err arm returns the value,
 	// the Ok arm carries the config forward. pool.open's Result is matched directly — no try
 	// (match-arm bindings are not in scope inside a nested try block).
-	match _build_rpc_config_from_json(&cfg_node) {
+	match _build_rpc_config_from_json(cfg_node) {
 		core.Result::Err(cfg_err) => {
 			return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(move cfg_err);
 		},
 		core.Result::Ok(rpc_cfg) => {
-			match _build_pool_config_from_json(&cfg_node) {
+			match _build_pool_config_from_json(cfg_node) {
 				core.Result::Err(cfg_err) => {
 					return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(move cfg_err);
 				},
@@ -926,7 +926,7 @@ pub fn build_host(var b: HostBuilder) nothrow -> core.Result<arc.Arc<MicroflowsH
 						core.Result::Err(open_err) => {
 							return core.Result<arc.Arc<MicroflowsHost>, HostConfigError>::Err(
 								HostConfigError(
-									kind = HostConfigErrorKind::PoolOpenFailed(upstream_tag = _dup(&open_err.tag)),
+									kind = HostConfigErrorKind::PoolOpenFailed(upstream_tag = _dup(open_err.tag)),
 									path = ""
 								)
 							);
@@ -956,7 +956,7 @@ fn _build_rpc_config_from_json(node: &json.JsonNode)
 	nothrow -> core.Result<rpc.RpcConnectionConfig, HostConfigError>
 {
 	var backend: String = "";
-	match _read_required_string(node, &"backend") {
+	match _read_required_string(node, "backend") {
 		core.Result::Ok(s) => { backend = move s; },
 		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
 	}
@@ -966,12 +966,12 @@ fn _build_rpc_config_from_json(node: &json.JsonNode)
 		);
 	}
 	var host: String = "";
-	match _read_required_string(node, &"host") {
+	match _read_required_string(node, "host") {
 		core.Result::Ok(s) => { host = move s; },
 		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
 	}
 	var port: Int = 0;
-	match _read_required_int(node, &"port") {
+	match _read_required_int(node, "port") {
 		core.Result::Ok(v) => { port = v; },
 		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
 	}
@@ -981,22 +981,22 @@ fn _build_rpc_config_from_json(node: &json.JsonNode)
 		);
 	}
 	var user: String = "";
-	match _read_required_string(node, &"user") {
+	match _read_required_string(node, "user") {
 		core.Result::Ok(s) => { user = move s; },
 		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
 	}
 	var password: String = "";
-	match _read_required_string(node, &"password") {
+	match _read_required_string(node, "password") {
 		core.Result::Ok(s) => { password = move s; },
 		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
 	}
 	var database: String = "";
-	match _read_required_string(node, &"database") {
+	match _read_required_string(node, "database") {
 		core.Result::Ok(s) => { database = move s; },
 		core.Result::Err(e) => { return core.Result<rpc.RpcConnectionConfig, HostConfigError>::Err(move e); }
 	}
-	val connect_timeout_ms: Int = _read_optional_positive_int(node, &"connect_timeout_ms", 5000);
-	val io_timeout_ms: Int = _read_optional_positive_int(node, &"io_timeout_ms", 30000);
+	val connect_timeout_ms: Int = _read_optional_positive_int(node, "connect_timeout_ms", 5000);
+	val io_timeout_ms: Int = _read_optional_positive_int(node, "io_timeout_ms", 30000);
 
 	var builder = rpc.new_connection_config_builder();
 	builder.with_host(move host);
@@ -1022,31 +1022,31 @@ fn _build_pool_config_from_json(node: &json.JsonNode)
 {
 	var pc: pool.PoolConfig = pool.default_pool_config();
 
-	val pool_opt: Optional<&json.JsonNode> = node.get(&"pool");
+	val pool_opt: Optional<&json.JsonNode> = node.get("pool");
 	match pool_opt {
 		Optional::Some(psub) => {
-			match psub.get_int_at_path(&"min_idle") {
+			match psub.get_int_at_path("min_idle") {
 				Optional::Some(v) => {
 					if v < 0 { return core.Result<pool.PoolConfig, HostConfigError>::Err(HostConfigError(kind = HostConfigErrorKind::JsonPoolSizingInvalid(key = "min_idle", value = v), path = "pool.min_idle")); }
 					pc.min_idle = v;
 				},
 				Optional::None => {}
 			}
-			match psub.get_int_at_path(&"max_conns") {
+			match psub.get_int_at_path("max_conns") {
 				Optional::Some(v) => {
 					if v < 1 { return core.Result<pool.PoolConfig, HostConfigError>::Err(HostConfigError(kind = HostConfigErrorKind::JsonPoolSizingInvalid(key = "max_conns", value = v), path = "pool.max_conns")); }
 					pc.max_conns = v;
 				},
 				Optional::None => {}
 			}
-			match psub.get_int_at_path(&"idle_timeout_ms") {
+			match psub.get_int_at_path("idle_timeout_ms") {
 				Optional::Some(v) => {
 					if v <= 0 { return core.Result<pool.PoolConfig, HostConfigError>::Err(HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "idle_timeout_ms", value = v), path = "pool.idle_timeout_ms")); }
 					pc.idle_timeout_ms = v;
 				},
 				Optional::None => {}
 			}
-			match psub.get_int_at_path(&"keepalive_interval_ms") {
+			match psub.get_int_at_path("keepalive_interval_ms") {
 				Optional::Some(v) => {
 					if v < 0 { return core.Result<pool.PoolConfig, HostConfigError>::Err(HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "keepalive_interval_ms", value = v), path = "pool.keepalive_interval_ms")); }
 					pc.keepalive_interval_ms = v;
@@ -1069,9 +1069,9 @@ fn _build_pool_config_from_json(node: &json.JsonNode)
 }
 
 fn _read_acquire_timeout_ms(node: &json.JsonNode) nothrow -> core.Result<Int, HostConfigError> {
-	match node.get(&"pool") {
+	match node.get("pool") {
 		Optional::Some(psub) => {
-			match psub.get_int_at_path(&"acquire_timeout_ms") {
+			match psub.get_int_at_path("acquire_timeout_ms") {
 				Optional::Some(v) => {
 					if v <= 0 { return core.Result<Int, HostConfigError>::Err(HostConfigError(kind = HostConfigErrorKind::JsonTimeoutNonPositive(key = "acquire_timeout_ms", value = v), path = "pool.acquire_timeout_ms")); }
 					return core.Result<Int, HostConfigError>::Ok(v);
@@ -1164,13 +1164,13 @@ implement MicroflowsHost for HostImpl {
 			var args = rpc.new_args();
 			args.push(rpc.arg_int(lease_seconds));
 			val sp: String = "sp_mf_clock_read";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "ok" {
-				val now = _doc_str_req(&doc, &"now", "clock-no-now");
+				val now = _doc_str_req(doc, "now", "clock-no-now");
 				// SP doc key stays "lease_expires_at" (its server-side name); the
 				// host surfaces it as the neutral `deadline`.
-				val deadline = _doc_str_req(&doc, &"lease_expires_at", "clock-no-expiry");
+				val deadline = _doc_str_req(doc, "lease_expires_at", "clock-no-expiry");
 				return ClockReading(now = move now, deadline = move deadline);
 			}
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:clock_read"));
@@ -1202,8 +1202,8 @@ implement MicroflowsHost for HostImpl {
 			args.push(_json_object_arg("continuation", continuation_json));
 			args.push(_meta_object_arg("event_payload", event_payload_json));
 			val sp: String = "sp_mf_workflow_create";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "created" { return CreateOutcome::Created(); }
 			if outcome == "exists" { return CreateOutcome::Exists(); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:create"));
@@ -1242,14 +1242,14 @@ implement MicroflowsHost for HostImpl {
 			args.push(_meta_object_arg("event_payload", event_payload_json));
 			args.push(rpc.arg_bytes(_dup_bytes(content_hash)));
 			args.push(rpc.arg_int(plan_length));
-			args.push(rpc.arg_bytes(_utf8_bytes(&args_canon)));
+			args.push(rpc.arg_bytes(_utf8_bytes(args_canon)));
 			val sp: String = "sp_mf_workflow_create_planned";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "created" { return CreatePlannedOutcome::Created(_decode_pin(&doc)); }
-			if outcome == "exists" { return CreatePlannedOutcome::Exists(_decode_pin(&doc)); }
-			if outcome == "plan_conflict" { return CreatePlannedOutcome::PlanConflict(_doc_int_req(&doc, &"plan_length", "create-planned-no-plan-length")); }
-			if outcome == "workflow_conflict" { return CreatePlannedOutcome::WorkflowConflict(_doc_int_req(&doc, &"plan_length", "create-planned-no-plan-length")); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "created" { return CreatePlannedOutcome::Created(_decode_pin(doc)); }
+			if outcome == "exists" { return CreatePlannedOutcome::Exists(_decode_pin(doc)); }
+			if outcome == "plan_conflict" { return CreatePlannedOutcome::PlanConflict(_doc_int_req(doc, "plan_length", "create-planned-no-plan-length")); }
+			if outcome == "workflow_conflict" { return CreatePlannedOutcome::WorkflowConflict(_doc_int_req(doc, "plan_length", "create-planned-no-plan-length")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:create_planned"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
@@ -1265,9 +1265,9 @@ implement MicroflowsHost for HostImpl {
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
 			val sp: String = "sp_mf_args_get";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "found" { return ArgsGetOutcome::Found(_doc_object_text_req(&doc, &"args")); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "found" { return ArgsGetOutcome::Found(_doc_object_text_req(doc, "args")); }
 			if outcome == "not_found" { return ArgsGetOutcome::NotFound(); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:args_get"));
 		} catch managed:ManagedError(e) {
@@ -1284,9 +1284,9 @@ implement MicroflowsHost for HostImpl {
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
 			val sp: String = "sp_mf_plan_get";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "found" { return PlanGetOutcome::Found(_decode_pin(&doc)); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "found" { return PlanGetOutcome::Found(_decode_pin(doc)); }
 			if outcome == "not_found" { return PlanGetOutcome::NotFound(); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:plan_get"));
 		} catch managed:ManagedError(e) {
@@ -1306,26 +1306,26 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_string(_dup(script_name)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_string(_dup(db_now)));
 			args.push(rpc.arg_string(_dup(lease_expires_at)));
 			val sp: String = "sp_mf_workflow_claim";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "none" { return ClaimOutcome::NoneDue(); }
 			if outcome == "claimed" {
 				// Bind every (throwing) field read BEFORE construction; construct
 				// LAST with only nothrow moves.
-				val wf_hex = _doc_str_req(&doc, &"workflow_id", "claim-no-workflow-id");
-				val wf_id = _hex16("claim-workflow-id-hex", &wf_hex);
-				val fencing = _doc_int_req(&doc, &"fencing_token", "claim-no-fencing");
-				val state_code = _doc_int_req(&doc, &"state", "claim-no-state");
-				val direction = _doc_int_req(&doc, &"execution_direction", "claim-no-direction");
-				val disp = _doc_int_req(&doc, &"current_disposition", "claim-no-disposition");
-				val sname = _doc_str_req(&doc, &"script_name", "claim-no-script-name");
-				val srev = _doc_int_req(&doc, &"script_revision", "claim-no-script-revision");
-				val attempt = _doc_int_req(&doc, &"current_operation_attempt", "claim-no-attempt");
-				val continuation = _doc_object_text_req(&doc, &"continuation");
+				val wf_hex = _doc_str_req(doc, "workflow_id", "claim-no-workflow-id");
+				val wf_id = _hex16("claim-workflow-id-hex", wf_hex);
+				val fencing = _doc_int_req(doc, "fencing_token", "claim-no-fencing");
+				val state_code = _doc_int_req(doc, "state", "claim-no-state");
+				val direction = _doc_int_req(doc, "execution_direction", "claim-no-direction");
+				val disp = _doc_int_req(doc, "current_disposition", "claim-no-disposition");
+				val sname = _doc_str_req(doc, "script_name", "claim-no-script-name");
+				val srev = _doc_int_req(doc, "script_revision", "claim-no-script-revision");
+				val attempt = _doc_int_req(doc, "current_operation_attempt", "claim-no-attempt");
+				val continuation = _doc_object_text_req(doc, "continuation");
 				return ClaimOutcome::Claimed(ClaimedWorkflow(
 					workflow_id = move wf_id,
 					fencing_token = fencing,
@@ -1358,13 +1358,13 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_string(_dup(db_now)));
 			args.push(rpc.arg_string(_dup(lease_expires_at)));
 			val sp: String = "sp_mf_workflow_heartbeat";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "extended" { return HeartbeatOutcome::Extended(); }
 			if outcome == "fence_lost" { return HeartbeatOutcome::FenceLost(); }
 			if outcome == "not_found" { return HeartbeatOutcome::NotFound(); }
@@ -1388,13 +1388,13 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_string(_dup(db_now)));
 			args.push(rpc.arg_string(_dup(next_attempt_at)));
 			val sp: String = "sp_mf_workflow_release";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "released" { return ReleaseOutcome::Released(); }
 			if outcome == "fence_lost" { return ReleaseOutcome::FenceLost(); }
 			if outcome == "not_found" { return ReleaseOutcome::NotFound(); }
@@ -1421,15 +1421,15 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_string(_dup(db_now)));
 			args.push(rpc.arg_string(_dup(next_attempt_at)));
 			args.push(rpc.arg_string(_dup(event_ts)));
 			args.push(rpc.arg_string(_dup(reason)));
 			val sp: String = "sp_mf_operation_dispatch_defer";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "deferred" { return ReleaseOutcome::Released(); }
 			if outcome == "fence_lost" { return ReleaseOutcome::FenceLost(); }
 			if outcome == "not_found" { return ReleaseOutcome::NotFound(); }
@@ -1458,7 +1458,7 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_int(operation_seq));
 			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
@@ -1468,16 +1468,16 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_int(max_elapsed_ms));
 			args.push(rpc.arg_int(min_attempts));
 			val sp: String = "sp_mf_workflow_reconcile_defer";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "deferred" { return ReconcileDeferOutcome::Deferred(_doc_int_req(&doc, &"attempts", "reconcile-no-attempts")); }
-			if outcome == "blocked" { return ReconcileDeferOutcome::Blocked(_doc_str_req(&doc, &"direction", "reconcile-no-direction"), _doc_str_req(&doc, &"reason", "reconcile-no-reason")); }
-			if outcome == "event_time_skew" { return ReconcileDeferOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "reconcile-no-defer-until")); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "deferred" { return ReconcileDeferOutcome::Deferred(_doc_int_req(doc, "attempts", "reconcile-no-attempts")); }
+			if outcome == "blocked" { return ReconcileDeferOutcome::Blocked(_doc_str_req(doc, "direction", "reconcile-no-direction"), _doc_str_req(doc, "reason", "reconcile-no-reason")); }
+			if outcome == "event_time_skew" { return ReconcileDeferOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "reconcile-no-defer-until")); }
 			if outcome == "fence_lost" { return ReconcileDeferOutcome::FenceLost(); }
 			if outcome == "not_found" { return ReconcileDeferOutcome::NotFound(); }
 			if outcome == "operation_not_found" { return ReconcileDeferOutcome::OperationNotFound(); }
 			if outcome == "operation_conflict" { return ReconcileDeferOutcome::OperationConflict(); }
-			if outcome == "operation_not_requested" { return ReconcileDeferOutcome::OperationNotRequested(_doc_int_req(&doc, &"status", "reconcile-no-status")); }
+			if outcome == "operation_not_requested" { return ReconcileDeferOutcome::OperationNotRequested(_doc_int_req(doc, "status", "reconcile-no-status")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:reconcile_defer"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
@@ -1503,7 +1503,7 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_int(seq));
 			args.push(rpc.arg_bytes(_dup_bytes(reverse_id)));
@@ -1513,19 +1513,19 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_int(max_elapsed_ms));
 			args.push(rpc.arg_int(min_attempts));
 			val sp: String = "sp_mf_checkpoint_reconcile_defer";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "deferred" { return CheckpointReconcileDeferOutcome::Deferred(_doc_int_req(&doc, &"attempts", "creconcile-no-attempts")); }
-			if outcome == "blocked" { return CheckpointReconcileDeferOutcome::Blocked(_doc_str_req(&doc, &"direction", "creconcile-no-direction"), _doc_str_req(&doc, &"reason", "creconcile-no-reason")); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "deferred" { return CheckpointReconcileDeferOutcome::Deferred(_doc_int_req(doc, "attempts", "creconcile-no-attempts")); }
+			if outcome == "blocked" { return CheckpointReconcileDeferOutcome::Blocked(_doc_str_req(doc, "direction", "creconcile-no-direction"), _doc_str_req(doc, "reason", "creconcile-no-reason")); }
 			if outcome == "already_blocked" { return CheckpointReconcileDeferOutcome::AlreadyBlocked(); }
-			if outcome == "event_time_skew" { return CheckpointReconcileDeferOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "creconcile-no-defer-until")); }
+			if outcome == "event_time_skew" { return CheckpointReconcileDeferOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "creconcile-no-defer-until")); }
 			if outcome == "fence_lost" { return CheckpointReconcileDeferOutcome::FenceLost(); }
 			if outcome == "not_found" { return CheckpointReconcileDeferOutcome::NotFound(); }
 			if outcome == "checkpoint_not_found" { return CheckpointReconcileDeferOutcome::CheckpointNotFound(); }
 			if outcome == "not_requested" { return CheckpointReconcileDeferOutcome::NotRequested(); }
 			if outcome == "reverse_id_mismatch" { return CheckpointReconcileDeferOutcome::ReverseIdMismatch(); }
-			if outcome == "checkpoint_not_active" { return CheckpointReconcileDeferOutcome::CheckpointNotActive(_doc_int_req(&doc, &"reversal_state", "creconcile-no-revstate")); }
-			if outcome == "out_of_order" { return CheckpointReconcileDeferOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "creconcile-no-topseq")); }
+			if outcome == "checkpoint_not_active" { return CheckpointReconcileDeferOutcome::CheckpointNotActive(_doc_int_req(doc, "reversal_state", "creconcile-no-revstate")); }
+			if outcome == "out_of_order" { return CheckpointReconcileDeferOutcome::OutOfOrder(_doc_int_req(doc, "top_seq", "creconcile-no-topseq")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:checkpoint_reconcile_defer"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
@@ -1550,7 +1550,7 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_int(operation_seq));
 			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
@@ -1559,15 +1559,15 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_string(_dup(event_ts)));
 			args.push(rpc.arg_int(after_ms));
 			val sp: String = "sp_mf_operation_pending_defer";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "defer" { return OperationPendingDeferOutcome::Defer(_doc_int_req(&doc, &"redispatch_count", "pending-no-count")); }
-			if outcome == "redispatch" { return OperationPendingDeferOutcome::Redispatch(_doc_int_req(&doc, &"redispatch_count", "pending-no-count")); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "defer" { return OperationPendingDeferOutcome::Defer(_doc_int_req(doc, "redispatch_count", "pending-no-count")); }
+			if outcome == "redispatch" { return OperationPendingDeferOutcome::Redispatch(_doc_int_req(doc, "redispatch_count", "pending-no-count")); }
 			if outcome == "fence_lost" { return OperationPendingDeferOutcome::FenceLost(); }
 			if outcome == "not_found" { return OperationPendingDeferOutcome::NotFound(); }
 			if outcome == "operation_not_found" { return OperationPendingDeferOutcome::OperationNotFound(); }
 			if outcome == "operation_conflict" { return OperationPendingDeferOutcome::OperationConflict(); }
-			if outcome == "operation_not_requested" { return OperationPendingDeferOutcome::OperationNotRequested(_doc_int_req(&doc, &"status", "pending-no-status")); }
+			if outcome == "operation_not_requested" { return OperationPendingDeferOutcome::OperationNotRequested(_doc_int_req(doc, "status", "pending-no-status")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_pending_defer"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
@@ -1592,7 +1592,7 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_int(seq));
 			args.push(rpc.arg_bytes(_dup_bytes(reverse_id)));
@@ -1601,18 +1601,18 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_string(_dup(event_ts)));
 			args.push(rpc.arg_int(after_ms));
 			val sp: String = "sp_mf_checkpoint_pending_defer";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "defer" { return CheckpointPendingDeferOutcome::Defer(_doc_int_req(&doc, &"redispatch_count", "cpending-no-count")); }
-			if outcome == "redispatch" { return CheckpointPendingDeferOutcome::Redispatch(_doc_int_req(&doc, &"redispatch_count", "cpending-no-count")); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "defer" { return CheckpointPendingDeferOutcome::Defer(_doc_int_req(doc, "redispatch_count", "cpending-no-count")); }
+			if outcome == "redispatch" { return CheckpointPendingDeferOutcome::Redispatch(_doc_int_req(doc, "redispatch_count", "cpending-no-count")); }
 			if outcome == "fence_lost" { return CheckpointPendingDeferOutcome::FenceLost(); }
 			if outcome == "not_found" { return CheckpointPendingDeferOutcome::NotFound(); }
 			if outcome == "checkpoint_not_found" { return CheckpointPendingDeferOutcome::CheckpointNotFound(); }
 			if outcome == "not_requested" { return CheckpointPendingDeferOutcome::NotRequested(); }
 			if outcome == "reverse_id_mismatch" { return CheckpointPendingDeferOutcome::ReverseIdMismatch(); }
 			if outcome == "already_blocked" { return CheckpointPendingDeferOutcome::AlreadyBlocked(); }
-			if outcome == "checkpoint_not_active" { return CheckpointPendingDeferOutcome::CheckpointNotActive(_doc_int_req(&doc, &"reversal_state", "cpending-no-revstate")); }
-			if outcome == "out_of_order" { return CheckpointPendingDeferOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "cpending-no-topseq")); }
+			if outcome == "checkpoint_not_active" { return CheckpointPendingDeferOutcome::CheckpointNotActive(_doc_int_req(doc, "reversal_state", "cpending-no-revstate")); }
+			if outcome == "out_of_order" { return CheckpointPendingDeferOutcome::OutOfOrder(_doc_int_req(doc, "top_seq", "cpending-no-topseq")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:checkpoint_pending_defer"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
@@ -1655,15 +1655,15 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_string(_dup(db_now)));
 			args.push(rpc.arg_string(_dup(lease_expires_at)));
 			val sp: String = "sp_mf_workflow_claim_by_id";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "not_found" { return ClaimByIdOutcome::NotFound(); }
 			if outcome == "not_claimable" { return ClaimByIdOutcome::NotClaimable(); }
-			if outcome == "claimed" { return ClaimByIdOutcome::Claimed(_parse_claimed(&doc)); }
+			if outcome == "claimed" { return ClaimByIdOutcome::Claimed(_parse_claimed(doc)); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:claim_workflow"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
@@ -1681,16 +1681,16 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
 			args.push(rpc.arg_string(_dup(db_now)));
 			val sp: String = "sp_mf_workflow_inspect";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "not_found" { return WorkflowInspectOutcome::NotFound(); }
 			if outcome == "found" {
-				val state_code = _doc_int_req(&doc, &"state", "inspect-no-state");
-				val direction = _doc_int_req(&doc, &"execution_direction", "inspect-no-direction");
-				val disp = _doc_int_req(&doc, &"current_disposition", "inspect-no-disposition");
-				val terminal = _doc_int_req(&doc, &"is_terminal", "inspect-no-terminal");
-				val leased = _doc_int_req(&doc, &"leased", "inspect-no-leased");
-				val continuation = _doc_object_text_req(&doc, &"continuation");
+				val state_code = _doc_int_req(doc, "state", "inspect-no-state");
+				val direction = _doc_int_req(doc, "execution_direction", "inspect-no-direction");
+				val disp = _doc_int_req(doc, "current_disposition", "inspect-no-disposition");
+				val terminal = _doc_int_req(doc, "is_terminal", "inspect-no-terminal");
+				val leased = _doc_int_req(doc, "leased", "inspect-no-leased");
+				val continuation = _doc_object_text_req(doc, "continuation");
 				return WorkflowInspectOutcome::Found(WorkflowSnapshot(
 					state_code = state_code,
 					execution_direction = direction,
@@ -1698,8 +1698,8 @@ implement MicroflowsHost for HostImpl {
 					is_terminal = terminal != 0,
 					leased = leased != 0,
 					continuation_json = move continuation,
-					terminal_reason = _doc_str_opt(&doc, &"terminal_reason"),
-					workflow_return_json = _doc_object_text_opt(&doc, &"workflow_return_json")
+					terminal_reason = _doc_str_opt(doc, "terminal_reason"),
+					workflow_return_json = _doc_object_text_opt(doc, "workflow_return_json")
 				));
 			}
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:inspect_workflow"));
@@ -1719,9 +1719,9 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
 			args.push(rpc.arg_int(operation_seq));
 			val sp: String = "sp_mf_operation_result";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "succeeded" { return OperationResultOutcome::Succeeded(_doc_object_text_req(&doc, &"result")); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "succeeded" { return OperationResultOutcome::Succeeded(_doc_object_text_req(doc, "result")); }
 			if outcome == "requested" { return OperationResultOutcome::Requested(); }
 			if outcome == "not_found" { return OperationResultOutcome::NotFound(); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_result"));
@@ -1744,7 +1744,7 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_int(operation_seq));
 			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
@@ -1752,8 +1752,8 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_string(_dup(event_ts)));
 			args.push(_meta_object_arg("event_payload", event_payload));
 			val sp: String = "sp_mf_operation_fail";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "blocked" { return OperationFailOutcome::Blocked(); }
 			if outcome == "already_blocked" { return OperationFailOutcome::AlreadyBlocked(); }
 			if outcome == "operation_conflict" { return OperationFailOutcome::OperationConflict(); }
@@ -1761,7 +1761,7 @@ implement MicroflowsHost for HostImpl {
 			if outcome == "not_found" { return OperationFailOutcome::NotFound(); }
 			if outcome == "operation_not_found" { return OperationFailOutcome::OperationNotFound(); }
 			if outcome == "event_time_skew" {
-				return OperationFailOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "fail-no-defer-until"));
+				return OperationFailOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "fail-no-defer-until"));
 			}
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_fail"));
 		} catch managed:ManagedError(e) {
@@ -1780,17 +1780,17 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
 			args.push(rpc.arg_int(operation_seq));
 			val sp: String = "sp_mf_operation_request_get";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "not_found" { return OperationRequestGetOutcome::NotFound(); }
 			if outcome == "found" {
-				val op_hex = _doc_str_req(&doc, &"operation_id", "reqget-no-opid");
-				val op_id = _hex16("reqget-opid-hex", &op_hex);
-				val op_name = _doc_str_req(&doc, &"operation_name", "reqget-no-name");
-				val schema_version = _doc_int_req(&doc, &"schema_version", "reqget-no-schema-version");
-				val input_json = _doc_object_text_req(&doc, &"input_json");
-				val input_hash = _doc_str_req(&doc, &"input_hash", "reqget-no-hash");
-				val status = _doc_int_req(&doc, &"status", "reqget-no-status");
+				val op_hex = _doc_str_req(doc, "operation_id", "reqget-no-opid");
+				val op_id = _hex16("reqget-opid-hex", op_hex);
+				val op_name = _doc_str_req(doc, "operation_name", "reqget-no-name");
+				val schema_version = _doc_int_req(doc, "schema_version", "reqget-no-schema-version");
+				val input_json = _doc_object_text_req(doc, "input_json");
+				val input_hash = _doc_str_req(doc, "input_hash", "reqget-no-hash");
+				val status = _doc_int_req(doc, "status", "reqget-no-status");
 				return OperationRequestGetOutcome::Found(OperationRequestRecord(
 					operation_id = move op_id,
 					operation_name = move op_name,
@@ -1821,25 +1821,25 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_int(operation_seq));
 			args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
 			args.push(rpc.arg_string(_dup(event_ts)));
 			args.push(rpc.arg_string(_dup(reason)));
 			val sp: String = "sp_mf_workflow_begin_reversal";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "reversing" { return BeginReversalOutcome::Reversing(_doc_int_req(&doc, &"top_seq", "begin-no-top-seq")); }
-			if outcome == "failed" { return BeginReversalOutcome::Failed(_doc_str_opt(&doc, &"terminal_reason")); }
-			if outcome == "already_begun" { return BeginReversalOutcome::AlreadyBegun(_doc_int_req(&doc, &"state", "begin-no-state"), _doc_str_opt(&doc, &"terminal_reason")); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "reversing" { return BeginReversalOutcome::Reversing(_doc_int_req(doc, "top_seq", "begin-no-top-seq")); }
+			if outcome == "failed" { return BeginReversalOutcome::Failed(_doc_str_opt(doc, "terminal_reason")); }
+			if outcome == "already_begun" { return BeginReversalOutcome::AlreadyBegun(_doc_int_req(doc, "state", "begin-no-state"), _doc_str_opt(doc, "terminal_reason")); }
 			if outcome == "trigger_mismatch" { return BeginReversalOutcome::TriggerMismatch(); }
 			if outcome == "operation_not_found" { return BeginReversalOutcome::OperationNotFound(); }
 			if outcome == "operation_conflict" { return BeginReversalOutcome::OperationConflict(); }
-			if outcome == "operation_not_failed" { return BeginReversalOutcome::OperationNotFailed(_doc_int_req(&doc, &"status", "begin-no-status")); }
+			if outcome == "operation_not_failed" { return BeginReversalOutcome::OperationNotFailed(_doc_int_req(doc, "status", "begin-no-status")); }
 			if outcome == "fence_lost" { return BeginReversalOutcome::FenceLost(); }
 			if outcome == "not_found" { return BeginReversalOutcome::NotFound(); }
-			if outcome == "event_time_skew" { return BeginReversalOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "begin-no-defer-until")); }
+			if outcome == "event_time_skew" { return BeginReversalOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "begin-no-defer-until")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:begin_reversal"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
@@ -1859,21 +1859,21 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_bytes(_dup_bytes(fail_id)));
 			args.push(rpc.arg_string(_dup(event_ts)));
 			args.push(rpc.arg_string(_dup(reason)));
 			val sp: String = "sp_mf_workflow_authored_fail";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "reversing" { return AuthoredFailOutcome::Reversing(_doc_int_req(&doc, &"top_seq", "afail-no-top-seq")); }
-			if outcome == "failed" { return AuthoredFailOutcome::Failed(_doc_str_opt(&doc, &"terminal_reason")); }
-			if outcome == "already_begun" { return AuthoredFailOutcome::AlreadyBegun(_doc_int_req(&doc, &"state", "afail-no-state"), _doc_str_opt(&doc, &"terminal_reason")); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "reversing" { return AuthoredFailOutcome::Reversing(_doc_int_req(doc, "top_seq", "afail-no-top-seq")); }
+			if outcome == "failed" { return AuthoredFailOutcome::Failed(_doc_str_opt(doc, "terminal_reason")); }
+			if outcome == "already_begun" { return AuthoredFailOutcome::AlreadyBegun(_doc_int_req(doc, "state", "afail-no-state"), _doc_str_opt(doc, "terminal_reason")); }
 			if outcome == "trigger_mismatch" { return AuthoredFailOutcome::TriggerMismatch(); }
 			if outcome == "fence_lost" { return AuthoredFailOutcome::FenceLost(); }
 			if outcome == "not_found" { return AuthoredFailOutcome::NotFound(); }
-			if outcome == "event_time_skew" { return AuthoredFailOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "afail-no-defer-until")); }
+			if outcome == "event_time_skew" { return AuthoredFailOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "afail-no-defer-until")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:authored_fail"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
@@ -1889,25 +1889,25 @@ implement MicroflowsHost for HostImpl {
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
 			val sp: String = "sp_mf_checkpoint_reverse_head";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "none_active" { return ReverseHeadOutcome::NoneActive(); }
 			if outcome == "pending" {
 				return ReverseHeadOutcome::Pending(
-					_doc_int_req(&doc, &"seq", "revhead-no-seq"),
-					_doc_str_req(&doc, &"operation_name", "revhead-no-opname"),
-					_doc_object_text_req(&doc, &"payload"),
-					_doc_int_req(&doc, &"call_kind", "revhead-no-call-kind"));
+					_doc_int_req(doc, "seq", "revhead-no-seq"),
+					_doc_str_req(doc, "operation_name", "revhead-no-opname"),
+					_doc_object_text_req(doc, "payload"),
+					_doc_int_req(doc, "call_kind", "revhead-no-call-kind"));
 			}
 			if outcome == "dispatched" {
 				return ReverseHeadOutcome::Dispatched(
-					_doc_int_req(&doc, &"seq", "revhead-no-seq"),
-					_doc_str_req(&doc, &"operation_name", "revhead-no-opname"),
-					_doc_str_req(&doc, &"reverse_invocation_id", "revhead-no-revid"),
-					_doc_str_req(&doc, &"reverse_operation_name", "revhead-no-rname"),
-					_doc_int_req(&doc, &"reverse_schema_version", "revhead-no-rsv"),
-					_doc_object_text_req(&doc, &"reverse_input_json"),
-					_doc_str_req(&doc, &"reverse_input_hash", "revhead-no-rhash"));
+					_doc_int_req(doc, "seq", "revhead-no-seq"),
+					_doc_str_req(doc, "operation_name", "revhead-no-opname"),
+					_doc_str_req(doc, "reverse_invocation_id", "revhead-no-revid"),
+					_doc_str_req(doc, "reverse_operation_name", "revhead-no-rname"),
+					_doc_int_req(doc, "reverse_schema_version", "revhead-no-rsv"),
+					_doc_object_text_req(doc, "reverse_input_json"),
+					_doc_str_req(doc, "reverse_input_hash", "revhead-no-rhash"));
 			}
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:reverse_head"));
 		} catch managed:ManagedError(e) {
@@ -1933,7 +1933,7 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_int(seq));
 			args.push(rpc.arg_bytes(_dup_bytes(reverse_id)));
@@ -1943,24 +1943,24 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_string(_dup(reverse_input_hash)));
 			args.push(rpc.arg_string(_dup(event_ts)));
 			val sp: String = "sp_mf_checkpoint_reverse_request";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "requested" { return ReverseRequestOutcome::Requested(_doc_str_req(&doc, &"reverse_invocation_id", "revreq-no-id")); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "requested" { return ReverseRequestOutcome::Requested(_doc_str_req(doc, "reverse_invocation_id", "revreq-no-id")); }
 			if outcome == "already_requested" {
 				return ReverseRequestOutcome::AlreadyRequested(
-					_doc_str_req(&doc, &"reverse_invocation_id", "revreq-no-id"),
-					_doc_str_req(&doc, &"reverse_operation_name", "revreq-no-rname"),
-					_doc_int_req(&doc, &"reverse_schema_version", "revreq-no-rsv"),
-					_doc_object_text_req(&doc, &"reverse_input_json"),
-					_doc_str_req(&doc, &"reverse_input_hash", "revreq-no-rhash"));
+					_doc_str_req(doc, "reverse_invocation_id", "revreq-no-id"),
+					_doc_str_req(doc, "reverse_operation_name", "revreq-no-rname"),
+					_doc_int_req(doc, "reverse_schema_version", "revreq-no-rsv"),
+					_doc_object_text_req(doc, "reverse_input_json"),
+					_doc_str_req(doc, "reverse_input_hash", "revreq-no-rhash"));
 			}
 			if outcome == "binding_conflict" { return ReverseRequestOutcome::BindingConflict(); }
-			if outcome == "out_of_order" { return ReverseRequestOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "revreq-no-top")); }
-			if outcome == "checkpoint_inactive" { return ReverseRequestOutcome::CheckpointInactive(_doc_int_req(&doc, &"reversal_state", "revreq-no-cpstate")); }
+			if outcome == "out_of_order" { return ReverseRequestOutcome::OutOfOrder(_doc_int_req(doc, "top_seq", "revreq-no-top")); }
+			if outcome == "checkpoint_inactive" { return ReverseRequestOutcome::CheckpointInactive(_doc_int_req(doc, "reversal_state", "revreq-no-cpstate")); }
 			if outcome == "checkpoint_not_found" { return ReverseRequestOutcome::CheckpointNotFound(); }
 			if outcome == "fence_lost" { return ReverseRequestOutcome::FenceLost(); }
 			if outcome == "not_found" { return ReverseRequestOutcome::NotFound(); }
-			if outcome == "event_time_skew" { return ReverseRequestOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "revreq-no-defer-until")); }
+			if outcome == "event_time_skew" { return ReverseRequestOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "revreq-no-defer-until")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:reverse_request"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
@@ -1981,26 +1981,26 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_int(seq));
 			args.push(rpc.arg_bytes(_dup_bytes(reverse_id)));
 			args.push(_json_object_arg("result_json", result_json));
 			args.push(rpc.arg_string(_dup(event_ts)));
 			val sp: String = "sp_mf_checkpoint_reverse_settle";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
-			if outcome == "reversed" { return ReverseSettleOutcome::Reversed(_doc_str_opt(&doc, &"terminal_reason")); }
-			if outcome == "reversing" { return ReverseSettleOutcome::Reversing(_doc_int_req(&doc, &"next_seq", "revsettle-no-next")); }
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
+			if outcome == "reversed" { return ReverseSettleOutcome::Reversed(_doc_str_opt(doc, "terminal_reason")); }
+			if outcome == "reversing" { return ReverseSettleOutcome::Reversing(_doc_int_req(doc, "next_seq", "revsettle-no-next")); }
 			if outcome == "already_reversed" { return ReverseSettleOutcome::AlreadyReversed(); }
 			if outcome == "reverse_id_mismatch" { return ReverseSettleOutcome::ReverseIdMismatch(); }
 			if outcome == "not_requested" { return ReverseSettleOutcome::NotRequested(); }
-			if outcome == "checkpoint_not_settleable" { return ReverseSettleOutcome::CheckpointNotSettleable(_doc_int_req(&doc, &"reversal_state", "revsettle-no-cpstate")); }
-			if outcome == "out_of_order" { return ReverseSettleOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "revsettle-no-top")); }
+			if outcome == "checkpoint_not_settleable" { return ReverseSettleOutcome::CheckpointNotSettleable(_doc_int_req(doc, "reversal_state", "revsettle-no-cpstate")); }
+			if outcome == "out_of_order" { return ReverseSettleOutcome::OutOfOrder(_doc_int_req(doc, "top_seq", "revsettle-no-top")); }
 			if outcome == "checkpoint_not_found" { return ReverseSettleOutcome::CheckpointNotFound(); }
 			if outcome == "fence_lost" { return ReverseSettleOutcome::FenceLost(); }
 			if outcome == "not_found" { return ReverseSettleOutcome::NotFound(); }
-			if outcome == "event_time_skew" { return ReverseSettleOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "revsettle-no-defer-until")); }
+			if outcome == "event_time_skew" { return ReverseSettleOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "revsettle-no-defer-until")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:reverse_settle"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
@@ -2022,7 +2022,7 @@ implement MicroflowsHost for HostImpl {
 			val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 			var args = rpc.new_args();
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-			args.push(rpc.arg_bytes(_dup_bytes(&self.identity.executor_id)));
+			args.push(rpc.arg_bytes(_dup_bytes(self.identity.executor_id)));
 			args.push(rpc.arg_int(fencing_token));
 			args.push(rpc.arg_int(seq));
 			args.push(rpc.arg_bytes(_dup_bytes(reverse_id)));
@@ -2030,18 +2030,18 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_string(_dup(reason)));
 			args.push(rpc.arg_string(_dup(event_ts)));
 			val sp: String = "sp_mf_checkpoint_reverse_block";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "blocked" { return ReverseBlockOutcome::Blocked(); }
 			if outcome == "already_blocked" { return ReverseBlockOutcome::AlreadyBlocked(); }
 			if outcome == "reverse_id_mismatch" { return ReverseBlockOutcome::ReverseIdMismatch(); }
 			if outcome == "not_requested" { return ReverseBlockOutcome::NotRequested(); }
-			if outcome == "checkpoint_not_blockable" { return ReverseBlockOutcome::CheckpointNotBlockable(_doc_int_req(&doc, &"reversal_state", "revblock-no-cpstate")); }
-			if outcome == "out_of_order" { return ReverseBlockOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "revblock-no-top")); }
+			if outcome == "checkpoint_not_blockable" { return ReverseBlockOutcome::CheckpointNotBlockable(_doc_int_req(doc, "reversal_state", "revblock-no-cpstate")); }
+			if outcome == "out_of_order" { return ReverseBlockOutcome::OutOfOrder(_doc_int_req(doc, "top_seq", "revblock-no-top")); }
 			if outcome == "checkpoint_not_found" { return ReverseBlockOutcome::CheckpointNotFound(); }
 			if outcome == "fence_lost" { return ReverseBlockOutcome::FenceLost(); }
 			if outcome == "not_found" { return ReverseBlockOutcome::NotFound(); }
-			if outcome == "event_time_skew" { return ReverseBlockOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "revblock-no-defer-until")); }
+			if outcome == "event_time_skew" { return ReverseBlockOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "revblock-no-defer-until")); }
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:reverse_block"));
 		} catch managed:ManagedError(e) {
 			val tag_owned: String = e.tag;
@@ -2080,20 +2080,20 @@ implement MicroflowsHost for HostImpl {
 			args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
 			args.push(rpc.arg_int(operation_seq));
 			val sp: String = "sp_mf_call_inspect";
-			val doc = _call_sp_doc(conn, &sp, move args);
-			val outcome = _doc_outcome(&doc);
+			val doc = _call_sp_doc(conn, sp, move args);
+			val outcome = _doc_outcome(doc);
 			if outcome == "not_found" { return CallInspectOutcome::NotFound(); }
 			if outcome == "found" {
-				val child_status = _doc_int_req(&doc, &"child_status", "call-inspect-no-child-status");
-				val state = _doc_int_req(&doc, &"state", "call-inspect-no-state");
-				val direction = _doc_int_req(&doc, &"execution_direction", "call-inspect-no-direction");
-				val disp = _doc_int_req(&doc, &"current_disposition", "call-inspect-no-disposition");
-				val terminal = _doc_int_req(&doc, &"is_terminal", "call-inspect-no-terminal");
+				val child_status = _doc_int_req(doc, "child_status", "call-inspect-no-child-status");
+				val state = _doc_int_req(doc, "state", "call-inspect-no-state");
+				val direction = _doc_int_req(doc, "execution_direction", "call-inspect-no-direction");
+				val disp = _doc_int_req(doc, "current_disposition", "call-inspect-no-disposition");
+				val terminal = _doc_int_req(doc, "is_terminal", "call-inspect-no-terminal");
 				return CallInspectOutcome::Found(
-					_doc_str_req(&doc, &"child_workflow_id", "call-inspect-no-child-id"),
+					_doc_str_req(doc, "child_workflow_id", "call-inspect-no-child-id"),
 					child_status, state, direction, disp, terminal != 0,
-					_doc_str_opt(&doc, &"terminal_reason"),
-					_doc_object_text_opt(&doc, &"workflow_return_json"));
+					_doc_str_opt(doc, "terminal_reason"),
+					_doc_object_text_opt(doc, "workflow_return_json"));
 			}
 			throw HostException(kind = HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:call_inspect"));
 		} catch managed:ManagedError(e) {
@@ -2262,8 +2262,8 @@ fn _call_hint_refresh_core(impl_: &HostImpl, workflow_id: &Array<Byte>, operatio
 		args.push(rpc.arg_int(child_status));
 		args.push(rpc.arg_string(_dup(event_ts)));
 		val sp: String = "sp_mf_call_hint_refresh";
-		val doc = _call_sp_doc(conn, &sp, move args);
-		val outcome = _doc_outcome(&doc);
+		val doc = _call_sp_doc(conn, sp, move args);
+		val outcome = _doc_outcome(doc);
 		if outcome == "refreshed" { return core.Result<CallHintRefreshOutcome, HostErrorKind>::Ok(CallHintRefreshOutcome::Refreshed()); }
 		if outcome == "not_found" { return core.Result<CallHintRefreshOutcome, HostErrorKind>::Ok(CallHintRefreshOutcome::NotFound()); }
 		return core.Result<CallHintRefreshOutcome, HostErrorKind>::Err(HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:call_hint_refresh"));
@@ -2287,8 +2287,8 @@ fn _child_terminal_notify_core(impl_: &HostImpl, child_workflow_id: &Array<Byte>
 		args.push(rpc.arg_int(child_status));
 		args.push(rpc.arg_string(_dup(event_ts)));
 		val sp: String = "sp_mf_child_terminal_notify";
-		val doc = _call_sp_doc(conn, &sp, move args);
-		val outcome = _doc_outcome(&doc);
+		val doc = _call_sp_doc(conn, sp, move args);
+		val outcome = _doc_outcome(doc);
 		if outcome == "notified" { return core.Result<ChildTerminalNotifyOutcome, HostErrorKind>::Ok(ChildTerminalNotifyOutcome::Notified()); }
 		if outcome == "not_found" { return core.Result<ChildTerminalNotifyOutcome, HostErrorKind>::Ok(ChildTerminalNotifyOutcome::NotFound()); }
 		return core.Result<ChildTerminalNotifyOutcome, HostErrorKind>::Err(HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:child_terminal_notify"));
@@ -2328,7 +2328,7 @@ fn _call_submit_core(impl_: &HostImpl, workflow_id: &Array<Byte>, fencing_token:
 	if parent_node_id.byte_length() == 0 { return core.Result<CallSubmitOutcome, HostErrorKind>::Err(HostErrorKind::InvalidArg(field = "parent_node_id")); }
 	if max_call_depth < 1 { return core.Result<CallSubmitOutcome, HostErrorKind>::Err(HostErrorKind::InvalidArg(field = "max_call_depth")); }
 	val input_canon = _canonical_args(input_json);
-	val input_hash = _canonical_input_hash(&input_canon);
+	val input_hash = _canonical_input_hash(input_canon);
 	match _acquire_conn_checked(impl_) {
 		core.Result::Err(kind) => { return core.Result<CallSubmitOutcome, HostErrorKind>::Err(move kind); },
 		core.Result::Ok(lease0) => {
@@ -2337,12 +2337,12 @@ fn _call_submit_core(impl_: &HostImpl, workflow_id: &Array<Byte>, fencing_token:
 				val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 				var args = rpc.new_args();
 				args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-				args.push(rpc.arg_bytes(_dup_bytes(&impl_.identity.executor_id)));
+				args.push(rpc.arg_bytes(_dup_bytes(impl_.identity.executor_id)));
 				args.push(rpc.arg_int(fencing_token));
 				args.push(rpc.arg_int(operation_seq));
 				args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
-				args.push(_json_object_arg("input_json", &input_canon));
-				args.push(rpc.arg_string(_dup(&input_hash)));
+				args.push(_json_object_arg("input_json", input_canon));
+				args.push(rpc.arg_string(_dup(input_hash)));
 				args.push(_json_object_arg("new_continuation", new_continuation));
 				args.push(rpc.arg_string(_dup(event_ts)));
 				args.push(_meta_object_arg("event_payload", event_payload));
@@ -2357,16 +2357,16 @@ fn _call_submit_core(impl_: &HostImpl, workflow_id: &Array<Byte>, fencing_token:
 				args.push(rpc.arg_string(_dup(parent_node_id)));
 				args.push(rpc.arg_int(max_call_depth));
 				val sp: String = "sp_mf_call_submit";
-				match _call_sp_doc_checked(conn, &sp, move args) {
+				match _call_sp_doc_checked(conn, sp, move args) {
 					core.Result::Err(kind) => { return core.Result<CallSubmitOutcome, HostErrorKind>::Err(move kind); },
 					core.Result::Ok(doc) => {
-						val outcome = _doc_outcome(&doc);
-						if outcome == "submitted" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::Submitted(_doc_str_req(&doc, &"child_workflow_id", "call-submit-no-child-id"))); }
-						if outcome == "already_submitted" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::AlreadySubmitted(_doc_str_req(&doc, &"child_workflow_id", "call-submit-no-child-id"))); }
+						val outcome = _doc_outcome(doc);
+						if outcome == "submitted" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::Submitted(_doc_str_req(doc, "child_workflow_id", "call-submit-no-child-id"))); }
+						if outcome == "already_submitted" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::AlreadySubmitted(_doc_str_req(doc, "child_workflow_id", "call-submit-no-child-id"))); }
 						if outcome == "call_conflict" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::CallConflict()); }
-						if outcome == "call_rejected" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::CallRejected(_doc_str_req(&doc, &"reason", "call-submit-no-reason"))); }
-						if outcome == "plan_violation" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::PlanViolation(_doc_str_req(&doc, &"reason", "call-submit-no-plan-reason"), _doc_int_req(&doc, &"plan_length", "call-submit-no-plan-length"))); }
-						if outcome == "event_time_skew" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "call-submit-no-defer-until"))); }
+						if outcome == "call_rejected" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::CallRejected(_doc_str_req(doc, "reason", "call-submit-no-reason"))); }
+						if outcome == "plan_violation" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::PlanViolation(_doc_str_req(doc, "reason", "call-submit-no-plan-reason"), _doc_int_req(doc, "plan_length", "call-submit-no-plan-length"))); }
+						if outcome == "event_time_skew" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "call-submit-no-defer-until"))); }
 						if outcome == "fence_lost" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::FenceLost()); }
 						if outcome == "not_found" { return core.Result<CallSubmitOutcome, HostErrorKind>::Ok(CallSubmitOutcome::NotFound()); }
 						return core.Result<CallSubmitOutcome, HostErrorKind>::Err(HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:call_submit"));
@@ -2401,7 +2401,7 @@ fn _operation_request_core(impl_: &HostImpl, workflow_id: &Array<Byte>, fencing_
 				val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 				var args = rpc.new_args();
 				args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-				args.push(rpc.arg_bytes(_dup_bytes(&impl_.identity.executor_id)));
+				args.push(rpc.arg_bytes(_dup_bytes(impl_.identity.executor_id)));
 				args.push(rpc.arg_int(fencing_token));
 				args.push(rpc.arg_int(operation_seq));
 				args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
@@ -2413,26 +2413,26 @@ fn _operation_request_core(impl_: &HostImpl, workflow_id: &Array<Byte>, fencing_
 				args.push(rpc.arg_string(_dup(event_ts)));
 				args.push(_meta_object_arg("event_payload", event_payload));
 				val sp: String = "sp_mf_operation_request";
-				match _call_sp_doc_checked(conn, &sp, move args) {
+				match _call_sp_doc_checked(conn, sp, move args) {
 					core.Result::Err(kind) => { return core.Result<OperationRequestOutcome, HostErrorKind>::Err(move kind); },
 					core.Result::Ok(doc) => {
-						val outcome = _doc_outcome(&doc);
+						val outcome = _doc_outcome(doc);
 						if outcome == "requested" {
-							val hex = _doc_str_req(&doc, &"operation_id", "request-no-opid");
-							return core.Result<OperationRequestOutcome, HostErrorKind>::Ok(OperationRequestOutcome::Requested(_hex16("request-opid-hex", &hex)));
+							val hex = _doc_str_req(doc, "operation_id", "request-no-opid");
+							return core.Result<OperationRequestOutcome, HostErrorKind>::Ok(OperationRequestOutcome::Requested(_hex16("request-opid-hex", hex)));
 						}
 						if outcome == "exists" {
-							val hex = _doc_str_req(&doc, &"operation_id", "request-no-opid");
-							return core.Result<OperationRequestOutcome, HostErrorKind>::Ok(OperationRequestOutcome::Exists(_hex16("request-opid-hex", &hex)));
+							val hex = _doc_str_req(doc, "operation_id", "request-no-opid");
+							return core.Result<OperationRequestOutcome, HostErrorKind>::Ok(OperationRequestOutcome::Exists(_hex16("request-opid-hex", hex)));
 						}
 						if outcome == "operation_conflict" { return core.Result<OperationRequestOutcome, HostErrorKind>::Ok(OperationRequestOutcome::OperationConflict()); }
 						if outcome == "fence_lost" { return core.Result<OperationRequestOutcome, HostErrorKind>::Ok(OperationRequestOutcome::FenceLost()); }
 						if outcome == "not_found" { return core.Result<OperationRequestOutcome, HostErrorKind>::Ok(OperationRequestOutcome::NotFound()); }
 						if outcome == "plan_violation" {
-							return core.Result<OperationRequestOutcome, HostErrorKind>::Ok(OperationRequestOutcome::PlanViolation(_doc_str_req(&doc, &"reason", "request-no-plan-violation-reason")));
+							return core.Result<OperationRequestOutcome, HostErrorKind>::Ok(OperationRequestOutcome::PlanViolation(_doc_str_req(doc, "reason", "request-no-plan-violation-reason")));
 						}
 						if outcome == "event_time_skew" {
-							return core.Result<OperationRequestOutcome, HostErrorKind>::Ok(OperationRequestOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "request-no-defer-until")));
+							return core.Result<OperationRequestOutcome, HostErrorKind>::Ok(OperationRequestOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "request-no-defer-until")));
 						}
 						return core.Result<OperationRequestOutcome, HostErrorKind>::Err(HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_request"));
 					}
@@ -2465,7 +2465,7 @@ fn _operation_settle_core(impl_: &HostImpl, workflow_id: &Array<Byte>, fencing_t
 				val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 				var args = rpc.new_args();
 				args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-				args.push(rpc.arg_bytes(_dup_bytes(&impl_.identity.executor_id)));
+				args.push(rpc.arg_bytes(_dup_bytes(impl_.identity.executor_id)));
 				args.push(rpc.arg_int(fencing_token));
 				args.push(rpc.arg_int(operation_seq));
 				args.push(rpc.arg_bytes(_dup_bytes(operation_id)));
@@ -2480,25 +2480,25 @@ fn _operation_settle_core(impl_: &HostImpl, workflow_id: &Array<Byte>, fencing_t
 				if is_final { is_final_int = 1; }
 				args.push(rpc.arg_int(is_final_int));
 				val sp: String = "sp_mf_operation_settle";
-				match _call_sp_doc_checked(conn, &sp, move args) {
+				match _call_sp_doc_checked(conn, sp, move args) {
 					core.Result::Err(kind) => { return core.Result<OperationSettleOutcome, HostErrorKind>::Err(move kind); },
 					core.Result::Ok(doc) => {
-						val outcome = _doc_outcome(&doc);
+						val outcome = _doc_outcome(doc);
 						if outcome == "settled" {
-							return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::Settled(_doc_object_text_req(&doc, &"result")));
+							return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::Settled(_doc_object_text_req(doc, "result")));
 						}
 						if outcome == "already_settled" {
-							return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::AlreadySettled(_doc_object_text_req(&doc, &"result")));
+							return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::AlreadySettled(_doc_object_text_req(doc, "result")));
 						}
 						if outcome == "operation_conflict" { return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::OperationConflict()); }
 						if outcome == "fence_lost" { return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::FenceLost()); }
 						if outcome == "not_found" { return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::NotFound()); }
 						if outcome == "operation_not_found" { return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::OperationNotFound()); }
 						if outcome == "plan_violation" {
-							return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::PlanViolation(_doc_str_req(&doc, &"reason", "settle-no-plan-violation-reason")));
+							return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::PlanViolation(_doc_str_req(doc, "reason", "settle-no-plan-violation-reason")));
 						}
 						if outcome == "event_time_skew" {
-							return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "settle-no-defer-until")));
+							return core.Result<OperationSettleOutcome, HostErrorKind>::Ok(OperationSettleOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "settle-no-defer-until")));
 						}
 						return core.Result<OperationSettleOutcome, HostErrorKind>::Err(HostErrorKind::BackendResponseInvalid(detail = "unexpected-outcome:operation_settle"));
 					}
@@ -2527,21 +2527,21 @@ fn _checkpoint_reverse_child_reopen_core(impl_: &HostImpl, workflow_id: &Array<B
 				val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 				var args = rpc.new_args();
 				args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-				args.push(rpc.arg_bytes(_dup_bytes(&impl_.identity.executor_id)));
+				args.push(rpc.arg_bytes(_dup_bytes(impl_.identity.executor_id)));
 				args.push(rpc.arg_int(fencing_token));
 				args.push(rpc.arg_int(seq));
 				args.push(rpc.arg_string(_dup(event_ts)));
 				val sp: String = "sp_mf_checkpoint_reverse_child_reopen";
-				match _call_sp_doc_checked(conn, &sp, move args) {
+				match _call_sp_doc_checked(conn, sp, move args) {
 					core.Result::Err(kind) => { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Err(move kind); },
 					core.Result::Ok(doc) => {
-						val outcome = _doc_outcome(&doc);
-						if outcome == "reopened" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::Reopened(_doc_str_req(&doc, &"child_workflow_id", "reopen-no-child-id"))); }
-						if outcome == "already_reopened" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::AlreadyReopened(_doc_int_req(&doc, &"child_state", "reopen-no-child-state"))); }
-						if outcome == "child_state_inconsistent" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::ChildStateInconsistent(_doc_int_req(&doc, &"child_state", "reopen-no-child-state"))); }
+						val outcome = _doc_outcome(doc);
+						if outcome == "reopened" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::Reopened(_doc_str_req(doc, "child_workflow_id", "reopen-no-child-id"))); }
+						if outcome == "already_reopened" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::AlreadyReopened(_doc_int_req(doc, "child_state", "reopen-no-child-state"))); }
+						if outcome == "child_state_inconsistent" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::ChildStateInconsistent(_doc_int_req(doc, "child_state", "reopen-no-child-state"))); }
 						if outcome == "child_no_active_checkpoint" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::ChildNoActiveCheckpoint()); }
-						if outcome == "out_of_order" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "reopen-no-top"))); }
-						if outcome == "event_time_skew" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "reopen-no-defer-until"))); }
+						if outcome == "out_of_order" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::OutOfOrder(_doc_int_req(doc, "top_seq", "reopen-no-top"))); }
+						if outcome == "event_time_skew" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "reopen-no-defer-until"))); }
 						if outcome == "fence_lost" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::FenceLost()); }
 						if outcome == "not_found" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::NotFound()); }
 						if outcome == "checkpoint_not_found" { return core.Result<CheckpointReverseChildReopenOutcome, HostErrorKind>::Ok(CheckpointReverseChildReopenOutcome::CheckpointNotFound()); }
@@ -2575,26 +2575,26 @@ fn _checkpoint_reverse_child_settle_core(impl_: &HostImpl, workflow_id: &Array<B
 				val conn: &mut rpc.RpcConnection = lease.conn().or_throw();
 				var args = rpc.new_args();
 				args.push(rpc.arg_bytes(_dup_bytes(workflow_id)));
-				args.push(rpc.arg_bytes(_dup_bytes(&impl_.identity.executor_id)));
+				args.push(rpc.arg_bytes(_dup_bytes(impl_.identity.executor_id)));
 				args.push(rpc.arg_int(fencing_token));
 				args.push(rpc.arg_int(seq));
 				args.push(rpc.arg_string(_dup(event_ts)));
 				val sp: String = "sp_mf_checkpoint_reverse_child_settle";
-				match _call_sp_doc_checked(conn, &sp, move args) {
+				match _call_sp_doc_checked(conn, sp, move args) {
 					core.Result::Err(kind) => { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Err(move kind); },
 					core.Result::Ok(doc) => {
-						val outcome = _doc_outcome(&doc);
-						if outcome == "reversed" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::Reversed(_doc_str_opt(&doc, &"terminal_reason"))); }
-						if outcome == "reversing" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::Reversing(_doc_int_req(&doc, &"next_seq", "settle-no-next-seq"))); }
+						val outcome = _doc_outcome(doc);
+						if outcome == "reversed" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::Reversed(_doc_str_opt(doc, "terminal_reason"))); }
+						if outcome == "reversing" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::Reversing(_doc_int_req(doc, "next_seq", "settle-no-next-seq"))); }
 						if outcome == "already_reversed" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::AlreadyReversed()); }
-						if outcome == "child_not_terminal" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::ChildNotTerminal(_doc_int_req(&doc, &"child_state", "settle-no-child-state"))); }
-						if outcome == "child_not_compensated" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::ChildNotCompensated(_doc_int_req(&doc, &"child_state", "settle-no-child-state"))); }
-						if outcome == "out_of_order" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::OutOfOrder(_doc_int_req(&doc, &"top_seq", "settle-no-top"))); }
-						if outcome == "event_time_skew" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::EventTimeSkew(_doc_str_req(&doc, &"defer_until", "settle-no-defer-until"))); }
+						if outcome == "child_not_terminal" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::ChildNotTerminal(_doc_int_req(doc, "child_state", "settle-no-child-state"))); }
+						if outcome == "child_not_compensated" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::ChildNotCompensated(_doc_int_req(doc, "child_state", "settle-no-child-state"))); }
+						if outcome == "out_of_order" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::OutOfOrder(_doc_int_req(doc, "top_seq", "settle-no-top"))); }
+						if outcome == "event_time_skew" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::EventTimeSkew(_doc_str_req(doc, "defer_until", "settle-no-defer-until"))); }
 						if outcome == "fence_lost" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::FenceLost()); }
 						if outcome == "not_found" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::NotFound()); }
 						if outcome == "checkpoint_not_found" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::CheckpointNotFound()); }
-						if outcome == "checkpoint_not_settleable" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::CheckpointNotSettleable(_doc_int_req(&doc, &"reversal_state", "settle-no-cpstate"))); }
+						if outcome == "checkpoint_not_settleable" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::CheckpointNotSettleable(_doc_int_req(doc, "reversal_state", "settle-no-cpstate"))); }
 						if outcome == "not_call_checkpoint" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::NotCallCheckpoint()); }
 						if outcome == "call_sidecar_not_found" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::CallSidecarNotFound()); }
 						if outcome == "child_not_found" { return core.Result<CheckpointReverseChildSettleOutcome, HostErrorKind>::Ok(CheckpointReverseChildSettleOutcome::ChildNotFound()); }
@@ -2611,16 +2611,16 @@ fn _checkpoint_reverse_child_settle_core(impl_: &HostImpl, workflow_id: &Array<B
 
 // Parse a 'claimed' result document into a ClaimedWorkflow.
 fn _parse_claimed(doc: &json.JsonNode) -> ClaimedWorkflow {
-	val wf_hex = _doc_str_req(doc, &"workflow_id", "claim-no-workflow-id");
-	val wf_id = _hex16("claim-workflow-id-hex", &wf_hex);
-	val fencing = _doc_int_req(doc, &"fencing_token", "claim-no-fencing");
-	val state_code = _doc_int_req(doc, &"state", "claim-no-state");
-	val direction = _doc_int_req(doc, &"execution_direction", "claim-no-direction");
-	val disp = _doc_int_req(doc, &"current_disposition", "claim-no-disposition");
-	val sname = _doc_str_req(doc, &"script_name", "claim-no-script-name");
-	val srev = _doc_int_req(doc, &"script_revision", "claim-no-script-revision");
-	val attempt = _doc_int_req(doc, &"current_operation_attempt", "claim-no-attempt");
-	val continuation = _doc_object_text_req(doc, &"continuation");
+	val wf_hex = _doc_str_req(doc, "workflow_id", "claim-no-workflow-id");
+	val wf_id = _hex16("claim-workflow-id-hex", wf_hex);
+	val fencing = _doc_int_req(doc, "fencing_token", "claim-no-fencing");
+	val state_code = _doc_int_req(doc, "state", "claim-no-state");
+	val direction = _doc_int_req(doc, "execution_direction", "claim-no-direction");
+	val disp = _doc_int_req(doc, "current_disposition", "claim-no-disposition");
+	val sname = _doc_str_req(doc, "script_name", "claim-no-script-name");
+	val srev = _doc_int_req(doc, "script_revision", "claim-no-script-revision");
+	val attempt = _doc_int_req(doc, "current_operation_attempt", "claim-no-attempt");
+	val continuation = _doc_object_text_req(doc, "continuation");
 	return ClaimedWorkflow(
 		workflow_id = move wf_id,
 		fencing_token = fencing,
@@ -2680,7 +2680,7 @@ fn _canonical_args(args_json: &String) -> String {
 	match json.parse_strict(args_json) {
 		core.Result::Ok(node) => {
 			match node.as_object() {
-				Optional::Some(_) => { return json.encode_compact_with_config(&node, &cfg); },
+				Optional::Some(_) => { return json.encode_compact_with_config(node, cfg); },
 				Optional::None => { throw HostException(kind = HostErrorKind::InvalidJson(field = "arguments")); }
 			}
 		},
@@ -2694,8 +2694,8 @@ fn _canonical_args(args_json: &String) -> String {
 // the same way. Callers must pass an already-canonicalized string; this does not canonicalize.
 fn _canonical_input_hash(canonical: &String) nothrow -> String {
 	val u: uuid.Uuid = uuid.v3_from_string(canonical);
-	val bytes: Array<Byte> = uuid.to_bytes(&u);
-	return codec.hex_encode(&bytes);
+	val bytes: Array<Byte> = uuid.to_bytes(u);
+	return codec.hex_encode(bytes);
 }
 
 // UTF-8 bytes of a String (for a binary RPC argument).
@@ -2789,7 +2789,7 @@ fn _classify_acquire_tag(tag: String) nothrow -> HostErrorKind {
 fn _exec_with_conn(conn: &mut rpc.RpcConnection, sp_name: &String, args: Array<rpc.RpcArg>)
 	-> rpc.RpcStatement
 {
-	match conn.call(sp_name, &args) {
+	match conn.call(sp_name, args) {
 		core.Result::Err(e) => {
 			val tag_owned: String = e.tag;
 			throw HostException(kind = HostErrorKind::BackendUnavailable(detail = move tag_owned));
@@ -2803,7 +2803,7 @@ fn _exec_with_conn(conn: &mut rpc.RpcConnection, sp_name: &String, args: Array<r
 fn _exec_with_conn_checked(conn: &mut rpc.RpcConnection, sp_name: &String, args: Array<rpc.RpcArg>)
 	nothrow -> core.Result<rpc.RpcStatement, HostErrorKind>
 {
-	match conn.call(sp_name, &args) {
+	match conn.call(sp_name, args) {
 		core.Result::Err(e) => {
 			val tag_owned: String = e.tag;
 			return core.Result<rpc.RpcStatement, HostErrorKind>::Err(HostErrorKind::BackendUnavailable(detail = move tag_owned));
@@ -2918,8 +2918,8 @@ fn _read_result_doc(stmt: &mut rpc.RpcStatement) -> json.JsonNode {
 	val event = _next(stmt);
 	match event {
 		rpc.RpcEvent::Row(row) => {
-			val text = _str_req(&row, 0);
-			return _parse_object_doc(&text);
+			val text = _str_req(row, 0);
+			return _parse_object_doc(text);
 		},
 		rpc.RpcEvent::ServerErr(err) => {
 			val errcode_owned: Uint = err.error_code; val msg_owned: String = err.message;
@@ -2935,8 +2935,8 @@ fn _call_sp_doc(conn: &mut rpc.RpcConnection, sp_name: &String, args: Array<rpc.
 	-> json.JsonNode
 {
 	var stmt = _exec_with_conn(conn, sp_name, move args);
-	val doc = _read_result_doc(&mut stmt);
-	_finish_stmt_and_commit(&mut stmt, conn);
+	val doc = _read_result_doc(stmt);
+	_finish_stmt_and_commit(stmt, conn);
 	return move doc;
 }
 
@@ -2951,8 +2951,8 @@ fn _read_result_doc_checked(stmt: &mut rpc.RpcStatement) -> core.Result<json.Jso
 		core.Result::Ok(event) => {
 			match event {
 				rpc.RpcEvent::Row(row) => {
-					val text = _str_req(&row, 0);
-					return core.Result<json.JsonNode, HostErrorKind>::Ok(_parse_object_doc(&text));
+					val text = _str_req(row, 0);
+					return core.Result<json.JsonNode, HostErrorKind>::Ok(_parse_object_doc(text));
 				},
 				rpc.RpcEvent::ServerErr(err) => {
 					val errcode_owned: Uint = err.error_code; val msg_owned: String = err.message;
@@ -2978,10 +2978,10 @@ fn _call_sp_doc_checked(conn: &mut rpc.RpcConnection, sp_name: &String, args: Ar
 		core.Result::Err(kind) => { return core.Result<json.JsonNode, HostErrorKind>::Err(move kind); },
 		core.Result::Ok(stmt) => {
 			var stmt_mut = move stmt;
-			match _read_result_doc_checked(&mut stmt_mut) {
+			match _read_result_doc_checked(stmt_mut) {
 				core.Result::Err(kind) => { return core.Result<json.JsonNode, HostErrorKind>::Err(move kind); },
 				core.Result::Ok(doc) => {
-					match _finish_stmt_and_commit_checked(&mut stmt_mut, conn) {
+					match _finish_stmt_and_commit_checked(stmt_mut, conn) {
 						core.Result::Err(kind) => { return core.Result<json.JsonNode, HostErrorKind>::Err(move kind); },
 						core.Result::Ok(_) => { return core.Result<json.JsonNode, HostErrorKind>::Ok(move doc); }
 					}
@@ -2992,7 +2992,7 @@ fn _call_sp_doc_checked(conn: &mut rpc.RpcConnection, sp_name: &String, args: Ar
 }
 
 fn _doc_outcome(doc: &json.JsonNode) -> String {
-	return _doc_str_req(doc, &"outcome", "result-no-outcome");
+	return _doc_str_req(doc, "outcome", "result-no-outcome");
 }
 
 fn _doc_str_req(doc: &json.JsonNode, key: &String, detail: String) -> String {
@@ -3024,10 +3024,10 @@ fn _doc_str_opt(doc: &json.JsonNode, key: &String) nothrow -> String {
 // Decode the durable pin from a create_planned / plan_get result document.
 fn _decode_pin(doc: &json.JsonNode) -> PinnedScript {
 	return PinnedScript(
-		script_name = _doc_str_req(doc, &"script_name", "pin-no-script-name"),
-		plan_version = _doc_str_req(doc, &"plan_version", "pin-no-plan-version"),
-		content_hash = _doc_str_req(doc, &"content_hash", "pin-no-content-hash"),
-		plan_length = _doc_int_req(doc, &"plan_length", "pin-no-plan-length"));
+		script_name = _doc_str_req(doc, "script_name", "pin-no-script-name"),
+		plan_version = _doc_str_req(doc, "plan_version", "pin-no-plan-version"),
+		content_hash = _doc_str_req(doc, "content_hash", "pin-no-content-hash"),
+		plan_length = _doc_int_req(doc, "plan_length", "pin-no-plan-length"));
 }
 
 fn _doc_int_req(doc: &json.JsonNode, key: &String, detail: String) -> Int {

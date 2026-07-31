@@ -88,14 +88,14 @@ fn _arm_fault(m: &conc.Mutex<json.JsonNode>, op: String, mode: String) nothrow -
 	var o = json.new_object();
 	o.set(move op, json.JsonNode::String(move mode));
 	var g = conc.lock(m);
-	val slot = conc.mutex_guard_get_mut(&mut g);
+	val slot = conc.mutex_guard_get_mut(g);
 	*slot = o.to_node();
 }
 
 // The armed mode for `op` ("reject" / "pending"), or "" if none.
 fn _armed_mode(m: &conc.Mutex<json.JsonNode>, op: &String) nothrow -> String {
 	var g = conc.lock(m);
-	val slot = conc.mutex_guard_get_mut(&mut g);
+	val slot = conc.mutex_guard_get_mut(g);
 	match slot.get(op) {
 		Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { return move v; }, Optional::None => {} } },
 		Optional::None => {}
@@ -172,11 +172,11 @@ fn _run(config_path: String, port_cli: Optional<Int>, service_group_default: Str
 	val _ = xb.stack_bytes(2097152);
 	conc.set_default_executor(conc.build_executor(xb.build()));
 
-	val cfg = _load_config_json(&config_path);
+	val cfg = _load_config_json(config_path);
 
 	// port precedence: --port wins, else config.port, else default.
 	var port = DEFAULT_PORT;
-	match cfg.get(&"port") {
+	match cfg.get("port") {
 		Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { port = v; }, Optional::None => {} } },
 		Optional::None => {}
 	}
@@ -184,12 +184,12 @@ fn _run(config_path: String, port_cli: Optional<Int>, service_group_default: Str
 		Optional::Some(v) => { port = v; },
 		Optional::None => {}
 	}
-	val service_group = _config_str(&cfg, &"service_group", service_group_default);
-	val worker_id = _config_str(&cfg, &"worker_id", worker_id_default);
+	val service_group = _config_str(cfg, "service_group", service_group_default);
+	val worker_id = _config_str(cfg, "worker_id", worker_id_default);
 
 	// Build the Singular gateway from the "singular" subtree.
-	val singular_sub = _require_singular(&cfg);
-	val gateway = _build_singular_gw(&singular_sub, &service_group, &worker_id);
+	val singular_sub = _require_singular(cfg);
+	val gateway = _build_singular_gw(singular_sub, service_group, worker_id);
 
 	val app = conc.arc(StubApp(gateway = move gateway, service_group = move service_group,
 	                           exec_count = conc.atomic_int(0), request_count = conc.atomic_int(0),
@@ -248,7 +248,7 @@ fn _run(config_path: String, port_cli: Optional<Int>, service_group_default: Str
 
 // Statement-form helpers (Drift: an expression-form match arm may not `throw`).
 fn _require_singular(cfg: &json.JsonNode) -> json.JsonNode {
-	match cfg.get(&"singular") {
+	match cfg.get("singular") {
 		Optional::Some(n) => { return n.clone_deep(); },
 		Optional::None => { throw StubError(message = "config: missing 'singular' subtree"); }
 	}
@@ -259,8 +259,8 @@ fn _build_singular_gw(singular_sub: &json.JsonNode, service_group: &String, work
 {
 	val identity = singular.identity_from_worker_name(_dup(service_group), worker_id);
 	var b = singular.new_gateway_builder();
-	singular.with_json(&mut b, singular_sub);
-	singular.with_identity(&mut b, move identity);
+	singular.with_json(b, singular_sub);
+	singular.with_identity(b, move identity);
 	match singular.build_gateway(move b) {
 		core.Result::Ok(g) => { return move g; },
 		core.Result::Err(_) => { throw StubError(message = "config: singular gateway build failed"); }
@@ -282,8 +282,8 @@ implement StubApp {
 		}
 		// Statement-form match: a bad parse returns 400; otherwise dispatch with
 		// the parsed input.
-		match json.parse(&req.body) {
-			core.Result::Ok(input) => { return self.handle_put_input(&op, &op_id, &input); },
+		match json.parse(req.body) {
+			core.Result::Ok(input) => { return self.handle_put_input(op, op_id, input); },
 			core.Result::Err(_) => { return _json(400, _envelope_error("invalid-json")); }
 		}
 	}
@@ -299,15 +299,15 @@ implement StubApp {
 		if !_supported_op(op) {
 			return _json(400, _envelope_error("unknown-operation"));
 		}
-		if !_validate_input(op, &eff) {
+		if !_validate_input(op, eff) {
 			return _json(400, _envelope_error("invalid-input"));
 		}
 		// Out-of-band armed fault for THIS operation name (test control; keeps business payloads clean).
-		val armed = _armed_mode(&self.armed, op);
+		val armed = _armed_mode(self.armed, op);
 		// Fault injection: DEFINITE rejection (non-retryable 400) BEFORE Singular, so
 		// no operation is created and the body never runs. Exercises the runner's
 		// reverse-path block (and the forward block).
-		if _fault_reject(&eff) or armed == "reject" {
+		if _fault_reject(eff) or armed == "reject" {
 			return _json(400, _envelope_error("fault-rejected"));
 		}
 		// Route-404 fault (armed via /arm): 404 BEFORE Singular -> NO operation created. The participant
@@ -326,35 +326,35 @@ implement StubApp {
 		val key = _op_key(op, op_id);
 		val token = _lease_token(op, op_id);
 		val input_hash = _input_hash(input);
-		val item_meta = _hash_meta(&input_hash);
+		val item_meta = _hash_meta(input_hash);
 
 		// 0.5: caller-supplied absolute times. claim_time = wall clock now; the lease deadline is
 		// claim_time + LEASE_TIMEOUT_SECONDS. The settle event_time (taken after the body runs + the
 		// start round-trip) is strictly later, satisfying Singular's monotonicity.
 		val claim_time = time.now_utc();
-		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(&claim_time) + _lease_ttl_seconds() * 1000000);
-		match self.gateway.get().start_checked(&key, &item_meta, &"{}", &claim_time, &lease_expires, &token) {
+		val lease_expires = time.utc_from_unix_micros(time.utc_unix_micros(claim_time) + _lease_ttl_seconds() * 1000000);
+		match self.gateway.get().start_checked(key, item_meta, "{}", claim_time, lease_expires, token) {
 			core.Result::Err(kind) => { return _retriable_response_or_rejected(move kind); },
 			core.Result::Ok(start_outcome) => {
 				match start_outcome {
 					singular.StartOutcome::Granted(lease) => {
 						// Fault injection: RESPOND-PENDING. 202 BEFORE the body -> nothing committed, op left Working
 						// (no reclaim path exercised). exec_count unchanged.
-						if _fault_respond_pending(&eff) {
+						if _fault_respond_pending(eff) {
 							return _json(202, _envelope_pending());
 						}
 						// Run the body IDEMPOTENTLY keyed by operation_id (APPLIED: exec_count++ + result stored;
 						// a later rerun for the same id is REPLAYED with no re-execution). Handles the omit_result /
 						// invalid_result protocol-violation faults internally (stored so a replay reproduces them).
-						val result_json = self.run_idempotent(op_id, op, &eff);
+						val result_json = self.run_idempotent(op_id, op, eff);
 						// Fault injection: CRASH-AFTER-COMMIT. The side effect is committed (applied + lease Working),
 						// but we "crash" before complete -> return 202 WITHOUT completing. The lease expires and a
 						// later byte-identical PUT reclaims it (Exists branch). Models case [12].
-						if _fault_crash_after_commit(&eff) {
+						if _fault_crash_after_commit(eff) {
 							return _json(202, _envelope_pending());
 						}
 						val settle_time = time.now_utc();
-						match self.gateway.get().complete_checked(&lease, &settle_time, &result_json) {
+						match self.gateway.get().complete_checked(lease, settle_time, result_json) {
 							core.Result::Err(kind) => { return _retriable_response_or_rejected(move kind); },
 							core.Result::Ok(settle_outcome) => {
 								match settle_outcome {
@@ -362,11 +362,11 @@ implement StubApp {
 										// Fault injection: DROP-AFTER-COMMIT (lost ack). The result is already durably
 										// committed; sleeping past the client's PUT timeout yields a genuine uncertain
 										// outcome. Still executed exactly once.
-										val delay_ms = _fault_delay_after_commit_ms(&eff);
+										val delay_ms = _fault_delay_after_commit_ms(eff);
 										if delay_ms > 0 {
 											val _ = conc.sleep(conc.Duration(millis = delay_ms));
 										}
-										return _json(200, _envelope_terminal(&tr));
+										return _json(200, _envelope_terminal(tr));
 									},
 									default => {
 										return _json(500, _envelope_error("complete-unexpected"));
@@ -378,7 +378,7 @@ implement StubApp {
 					singular.StartOutcome::Exists => {
 						// Already exists: same id + different input -> 409. The bound input hash lives in Singular's
 						// item_meta (single authority), read back via history. A missing/corrupt record -> 500.
-						match self.read_original_hash(&key) {
+						match self.read_original_hash(key) {
 							Optional::Some(original_hash) => {
 								if original_hash != input_hash {
 									return _json(409, _envelope_error("input-conflict"));
@@ -392,23 +392,23 @@ implement StubApp {
 								//                new lease -> 200. This is the crash-after-commit recovery.
 								val r_token = singular.new_lease_token();
 								val r_claim = time.now_utc();
-								val r_expires = time.utc_from_unix_micros(time.utc_unix_micros(&r_claim) + _lease_ttl_seconds() * 1000000);
+								val r_expires = time.utc_from_unix_micros(time.utc_unix_micros(r_claim) + _lease_ttl_seconds() * 1000000);
 								val recovery = Optional<singular.RecoveryLease>::Some(singular.RecoveryLease(
 									lease_meta_json = "{}", event_time = move r_claim, lease_expires_at = move r_expires, lease_token = move r_token));
-								match self.gateway.get().resume_checked(&key, &recovery) {
+								match self.gateway.get().resume_checked(key, recovery) {
 									core.Result::Err(kind) => { return _retriable_response_or_rejected(move kind); },
 									core.Result::Ok(resume_outcome) => {
 										match resume_outcome {
-											singular.ResumeOutcome::Terminal(tr) => { return _json(200, _envelope_terminal(&tr)); },
+											singular.ResumeOutcome::Terminal(tr) => { return _json(200, _envelope_terminal(tr)); },
 											singular.ResumeOutcome::Active(_) => { return _json(202, _envelope_pending()); },
 											singular.ResumeOutcome::Granted(rlease, _attempt, _ckpt) => {
-												val result_json = self.run_idempotent(op_id, op, &eff);
+												val result_json = self.run_idempotent(op_id, op, eff);
 												val settle_time = time.now_utc();
-												match self.gateway.get().complete_checked(&rlease, &settle_time, &result_json) {
+												match self.gateway.get().complete_checked(rlease, settle_time, result_json) {
 													core.Result::Err(kind) => { return _retriable_response_or_rejected(move kind); },
 													core.Result::Ok(settle_outcome) => {
 														match settle_outcome {
-															singular.SettleOutcome::Settled(tr) => { return _json(200, _envelope_terminal(&tr)); },
+															singular.SettleOutcome::Settled(tr) => { return _json(200, _envelope_terminal(tr)); },
 															default => { return _json(500, _envelope_error("reclaim-complete-unexpected")); }
 														}
 													}
@@ -444,11 +444,11 @@ implement StubApp {
 		var mode = "";
 		match rest.body_json(req) {
 			core.Result::Ok(h) => {
-				match h.get(&"mode") { Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { mode = move v; }, Optional::None => {} } }, Optional::None => {} }
+				match h.get("mode") { Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { mode = move v; }, Optional::None => {} } }, Optional::None => {} }
 			},
 			core.Result::Err(_) => {}
 		}
-		_arm_fault(&self.armed, move op, move mode);
+		_arm_fault(self.armed, move op, move mode);
 		return _json(200, "{\"armed\":true}");
 	}
 
@@ -475,12 +475,12 @@ implement StubApp {
 		val op = rest.path_param(req, "operation").or_throw();
 		val op_id = rest.path_param(req, "operation_id").or_throw();
 		// Route-404 fault: GET 404 (no record), matching the PUT -> a persistent route-unknown.
-		if _armed_mode(&self.armed, &op) == "route_404" {
+		if _armed_mode(self.armed, op) == "route_404" {
 			return _json(404, _envelope_unknown());
 		}
-		val key = _op_key(&op, &op_id);
-		match self.gateway.get().inspect(&key) {
-			singular.InspectOutcome::Terminal(tr, _) => { return _json(200, _envelope_terminal(&tr)); },
+		val key = _op_key(op, op_id);
+		match self.gateway.get().inspect(key) {
+			singular.InspectOutcome::Terminal(tr, _) => { return _json(200, _envelope_terminal(tr)); },
 			singular.InspectOutcome::Working(_, _, _) => { return _json(202, _envelope_pending()); },
 			singular.InspectOutcome::NotFound => { return _json(404, _envelope_unknown()); }
 		}
@@ -495,9 +495,9 @@ implement StubApp {
 		if entries.len == 0 { return Optional<String>::None(); }
 		// The earliest entry (Claimed at start) carries the original item_meta.
 		val meta = entries[0].item_meta.clone();
-		match json.parse(&meta) {
+		match json.parse(meta) {
 			core.Result::Ok(n) => {
-				match n.get(&"input_hash") {
+				match n.get("input_hash") {
 					Optional::Some(h) => {
 						match h.as_string() {
 							Optional::Some(s) => { return Optional<String>::Some(move s); },
@@ -519,9 +519,9 @@ implement StubApp {
 	// return the stored result with NO re-execution, so `exec_count` stays 1 across an expired-lease RECLAIM.
 	fn run_idempotent(self: &StubApp, op_id: &String, op: &String, eff: &json.JsonNode) -> String {
 		val store_key = _replay_key(op, op_id);
-		var g = conc.lock(&self.applied);
-		val slot = conc.mutex_guard_get_mut(&mut g);
-		match slot.get(&store_key) {
+		var g = conc.lock(self.applied);
+		val slot = conc.mutex_guard_get_mut(g);
+		match slot.get(store_key) {
 			Optional::Some(prior) => { match prior.as_string() { Optional::Some(s) => { return move s; }, Optional::None => {} } },
 			Optional::None => {}
 		}
@@ -529,7 +529,7 @@ implement StubApp {
 		if _fault_omit_result(eff) { result_json = "{\"__omit_result__\":true}"; }
 		else { if _fault_invalid_result(eff) { result_json = "{\"__invalid_result__\":true}"; } else { result_json = _execute_op(op, eff); } }
 		val _prev = self.exec_count.fetch_add(1, conc.MemoryOrder::SeqCst());
-		val merged = _store_with(slot, &store_key, &result_json);
+		val merged = _store_with(slot, store_key, result_json);
 		*slot = move merged;
 		return move result_json;
 	}
@@ -547,9 +547,9 @@ implement StubApp {
 // Optional test-only fault: input._fault.respond_pending -> return 202 (working)
 // without committing, to exercise the coordinator's pending/defer path.
 fn _fault_respond_pending(input: &json.JsonNode) nothrow -> Bool {
-	match input.get(&"_fault") {
+	match input.get("_fault") {
 		Optional::Some(f) => {
-			match f.get(&"respond_pending") {
+			match f.get("respond_pending") {
 				Optional::Some(n) => { match n.as_bool() { Optional::Some(v) => { return v; }, Optional::None => { return false; } } },
 				Optional::None => { return false; }
 			}
@@ -565,9 +565,9 @@ fn _fault_respond_pending(input: &json.JsonNode) nothrow -> Bool {
 // recovery the bookkeeper Phase 7 case [12] exercises end-to-end. (Distinct from `respond_pending`, which
 // returns 202 BEFORE the body, committing nothing.)
 fn _fault_crash_after_commit(input: &json.JsonNode) nothrow -> Bool {
-	match input.get(&"_fault") {
+	match input.get("_fault") {
 		Optional::Some(f) => {
-			match f.get(&"crash_after_commit") {
+			match f.get("crash_after_commit") {
 				Optional::Some(n) => { match n.as_bool() { Optional::Some(v) => { return v; }, Optional::None => { return false; } } },
 				Optional::None => { return false; }
 			}
@@ -581,7 +581,7 @@ fn _fault_crash_after_commit(input: &json.JsonNode) nothrow -> Bool {
 fn _lease_ttl_seconds() nothrow -> Int {
 	match env.get("MICROFLOWS_STUB_LEASE_TTL_SECONDS") {
 		Optional::Some(v) => {
-			match json.parse_strict(&v) {
+			match json.parse_strict(v) {
 				core.Result::Ok(n) => { match n.as_int() { Optional::Some(i) => { if i >= 1 { return i; } }, Optional::None => {} } },
 				core.Result::Err(_) => {}
 			}
@@ -610,9 +610,9 @@ fn _store_with(cur: &json.JsonNode, key: &String, value: &String) -> json.JsonNo
 // Fault: the participant COMMITS and returns a conformant-looking 200 but WITHOUT `result` (a
 // protocol violation) — exercises the runner's participant_protocol_missing_result path.
 fn _fault_omit_result(input: &json.JsonNode) nothrow -> Bool {
-	match input.get(&"_fault") {
+	match input.get("_fault") {
 		Optional::Some(f) => {
-			match f.get(&"omit_result") {
+			match f.get("omit_result") {
 				Optional::Some(n) => { match n.as_bool() { Optional::Some(v) => { return v; }, Optional::None => { return false; } } },
 				Optional::None => { return false; }
 			}
@@ -624,9 +624,9 @@ fn _fault_omit_result(input: &json.JsonNode) nothrow -> Bool {
 // Fault: the participant commits + returns a 200 whose `result` is present but NOT an object (e.g. a
 // scalar) — a protocol violation -> participant_protocol_invalid_result.
 fn _fault_invalid_result(input: &json.JsonNode) nothrow -> Bool {
-	match input.get(&"_fault") {
+	match input.get("_fault") {
 		Optional::Some(f) => {
-			match f.get(&"invalid_result") {
+			match f.get("invalid_result") {
 				Optional::Some(n) => { match n.as_bool() { Optional::Some(v) => { return v; }, Optional::None => { return false; } } },
 				Optional::None => { return false; }
 			}
@@ -637,9 +637,9 @@ fn _fault_invalid_result(input: &json.JsonNode) nothrow -> Bool {
 
 // Fault: a DEFINITE non-retryable rejection (400). No Singular op, no execution.
 fn _fault_reject(input: &json.JsonNode) nothrow -> Bool {
-	match input.get(&"_fault") {
+	match input.get("_fault") {
 		Optional::Some(f) => {
-			match f.get(&"reject") {
+			match f.get("reject") {
 				Optional::Some(n) => { match n.as_bool() { Optional::Some(v) => { return v; }, Optional::None => { return false; } } },
 				Optional::None => { return false; }
 			}
@@ -649,9 +649,9 @@ fn _fault_reject(input: &json.JsonNode) nothrow -> Bool {
 }
 
 fn _fault_delay_after_commit_ms(input: &json.JsonNode) nothrow -> Int {
-	match input.get(&"_fault") {
+	match input.get("_fault") {
 		Optional::Some(f) => {
-			match f.get(&"delay_after_commit_ms") {
+			match f.get("delay_after_commit_ms") {
 				Optional::Some(n) => { match n.as_int() { Optional::Some(v) => { return v; }, Optional::None => { return 0; } } },
 				Optional::None => { return 0; }
 			}
@@ -663,7 +663,7 @@ fn _fault_delay_after_commit_ms(input: &json.JsonNode) nothrow -> Int {
 fn _echo_transform(input: &json.JsonNode) -> String {
 	// Precondition: _validate_echo(input) is true (checked before start()).
 	var sum: Int = 0;
-	match input.get(&"values") {
+	match input.get("values") {
 		Optional::Some(arr) => {
 			match arr.as_array() {
 				Optional::Some(items) => {
@@ -691,7 +691,7 @@ fn _echo_transform(input: &json.JsonNode) -> String {
 // JSON integers pass — missing values, non-array values, and non-integer
 // numbers/elements are rejected.
 fn _validate_echo(input: &json.JsonNode) nothrow -> Bool {
-	match input.get(&"values") {
+	match input.get("values") {
 		Optional::Some(arr) => {
 			match arr.as_array() {
 				Optional::Some(items) => {
@@ -770,9 +770,9 @@ fn _id_result(id_field: String, prefix: String, src: String) nothrow -> String {
 // effective business payload is forward.input (a comp may also consult forward.result). A forward op's
 // body IS its input. Detect the envelope structurally — the coordinator sends it only for compensations.
 fn _effective_input(input: &json.JsonNode) nothrow -> json.JsonNode {
-	match input.get(&"forward") {
+	match input.get("forward") {
 		Optional::Some(fwd) => {
-			match fwd.get(&"input") {
+			match fwd.get("input") {
 				Optional::Some(fi) => { return fi.clone_deep(); },
 				Optional::None => { return input.clone_deep(); }
 			}
@@ -784,13 +784,13 @@ fn _effective_input(input: &json.JsonNode) nothrow -> json.JsonNode {
 // `decide` returns the business status the workflow branches on, echoed from the forward input so the
 // TEST controls the branch: decision "declined" -> {status:"declined"}, else {status:"approved"}.
 fn _decide(input: &json.JsonNode) -> String {
-	val decision = _str_field(input, &"decision");
+	val decision = _str_field(input, "decision");
 	var st: String = "approved";
 	if decision == "declined" { st = "declined"; }
 	if decision == "overlong" { st = "overlong"; }
 	var o = json.new_object();
 	o.set("status", json.JsonNode::String(move st));
-	o.set("ref", json.JsonNode::String(_str_field(input, &"ref")));
+	o.set("ref", json.JsonNode::String(_str_field(input, "ref")));
 	// decision "overlong" adds a deliberately >190-byte string field, so a workflow that does
 	// `fail result d.long_reason` exercises the dynamic invalid-reason path (String-typed, too long at
 	// drive). Other decisions omit it, matching a {status,ref} result contract.
@@ -809,7 +809,7 @@ fn _repeat_z(n: Int) nothrow -> String {
 // business-negative result, per the saga model). Echoes ref for observability.
 fn _undo_decide(input: &json.JsonNode) -> String {
 	var o = json.new_object();
-	o.set("undone_ref", json.JsonNode::String(_str_field(input, &"ref")));
+	o.set("undone_ref", json.JsonNode::String(_str_field(input, "ref")));
 	return json.encode(o.to_node());
 }
 
@@ -820,20 +820,20 @@ fn _supported_op(op: &String) nothrow -> Bool {
 }
 
 fn _validate_input(op: &String, input: &json.JsonNode) nothrow -> Bool {
-	match _biz_spec(op) { Optional::Some(spec) => { return _has_str(input, &spec.src); }, Optional::None => {} }
+	match _biz_spec(op) { Optional::Some(spec) => { return _has_str(input, spec.src); }, Optional::None => {} }
 	if op == OP_ECHO_TRANSFORM { return _validate_echo(input); }
 	if op == OP_STRING_JOIN { return _validate_string_join(input); }
 	if op == OP_RELEASE { return _validate_release(input); }
 	if op == OP_RESERVE { return _validate_reserve(input); }
 	if op == OP_CONFIRM { return _validate_confirm(input); }
 	if op == OP_UNCONFIRM { return _validate_confirm(input); }
-	if op == OP_DECIDE { return _has_str(input, &"ref") and _has_str(input, &"decision"); }
-	if op == OP_UNDO_DECIDE { return _has_str(input, &"ref"); }
+	if op == OP_DECIDE { return _has_str(input, "ref") and _has_str(input, "decision"); }
+	if op == OP_UNDO_DECIDE { return _has_str(input, "ref"); }
 	return false;
 }
 
 fn _execute_op(op: &String, input: &json.JsonNode) -> String {
-	match _biz_spec(op) { Optional::Some(spec) => { return _id_result(spec.id_field, spec.prefix, _str_field(input, &spec.src)); }, Optional::None => {} }
+	match _biz_spec(op) { Optional::Some(spec) => { return _id_result(spec.id_field, spec.prefix, _str_field(input, spec.src)); }, Optional::None => {} }
 	if op == OP_STRING_JOIN { return _string_join(input); }
 	if op == OP_RELEASE { return _release(input); }
 	if op == OP_RESERVE { return _reserve(input); }
@@ -848,7 +848,7 @@ fn _execute_op(op: &String, input: &json.JsonNode) -> String {
 // Validate the confirm/unconfirm input: { "reserved": "<id>" } — the SHAPE of a reserve RESULT, so a
 // merged branch reserve result can feed this shared op. Extra keys ignored.
 fn _validate_confirm(input: &json.JsonNode) nothrow -> Bool {
-	match input.get(&"reserved") {
+	match input.get("reserved") {
 		Optional::Some(n) => {
 			match n.as_string() { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
 		},
@@ -859,7 +859,7 @@ fn _validate_confirm(input: &json.JsonNode) nothrow -> Bool {
 fn _confirm(input: &json.JsonNode) -> String {
 	// Precondition: _validate_confirm(input) is true. Echo the reserved id so the result is observable.
 	var reserved: String = "";
-	match input.get(&"reserved") {
+	match input.get("reserved") {
 		Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { reserved = move v; }, Optional::None => {} } },
 		Optional::None => {}
 	}
@@ -871,7 +871,7 @@ fn _confirm(input: &json.JsonNode) -> String {
 fn _unconfirm(input: &json.JsonNode) -> String {
 	// Compensation for `confirm`: input is the confirm checkpoint payload ({"reserved": id}).
 	var reserved: String = "";
-	match input.get(&"reserved") {
+	match input.get("reserved") {
 		Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { reserved = move v; }, Optional::None => {} } },
 		Optional::None => {}
 	}
@@ -883,7 +883,7 @@ fn _unconfirm(input: &json.JsonNode) -> String {
 // Validate the forward reserve input: { "reservation": "<id>" }. Extra keys (e.g.
 // _fault) are ignored, so a fault-injected reservation still validates.
 fn _validate_reserve(input: &json.JsonNode) nothrow -> Bool {
-	match input.get(&"reservation") {
+	match input.get("reservation") {
 		Optional::Some(n) => {
 			match n.as_string() { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
 		},
@@ -895,7 +895,7 @@ fn _reserve(input: &json.JsonNode) -> String {
 	// Precondition: _validate_reserve(input) is true. Echo the reservation id into
 	// the result so a forward success carries an observable, distinct value.
 	var reservation: String = "";
-	match input.get(&"reservation") {
+	match input.get("reservation") {
 		Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { reservation = move v; }, Optional::None => {} } },
 		Optional::None => {}
 	}
@@ -907,7 +907,7 @@ fn _reserve(input: &json.JsonNode) -> String {
 // Validate the compensation input: { "reservation": "<id>" } (the forward
 // checkpoint payload). Extra keys (e.g. _fault) are ignored.
 fn _validate_release(input: &json.JsonNode) nothrow -> Bool {
-	match input.get(&"reservation") {
+	match input.get("reservation") {
 		Optional::Some(n) => {
 			match n.as_string() { Optional::Some(_) => { return true; }, Optional::None => { return false; } }
 		},
@@ -919,7 +919,7 @@ fn _release(input: &json.JsonNode) -> String {
 	// Precondition: _validate_release(input) is true. Echo the reservation back so
 	// the compensation result proves it ran on the durable checkpoint payload.
 	var reservation: String = "";
-	match input.get(&"reservation") {
+	match input.get("reservation") {
 		Optional::Some(n) => { match n.as_string() { Optional::Some(v) => { reservation = move v; }, Optional::None => {} } },
 		Optional::None => {}
 	}
@@ -931,11 +931,11 @@ fn _release(input: &json.JsonNode) -> String {
 
 // Validate the string-join input schema: { "parts": [string, ...], "sep": string }.
 fn _validate_string_join(input: &json.JsonNode) nothrow -> Bool {
-	match input.get(&"sep") {
+	match input.get("sep") {
 		Optional::Some(s) => { match s.as_string() { Optional::Some(_) => {}, Optional::None => { return false; } } },
 		Optional::None => { return false; }
 	}
-	match input.get(&"parts") {
+	match input.get("parts") {
 		Optional::Some(arr) => {
 			match arr.as_array() {
 				Optional::Some(items) => {
@@ -959,13 +959,13 @@ fn _validate_string_join(input: &json.JsonNode) nothrow -> Bool {
 fn _string_join(input: &json.JsonNode) -> String {
 	// Precondition: _validate_string_join(input) is true (checked before start()).
 	var sep: String = "";
-	match input.get(&"sep") {
+	match input.get("sep") {
 		Optional::Some(s) => { match s.as_string() { Optional::Some(v) => { sep = move v; }, Optional::None => {} } },
 		Optional::None => {}
 	}
 	var joined: String = "";
 	var first = true;
-	match input.get(&"parts") {
+	match input.get("parts") {
 		Optional::Some(arr) => {
 			match arr.as_array() {
 				Optional::Some(items) => {
@@ -974,7 +974,7 @@ fn _string_join(input: &json.JsonNode) -> String {
 						match items[i].as_string() {
 							Optional::Some(p) => {
 								if first { joined = move p; first = false; }
-								else { joined = joined + _dup(&sep) + move p; }
+								else { joined = joined + _dup(sep) + move p; }
 							},
 							Optional::None => {}
 						}
@@ -1001,7 +1001,7 @@ fn _join(parts: &Array<String>) nothrow -> String {
 	var out: String = "";
 	var i = 0;
 	while i < parts.len {
-		out = out + fmt.format_int(parts[i].byte_length()) + ":" + _dup(&parts[i]) + ";";
+		out = out + fmt.format_int(parts[i].byte_length()) + ":" + _dup(parts[i]) + ";";
 		i = i + 1;
 	}
 	return move out;
@@ -1011,8 +1011,8 @@ fn _join(parts: &Array<String>) nothrow -> String {
 // stable across retries, collision-free via length-prefixed encoding.
 fn _op_key(op: &String, op_id: &String) nothrow -> Array<Byte> {
 	val parts: Array<String> = ["key", _dup(op), _dup(op_id)];
-	val seed = _join(&parts);
-	return singular.uuid_v3_from_string(&seed);
+	val seed = _join(parts);
+	return singular.uuid_v3_from_string(seed);
 }
 
 // In-memory replay-store key over the SAME logical identity as the Singular key —
@@ -1020,14 +1020,14 @@ fn _op_key(op: &String, op_id: &String) nothrow -> Array<Byte> {
 // A plain String (the ledger is a JSON-object map) rather than _op_key's UUID.
 fn _replay_key(op: &String, op_id: &String) nothrow -> String {
 	val parts: Array<String> = ["rk", _dup(op), _dup(op_id)];
-	return _join(&parts);
+	return _join(parts);
 }
 
 // Deterministic 16-byte capability token per operation (single-worker stub).
 fn _lease_token(op: &String, op_id: &String) nothrow -> Array<Byte> {
 	val parts: Array<String> = ["tok", _dup(op), _dup(op_id)];
-	val seed = _join(&parts);
-	return singular.uuid_v3_from_string(&seed);
+	val seed = _join(parts);
+	return singular.uuid_v3_from_string(seed);
 }
 
 // Canonical input hash: a UUIDv3 (md5-based) over the COMPACT canonical
@@ -1038,9 +1038,9 @@ fn _input_hash(input: &json.JsonNode) -> String {
 	// CANONICAL: lexicographically-ordered object keys, so semantically equal
 	// documents with reordered keys hash identically (no false 409).
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
-	val compact = json.encode_compact_with_config(input, &cfg);
-	val bytes = singular.uuid_v3_from_string(&compact);
-	match singular.bytes_to_uuid(&bytes) {
+	val compact = json.encode_compact_with_config(input, cfg);
+	val bytes = singular.uuid_v3_from_string(compact);
+	match singular.bytes_to_uuid(bytes) {
 		core.Result::Ok(s) => { return move s; },
 		core.Result::Err(_) => { throw StubError(message = "input-hash encode failed"); }
 	}
@@ -1066,8 +1066,8 @@ fn _envelope_terminal(tr: &singular.TerminalResult) -> String {
 					// (invalid) `result`, reproduced identically on PUT and GET reconcile.
 					var omit = false;
 					var invalid = false;
-					match n.get(&"__omit_result__") { Optional::Some(_) => { omit = true; }, Optional::None => {} }
-					match n.get(&"__invalid_result__") { Optional::Some(_) => { invalid = true; }, Optional::None => {} }
+					match n.get("__omit_result__") { Optional::Some(_) => { omit = true; }, Optional::None => {} }
+					match n.get("__invalid_result__") { Optional::Some(_) => { invalid = true; }, Optional::None => {} }
 					if invalid { o.set("result", json.JsonNode::String("not-an-object")); }
 					else { if !omit { o.set("result", move n); } }
 				},
@@ -1138,7 +1138,7 @@ fn _load_config_json(path: &String) throws -> json.JsonNode {
 	match io.file_builder(_dup(path)).read(true).timeout(timeout).build() {
 		core.Result::Ok(file) => {
 			val text = _drain(move file);
-			match json.parse(&text) {
+			match json.parse(text) {
 				core.Result::Ok(n) => { return move n; },
 				core.Result::Err(_) => { throw StubError(message = "config: JSON parse failed"); }
 			}
@@ -1152,7 +1152,7 @@ fn _drain(var f: io.ConfiguredFile) throws -> String {
 	var buf = io.buffer(4096);
 	var done = false;
 	while !done {
-		match f.read(&mut buf) {
+		match f.read(buf) {
 			core.Result::Ok(n) => {
 				if n == 0 { done = true; }
 				else { out = out + core.string_from_utf8_bytes(io.buffer_ptr(&buf), n); }

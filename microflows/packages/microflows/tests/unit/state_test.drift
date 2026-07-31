@@ -33,8 +33,8 @@ fn _dir(code: Int) nothrow -> st.ExecutionDirection {
 fn _target(from_code: Int, dir_code: Int, cause: &st.TransitionCause) nothrow -> Int {
 	val from = _state(from_code);
 	val dir = _dir(dir_code);
-	match st.transition_target(&from, &dir, cause) {
-		Optional::Some(s) => { return st.state_code(&s); },
+	match st.transition_target(from, dir, cause) {
+		Optional::Some(s) => { return st.state_code(s); },
 		Optional::None => { return 0; }
 	}
 }
@@ -47,9 +47,9 @@ fn scenario_state_codes_names() nothrow -> Int {
 	while code <= 7 {
 		if !_has_state(code) { return 100 + code; }
 		val s = _state(code);
-		if st.state_code(&s) != code { return 110 + code; }
-		match st.state_from_name(st.state_name(&s)) {
-			Optional::Some(back) => { if st.state_code(&back) != code { return 120 + code; } },
+		if st.state_code(s) != code { return 110 + code; }
+		match st.state_from_name(st.state_name(s)) {
+			Optional::Some(back) => { if st.state_code(back) != code { return 120 + code; } },
 			Optional::None => { return 130 + code; }
 		}
 		code = code + 1;
@@ -59,8 +59,8 @@ fn scenario_state_codes_names() nothrow -> Int {
 	match st.state_from_name("running") { Optional::Some(_) => { return 143; }, Optional::None => {} }
 	val b = _state(3);
 	val re = _state(6);
-	if st.state_name(&b) != "blocked_resolution" { return 151; }
-	if st.state_name(&re) != "resolved_exception" { return 152; }
+	if st.state_name(b) != "blocked_resolution" { return 151; }
+	if st.state_name(re) != "resolved_exception" { return 152; }
 	return 0;
 }
 
@@ -72,8 +72,8 @@ fn scenario_claimable_terminal() nothrow -> Int {
 	var code = 1;
 	while code <= 7 {
 		val s = _state(code);
-		val claim = st.is_claimable(&s);
-		val term = st.is_terminal(&s);
+		val claim = st.is_claimable(s);
+		val term = st.is_terminal(s);
 		if code == 1 or code == 2 { if !claim or term { return 200 + code; } }
 		if code == 3 { if claim or term { return 203; } }
 		if code == 4 or code == 5 or code == 6 or code == 7 { if claim or !term { return 220 + code; } }
@@ -91,9 +91,9 @@ fn scenario_direction_invariant() nothrow -> Int {
 	var code = 1;
 	while code <= 2 {
 		val d = _dir(code);
-		if st.direction_code(&d) != code { return 300 + code; }
-		match st.direction_from_name(st.direction_name(&d)) {
-			Optional::Some(back) => { if st.direction_code(&back) != code { return 310 + code; } },
+		if st.direction_code(d) != code { return 300 + code; }
+		match st.direction_from_name(st.direction_name(d)) {
+			Optional::Some(back) => { if st.direction_code(back) != code { return 310 + code; } },
 			Optional::None => { return 320 + code; }
 		}
 		code = code + 1;
@@ -105,7 +105,7 @@ fn scenario_direction_invariant() nothrow -> Int {
 		while dc <= 2 {
 			val s = _state(sc);
 			val d = _dir(dc);
-			val got = st.state_direction_valid(&s, &d);
+			val got = st.state_direction_valid(s, d);
 			var want = false;
 			if sc == 1 and dc == 1 { want = true; }       // forward -> forward
 			if sc == 2 and dc == 2 { want = true; }       // reversing -> reverse
@@ -135,20 +135,20 @@ fn scenario_input_invariant_guard() nothrow -> Int {
 	val causes_d = st.TransitionCause::ResolveForwardSuccess();
 	val causes_e = st.TransitionCause::ResolveAcceptException();
 	// (forward=1, reverse=2) is impossible -> every cause yields 0.
-	if _target(1, 2, &causes_a) != 0 { return 381; }
-	if _target(1, 2, &causes_b) != 0 { return 382; }
-	if _target(1, 2, &causes_d) != 0 { return 383; }
+	if _target(1, 2, causes_a) != 0 { return 381; }
+	if _target(1, 2, causes_b) != 0 { return 382; }
+	if _target(1, 2, causes_d) != 0 { return 383; }
 	// (reversing=2, forward=1) impossible.
-	if _target(2, 1, &causes_c) != 0 { return 384; }
-	if _target(2, 1, &causes_b) != 0 { return 385; }
+	if _target(2, 1, causes_c) != 0 { return 384; }
+	if _target(2, 1, causes_b) != 0 { return 385; }
 	// (completed=4, reverse=2) impossible.
-	if _target(4, 2, &causes_a) != 0 { return 386; }
+	if _target(4, 2, causes_a) != 0 { return 386; }
 	// (reversed=5, forward=1) impossible.
-	if _target(5, 1, &causes_e) != 0 { return 387; }
+	if _target(5, 1, causes_e) != 0 { return 387; }
 	// blocked(3) is valid in BOTH directions -> guard must NOT block it:
 	// blocked+forward + ResolveForwardSuccess -> forward(1) still works.
-	if _target(3, 1, &causes_d) != 1 { return 388; }
-	if _target(3, 2, &causes_e) != 6 { return 389; }
+	if _target(3, 1, causes_d) != 1 { return 388; }
+	if _target(3, 2, causes_e) != 6 { return 389; }
 	return 0;
 }
 
@@ -157,23 +157,23 @@ fn scenario_input_invariant_guard() nothrow -> Int {
 // ============================================================
 fn scenario_nonblocked_causes() nothrow -> Int {
 	val fc = st.TransitionCause::ForwardComplete();
-	if _target(1, 1, &fc) != 4 { return 401; }
-	if _target(2, 2, &fc) != 0 or _target(3, 1, &fc) != 0 or _target(4, 1, &fc) != 0 { return 402; }
+	if _target(1, 1, fc) != 4 { return 401; }
+	if _target(2, 2, fc) != 0 or _target(3, 1, fc) != 0 or _target(4, 1, fc) != 0 { return 402; }
 	val of = st.TransitionCause::OperationFailure();
-	if _target(1, 1, &of) != 2 { return 403; }
-	if _target(2, 2, &of) != 0 { return 404; }
+	if _target(1, 1, of) != 2 { return 403; }
+	if _target(2, 2, of) != 0 { return 404; }
 	val fi = st.TransitionCause::ForwardIndeterminate();
-	if _target(1, 1, &fi) != 3 { return 405; }
-	if _target(2, 2, &fi) != 0 { return 406; }
+	if _target(1, 1, fi) != 3 { return 405; }
+	if _target(2, 2, fi) != 0 { return 406; }
 	val ca = st.TransitionCause::Cancellation();
-	if _target(1, 1, &ca) != 2 { return 407; }
-	if _target(3, 1, &ca) != 0 { return 408; }
+	if _target(1, 1, ca) != 2 { return 407; }
+	if _target(3, 1, ca) != 0 { return 408; }
 	val uc = st.TransitionCause::UnwindComplete();
-	if _target(2, 2, &uc) != 5 { return 409; }
-	if _target(1, 1, &uc) != 0 or _target(3, 2, &uc) != 0 { return 410; }
+	if _target(2, 2, uc) != 5 { return 409; }
+	if _target(1, 1, uc) != 0 or _target(3, 2, uc) != 0 { return 410; }
 	val rb = st.TransitionCause::ReverseBlocked();
-	if _target(2, 2, &rb) != 3 { return 411; }
-	if _target(1, 1, &rb) != 0 { return 412; }
+	if _target(2, 2, rb) != 3 { return 411; }
+	if _target(1, 1, rb) != 0 { return 412; }
 	return 0;
 }
 
@@ -187,18 +187,18 @@ fn scenario_resolution_causes() nothrow -> Int {
 	val rae = st.TransitionCause::ResolveAcceptException();
 
 	// blocked + forward dir
-	if _target(3, 1, &rfs) != 1 { return 501; }   // -> forward
-	if _target(3, 1, &rff) != 2 { return 502; }   // -> reversing
-	if _target(3, 1, &rrc) != 0 { return 503; }
-	if _target(3, 1, &rae) != 6 { return 504; }   // -> resolved_exception (NOT reversed)
+	if _target(3, 1, rfs) != 1 { return 501; }   // -> forward
+	if _target(3, 1, rff) != 2 { return 502; }   // -> reversing
+	if _target(3, 1, rrc) != 0 { return 503; }
+	if _target(3, 1, rae) != 6 { return 504; }   // -> resolved_exception (NOT reversed)
 
 	// blocked + reverse dir
-	if _target(3, 2, &rfs) != 0 { return 505; }
-	if _target(3, 2, &rff) != 0 { return 506; }
-	if _target(3, 2, &rrc) != 2 { return 507; }   // -> reversing
-	if _target(3, 2, &rae) != 6 { return 508; }   // -> resolved_exception
+	if _target(3, 2, rfs) != 0 { return 505; }
+	if _target(3, 2, rff) != 0 { return 506; }
+	if _target(3, 2, rrc) != 2 { return 507; }   // -> reversing
+	if _target(3, 2, rae) != 6 { return 508; }   // -> resolved_exception
 
-	if _target(1, 1, &rfs) != 0 or _target(2, 2, &rrc) != 0 or _target(4, 1, &rae) != 0 { return 509; }
+	if _target(1, 1, rfs) != 0 or _target(2, 2, rrc) != 0 or _target(4, 1, rae) != 0 { return 509; }
 	return 0;
 }
 
@@ -208,10 +208,10 @@ fn scenario_resolution_causes() nothrow -> Int {
 fn _trans_dir(from_code: Int, dir_code: Int, cause: &st.TransitionCause) nothrow -> Int {
 	val from = _state(from_code);
 	val dir = _dir(dir_code);
-	match st.transition(&from, &dir, cause) {
+	match st.transition(from, dir, cause) {
 		Optional::Some(t) => {
-			val sc = st.state_code(&t.to_state);
-			val dcode = st.direction_code(&t.to_direction);
+			val sc = st.state_code(t.to_state);
+			val dcode = st.direction_code(t.to_direction);
 			return sc * 10 + dcode;
 		},
 		Optional::None => { return 0; }
@@ -220,22 +220,22 @@ fn _trans_dir(from_code: Int, dir_code: Int, cause: &st.TransitionCause) nothrow
 
 fn scenario_transition_direction() nothrow -> Int {
 	val of = st.TransitionCause::OperationFailure();
-	if _trans_dir(1, 1, &of) != 22 { return 601; }     // -> reversing, reverse
+	if _trans_dir(1, 1, of) != 22 { return 601; }     // -> reversing, reverse
 	val fi = st.TransitionCause::ForwardIndeterminate();
-	if _trans_dir(1, 1, &fi) != 31 { return 602; }     // -> blocked, retains forward
+	if _trans_dir(1, 1, fi) != 31 { return 602; }     // -> blocked, retains forward
 	val rb = st.TransitionCause::ReverseBlocked();
-	if _trans_dir(2, 2, &rb) != 32 { return 603; }     // -> blocked, retains reverse
+	if _trans_dir(2, 2, rb) != 32 { return 603; }     // -> blocked, retains reverse
 	val rfs = st.TransitionCause::ResolveForwardSuccess();
-	if _trans_dir(3, 1, &rfs) != 11 { return 604; }    // -> forward, forward
+	if _trans_dir(3, 1, rfs) != 11 { return 604; }    // -> forward, forward
 	val rff = st.TransitionCause::ResolveForwardFailed();
-	if _trans_dir(3, 1, &rff) != 22 { return 605; }    // -> reversing, reverse
+	if _trans_dir(3, 1, rff) != 22 { return 605; }    // -> reversing, reverse
 	val rae = st.TransitionCause::ResolveAcceptException();
-	if _trans_dir(3, 1, &rae) != 61 { return 606; }    // -> resolved_exception, retains forward
-	if _trans_dir(3, 2, &rae) != 62 { return 607; }    // -> resolved_exception, retains reverse
+	if _trans_dir(3, 1, rae) != 61 { return 606; }    // -> resolved_exception, retains forward
+	if _trans_dir(3, 2, rae) != 62 { return 607; }    // -> resolved_exception, retains reverse
 	val fc = st.TransitionCause::ForwardComplete();
-	if _trans_dir(1, 1, &fc) != 41 { return 608; }     // -> completed, forward
+	if _trans_dir(1, 1, fc) != 41 { return 608; }     // -> completed, forward
 	val uc = st.TransitionCause::UnwindComplete();
-	if _trans_dir(2, 2, &uc) != 52 { return 609; }     // -> reversed, reverse
+	if _trans_dir(2, 2, uc) != 52 { return 609; }     // -> reversed, reverse
 	return 0;
 }
 
@@ -244,7 +244,7 @@ fn scenario_transition_direction() nothrow -> Int {
 // ============================================================
 fn _declared(cause: &st.TransitionCause) nothrow -> Int {
 	match st.cause_disposition(cause) {
-		Optional::Some(d) => { return st.disposition_code(&d); },
+		Optional::Some(d) => { return st.disposition_code(d); },
 		Optional::None => { return -1; }
 	}
 }
@@ -260,16 +260,16 @@ fn scenario_cause_dispositions() nothrow -> Int {
 	val rff = st.TransitionCause::ResolveForwardFailed();
 	val rrc = st.TransitionCause::ResolveReversalContinue();
 	val rae = st.TransitionCause::ResolveAcceptException();
-	if _declared(&fc) != 1 { return 701; }    // completed
-	if _declared(&of) != 2 { return 702; }    // failed
-	if _declared(&fi) != 4 { return 703; }    // indeterminate
-	if _declared(&ca) != 3 { return 704; }    // cancelled
-	if _declared(&uc) != -1 { return 705; }   // keep
-	if _declared(&rb) != -1 { return 706; }   // keep
-	if _declared(&rfs) != 0 { return 707; }   // none (resume forward)
-	if _declared(&rff) != 2 { return 708; }   // failed
-	if _declared(&rrc) != -1 { return 709; }  // keep
-	if _declared(&rae) != -1 { return 710; }  // keep underlying cause
+	if _declared(fc) != 1 { return 701; }    // completed
+	if _declared(of) != 2 { return 702; }    // failed
+	if _declared(fi) != 4 { return 703; }    // indeterminate
+	if _declared(ca) != 3 { return 704; }    // cancelled
+	if _declared(uc) != -1 { return 705; }   // keep
+	if _declared(rb) != -1 { return 706; }   // keep
+	if _declared(rfs) != 0 { return 707; }   // none (resume forward)
+	if _declared(rff) != 2 { return 708; }   // failed
+	if _declared(rrc) != -1 { return 709; }  // keep
+	if _declared(rae) != -1 { return 710; }  // keep underlying cause
 	return 0;
 }
 
@@ -295,9 +295,9 @@ fn scenario_dispositions() nothrow -> Int {
 	while code <= 4 {
 		if !_has_disp(code) { return 800 + code; }
 		val d = _disp(code);
-		if st.disposition_code(&d) != code { return 810 + code; }
-		match st.disposition_from_name(st.disposition_name(&d)) {
-			Optional::Some(back) => { if st.disposition_code(&back) != code { return 820 + code; } },
+		if st.disposition_code(d) != code { return 810 + code; }
+		match st.disposition_from_name(st.disposition_name(d)) {
+			Optional::Some(back) => { if st.disposition_code(back) != code { return 820 + code; } },
 			Optional::None => { return 830 + code; }
 		}
 		code = code + 1;
@@ -310,7 +310,7 @@ fn scenario_dispositions() nothrow -> Int {
 		while dc <= 4 {
 			val s = _state(sc);
 			val d = _disp(dc);
-			val got = st.disposition_valid_for(&s, &d);
+			val got = st.disposition_valid_for(s, d);
 			var want = false;
 			if sc == 1 and dc == 0 { want = true; }
 			if sc == 2 and (dc == 2 or dc == 3) { want = true; }
