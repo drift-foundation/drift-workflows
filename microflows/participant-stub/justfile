@@ -31,8 +31,11 @@ build:
 	set -euo pipefail
 	DC="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/driftc"
 	mkdir -p "{{BIN_DIR}}"
-	DEPS="$(python3 -c "import json; r=json.load(open('drift/lock.json'))['artifacts']['microflows-participant-stub']['resolved']; print(' '.join('--dep %s@%s'%(n, r[n]['version']) for n in sorted(r) if n != 'singular'))")"
-	[[ -n "$DEPS" ]] || { echo "error: no external deps resolved in drift/lock.json (run 'just prepare')" >&2; exit 1; }
+	# External --dep flags via the repo-root authority (tools/cert_deps.py): committed lock
+	# in the strict dev lane; snapshot-gated source-rebuild resolution under
+	# DRIFT_CERT_MODE=certify (the cert pool is candidate-only by contract).
+	DEPS="$(python3 ../../tools/cert_deps.py --manifest drift/manifest.json --artifact microflows-participant-stub --lock drift/lock.json --exclude singular)"
+	[[ -n "$DEPS" ]] || { echo "error: no external deps resolved (run 'just prepare')" >&2; exit 1; }
 	"$DC" --target-word-bits 64 --trust-store drift/trust.json --package-root "{{_pkg-root}}" \
 	  $DEPS --entry "microflows.participant_stub::main" \
 	  ../../singular/drift/packages/singular/src/*.drift src/*.drift \

@@ -21,8 +21,11 @@ build:
 	# pre-deployed package, so this works on a fresh cert host where microflows isn't certified yet —
 	# it IS the package under certification, so a deployed-package build would be an unsatisfiable
 	# bootstrap. External --dep flags are read from this app's lock (`just prepare` keeps them current).
-	DEPS="$(python3 -c "import json; r=json.load(open('drift/lock.json'))['artifacts']['microflows-runner']['resolved']; print(' '.join('--dep %s@%s'%(n, r[n]['version']) for n in sorted(r) if n != 'microflows'))")"
-	[[ -n "$DEPS" ]] || { echo "error: no external deps resolved in drift/lock.json (run 'just prepare')" >&2; exit 1; }
+	# External --dep flags via the repo-root authority (tools/cert_deps.py): committed lock
+	# in the strict dev lane; snapshot-gated source-rebuild resolution under
+	# DRIFT_CERT_MODE=certify (the cert pool is candidate-only by contract).
+	DEPS="$(python3 ../../tools/cert_deps.py --manifest drift/manifest.json --artifact microflows-runner --lock drift/lock.json --exclude microflows)"
+	[[ -n "$DEPS" ]] || { echo "error: no external deps resolved (run 'just prepare')" >&2; exit 1; }
 	"$DC" --target-word-bits 64 --trust-store drift/trust.json --package-root "{{_pkg-root}}" \
 	  $DEPS --entry "microflows.runner::main" \
 	  ../packages/microflows/src/*.drift src/*.drift \

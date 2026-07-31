@@ -67,15 +67,13 @@ NONCE = f"{os.getpid()}-{time.time_ns()}"
 
 
 def resolved_dep_flags():
-    """Full resolved dep set (incl. transitive) for `microflows`, from the lock."""
-    lock = json.loads(LOCK.read_text())
-    resolved = (lock.get("artifacts", {}).get(ARTIFACT, {}) or {}).get("resolved", {}) or {}
-    if not resolved:
-        sys.exit(f"error: no resolved deps for {ARTIFACT!r} in {LOCK} (run `just prepare`)")
-    flags = []
-    for name in sorted(resolved):
-        flags += ["--dep", f"{name}@{resolved[name]['version']}"]
-    return flags
+    """Full resolved dep set (incl. transitive) for `microflows` via the repo-root
+    tools/cert_deps.py authority: committed lock in the strict dev lane;
+    snapshot-gated source-rebuild resolution under DRIFT_CERT_MODE=certify
+    (lock demoted to evidence — the cert pool is candidate-only by contract)."""
+    sys.path.insert(0, str(ROOT.parent / "tools"))
+    import cert_deps
+    return cert_deps.dep_flags(MANIFEST, ARTIFACT, LOCK)
 
 
 def src_files():

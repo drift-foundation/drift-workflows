@@ -80,19 +80,14 @@ def _manifest_src_files(project_root, art):
 
 
 def _external_deps(app, artifact_name):
-    """--dep flags for every RESOLVED dependency except the source-compiled local
-    lib (read from the lock so transitive deps + version bumps track automatically)."""
-    lock = _read_json(f"{app['app_proj']}/drift/lock.json")
-    resolved = ((lock.get("artifacts", {}) or {}).get(artifact_name, {}) or {}).get("resolved", {}) or {}
-    if not resolved:
-        sys.exit(f"error: no resolved deps for {artifact_name} in {app['app_proj']}/drift/lock.json "
-                 f"(run `just prepare` in that project)")
-    flags = []
-    for name in sorted(resolved):
-        if name == app["local_lib"]:
-            continue  # compiled from source, not consumed as a package
-        flags += ["--dep", f"{name}@{resolved[name].get('version')}"]
-    return flags
+    """--dep flags for every dependency except the source-compiled local lib, via
+    the repo-root tools/cert_deps.py authority: committed lock in the strict dev
+    lane; snapshot-gated source-rebuild resolution under DRIFT_CERT_MODE=certify
+    (lock demoted to evidence — the cert pool is candidate-only by contract)."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import cert_deps
+    return cert_deps.dep_flags(ROOT / app["app_proj"] / "drift" / "manifest.json", artifact_name,
+                               ROOT / app["app_proj"] / "drift" / "lock.json", exclude=(app["local_lib"],))
 
 
 def _build_job(app):
