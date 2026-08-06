@@ -29,7 +29,7 @@ test:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source "../../tools/cert-env.sh"
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.35.0}"
 	[[ -x "$MARIACHI_BIN" ]] || { echo "error: mariachi not found at '$MARIACHI_BIN' (set MARIACHI_BIN or DRIFT_CERT_CAPABILITIES.tool:mariachi)" >&2; exit 1; }
 	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
@@ -84,7 +84,7 @@ perf *ARGS:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source "../../tools/cert-env.sh"
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.35.0}"
 	[[ -x "$MARIACHI_BIN" ]] || { echo "error: mariachi not found at '$MARIACHI_BIN' (set MARIACHI_BIN or DRIFT_CERT_CAPABILITIES.tool:mariachi)" >&2; exit 1; }
 	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
@@ -124,7 +124,7 @@ stress:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source "../../tools/cert-env.sh"
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.35.0}"
 	[[ -x "$MARIACHI_BIN" ]] || { echo "error: mariachi not found at '$MARIACHI_BIN' (set MARIACHI_BIN or DRIFT_CERT_CAPABILITIES.tool:mariachi)" >&2; exit 1; }
 	export DRIFT_PKG_ROOT="${DRIFT_PKG_ROOT:-$HOME/opt/drift/certified/current/pkgs}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"

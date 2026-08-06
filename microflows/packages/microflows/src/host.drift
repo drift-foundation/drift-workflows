@@ -2677,7 +2677,7 @@ fn _canonical_args(args_json: &String) -> String {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
 	// STRICT: reject duplicate keys + non-standard numbers, so the canonical argument document
 	// (and the workflow_conflict identity it backs) is well-defined.
-	match json.parse_strict(args_json) {
+	match json.parse(args_json) {
 		core.Result::Ok(node) => {
 			match node.as_object() {
 				Optional::Some(_) => { return json.encode_compact_with_config(node, cfg); },

@@ -904,7 +904,7 @@ fn _parse_constr_value(c: &mut Cursor) -> json.JsonNode {
 			}
 		}
 		if _str_eq(kw, "true") or _str_eq(kw, "false") or _str_eq(kw, "null") {
-			match json.parse_strict(kw) {
+			match json.parse(kw) {
 				core.Result::Ok(n) => { var o = json.new_object(); o.set("const", move n); return o.to_node(); },
 				core.Result::Err(_) => { throw ParseError(code = "invalid-json", byte_offset = kw_start, line = 0, column = 0, expected = "", found = "", message = "invalid JSON literal"); }
 			}
@@ -1165,7 +1165,7 @@ fn _parse_json_value(c: &mut Cursor) -> json.JsonNode {
 	val start = c.pos;
 	val end = _scan_json_value(c);
 	val raw = _slice(c, start, end - start);
-	match json.parse_strict(raw) {
+	match json.parse(raw) {
 		core.Result::Ok(n) => { return move n; },
 		core.Result::Err(_) => { throw ParseError(code = "invalid-json", byte_offset = start, line = 0, column = 0, expected = "", found = "", message = "invalid JSON value in case arm 'match'"); }
 	}

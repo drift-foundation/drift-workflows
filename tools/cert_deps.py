@@ -32,6 +32,45 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Minimum driftc this repo compiles with. 0.35.0 is a hard floor, not advisory:
+# std.json's permissive parse() profile only disappeared in the 0.33.93 clean
+# break carried by this train — an older compiler accepts the same sources but
+# silently parses every production JSON boundary permissively (duplicate keys,
+# non-RFC numbers), defeating the strict-acceptance contract the packages
+# version against. Coverage: dep-resolving compiles hit this via
+# resolved_versions() (emitters import it; runner/participant-stub build
+# recipes exec this module for their --dep flags); dep-FREE compiles (the
+# standalone runner ir/unit tests) are covered because every plan emitter
+# calls enforce_toolchain_floor() at emit time, and the runner justfile's
+# local direct-driftc test loop runs `cert_deps.py --check-floor` first.
+TOOLCHAIN_FLOOR = (0, 35, 0)
+
+
+def enforce_toolchain_floor(env=None):
+    """Fail-closed floor gate: exits unless $DRIFT_TOOLCHAIN_ROOT's driftc reports
+    (via `--version --json`, exit 0) a version >= TOOLCHAIN_FLOOR."""
+    env = os.environ if env is None else env
+    toolchain = Path(env.get("DRIFT_TOOLCHAIN_ROOT") or os.path.expanduser("~/opt/drift/certified/current/toolchain"))
+    driftc = toolchain / "bin" / "driftc"
+    if not driftc.is_file():
+        sys.exit(f"cert-deps: driftc not found at {driftc} (set DRIFT_TOOLCHAIN_ROOT)")
+    proc = subprocess.run([str(driftc), "--version", "--json"], capture_output=True, text=True)
+    floor = ".".join(map(str, TOOLCHAIN_FLOOR))
+    # Nonzero exit is a failure REGARDLESS of stdout: a broken/hostile driftc can
+    # emit plausible version JSON while dying — never parse past a bad status.
+    if proc.returncode != 0:
+        sys.exit(f"cert-deps: `{driftc} --version --json` failed (exit {proc.returncode}; "
+                 f"stderr {proc.stderr.strip()!r}) — toolchain >= {floor} required")
+    try:
+        ver = json.loads(proc.stdout)["toolchain"]["driftc"]
+        parsed = tuple(int(p) for p in ver.split("."))
+    except Exception:
+        sys.exit(f"cert-deps: cannot read driftc version from `{driftc} --version --json` "
+                 f"(stdout {proc.stdout!r}) — toolchain >= {floor} required")
+    if parsed < TOOLCHAIN_FLOOR:
+        sys.exit(f"cert-deps: driftc {ver} is below this repo's floor {floor} "
+                 f"(strict std.json acceptance contract; point DRIFT_TOOLCHAIN_ROOT at >= {floor})")
+
 
 def _strict_versions(artifact, lock_path, exclude):
     with open(lock_path) as f:
@@ -83,6 +122,7 @@ def resolved_versions(manifest_path, artifact, lock_path, exclude=(), env=None):
     --source-rebuild`; lock demoted to evidence on stderr."""
     env = os.environ if env is None else env
     exclude = set(exclude)
+    enforce_toolchain_floor(env)
     if env.get("DRIFT_CERT_MODE") == "certify":
         return _certify_versions(manifest_path, artifact, exclude, env)
     return _strict_versions(artifact, lock_path, exclude)
@@ -100,11 +140,18 @@ def dep_flags(manifest_path, artifact, lock_path, exclude=(), env=None):
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Emit --dep flags for a gate compile (strict lock / certify source-rebuild).")
-    ap.add_argument("--manifest", required=True)
-    ap.add_argument("--artifact", required=True)
-    ap.add_argument("--lock", required=True)
+    ap.add_argument("--check-floor", action="store_true",
+                    help="only enforce the driftc floor (for dep-free direct-driftc recipes), no --dep output")
+    ap.add_argument("--manifest")
+    ap.add_argument("--artifact")
+    ap.add_argument("--lock")
     ap.add_argument("--exclude", action="append", default=[])
     args = ap.parse_args()
+    if args.check_floor:
+        enforce_toolchain_floor()
+        return
+    if not (args.manifest and args.artifact and args.lock):
+        ap.error("--manifest, --artifact and --lock are required unless --check-floor")
     print(" ".join(dep_flags(args.manifest, args.artifact, args.lock, args.exclude)))
 
 

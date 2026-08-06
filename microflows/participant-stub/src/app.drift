@@ -581,7 +581,7 @@ fn _fault_crash_after_commit(input: &json.JsonNode) nothrow -> Bool {
 fn _lease_ttl_seconds() nothrow -> Int {
 	match env.get("MICROFLOWS_STUB_LEASE_TTL_SECONDS") {
 		Optional::Some(v) => {
-			match json.parse_strict(v) {
+			match json.parse(v) {
 				core.Result::Ok(n) => { match n.as_int() { Optional::Some(i) => { if i >= 1 { return i; } }, Optional::None => {} } },
 				core.Result::Err(_) => {}
 			}

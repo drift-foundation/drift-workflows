@@ -36,6 +36,15 @@ BEGIN
 	ELSEIF arg_idempotency_key = 0x0D THEN
 		SELECT JSON_OBJECT('outcome','working','lease_owner','zznot-hexzz',
 			'lease_expires_at','2026-01-01 00:00:00.000000','checkpoint', JSON_EXTRACT('{}','$')) AS result;  -- owner not hex (checkpoint valid)
+	ELSEIF arg_idempotency_key = 0x0F THEN
+		-- strict std.json (drift 0.35.0 floor): DUPLICATE TOP-LEVEL KEY in the envelope must be
+		-- rejected by the gateway's strict parse. Raw string on purpose: JSON_OBJECT cannot emit
+		-- duplicates, and MariaDB's JSON_VALID would ACCEPT this document — the DB cannot backstop
+		-- us until the 12.3 migration adds IS JSON OBJECT WITH UNIQUE KEYS guards.
+		SELECT '{"outcome":"terminal","outcome":"terminal","state":"done","payload":{"ok":true},"checkpoint":{}}' AS result;
+	ELSEIF arg_idempotency_key = 0x10 THEN
+		-- strict std.json (drift 0.35.0 floor): duplicate key NESTED inside payload must be rejected.
+		SELECT '{"outcome":"terminal","state":"done","payload":{"ok":true,"ok":false},"checkpoint":{}}' AS result;
 	ELSE
 		-- 0x0E: owner hex decodes to 1 byte, not 16 (checkpoint valid, so the throw is the owner).
 		SELECT JSON_OBJECT('outcome','working','lease_owner','00',

@@ -688,7 +688,7 @@ fn _op_by_name(merged: &json.JsonNode, name: &String) nothrow -> String {
 
 // Parse a JSON literal (test input); abort the test scenario on a malformed literal.
 fn _pj(text: &String) -> json.JsonNode {
-	match json.parse_strict(text) {
+	match json.parse(text) {
 		core.Result::Ok(n) => { return move n; },
 		core.Result::Err(_) => { throw TestError(message = "bad test JSON literal"); }
 	}

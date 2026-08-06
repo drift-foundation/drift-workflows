@@ -104,5 +104,5 @@ examples/
 | order_fulfillment (calls shipment_booking) | typed call + return completes; later-step failure → **reverse-child compensation** (parent `pending` on the child, no cascade; child compensates itself; parent ends `failed`, `compensated:true`) |
 | (any) | manifest **reload** doesn't break a pinned older workflow; **terminal replay** with the participant down |
 
-Toolchain: driftc 0.33.91+ / ABI 22. As-built design: `microflows/doc/microflows_design.md` §15 (service),
+Toolchain: driftc 0.35.0+ / ABI 22. As-built design: `microflows/doc/microflows_design.md` §15 (service),
 §12 (the language/IR), and §16 (workflow composition).

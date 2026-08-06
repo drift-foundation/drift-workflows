@@ -4,18 +4,18 @@
     "singular": {
       "resolved": {
         "mariadb-rpc": {
-          "version": "0.8.1",
-          "sha256": "bf31837d6b43cca1c481aef28e7ee558b0b5b6eb1b2ec26f6202ea7cf30953ba",
+          "version": "0.8.2",
+          "sha256": "ce9c85315cb1d1db48413cb538e545bb3fe3c3d4741e7d60eb786ea997823778",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:3f802e4e504f8dcbc466f9370fc598c88345fde84acf3584d98b076e2a3df06a",
+          "source_content_id": "sha256:5964142028fd40bff24494f91b0209cfafda543835540b0fd5028b4de2112dea",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         },
         "mariadb-wire-proto": {
-          "version": "0.6.1",
-          "sha256": "a0f407509beab63abfb16b2ea43cb94d83d06397cb8b8be1df9d44f0951fe3b1",
+          "version": "0.6.2",
+          "sha256": "a2c61ac6813a2b8d7b71a1ec7fe7af43eee089ad1a8e7c010d6335ccbfaf4370",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:d40cd20b4a931c696d17e4b1ef400bd01c627517b96448c0fcafd78bdf6edd01",
+          "source_content_id": "sha256:360be1a40772b3833a8b7195640a3b9348f3a71b8fe1a5b18b1b1ac9aa5be80c",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "transitive"
         }

@@ -17,7 +17,7 @@ import microflows.runner.ir as ir;
 // parse_graph on a JSON config string: true iff it is REJECTED (Err). (The JSON itself must be
 // valid — we test graph-level rejection, not JSON parse errors.)
 fn _pg_rejects(text: &String) -> Bool {
-	match json.parse_strict(text) {
+	match json.parse(text) {
 		core.Result::Ok(n) => {
 			match ir.parse_graph(n) {
 				core.Result::Err(e) => { return true; },
@@ -28,7 +28,7 @@ fn _pg_rejects(text: &String) -> Bool {
 	}
 }
 fn _pg_accepts(text: &String) -> Bool {
-	match json.parse_strict(text) {
+	match json.parse(text) {
 		core.Result::Ok(n) => {
 			match ir.parse_graph(n) {
 				core.Result::Ok(g) => { return true; },
@@ -42,7 +42,7 @@ fn _pg_accepts(text: &String) -> Bool {
 // parse_graph THEN validate_graph: true iff the config is rejected at EITHER stage. (Some hardening
 // — duplicate arm constants — is enforced by validate_graph, not the parser.)
 fn _pgv_rejects(text: &String) -> Bool {
-	match json.parse_strict(text) {
+	match json.parse(text) {
 		core.Result::Ok(n) => {
 			match ir.parse_graph(n) {
 				core.Result::Ok(g) => {
@@ -55,7 +55,7 @@ fn _pgv_rejects(text: &String) -> Bool {
 	}
 }
 fn _pgv_accepts(text: &String) -> Bool {
-	match json.parse_strict(text) {
+	match json.parse(text) {
 		core.Result::Ok(n) => {
 			match ir.parse_graph(n) {
 				core.Result::Ok(g) => {
@@ -73,7 +73,7 @@ fn _pgv_accepts(text: &String) -> Bool {
 // `return` node is NOT parse-gated — only the `.mf` `return` statement is — so explicit returns can
 // be authored here without un-gating.)
 fn _vrc(text: &String, rt: &Optional<ir.IrType>) -> Optional<String> {
-	match json.parse_strict(text) {
+	match json.parse(text) {
 		core.Result::Ok(n) => {
 			match ir.parse_graph(n) {
 				core.Result::Ok(g) => { return ir.validate_return_contract(g, rt); },
@@ -97,7 +97,7 @@ fn _vrc_accepts(text: &String, rt: &Optional<ir.IrType>) -> Bool {
 fn _tc_rt(text: &String, rt: &Optional<ir.IrType>) -> Optional<String> {
 	val at = ir.empty_object_type();
 	val no_contracts: Array<ir.OpContract> = [];
-	match json.parse_strict(text) {
+	match json.parse(text) {
 		core.Result::Ok(n) => {
 			match ir.parse_graph(n) {
 				core.Result::Ok(g) => { return ir.type_check_graph(g, at, no_contracts, rt, Optional<Array<ir.CallTarget>>::None()); },
@@ -116,7 +116,7 @@ fn _tc_rt_accepts(text: &String, rt: &Optional<ir.IrType>) -> Bool {
 
 // Parse an IR value type from its JSON encoding (for type-checker tests).
 fn _pt(text: &String) -> ir.IrType {
-	match json.parse_strict(text) {
+	match json.parse(text) {
 		core.Result::Ok(n) => { return ir.parse_type(n); },
 		core.Result::Err(e) => { return ir.empty_object_type(); }
 	}

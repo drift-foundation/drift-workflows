@@ -113,6 +113,9 @@ def emit_test():
 
 
 def main():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import cert_deps
+    cert_deps.enforce_toolchain_floor()   # floor gates EVERY plan, incl. dep-free jobs
     ap = argparse.ArgumentParser()
     ap.add_argument("gate", choices=["test"])
     ap.add_argument("--out", default="-")

@@ -778,7 +778,7 @@ fn _parse_path_opt(n: &json.JsonNode, key: &String) -> Array<String> {
 // the same scheme and may later delegate here. Err(IrError) on malformed input.
 pub fn canonical_json(text: &String) nothrow -> core.Result<String, IrError> {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
-	match json.parse_strict(text) {
+	match json.parse(text) {
 		core.Result::Ok(n) => { return core.Result<String, IrError>::Ok(json.encode_compact_with_config(n, cfg)); },
 		core.Result::Err(_) => { return core.Result<String, IrError>::Err(IrError(message = "constant is not valid JSON")); }
 	}
@@ -1109,7 +1109,7 @@ pub variant StepOutcome {
 pub fn advance(g: &IrGraph, arguments: &String, settled: &Array<OpResult>) nothrow -> StepOutcome {
 	var args_ok = false;
 	var args_node = json.new_object().to_node();
-	match json.parse_strict(arguments) {
+	match json.parse(arguments) {
 		core.Result::Ok(n) => { args_node = move n; args_ok = true; },
 		core.Result::Err(_) => {}
 	}
@@ -1253,7 +1253,7 @@ fn _eval(g: &IrGraph, e: &IrExpr, args: &json.JsonNode, settled: &Array<OpResult
          lnames: &Array<String>, lvals: &Array<json.JsonNode>) nothrow -> core.Result<json.JsonNode, IrError> {
 	match e {
 		IrExpr::EConst(canonical_json) => {
-			match json.parse_strict(canonical_json) {
+			match json.parse(canonical_json) {
 				core.Result::Ok(n) => { return core.Result<json.JsonNode, IrError>::Ok(move n); },
 				core.Result::Err(_) => { return _ev_err("EConst is not valid JSON"); }
 			}
@@ -1267,7 +1267,7 @@ fn _eval(g: &IrGraph, e: &IrExpr, args: &json.JsonNode, settled: &Array<OpResult
 		IrExpr::EResult(node, path) => {
 			match _find_settled(settled, node) {
 				Optional::Some(rj) => {
-					match json.parse_strict(rj) {
+					match json.parse(rj) {
 						core.Result::Ok(rn) => {
 							match _project(rn, path) {
 								Optional::Some(n) => { return core.Result<json.JsonNode, IrError>::Ok(move n); },
@@ -1883,7 +1883,7 @@ fn _binder_available_after(g: &IrGraph, name: &String, x: Int) nothrow -> Bool {
 fn _check_fail_reason_const(reason: &IrExpr) nothrow -> Optional<String> {
 	match reason {
 		IrExpr::EConst(cj) => {
-			match json.parse_strict(cj) {
+			match json.parse(cj) {
 				core.Result::Ok(n) => {
 					match n.as_string() {
 						Optional::Some(sv) => { if sv.byte_length() > 190 { return Optional<String>::Some("fail reason string literal exceeds 190 bytes"); } return Optional<String>::None(); },
@@ -2252,7 +2252,7 @@ pub fn type_check_graph(g: &IrGraph, arg_type: &IrType, contracts: &Array<OpCont
 							InferType::Known(st) => {
 								var a = 0;
 								while a < arms.len {
-									match json.parse_strict(arms[a].match_const) {
+									match json.parse(arms[a].match_const) {
 										core.Result::Ok(mn) => {
 											match validate(mn, st) {
 												Optional::Some(m) => { return Optional<String>::Some("NCase arm constant incompatible with scrutinee type: " + move m); },
@@ -2378,7 +2378,7 @@ fn _check_value_is(g: &IrGraph, e: &IrExpr, expected: &IrType, arg_type: &IrType
 fn _const_value_of(g: &IrGraph, e: &IrExpr) nothrow -> Optional<json.JsonNode> {
 	match e {
 		IrExpr::EConst(canonical_json) => {
-			match json.parse_strict(canonical_json) {
+			match json.parse(canonical_json) {
 				core.Result::Ok(n) => { return Optional<json.JsonNode>::Some(move n); },
 				core.Result::Err(_) => { return Optional<json.JsonNode>::None(); }
 			}
@@ -2590,7 +2590,7 @@ fn _infer_expr_type(g: &IrGraph, e: &IrExpr, arg_type: &IrType, contracts: &Arra
                     lt_names: &Array<String>, lt_types: &Array<InferType>, call_targets: &Optional<Array<CallTarget>>) nothrow -> core.Result<InferType, IrError> {
 	match e {
 		IrExpr::EConst(canonical_json) => {
-			match json.parse_strict(canonical_json) {
+			match json.parse(canonical_json) {
 				core.Result::Ok(n) => { return core.Result<InferType, IrError>::Ok(_infer_const_type(n)); },
 				core.Result::Err(_) => { return core.Result<InferType, IrError>::Ok(InferType::Imprecise()); }
 			}

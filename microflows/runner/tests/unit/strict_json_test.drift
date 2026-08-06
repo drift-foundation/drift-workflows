@@ -1,0 +1,75 @@
+// Strict std.json acceptance pins (drift 0.35.0 / ABI 22 floor) — duplicate-key rejection at
+// the runner's JSON acceptance boundaries. 0.35.0 removed std.json's permissive parse()
+// profile, so these boundaries now REJECT duplicate-key objects and non-RFC numbers; this test
+// pins that ACCEPTANCE CONTRACT (not the stdlib itself): losing it — e.g. by compiling below
+// the floor or routing a boundary through a permissive config — is a regression, because
+// MariaDB's own JSON_VALID admits duplicate-key documents and cannot backstop us. DB-side
+// parity (IS JSON OBJECT WITH UNIQUE KEYS constraints/SP guards + DB-boundary pins) is blocked
+// on the MariaDB 12.3 migration: work/mariadb-12.3-json-parity/.
+//
+// Standalone: compiled with ../src/ir.drift (ir imports only std.*), no DB.
+
+module microflows.runner.tests.strict_json_test;
+
+import std.core as core;
+import std.console as con;
+import std.json as json;
+import microflows.runner.ir as ir;
+
+// canonical_json (the EConst / case-arm canonical-identity boundary): true iff rejected.
+fn _cj_rejects(text: &String) -> Bool {
+	match ir.canonical_json(text) {
+		core.Result::Err(_) => { return true; },
+		core.Result::Ok(_) => { return false; }
+	}
+}
+
+fn scenario() -> Int {
+	// Control: strict parse still accepts well-formed JSON and canonicalizes key order.
+	match ir.canonical_json("{\"b\":2,\"a\":1}") {
+		core.Result::Ok(c) => { if c != "{\"a\":1,\"b\":2}" { return 11; } },
+		core.Result::Err(_) => { return 12; }
+	}
+	// Duplicate keys rejected: top-level, nested in an object, nested inside an array element.
+	if !_cj_rejects("{\"a\":1,\"a\":2}") { return 13; }
+	if !_cj_rejects("{\"outer\":{\"a\":1,\"a\":2}}") { return 14; }
+	if !_cj_rejects("[{\"a\":1,\"a\":2}]") { return 15; }
+	// Strict RFC numbers: leading zero rejected.
+	if !_cj_rejects("{\"a\":01}") { return 16; }
+
+	// Caller-arguments boundary: advance() Faults on duplicate-key args (top-level + nested)
+	// and still completes on the well-formed control.
+	var gnode = json.new_object().to_node();
+	match json.parse("{\"entry\":\"n0\",\"nodes\":[{\"kind\":\"return\",\"id\":\"n0\",\"value\":{\"const\":1}}]}") {
+		core.Result::Ok(n) => { gnode = move n; },
+		core.Result::Err(_) => { return 21; }
+	}
+	var none: Array<ir.OpResult> = [];
+	match ir.parse_graph(gnode) {
+		core.Result::Ok(g) => {
+			match ir.advance(g, "{\"a\":1}", none) {
+				ir.StepOutcome::Completed(_) => {},
+				default => { return 22; }
+			}
+			match ir.advance(g, "{\"a\":1,\"a\":2}", none) {
+				ir.StepOutcome::Fault(_) => {},
+				default => { return 23; }
+			}
+			match ir.advance(g, "{\"outer\":{\"a\":1,\"a\":2}}", none) {
+				ir.StepOutcome::Fault(_) => {},
+				default => { return 24; }
+			}
+		},
+		core.Result::Err(_) => { return 25; }
+	}
+	return 0;
+}
+
+pub fn main() nothrow -> Int {
+	con.println("strict std.json acceptance pins (duplicate keys / RFC numbers; drift 0.35.0 floor)");
+	var r = 0;
+	try { r = scenario(); } catch unexpected { return 91; }
+	if r != 0 { return r; }
+	con.println("all pass");
+	return 0;
+}

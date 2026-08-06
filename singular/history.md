@@ -1,3 +1,20 @@
+## 2026-08-06 – 0.10.0: strict JSON acceptance (drift 0.35.0 / ABI 22)
+
+Compiler floor raised to driftc 0.35.0 (enforced fail-closed by
+`tools/cert_deps.py` — at `--dep` derivation for dep-resolving compiles and at
+plan-emit time in every emitter for dep-free ones — not just advertised;
+nonzero driftc exit rejected before stdout parse; pinned by
+`tools/tests/test_cert_deps_floor.py`). 0.35.0 carries std.json's 0.33.93
+clean break: the permissive `parse()` profile is gone (`parse_strict()` removed;
+`parse()` IS the strict entry). `gateway.drift`'s two backend-response parse
+boundaries therefore now reject duplicate-key objects, non-RFC numbers (leading
+zeros), unescaped control bytes, and invalid `\uXXXX` escapes, where the
+pre-0.35.0 permissive default accepted them. That is an acceptance-contract
+tightening — MariaDB's own `JSON_VALID` admits duplicate-key documents, so the
+backend cannot be assumed to have filtered them — hence a minor bump, not a
+patch. Duplicate-key rejection is pinned by a focused regression at the
+malformed-backend boundary. No API or schema change otherwise.
+
 ## 2026-07-03 – 0.8.0: RpcCommitError compatibility (mariadb-rpc kind/cause_tag redesign)
 
 Bumped from 0.7.0 (source changed; 0.7.0 predates this work and was already an existing version, so

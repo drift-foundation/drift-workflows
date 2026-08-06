@@ -1,7 +1,7 @@
 # Singular — idempotency/lease coordination library
 #
 # Environment:
-#   DRIFT_TOOLCHAIN_ROOT — required for cert gates (just test). Toolchain >= 0.33.91.
+#   DRIFT_TOOLCHAIN_ROOT — required for cert gates (just test). Toolchain >= 0.35.0.
 #   DRIFT_PKG_ROOT       — foundation-libs root for resolving external deps
 #                          (default: $HOME/opt/drift/certified/current/pkgs).
 #
@@ -38,7 +38,7 @@ test:
 _test-grouped DB_GROUP:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.35.0}"
 	export DRIFT_PKG_ROOT="{{_pkg-root}}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
@@ -57,7 +57,7 @@ stress:
 _stress-grouped DB_GROUP:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.35.0}"
 	export DRIFT_PKG_ROOT="{{_pkg-root}}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
@@ -72,7 +72,7 @@ _stress-grouped DB_GROUP:
 perf *ARGS:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.35.0}"
 	export DRIFT_PKG_ROOT="{{_pkg-root}}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
@@ -101,7 +101,7 @@ test-sql:
 check-one FILE:
 	#!/usr/bin/env bash
 	set -uo pipefail
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.35.0}"
 	export DRIFT_PKG_ROOT="{{_pkg-root}}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }
@@ -119,7 +119,7 @@ test-malformed-fixture:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	source "../../tools/cert-env.sh"
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.35.0}"
 	"$MARIACHI_BIN" \
 	  --schema-template ../db-tests/malformed \
 	  --host "$DB_HOST" --port "$DB_PORT" \
@@ -132,7 +132,7 @@ test-malformed-fixture:
 compile-check FILE="packages/singular/src/lib.drift":
 	#!/usr/bin/env bash
 	set -uo pipefail
-	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.33.91}"
+	: "${DRIFT_TOOLCHAIN_ROOT:?set DRIFT_TOOLCHAIN_ROOT to a toolchain >= 0.35.0}"
 	export DRIFT_PKG_ROOT="{{_pkg-root}}"
 	RUNNER="${DRIFT_TOOLCHAIN_ROOT}/lib/tools/drift_test_run.py"
 	[[ -f "$RUNNER" ]] || { echo "error: shared executor not found at $RUNNER (need toolchain >= 0.33.17)" >&2; exit 1; }

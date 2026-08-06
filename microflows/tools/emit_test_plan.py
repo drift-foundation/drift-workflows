@@ -208,6 +208,9 @@ def emit_compile(rel):
 
 def main():
     global DB_GROUP
+    sys.path.insert(0, str(ROOT.parent / "tools"))
+    import cert_deps
+    cert_deps.enforce_toolchain_floor()   # floor gates EVERY plan, incl. dep-free jobs
     ap = argparse.ArgumentParser(description="Emit a drift_test_run.py plan for a Microflows gate.")
     ap.add_argument("gate", choices=["test", "one", "compile"])
     ap.add_argument("--file", help="test/source file (for one|compile)")

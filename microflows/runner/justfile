@@ -44,9 +44,10 @@ test:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	DC="${DRIFT_TOOLCHAIN_ROOT:-$HOME/opt/drift/certified/current/toolchain}/bin/driftc"
+	python3 ../../tools/cert_deps.py --check-floor   # dep-free direct-driftc loop: enforce the repo floor first
 	OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 	# ir-only tests (graph IR construction/hashing + interpreter execution) compile standalone.
-	for t in ir_graph_test ir_exec_test; do
+	for t in ir_graph_test ir_exec_test strict_json_test; do
 		for variant in base asan; do
 			san=""; [[ "$variant" == asan ]] && san="--sanitize=address"
 			"$DC" --target-word-bits 64 $san \

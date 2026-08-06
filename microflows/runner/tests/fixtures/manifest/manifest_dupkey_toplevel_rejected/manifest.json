@@ -1,0 +1,10 @@
+{
+  "deployment": {
+    "worker_id": "w",
+    "db": {"host": "127.0.0.1", "port": 34214, "user": "root", "password": "", "database": "microflows"},
+    "participants": [],
+    "operations": []
+  },
+  "scripts": [{"name": "parent", "version": "1.0.0", "path": "parent.mf", "returns": {}}],
+  "scripts": [{"name": "parent", "version": "1.0.0", "path": "parent.mf", "returns": {}}]
+}

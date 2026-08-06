@@ -51,7 +51,7 @@ use trait iter.SinglePassIterator;
 // Artifact version echoed by `--version` (and the cli help header) for BOTH binaries built from
 // this module (uflowsd service + mfrunner dev CLI). The ROOT drift/manifest.json is the version
 // AUTHORITY (uflowsd entry) — bump this constant together with every manifest version bump.
-const RUNNER_VERSION: String = "0.7.3";
+const RUNNER_VERSION: String = "0.8.0";
 
 const SCRIPT_NAME: String = "protocol_spike";
 // Legacy single-op pin (tb_mf_workflow.script_revision); the plan model keys on a
@@ -1163,7 +1163,7 @@ fn _deployment_for(base: &json.JsonNode, name: &String, version: &String, return
 fn _load_manifest(manifest_path: &String) throws -> ManifestSet {
 	val raw = _read_text(manifest_path);
 	var mjson = json.JsonNode::Null();
-	match json.parse_strict(raw) {
+	match json.parse(raw) {
 		core.Result::Ok(n) => { mjson = move n; },
 		core.Result::Err(_) => { throw RunnerError(message = "manifest is not valid JSON"); }
 	}
@@ -1482,7 +1482,7 @@ fn _run_planned(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 			var args_err: Optional<String> = Optional<String>::None();
 			// STRICT: a lenient parse keeps-last duplicate keys (so a duplicate could bypass the
 			// type's field/closed-object checks) and accepts non-standard numbers.
-			match json.parse_strict(args_json) {
+			match json.parse(args_json) {
 				core.Result::Ok(node) => { args_err = ir.validate(node, reg.revisions[aidx].arg_type); },
 				core.Result::Err(_) => { args_err = Optional<String>::Some("arguments are not valid JSON"); }
 			}
@@ -2067,7 +2067,7 @@ fn _assert_reversible(cfg: &json.JsonNode, graph: &ir.IrGraph, allow_calls: Bool
 // value's identity is independent of key spelling/order in config.
 fn _canonical_json(input_json: &String) -> String {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
-	match json.parse_strict(input_json) {
+	match json.parse(input_json) {
 		core.Result::Ok(n) => { return json.encode_compact_with_config(n, cfg); },
 		core.Result::Err(_) => { throw RunnerError(message = "plan step input is not valid JSON"); }
 	}
@@ -2596,7 +2596,7 @@ fn _run_forward(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Arr
 // trigger operation is still status=requested (rejected, never settled), which
 // begin_reversal requires.
 fn _fail_reason_string(reason_json: &String) nothrow -> Optional<String> {
-	match json.parse_strict(reason_json) {
+	match json.parse(reason_json) {
 		core.Result::Ok(n) => {
 			match n.as_string() {
 				Optional::Some(sv) => { if sv.byte_length() > 190 { return Optional<String>::None(); } return Optional<String>::Some(move sv); },
@@ -3031,7 +3031,7 @@ fn _blocked_from_continuation(snap: &mf.WorkflowSnapshot) nothrow -> Optional<Ou
 	// Render blocked ONLY for a durable blocked_resolution(3) row. A stale/malformed `pos:blocked` on a
 	// forward/reversing/deferred row must NOT suppress normal retry — the durable state is authoritative.
 	if snap.state_code != STATE_BLOCKED { return Optional<Outcome>::None(); }
-	match json.parse_strict(snap.continuation_json) {
+	match json.parse(snap.continuation_json) {
 		core.Result::Ok(n) => {
 			var pos = "";
 			match n.get("pos") { Optional::Some(pp) => { match pp.as_string() { Optional::Some(v) => { pos = move v; }, Optional::None => {} } }, Optional::None => {} }
@@ -3641,12 +3641,12 @@ fn _run_reversal(host: &mf.MicroflowsHost, cfg: &json.JsonNode, workflow_id: &Ar
 				// Reversal context comes from DURABLE state and is never synthesized: strict-parse the stored
 				// forward input + result; a malformed value is a durable inconsistency -> defer with a distinct reason.
 				var fwd_input_node = json.JsonNode::Null();
-				match json.parse_strict(forward_payload) {
+				match json.parse(forward_payload) {
 					core.Result::Ok(n) => { fwd_input_node = move n; },
 					core.Result::Err(_) => { return _defer_dispatch(host, workflow_id, fencing_token, "reverse_forward_input_invalid", admission); }
 				}
 				var fwd_result_node = json.JsonNode::Null();
-				match json.parse_strict(fwd_result) {
+				match json.parse(fwd_result) {
 					core.Result::Ok(n) => { fwd_result_node = move n; },
 					core.Result::Err(_) => { return _defer_dispatch(host, workflow_id, fencing_token, "reverse_forward_result_invalid", admission); }
 				}
@@ -3792,7 +3792,7 @@ fn _child_workflow_id_node(workflow_hex: &String, content_hash_hex: &String, nod
 
 fn _input_hash(input_json: &String) -> String {
 	val cfg = json.JsonConfig(key_order = json.JsonKeyOrder::OrderedLexUtf8());
-	match json.parse_strict(input_json) {
+	match json.parse(input_json) {
 		core.Result::Ok(n) => {
 			val compact = json.encode_compact_with_config(n, cfg);
 			val u = uuid.v3_from_string(compact);
@@ -4268,7 +4268,7 @@ fn _load_config_json(path: &String) throws -> json.JsonNode {
 			val text = _drain(move file);
 			// STRICT: reject duplicate keys + non-standard number forms (a lenient parse would
 			// keep-last duplicates and weaken canonical identity / the unknown-key guarantee).
-			match json.parse_strict(text) {
+			match json.parse(text) {
 				core.Result::Ok(n) => { return move n; },
 				core.Result::Err(_) => { throw RunnerError(message = "config: JSON parse failed"); }
 			}

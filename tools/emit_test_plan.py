@@ -119,7 +119,7 @@ def _reordered(jobs, group, start):
 def _runner_ir_jobs():
     build, run_unit = [], []
     src = str(RUNNER_ROOT / "src" / "ir.drift")
-    for t in ("ir_graph_test", "ir_exec_test"):
+    for t in ("ir_graph_test", "ir_exec_test", "strict_json_test"):
         test_src = str(RUNNER_ROOT / "tests" / "unit" / f"{t}.drift")
         entry = f"microflows.runner.tests.{t}::main"
         for variant, sanitize in (("base", False), ("asan", True)):
@@ -251,6 +251,10 @@ def emit_test():
     run_unit += _jobs_of(microflows_plan, "run-unit")
     run_unit += ir_run_unit
     run_unit += _runner_fixture_jobs("{work}/microflows-runner")
+    # DB-free, toolchain-free: pins the cert_deps floor gate itself (nonzero-exit
+    # rejection, below-floor rejection, at/above-floor acceptance) on fake driftc stubs.
+    run_unit.append({"id": "cert-deps-floor-test",
+                     "cmd": [sys.executable, str(ROOT / "tools" / "tests" / "test_cert_deps_floor.py")]})
 
     # run-live: one shared serial chain -- schema resets as jobs, then each
     # component's own DB-backed tests in their existing relative order, then
@@ -305,6 +309,8 @@ def main():
     ap.add_argument("gate", choices=["test"])
     ap.add_argument("--out", default="-", help="output path for the plan JSON (default: stdout)")
     args = ap.parse_args()
+    import cert_deps
+    cert_deps.enforce_toolchain_floor()   # floor gates EVERY plan, incl. dep-free standalone jobs
     check_version_sync()
     plan = emit_test()
     text = json.dumps(plan, indent=2)

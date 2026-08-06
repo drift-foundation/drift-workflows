@@ -94,6 +94,12 @@ fn scenario_object_contract() -> Int {
     if !_expect_reject(g, 8) { return 33; }   // malformed JSON envelope
     if !_expect_reject(g, 9) { return 34; }   // scalar envelope
 
+    // REJECT: strict std.json (drift 0.35.0 floor) — duplicate keys, top-level + nested.
+    // MariaDB JSON_VALID accepts both documents, so only the gateway's strict parse can
+    // reject them; DB-side parity is blocked on the 12.3 migration (UNIQUE KEYS guards).
+    if !_expect_reject(g, 15) { return 35; }  // 0x0F duplicate top-level key in envelope
+    if !_expect_reject(g, 16) { return 36; }  // 0x10 duplicate key nested in payload
+
     // REJECT: working snapshot fields.
     if !_expect_reject(g, 12) { return 41; }  // 0x0C checkpoint not an object
     if !_expect_reject(g, 13) { return 42; }  // 0x0D owner not hex

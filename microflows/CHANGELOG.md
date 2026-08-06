@@ -4,6 +4,30 @@
 > participant HTTP surface stays `/microflows/v1/…` — the v1 *contract* tightened, it was not forked to
 > v2. Full prose: `work/uflowsd/RELEASE_ANNOUNCEMENT_DRAFT.md`.
 
+## microflows 0.9.0 · uflowsd 0.8.0 — strict JSON acceptance (drift 0.35.0 / ABI 22)
+
+Compiler floor raised to driftc 0.35.0 and ENFORCED fail-closed by
+`tools/cert_deps.py` (older compilers accept the same sources but parse every
+JSON boundary permissively, silently defeating this contract): dep-resolving
+compiles hit the check when their `--dep` flags are derived, every plan
+emitter enforces it at emit time (covering the dep-free standalone unit-test
+compiles), and the runner's direct-driftc local test loop runs
+`cert_deps.py --check-floor` first. A driftc exiting nonzero is rejected
+before its stdout is parsed; the gate itself is pinned by
+`tools/tests/test_cert_deps_floor.py` in the root combined plan. 0.35.0 removes
+std.json's permissive `parse()` profile (`parse_strict()` gone; `parse()` IS the
+strict entry): the 29 former `parse_strict` sites keep their exact semantics,
+and the pre-existing `json.parse` consumers — caller/args JSON, participant
+HTTP request/response payloads, operation results, continuation/reason
+envelopes, and the operator manifest — now reject duplicate-key objects,
+non-RFC numbers, unescaped control bytes, and invalid `\uXXXX` escapes.
+MariaDB's `JSON_VALID` admits duplicate-key documents, so DB-resident JSON was
+never guaranteed pre-filtered: this is an acceptance-contract **tightening**
+(minor bump; the `/microflows/v1/…` surface is unchanged otherwise).
+Duplicate-key rejection is pinned by focused regressions at the runner's
+manifest/args/envelope boundaries. Deps repinned to the staged 0.35.0 pool;
+uflowsd's `microflows` range moves 0.8 → 0.9.
+
 ## microflows 0.5.0 · uflowsd 0.3.0 — unreleased
 
 Certified driftc 0.33.64 / ABI 18. Root `just test` green: singular, the microflows component (148-check
