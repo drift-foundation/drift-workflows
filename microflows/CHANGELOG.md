@@ -4,6 +4,29 @@
 > participant HTTP surface stays `/microflows/v1/…` — the v1 *contract* tightened, it was not forked to
 > v2. Full prose: `work/uflowsd/RELEASE_ANNOUNCEMENT_DRAFT.md`.
 
+## uflowsd 0.8.1 — adopt web-rest 0.7 (drift 0.35.0 / ABI 22, unchanged)
+
+uflowsd's `web-rest` range moves 0.6 → 0.7, tracking drift-web's `web-rest 0.7.0`.
+That release fixes a response-framing defect in the server — a duplicate,
+self-contradicting `Connection` field, and a socket served after it had been
+advertised as closing — by making the connection-close decision server-owned and
+folding it together with the request's own framing into a single decision. It also
+adds one validation policy for application-supplied response headers and
+error-carried headers.
+
+No uflowsd source change was required by the adoption. The two breaking changes in
+web-rest 0.7.0 are `with_response_header` returning `core.Result<Void, HeaderError>`
+and `RestError` gaining a required `headers_json` field; uflowsd calls neither and
+constructs no `RestError`. Its response construction goes through `json_response`,
+whose signature is unchanged. The wire behavior of the embedded server does change
+— correctly — so the fix is inherited rather than reimplemented here.
+
+ABI is unchanged at 22 and the compiler floor stays 0.35.0; this bump exists
+because the dependency-range change alters uflowsd's artifact source content
+identity, and the sealed 0.8.0 artifact cannot be reissued with different manifest
+content. `microflows 0.9.0` and `singular 0.10.0` are unaffected — neither depends
+on `web-rest`.
+
 ## microflows 0.9.0 · uflowsd 0.8.0 — strict JSON acceptance (drift 0.35.0 / ABI 22)
 
 Compiler floor raised to driftc 0.35.0 and ENFORCED fail-closed by

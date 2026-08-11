@@ -51,7 +51,7 @@ use trait iter.SinglePassIterator;
 // Artifact version echoed by `--version` (and the cli help header) for BOTH binaries built from
 // this module (uflowsd service + mfrunner dev CLI). The ROOT drift/manifest.json is the version
 // AUTHORITY (uflowsd entry) — bump this constant together with every manifest version bump.
-const RUNNER_VERSION: String = "0.8.0";
+const RUNNER_VERSION: String = "0.8.1";
 
 const SCRIPT_NAME: String = "protocol_spike";
 // Legacy single-op pin (tb_mf_workflow.script_revision); the plan model keys on a

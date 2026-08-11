@@ -19,7 +19,7 @@
       "package_deps": [
         {
           "name": "web-rest",
-          "version": "0.6"
+          "version": "0.7"
         },
         {
           "name": "mariadb-rpc",

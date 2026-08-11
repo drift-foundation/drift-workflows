@@ -44,10 +44,10 @@
           "dep_type": "transitive"
         },
         "web-rest": {
-          "version": "0.6.5",
-          "sha256": "7fbf466b95f16f3a3dae92df3f20fe4c1dc0a27f5b6f05e00280fa1cde8177b9",
+          "version": "0.7.0",
+          "sha256": "1d34159f0ede4a79c730a176e454165fa29e868fa3a8289024e869799751298c",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:f5058556557e34ac5fa621b0855b1290e0334b73b741349b8246c192c4b40ef0",
+          "source_content_id": "sha256:f59004d190744de7eda4151fb626d27fb06ab4c2835394dc8edfdc19af964071",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         }
@@ -96,10 +96,10 @@
           "dep_type": "transitive"
         },
         "web-rest": {
-          "version": "0.6.5",
-          "sha256": "7fbf466b95f16f3a3dae92df3f20fe4c1dc0a27f5b6f05e00280fa1cde8177b9",
+          "version": "0.7.0",
+          "sha256": "1d34159f0ede4a79c730a176e454165fa29e868fa3a8289024e869799751298c",
           "author_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
-          "source_content_id": "sha256:f5058556557e34ac5fa621b0855b1290e0334b73b741349b8246c192c4b40ef0",
+          "source_content_id": "sha256:f59004d190744de7eda4151fb626d27fb06ab4c2835394dc8edfdc19af964071",
           "source_attestation_key": "ed25519:6DSIXZVQiEPX1/4G95LcyZZRmuyqEeSTFiqQ4N+mjz0=",
           "dep_type": "direct"
         }

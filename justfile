@@ -246,11 +246,13 @@ _integration-gate GATE:
 # artifact VERSIONS — the per-component manifests are local-dev only and pin every artifact to the
 # sentinel `0.0.0` (drift requires a non-empty version; the sentinel makes clear no release-
 # authoritative version lives in a component tree). Bump versions in the root, then `just reseal`.
-# The orchestrator's stage_packages stages the PACKAGES ONLY:
-# `drift deploy --artifact singular --artifact microflows --dest <libs_root>` and binds real cert-suite
-# evidence. `uflowsd` is a kind:app artifact — NOT staged via the cert pool — its
-# stage_packages is package-only BY POLICY (the app author/cert legs DO work: shipped driftc 0.33.61,
-# `drift verify-app` green). uflowsd is built/signed LOCALLY by `just deploy` (which adds --app-dest + key). The local recipes
+# The orchestrator's stage_packages stages the PACKAGES **AND** the app, and binds real cert-suite
+# evidence. Its command (build-orchestrator `orchestration.json`, drift-workflows entry) is an
+# UNFILTERED `drift deploy --dest <pkgs_root> --app-dest <apps_root>`: no `--artifact` selection, and an
+# explicit app destination, so the kind:app `uflowsd` artifact IS staged via the cert pool (cf. the
+# staged `apps/` tree). An earlier version of this comment claimed package-only staging
+# `--artifact singular --artifact microflows` "BY POLICY"; that was stale and misread a run which failed
+# while staging the app. uflowsd is ALSO built/signed LOCALLY by `just deploy` (--app-dest + key). The local recipes
 # here are the dev fallback (`--cert-suite-id drift-workflows/dev --cert-suite-no-evidence`) — no bespoke
 # evidence ceremony, same as the other Foundation cert-pool repos.
 

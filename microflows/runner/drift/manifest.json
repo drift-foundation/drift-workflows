@@ -17,7 +17,7 @@
       "package_deps": [
         { "name": "mariadb-rpc", "version": "0.8" },
         { "name": "web-client", "version": "0.5" },
-        { "name": "web-rest", "version": "0.6" }
+        { "name": "web-rest", "version": "0.7" }
       ]
     },
     {
@@ -32,7 +32,7 @@
       "package_deps": [
         { "name": "mariadb-rpc", "version": "0.8" },
         { "name": "web-client", "version": "0.5" },
-        { "name": "web-rest", "version": "0.6" }
+        { "name": "web-rest", "version": "0.7" }
       ]
     }
   ]
