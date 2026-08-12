@@ -8,6 +8,7 @@ from conversation history and a dirty worktree.
 - When an effort LANDS, **delete its folder** — the commit history is the record
   (the working notes are scaffolding, not an archive). Do not leave landed efforts
   as a log; that just duplicates history and goes stale.
+- Never delete a work folder before its record-bearing commit has been pushed. Every review-finding folder must be committed and pushed at least once for backup, even when it is included only "for the record" or is unrelated to the commit's main change; after the finding is closed, remove it in a follow-up cleanup commit and push that commit.
 - Each folder has a `README.md` (the charter — sections below) and a `PROGRESS.md`
   (at-a-glance status + literal next action). Keep both short and current.
 - These are working notes, not design docs. Authoritative architecture lives in
